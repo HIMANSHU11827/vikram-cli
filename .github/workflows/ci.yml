@@ -1,0 +1,164 @@
+# VIKRAM CI
+#
+# Grounded in docs/development/testing-strategy.md §8 (CI matrix). Deviations
+# from §8, each also noted at the relevant job:
+#  - OS: hosted ubuntu/windows/macos `-latest` labels only. §8's
+#    ubuntu-24.04-aarch64 ARM runner is not a hosted `-latest` label (needs a
+#    self-hosted/preview runner); add when ARM runners are provisioned.
+#  - Cross builds (aarch64-unknown-linux-gnu/musl, x86_64-unknown-linux-musl
+#    via `cross`; aarch64-linux-android via cargo-zigbuild) are DEFERRED: the
+#    cross/zigbuild toolchains are not wired into this repo yet and could not be
+#    verified here. They are compile-only, so they can land as an extra job
+#    without blocking the PR gate.
+#  - §8's PR gate uses `cargo nextest` + `cargo insta test --check`; this
+#    workflow uses `cargo test --workspace --all-targets` because neither
+#    nextest nor insta is installed in the project toolchain today.
+#  - §8's nightly L5 chaos matrix / L6 criterion+dhat / L8 model evals need
+#    infrastructure that does not exist in the workspace yet (vikram-testfx,
+#    vikram-metrics, evals/ harness). Nightly here is a clippy+fmt canary only.
+#  - §8's test-fx containment check (`cargo tree -e features --release |
+#    grep -q test-fx`) is omitted until crates/testfx exists; with no test-fx
+#    feature today, grep finds nothing and the step would fail spuriously.
+#  - §8's budget smoke (idle RSS bound) needs vikram-metrics; not present yet.
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# Cancel superseded runs on the same ref so the PR queue stays short (§8 wants
+# the whole gate under 15 minutes).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt (rustfmt --check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          channel: stable
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      # KNOWN RED TODAY (baseline 2026-10-31): `cargo fmt --all -- --check`
+      # fails on 29 files (chat.rs, contracts/{error,journal,lib,message,
+      # policy,version}.rs, kernel/{effects,grants,lib,machine}.rs, policy/lib.rs,
+      # runtime/{agents,bus,lib,openai,runtime,session,tools,turn}.rs,
+      # store/lib.rs, tui/{app,input,layout,theme,ui}.rs,
+      # tui/widgets/{conversation,markdown,panels}.rs).
+      # Owner: run `cargo fmt --all` once to turn this gate green.
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          channel: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # No `-D warnings`: the workspace is NOT clippy-clean today (baseline
+      # 2026-10-31, stable 1.99.1: 12 warning sites / 9 lints). Known warnings
+      # are tracked as tech debt to fix:
+      #   clippy::question_mark           vikram-runtime/src/openai.rs:296
+      #   clippy::manual_map              vikram-runtime/src/runtime.rs:331
+      #   clippy::field_reassign_with_default  vikram-runtime/src/openai.rs:485 (test cfg)
+      #   clippy::await_holding_lock      vikram-runtime/src/runtime.rs:701,715,732,761 (test cfg)
+      #   unused_imports (rustc)          vikram-tui/src/widgets/panels.rs:788 (`Trust`)
+      #   clippy::manual_clamp            vikram-tui/src/widgets/conversation.rs:304
+      #   clippy::needless_range_loop     vikram-tui/src/widgets/markdown.rs:236
+      #   clippy::while_let_on_iterator   vikram-tui/src/widgets/markdown.rs:558
+      #   clippy::print_literal           vikram-cli/src/main.rs:280
+      # Once these are cleared, tighten to:
+      #   cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features
+
+  test:
+    name: test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          channel: stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets
+
+  doc:
+    name: doc (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          channel: stable
+      - uses: Swatinem/rust-cache@v2
+      # No RUSTDOCFLAGS="-D warnings": `cargo doc --workspace --no-deps` emits
+      # 1 warning today (broken intra-doc link [`App`] in
+      # vikram-tui/src/widgets/mod.rs:1). Add `-D warnings` after that is fixed.
+      - run: cargo doc --workspace --no-deps
+
+  nightly:
+    name: nightly canary (clippy + fmt)
+    runs-on: ubuntu-latest
+    # Nightly can break independently of our code (new lints, rustfmt style
+    # drift, compiler regressions), so this job is informational only and must
+    # never block merges.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          channel: nightly
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      # Deliberately no -D warnings: nightly adds lints over time.
+      - run: cargo clippy --workspace --all-targets --all-features
+      # No rustfmt.toml/.rustfmt.toml override exists in the repo, so nightly
+      # rustfmt's default style is what gets checked; expect drift vs the
+      # formatted codebase until `cargo fmt` is run and landings stabilize.
+      - run: cargo fmt --all -- --check
+
+  msrv:
+    name: msrv check (1.86)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Every crate pins rust-version = "1.86"; this job proves the declared
+      # MSRV still compiles (check only, no tests/clippy on the old toolchain).
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          channel: "1.86"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace
+
+  build-matrix:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          channel: stable
+      - uses: Swatinem/rust-cache@v2
+      # --locked: Cargo.lock is committed; CI must build exactly it and never
+      # silently update the lockfile.
+      - run: cargo build --workspace --locked

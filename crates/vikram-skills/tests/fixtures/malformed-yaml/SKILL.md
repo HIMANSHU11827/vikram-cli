@@ -1,0 +1,1 @@
+---\nname: bad\n  description: [unclosed\n---\n

@@ -1,0 +1,1 @@
+---\nname: native-valid\ndescription: A valid native skill for testing\nversion: "1.0.0"\n---\n# Native Valid\n\nThis is a valid skill.\n

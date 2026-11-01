@@ -1,0 +1,43 @@
+use std::path::PathBuf;
+use vikram_contracts::{SessionId, TeamId, VikramError};
+
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeError {
+    #[error("configuration at `{path}` is invalid: {reason}")]
+    Config { path: PathBuf, reason: String },
+
+    #[error("storage failure: {0}")]
+    Store(String),
+
+    #[error("i/o failure: {0}")]
+    Io(String),
+
+    #[error("model provider failed: {0}")]
+    Provider(String),
+
+    #[error("no model configured: set `model` and the API key named by `api_key_env`")]
+    ModelUnavailable,
+
+    #[error("session `{0}` does not exist")]
+    SessionNotFound(SessionId),
+
+    #[error("unknown agent `{0}`")]
+    AgentNotFound(String),
+
+    #[error("unknown team `{0}`")]
+    TeamNotFound(TeamId),
+
+    #[error("permission denied: {0}")]
+    Denied(String),
+
+    #[error("contract violation: {0}")]
+    Contract(#[from] VikramError),
+
+    #[error("runtime is shutting down")]
+    ShuttingDown,
+
+    #[error("invalid runtime state: {0}")]
+    InvalidState(String),
+}
+
+pub type Result<T> = std::result::Result<T, RuntimeError>;

@@ -1,0 +1,8 @@
+target/
+.env
+*.log
+codex/
+gitui/
+openhands2/
+inspect_ai/
+harbor/

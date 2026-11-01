@@ -1,0 +1,28 @@
+[package]
+name = "vikram-cli"
+description = "The vikram command: terminal interface, headless chat, and operator commands."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "vikram"
+path = "src/main.rs"
+
+[dependencies]
+vikram-contracts.workspace = true
+vikram-runtime.workspace = true
+vikram-skills.workspace = true
+vikram-tui.workspace = true
+vikram-store.workspace = true
+clap.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

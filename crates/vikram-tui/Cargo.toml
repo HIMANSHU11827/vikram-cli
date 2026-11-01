@@ -1,0 +1,19 @@
+[package]
+name = "vikram-tui"
+description = "The VIKRAM terminal interface: state, rendering and input handling."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vikram-contracts.workspace = true
+vikram-kernel.workspace = true
+vikram-runtime.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+tempfile.workspace = true
