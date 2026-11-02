@@ -1093,8 +1093,10 @@ fn clip(text: &str, width: usize, ascii: bool) -> String {
 fn docked(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
+    // Hug the bottom-left corner of the region: the transcript stays readable above and to the
+    // right, which is where the answer keeps appearing while a panel waits for an answer.
     Rect::new(
-        area.x + (area.width - width) / 2,
+        area.x,
         area.y + area.height.saturating_sub(height),
         width,
         height,
@@ -1112,6 +1114,7 @@ mod dock_tests {
 
         assert_eq!(rect.y + rect.height, region.y + region.height);
         assert_eq!(rect.y, 15, "a docked panel hangs from the bottom edge");
+        assert_eq!(rect.x, region.x, "and sits against the left edge");
         assert_eq!(rect.width, 72);
     }
 
