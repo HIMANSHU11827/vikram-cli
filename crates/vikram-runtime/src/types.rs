@@ -365,6 +365,12 @@ pub enum RuntimeEvent {
         discovered: usize,
         loaded: usize,
     },
+    /// What the configured endpoint says it serves, read from its own `/models` listing. An endpoint
+    /// that will not answer arrives as `error` rather than as an empty list that looks like a reply.
+    ModelsListed {
+        models: Vec<String>,
+        error: Option<String>,
+    },
     Notice {
         level: NoticeLevel,
         text: String,

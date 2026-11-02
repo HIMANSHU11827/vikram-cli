@@ -135,6 +135,32 @@ impl MemoryStore {
             .collect()
     }
 
+    /// Every key in every scope, ordered by scope then key. The interface shows what the model has
+    /// remembered; a scope-filtered list would make the panel depend on a word the operator has to
+    /// guess first.
+    pub fn list_all(&self) -> Vec<(String, String, String)> {
+        let conn = self.lock();
+        let mut stmt = match conn
+            .prepare("SELECT scope, key, value FROM memory ORDER BY scope ASC, key ASC")
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .ok();
+        match rows {
+            Some(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            None => Vec::new(),
+        }
+    }
+
     pub fn list<S>(&self, scope: S) -> Vec<(String, String)>
     where
         S: AsRef<str>,
@@ -220,6 +246,22 @@ fn migrate(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_scope_is_listed_so_a_panel_never_hides_what_was_remembered() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store.save("greeting", "hello", "global").unwrap();
+        store.save("convention", "tabs", "project").unwrap();
+        let all = store.list_all();
+        assert_eq!(
+            all,
+            vec![
+                ("global".to_owned(), "greeting".to_owned(), "hello".to_owned()),
+                ("project".to_owned(), "convention".to_owned(), "tabs".to_owned()),
+            ],
+            "ordered by scope then key, and both scopes present"
+        );
+    }
 
     #[test]
     fn save_and_get_round_trip() {

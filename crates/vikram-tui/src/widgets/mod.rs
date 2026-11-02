@@ -4,8 +4,10 @@
 pub mod conversation;
 pub mod markdown;
 pub mod panels;
+pub mod picker;
 
 pub use conversation::{conversation, conversation_lines, extract_file_path};
 pub use panels::{
     bots_panel, hive_panel, overlay, plasma, session_tabs, shortcuts, status_bar, suggestions_popup,
 };
+pub use picker::{Picker, PickerItem, PickerKind, Verb, picker_lines, picker_title};

@@ -110,7 +110,7 @@ pub enum InspectorKind {
     Model,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Overlay {
     Help,
     Approvals,
@@ -126,6 +126,39 @@ pub enum Overlay {
         selected: usize,
     },
     Skills,
+    /// The searchable chooser that a `/` command opens instead of printing a list.
+    Picker(crate::widgets::Picker),
+    /// A panel of what the runtime already knows. Read-only on purpose: there is no choice to make,
+    /// and offering options that do nothing would be worse than showing none.
+    Info {
+        title: String,
+        lines: Vec<String>,
+    },
+    /// A panel that asks before something irreversible happens. `yes` is the command the host
+    /// executes if the operator answers Enter.
+    Confirm {
+        title: String,
+        lines: Vec<String>,
+        yes: Box<UiCommand>,
+    },
+    /// A one-line field for the values a chooser cannot express: a model id the endpoint does not
+    /// list, a rule to save. Enter commits it; Esc leaves everything as it was.
+    Prompt {
+        title: String,
+        hint: String,
+        editor: Editor,
+        action: PromptAction,
+    },
+}
+
+/// What a text panel's Enter means. A closed set, so a prompt can never submit something the host
+/// has no path for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptAction {
+    /// The typed text is a model id; the host applies it with the same call the picker uses.
+    SetModel,
+    /// The typed text is an allow-list rule to save.
+    AddAllowRule,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,6 +215,34 @@ pub enum UiCommand {
         agent: AgentId,
         action: AgentAction,
     },
+    /// The operator used a verb on a row. The kind and verb together say what to do — a model to
+    /// switch to, a session to close, an MCP server to flip — so the host acts instead of the
+    /// interface guessing which of several meanings was meant.
+    Act {
+        kind: crate::widgets::PickerKind,
+        verb: crate::widgets::Verb,
+        value: String,
+        session: SessionId,
+    },
+    /// Read the configured endpoint's own model list.
+    RefreshModels,
+    /// Forget one saved allow-list rule, by its index in the list the operator was shown.
+    Unallow {
+        index: usize,
+    },
+    /// Stop a background task by id, which is what the tasks panel shows.
+    StopTask {
+        id: String,
+    },
+    /// Empty this conversation's transcript in the view.
+    Clear {
+        session: SessionId,
+    },
+    /// Forget one remembered key: the memory panel's second verb.
+    ForgetMemory {
+        scope: String,
+        key: String,
+    },
     RefreshMetrics,
     Quit,
 }
@@ -207,6 +268,7 @@ pub struct SessionView {
     pub activity: Vec<Activity>,
     pub expanded_activities: std::collections::HashSet<usize>,
     pub selected_activity: Option<usize>,
+    pub expanded_thought: bool,
     pub unread: usize,
 }
 
@@ -232,6 +294,7 @@ impl SessionView {
             activity: Vec::new(),
             expanded_activities: std::collections::HashSet::new(),
             selected_activity: None,
+            expanded_thought: false,
             unread: 0,
         }
     }
@@ -320,6 +383,18 @@ pub struct App {
     /// Answers typed here and not yet handed to the runtime, as `(request_id, answer)`.
     pub pending_answers: Vec<(String, String)>,
     pub commands: Vec<UiCommand>,
+    /// The endpoint's own model list, as last reported. Empty until a listing arrives; `models_error`
+    /// is what an endpoint that refused looks like, so an empty picker never means "no models".
+    pub models: Vec<String>,
+    pub models_error: Option<String>,
+    pub models_loading: bool,
+    /// The agent chosen in the agent panel, waiting for the verb panel to say what to do with it.
+    /// Two panels, one subject: the second panel cannot be answered without the first.
+    pub pending_agent: Option<AgentId>,
+    /// Where each picker row was drawn, as `(y, visible position)`, and the panel's x range. The
+    /// draw writes it and the mouse reads it, which is the only way a click can name a row.
+    pub picker_rows: Vec<(u16, usize)>,
+    pub picker_x: Option<(u16, u16)>,
 }
 
 impl App {
@@ -351,6 +426,78 @@ impl App {
             pending_question: None,
             pending_answers: Vec::new(),
             commands: Vec::new(),
+            models: Vec::new(),
+            models_error: None,
+            models_loading: false,
+            pending_agent: None,
+            picker_rows: Vec::new(),
+            picker_x: None,
+        }
+    }
+
+    /// Open the one-line field. The editor starts empty; the hint says what Enter will do, because a
+    /// text box that does not say what it commits is a trap.
+    pub fn open_prompt(
+        &mut self,
+        title: impl Into<String>,
+        hint: impl Into<String>,
+        action: PromptAction,
+    ) {
+        self.overlay = Some(Overlay::Prompt {
+            title: title.into(),
+            hint: hint.into(),
+            editor: Editor::new(),
+            action,
+        });
+    }
+
+    /// Show a chooser. One overlay at a time: opening a panel replaces whatever was open, because
+    /// two menus competing for the same keys is how an interface loses an instruction.
+    pub fn open_picker(&mut self, picker: crate::widgets::Picker) {
+        self.overlay = Some(Overlay::Picker(picker));
+    }
+
+    pub fn open_info(&mut self, title: impl Into<String>, lines: Vec<String>) {
+        self.overlay = Some(Overlay::Info {
+            title: title.into(),
+            lines,
+        });
+    }
+
+    pub fn open_confirm(&mut self, title: impl Into<String>, lines: Vec<String>, yes: UiCommand) {
+        self.overlay = Some(Overlay::Confirm {
+            title: title.into(),
+            lines,
+            yes: Box::new(yes),
+        });
+    }
+
+    /// The model chooser, built from the endpoint's listing and the model this session is on. While
+    /// the listing is in flight the rows are absent and the note says so, which is the difference
+    /// between "still reading" and "this endpoint serves nothing".
+    pub fn model_picker(&self) -> crate::widgets::Picker {
+        let current = self
+            .display_session()
+            .and_then(|session| session.model.clone());
+        let items: Vec<crate::widgets::PickerItem> = self
+            .models
+            .iter()
+            .map(|name| {
+                let item =
+                    crate::widgets::PickerItem::new(name.clone(), String::new(), name.clone());
+                if current.as_deref() == Some(name.as_str()) {
+                    item.as_current()
+                } else {
+                    item
+                }
+            })
+            .collect();
+        let picker = crate::widgets::Picker::new(crate::widgets::PickerKind::Model, "Model", items);
+        match (&self.models_error, self.models_loading, current) {
+            (Some(error), _, _) => picker.with_note(error.clone()),
+            (None, true, _) => picker.with_note("reading the endpoint's model list…"),
+            (None, false, Some(model)) => picker.with_note(format!("now on {model}")),
+            (None, false, None) => picker.with_note("no model is set for this session yet"),
         }
     }
 
@@ -663,6 +810,23 @@ impl App {
                 self.metrics.skills_discovered = discovered;
                 self.metrics.skills_loaded = loaded;
             }
+            RuntimeEvent::ModelsListed { models, error } => {
+                self.models_loading = false;
+                self.models_error = error;
+                self.models = models;
+                // A chooser that was opened while the listing was in flight is filled here, once.
+                // It is the only place the two halves meet, which is why "still reading" cannot
+                // be mistaken for "this endpoint serves nothing".
+                let showing_models = matches!(
+                    &self.overlay,
+                    Some(Overlay::Picker(picker))
+                        if picker.kind == crate::widgets::PickerKind::Model
+                );
+                if showing_models {
+                    let picker = self.model_picker();
+                    self.overlay = Some(Overlay::Picker(picker));
+                }
+            }
             RuntimeEvent::Notice { level, text } => self.push_notice(level, text),
             RuntimeEvent::ModeChanged { mode, .. } => {
                 self.mode = mode;
@@ -813,5 +977,88 @@ impl App {
             view.scroll = 0;
             view.follow = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vikram_runtime::types::SessionSnapshot;
+
+    fn app_on(model: Option<&str>) -> App {
+        let mut app = App::new(false);
+        app.sessions
+            .push(SessionView::from_snapshot(SessionSnapshot {
+                id: SessionId::generate(),
+                title: "one".to_owned(),
+                cwd: "/work".into(),
+                model: model.map(str::to_owned),
+                messages: Vec::new(),
+                turn: TurnState::Idle,
+                tokens: Default::default(),
+                created_ms: 0,
+                updated_ms: 0,
+                agent: None,
+                queued: 0,
+            }));
+        app
+    }
+
+    #[test]
+    fn a_model_panel_that_is_waiting_says_so_and_is_filled_when_the_listing_lands() {
+        let mut app = app_on(Some("qwen3-coder"));
+        app.models_loading = true;
+        app.open_picker(app.model_picker());
+        let waiting = app.model_picker();
+        assert!(waiting.items.is_empty());
+        assert!(
+            waiting.note.as_deref().unwrap().contains("reading"),
+            "an unanswered endpoint must not look like an empty one: {:?}",
+            waiting.note
+        );
+
+        app.on_event(RuntimeEvent::ModelsListed {
+            models: vec!["gpt-5.2".to_owned(), "qwen3-coder".to_owned()],
+            error: None,
+        });
+
+        let Some(Overlay::Picker(picker)) = app.overlay.as_ref() else {
+            panic!("the panel that was open has to be the one that is filled");
+        };
+        assert_eq!(picker.items.len(), 2);
+        assert!(
+            picker
+                .items
+                .iter()
+                .find(|item| item.value == "qwen3-coder")
+                .is_some_and(|item| item.current),
+            "the model in force is marked, not guessed"
+        );
+        assert!(!app.models_loading);
+    }
+
+    #[test]
+    fn an_endpoint_that_refuses_is_reported_as_the_reason_rather_than_as_no_models() {
+        let mut app = app_on(None);
+        app.models_loading = true;
+        app.on_event(RuntimeEvent::ModelsListed {
+            models: Vec::new(),
+            error: Some("connection refused".to_owned()),
+        });
+        let picker = app.model_picker();
+        assert!(picker.items.is_empty());
+        assert_eq!(picker.note.as_deref(), Some("connection refused"));
+        assert!(!app.models_loading);
+    }
+
+    #[test]
+    fn a_listing_that_arrives_when_no_panel_is_open_changes_nothing_visible() {
+        let mut app = app_on(Some("qwen3-coder"));
+        app.on_event(RuntimeEvent::ModelsListed {
+            models: vec!["gpt-5.2".to_owned()],
+            error: None,
+        });
+        assert!(app.overlay.is_none());
+        assert_eq!(app.models, vec!["gpt-5.2".to_owned()]);
     }
 }

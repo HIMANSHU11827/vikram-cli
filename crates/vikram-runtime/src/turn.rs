@@ -11,8 +11,8 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 use vikram_contracts::policy::Decision;
 use vikram_contracts::{
-    ApprovalId, Block, Message, PermissionMode, RecordKind, Role, ToolCall, ToolCallId, Trust,
-    TurnId,
+    ApprovalId, Block, Message, PermissionMode, PermissionRequest, RecordKind, Role, ToolCall,
+    ToolCallId, Trust, TurnId,
 };
 
 use crate::agents::ManagedAgent;
@@ -28,6 +28,33 @@ use crate::types::{
 pub struct AgentRun {
     pub agent: Arc<ManagedAgent>,
     pub task_id: String,
+}
+
+/// Who asked for a tool call. The gate itself is identical in both cases — the same evaluator, the
+/// same floor, the same posture — so making this a parameter cannot widen anything. What differs is
+/// the provenance recorded on the request and whether the call is allowed to rewrite the turn state
+/// of a session that may already be running one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Origin {
+    Model,
+    /// Typed by the human at the keyboard: the `!` prefix.
+    Operator,
+}
+
+impl Origin {
+    fn trust(self) -> Trust {
+        match self {
+            Origin::Model => Trust::Model,
+            Origin::Operator => Trust::User,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Origin::Model => "model",
+            Origin::Operator => "operator",
+        }
+    }
 }
 
 pub(crate) fn spawn_turn(
@@ -129,7 +156,7 @@ pub(crate) async fn run_turn(
         request_messages.extend(session.messages());
 
         let request = CompletionRequest {
-            model: provider.model().to_owned(),
+            model: inner.model(),
             messages: request_messages,
             tools: inner.tools.specs(),
             max_output_tokens: inner.config.max_output_tokens,
@@ -235,7 +262,8 @@ pub(crate) async fn run_turn(
                 break;
             }
             steps_used += 1;
-            let (content, ok) = run_tool(&inner, &session, &call, &cancel, &agent).await;
+            let (content, ok) =
+                run_tool(&inner, &session, &call, &cancel, &agent, Origin::Model).await;
             results.push((call.id.clone(), content, ok));
             if cancel.is_cancelled() {
                 cancelled_mid_tools = true;
@@ -391,12 +419,26 @@ async fn wait_unpaused(agent: &Option<AgentRun>, cancel: &vikram_kernel::Cancell
     }
 }
 
+/// Run one tool call the operator asked for by name — what `!` types, and what a `/` command that
+/// actually does something does. It goes through the same gate, the same approval prompt and the
+/// same journal entries as a model-issued call; what differs is the provenance, and that the output
+/// is not handed back to a model.
+pub(crate) async fn run_operator_tool(
+    inner: &Arc<RuntimeInner>,
+    session: &Arc<SessionRuntime>,
+    call: &ToolCall,
+) -> (String, bool) {
+    let cancel = session.cancel_handle();
+    run_tool(inner, session, call, &cancel, &None, Origin::Operator).await
+}
+
 async fn run_tool(
     inner: &Arc<RuntimeInner>,
     session: &Arc<SessionRuntime>,
     call: &ToolCall,
     cancel: &vikram_kernel::CancellationToken,
     agent: &Option<AgentRun>,
+    origin: Origin,
 ) -> (String, bool) {
     let Some(tool) = inner.tools.get(&call.name) else {
         inner.emit(RuntimeEvent::ToolFinished {
@@ -410,7 +452,12 @@ async fn run_tool(
     };
 
     let request = match tool.permission(&call.arguments) {
-        Ok(request) => request,
+        // A tool prices its own model-authored call; the operator typing the same command at the
+        // keyboard is the same request with different provenance, and nothing else.
+        Ok(request) => PermissionRequest {
+            originating_trust: origin.trust(),
+            ..request
+        },
         Err(err) => {
             inner.emit(RuntimeEvent::ToolFinished {
                 session: session.id.clone(),
@@ -436,9 +483,14 @@ async fn run_tool(
             "evaluated": decision_name(&raw),
             "decision": decision_name(&decision),
             "auto": auto,
+            "trust": origin.as_str(),
             "reason": decision_reason(&decision),
         }),
     );
+
+    // The operator's `!` runs beside whatever the session is already doing, so it may only publish
+    // turn state when nothing else owns the turn; a model call owns it by definition.
+    let owns_turn = origin == Origin::Model || !session.is_busy();
 
     match decision {
         Decision::Deny { reason } => {
@@ -469,7 +521,9 @@ async fn run_tool(
                     respond: tx,
                 },
             );
-            session.set_turn(TurnState::WaitingApproval);
+            if owns_turn {
+                session.set_turn(TurnState::WaitingApproval);
+            }
             if let Some(run) = agent {
                 run.agent.set_state(AgentState::Waiting);
                 inner.publish_agent(&run.agent);
@@ -506,7 +560,9 @@ async fn run_tool(
                 });
                 return ("permission denied by operator".into(), false);
             }
-            session.set_turn(TurnState::Tooling);
+            if owns_turn {
+                session.set_turn(TurnState::Tooling);
+            }
             if let Some(run) = agent {
                 run.agent.set_state(AgentState::Running);
                 inner.publish_agent(&run.agent);
@@ -528,7 +584,9 @@ async fn run_tool(
         name: call.name.clone(),
         summary: summary.clone(),
     });
-    session.set_turn(TurnState::Tooling);
+    if owns_turn {
+        session.set_turn(TurnState::Tooling);
+    }
     if let Some(run) = agent {
         run.agent.set_state(AgentState::Running);
         inner.publish_agent(&run.agent);

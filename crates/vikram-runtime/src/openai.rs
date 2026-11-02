@@ -71,6 +71,69 @@ impl OpenAiProvider {
     }
 }
 
+/// The model identifiers an endpoint offers, from the body of a `GET {base_url}/models` reply.
+/// Two shapes are read because the servers speaking this protocol do not agree on the key name:
+/// OpenAI-style `{"data": [{"id": …}]}` and llama.cpp/Ollama-style `{"models": [{"name": …}]}`.
+/// Anything else yields an empty list, which the caller reports as an unusable reply rather than
+/// as an endpoint that offers nothing.
+pub fn model_ids(body: &Value) -> Vec<String> {
+    let entries = body
+        .get("data")
+        .or_else(|| body.get("models"))
+        .and_then(Value::as_array);
+    let Some(entries) = entries else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .get("id")
+                .or_else(|| entry.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Ask the configured endpoint what it serves. Kept separate from the provider object because the
+/// listing is a property of the *server*, not of the model currently chosen.
+pub async fn list_models(
+    base_url: &str,
+    api_key: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|err| err.to_string())?;
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let reply = client
+        .get(&url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(|err| format!("could not reach {url}: {err}"))?;
+    let status = reply.status();
+    let body: Value = reply
+        .json()
+        .await
+        .map_err(|err| format!("{status} from {url}, and the body was not json: {err}"))?;
+    if !status.is_success() {
+        return Err(format!("{status} from {url}"));
+    }
+    let ids = model_ids(&body);
+    if ids.is_empty() {
+        return Err(format!("{url} returned no model list we can read"));
+    }
+    Ok(ids)
+}
+
 impl Provider for OpenAiProvider {
     fn name(&self) -> &str {
         "openai-compat"
@@ -676,6 +739,36 @@ mod tests {
             ..Config::default()
         };
         assert!(OpenAiProvider::from_config(&config).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_listing_is_read_from_both_shapes_the_servers_use() {
+        let openai = serde_json::json!({"object": "list", "data": [
+            {"id": "gpt-5.2", "object": "model"},
+            {"id": "qwen3-coder", "object": "model"},
+            {"id": "gpt-5.2", "object": "model"}
+        ]});
+        assert_eq!(
+            model_ids(&openai),
+            vec!["gpt-5.2".to_owned(), "qwen3-coder".to_owned()],
+            "duplicates collapse and the order is stable"
+        );
+
+        let local = serde_json::json!({"models": [
+            {"name": "llama3.1:8b"},
+            {"name": "  "},
+            {"name": "qwen2.5-coder:32b"}
+        ]});
+        assert_eq!(
+            model_ids(&local),
+            vec!["llama3.1:8b".to_owned(), "qwen2.5-coder:32b".to_owned()],
+            "a local server answers under `models[].name`, and a blank name is not a model"
+        );
+
+        assert!(
+            model_ids(&serde_json::json!({"error": "unauthorized"})).is_empty(),
+            "a reply that lists nothing reads as nothing, not as a guessed default"
+        );
     }
 
     #[test]

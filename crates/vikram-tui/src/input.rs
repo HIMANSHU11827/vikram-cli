@@ -8,9 +8,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use vikram_contracts::AgentId;
 
 use crate::app::{
-    AgentAction, App, Focus, InspectorKind, Overlay, Suggestion, SuggestionPopup, UiCommand,
+    AgentAction, App, Focus, InspectorKind, Overlay, PromptAction, Suggestion, SuggestionPopup,
+    UiCommand,
 };
+use crate::commands;
 use crate::editor::Editor;
+use crate::widgets::{Picker, PickerItem, PickerKind};
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if key.kind == KeyEventKind::Release {
@@ -31,7 +34,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         app.focus = Focus::Input;
         return true;
     }
-    if app.overlay.is_some() {
+    // Ctrl+C is the operator's stop, not the panel's key: a menu that traps it is a menu you
+    // cannot leave in a hurry. Panels get every other key.
+    if app.overlay.is_some() && !(ctrl_held && key.code == KeyCode::Char('c')) {
         return handle_overlay(app, key);
     }
 
@@ -41,6 +46,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // ---- global shortcuts ------------------------------------------------
     match key.code {
         KeyCode::Char('c') if ctrl => {
+            app.overlay = None;
+            app.suggestions = None;
             if app.active_session().is_some_and(|s| s.is_busy()) {
                 if let Some(session) = app.active_session() {
                     app.commands.push(UiCommand::Cancel {
@@ -82,6 +89,25 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 vikram_runtime::types::NoticeLevel::Info,
                 "screen redrawn; history preserved",
             );
+            return true;
+        }
+        KeyCode::Char('t') if ctrl => {
+            // Thinking is folded by default because a reasoning stream is the longest thing a
+            // model emits and it should not push the answer off the screen.
+            let Some(session) = app.active_session_mut() else {
+                app.push_notice(
+                    vikram_runtime::types::NoticeLevel::Info,
+                    "no session to show thinking in",
+                );
+                return true;
+            };
+            session.expanded_thought = !session.expanded_thought;
+            let state = if session.expanded_thought {
+                "thinking shown"
+            } else {
+                "thinking folded"
+            };
+            app.push_notice(vikram_runtime::types::NoticeLevel::Info, state);
             return true;
         }
         KeyCode::F(1) => {
@@ -253,34 +279,11 @@ fn handle_input(app: &mut App, key: KeyEvent) -> bool {
                 .map(|s| s.editor.text())
                 .unwrap_or_default();
             if text.trim().starts_with('/') {
-                let prefix = text.trim().trim_start_matches('/').to_lowercase();
-                let commands = vec![
-                    "/help",
-                    "/status",
-                    "/new",
-                    "/clear",
-                    "/exit",
-                    "/bot",
-                    "/files",
-                    "/tools",
-                    "/plugins",
-                    "/mcp",
-                    "/permissions",
-                    "/mode",
-                    "/allow",
-                    "/model",
-                    "/provider",
-                ];
-                let candidates: Vec<String> = commands
+                // Tab completes from the same table the palette and the dispatcher read, so it can
+                // never offer a command that would be answered with "unknown command".
+                let candidates: Vec<String> = crate::commands::starting_with(&text)
                     .into_iter()
-                    .filter(|c| {
-                        prefix.is_empty()
-                            || c.to_lowercase().contains(&prefix)
-                            || c.to_lowercase()
-                                .trim_start_matches('/')
-                                .starts_with(&prefix)
-                    })
-                    .map(|s| s.to_owned())
+                    .map(|command| format!("/{}", command.name))
                     .collect();
                 if !candidates.is_empty() {
                     app.overlay = Some(Overlay::Autocomplete {
@@ -543,59 +546,6 @@ fn handle_bots(app: &mut App, key: KeyEvent) -> bool {
     }
 }
 
-/// Slash commands with the description shown in the suggestion popup.
-const COMMANDS: &[(&str, &str)] = &[
-    ("/help", "Show available commands"),
-    ("/status", "Runtime and session status"),
-    ("/doctor", "Check local prerequisites"),
-    ("/version", "Show the VIKRAM version"),
-    ("/new", "Start a new session"),
-    ("/clear", "Clear the conversation"),
-    ("/compact", "Compact the context"),
-    ("/context", "Show context usage"),
-    ("/model", "Model and provider info"),
-    ("/provider", "Provider status"),
-    ("/bot", "List or manage bots"),
-    ("/team", "List or manage HIVE teams"),
-    ("/agents", "List agents"),
-    ("/files", "Search project files"),
-    ("/search", "Search the workspace"),
-    ("/tools", "List available tools"),
-    ("/skills", "List installed skills"),
-    ("/plugins", "List plugins"),
-    ("/mcp", "MCP servers"),
-    ("/permissions", "Permission policy"),
-    ("/mode", "Show or change the approval posture"),
-    ("/allow", "The saved allow-list"),
-    ("/usage", "Token usage"),
-    ("/diff", "Show git diff"),
-    ("/undo", "Undo the last change"),
-    ("/test", "Run the test suite"),
-    ("/build", "Build the project"),
-    ("/exit", "Quit VIKRAM"),
-];
-
-/// Common shell commands offered after `!`.
-const SHELL_COMMANDS: &[&str] = &[
-    "git status",
-    "git diff",
-    "git log --oneline -20",
-    "cargo build",
-    "cargo test",
-    "cargo check",
-    "cargo fmt",
-    "cargo clippy",
-    "ls -la",
-    "pwd",
-    "find . -name",
-    "rg ",
-    "python3 ",
-    "node ",
-    "npm test",
-    "docker ps",
-    "make",
-];
-
 fn handle_suggestion_key(app: &mut App, key: KeyEvent) -> bool {
     let Some(popup) = app.suggestions.as_ref() else {
         return false;
@@ -719,12 +669,11 @@ fn refresh_suggestions(app: &mut App) {
     let mut items: Vec<Suggestion> = Vec::new();
     match token.kind {
         PrefixKind::Slash => {
-            for (name, desc) in COMMANDS {
-                let bare = name.trim_start_matches('/');
-                if query.is_empty() || bare.starts_with(&query) || bare.contains(&query) {
+            for command in crate::commands::COMMANDS {
+                if query.is_empty() || command.name.contains(&query) {
                     items.push(Suggestion {
-                        text: (*name).to_owned(),
-                        description: (*desc).to_owned(),
+                        text: format!("/{}", command.name),
+                        description: command.description.to_owned(),
                         category: "command".to_owned(),
                     });
                 }
@@ -747,7 +696,7 @@ fn refresh_suggestions(app: &mut App) {
                     }
                 }
             }
-            for cmd in SHELL_COMMANDS {
+            for cmd in crate::commands::SHELL_COMMANDS {
                 if (query.is_empty() || cmd.to_lowercase().contains(&query))
                     && !items.iter().any(|i| i.text == *cmd)
                 {
@@ -781,7 +730,7 @@ fn refresh_suggestions(app: &mut App) {
                     });
                 }
             }
-            let files = collect_files(&session.cwd, 300);
+            let files = crate::commands::workspace_files(&session.cwd, 300);
             let mut scored: Vec<(u8, String)> = Vec::new();
             for file in files {
                 let lower = file.to_lowercase();
@@ -860,40 +809,6 @@ fn accept_suggestion(app: &mut App) {
 }
 
 /// Walk the workspace for `@` file completion. Skips heavy/vendored directories and caps the walk.
-fn collect_files(root: &std::path::Path, cap: usize) -> Vec<String> {
-    use std::path::PathBuf;
-    let mut out: Vec<String> = Vec::new();
-    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
-    while let Some((dir, depth)) = stack.pop() {
-        if out.len() >= cap || depth > 3 {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            if matches!(
-                name.as_str(),
-                ".git" | "target" | "node_modules" | "dist" | "build" | ".venv" | "__pycache__"
-            ) {
-                continue;
-            }
-            if path.is_dir() {
-                stack.push((path, depth + 1));
-            } else if let Ok(rel) = path.strip_prefix(root) {
-                out.push(rel.to_string_lossy().replace('\\', "/"));
-                if out.len() >= cap {
-                    return out;
-                }
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
 /// Resolve @path references in text by reading file content and appending as context.
 fn resolve_references(text: &str, cwd: std::path::PathBuf) -> String {
     let mut result = text.to_owned();
@@ -945,15 +860,14 @@ fn submit(app: &mut App, queue: bool) {
     session.editor.remember(&text);
     session.editor.clear();
 
-    // Intercept /, @, ! prefixes.
-    if let Some(cmd) = trimmed.strip_prefix('!') {
-        app.commands.push(UiCommand::RunShell {
-            session: id,
-            command: cmd.trim().to_owned(),
-        });
-        return;
-    }
+    // Intercept /, @, ! prefixes. A bare prefix opens the panel for what it introduces; anything
+    // after it is an instruction and goes to the host, which turns a command into its chooser
+    // rather than answering with text.
     if let Some(rest) = trimmed.strip_prefix('/') {
+        if rest.trim().is_empty() {
+            open_palette(app);
+            return;
+        }
         let mut parts = rest.splitn(2, char::is_whitespace);
         let cmd = parts.next().unwrap_or("").to_owned();
         let args = parts.next().unwrap_or("").trim().to_owned();
@@ -961,6 +875,21 @@ fn submit(app: &mut App, queue: bool) {
             session: id,
             command: cmd,
             args,
+        });
+        return;
+    }
+    if trimmed == "@" {
+        open_file_picker(app);
+        return;
+    }
+    if let Some(cmd) = trimmed.strip_prefix('!') {
+        if cmd.trim().is_empty() {
+            open_shell_picker(app);
+            return;
+        }
+        app.commands.push(UiCommand::RunShell {
+            session: id,
+            command: cmd.trim().to_owned(),
         });
         return;
     }
@@ -979,6 +908,163 @@ fn submit(app: &mut App, queue: bool) {
             text: resolved,
         });
     }
+}
+
+/// The palette: every command, in the table's order, with what it does. Choosing a row is the same
+/// instruction as typing `/name`, so there is only one thing to learn.
+pub fn open_palette(app: &mut App) {
+    let items: Vec<PickerItem> = commands::COMMANDS
+        .iter()
+        .map(|command| {
+            PickerItem::new(
+                format!("/{}", command.name),
+                command.description,
+                command.name,
+            )
+        })
+        .collect();
+    app.open_picker(Picker::new(PickerKind::Command, "Commands", items));
+}
+
+/// Workspace files as references. Choosing one inserts `@path` — what the operator would have
+/// typed — and the file is not read until the message is sent.
+pub fn open_file_picker(app: &mut App) {
+    let Some(cwd) = app.active_session().map(|session| session.cwd.clone()) else {
+        return;
+    };
+    let paths = commands::workspace_files(&cwd, 400);
+    let empty = paths.is_empty();
+    let items: Vec<PickerItem> = paths
+        .into_iter()
+        .map(|path| PickerItem::new(path.clone(), String::new(), path))
+        .collect();
+    let picker = Picker::new(PickerKind::File, "Reference a file", items);
+    app.open_picker(if empty {
+        picker.with_note("no files under this workspace")
+    } else {
+        picker
+    });
+}
+
+/// Shell commands offered after `!`: this session's recent ones first, then the common list. The
+/// `!` line still runs anything typed, so this is a shortcut, not a ceiling.
+pub fn open_shell_picker(app: &mut App) {
+    let mut items: Vec<PickerItem> = Vec::new();
+    if let Some(session) = app.active_session() {
+        for entry in session.editor.history() {
+            if let Some(command) = entry.trim().strip_prefix('!') {
+                let command = command.trim();
+                if !command.is_empty() && !items.iter().any(|item| item.value == command) {
+                    items.push(PickerItem::new(command, "recent", command));
+                }
+            }
+        }
+    }
+    for command in commands::SHELL_COMMANDS {
+        if !items.iter().any(|item| item.value == *command) {
+            items.push(PickerItem::new(*command, "shell", *command));
+        }
+    }
+    app.open_picker(Picker::new(PickerKind::Shell, "Run a shell command", items));
+}
+
+/// The picker's keys. Filter, move, choose; an empty result cannot be chosen, and Esc always
+/// leaves the input exactly as it was.
+fn handle_picker_overlay(app: &mut App, mut picker: Picker, key: KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => {
+            app.overlay = None;
+            true
+        }
+        KeyCode::Enter => {
+            commit_verb(app, &picker, picker.kind.primary_verb());
+            true
+        }
+        KeyCode::Up => {
+            picker.move_by(-1);
+            app.overlay = Some(Overlay::Picker(picker));
+            true
+        }
+        KeyCode::Down => {
+            picker.move_by(1);
+            app.overlay = Some(Overlay::Picker(picker));
+            true
+        }
+        KeyCode::PageUp => {
+            picker.move_by(-5);
+            app.overlay = Some(Overlay::Picker(picker));
+            true
+        }
+        KeyCode::PageDown => {
+            picker.move_by(5);
+            app.overlay = Some(Overlay::Picker(picker));
+            true
+        }
+        KeyCode::Char('d') if ctrl => {
+            picker.move_by(5);
+            app.overlay = Some(Overlay::Picker(picker));
+            true
+        }
+        KeyCode::Char('u') if ctrl => {
+            picker.move_by(-5);
+            app.overlay = Some(Overlay::Picker(picker));
+            true
+        }
+        KeyCode::Home => {
+            picker.selected = 0;
+            app.overlay = Some(Overlay::Picker(picker));
+            true
+        }
+        KeyCode::End => {
+            picker.selected = picker.visible().len().saturating_sub(1);
+            app.overlay = Some(Overlay::Picker(picker));
+            true
+        }
+        KeyCode::Backspace => {
+            picker.backspace();
+            app.overlay = Some(Overlay::Picker(picker));
+            true
+        }
+        KeyCode::Char(c) if ctrl => {
+            match picker.kind.verb_for_key(c) {
+                Some(verb) => {
+                    commit_verb(app, &picker, verb);
+                }
+                // A Ctrl key this panel does not declare belongs to nobody: swallowing it would
+                // hide a typo, so the panel is simply re-drawn.
+                None => app.overlay = Some(Overlay::Picker(picker)),
+            }
+            true
+        }
+        KeyCode::Char(c) => {
+            picker.type_str(&c.to_string());
+            app.overlay = Some(Overlay::Picker(picker));
+            true
+        }
+        _ => {
+            app.overlay = Some(Overlay::Picker(picker));
+            true
+        }
+    }
+}
+
+/// Hand the row under the cursor to the host with the verb that was pressed. A verb on an empty
+/// list does nothing: there is no row, so there is nothing to act on.
+fn commit_verb(app: &mut App, picker: &Picker, verb: crate::widgets::Verb) {
+    let Some(value) = picker.selected_item().map(|item| item.value.clone()) else {
+        return;
+    };
+    let Some(session) = app.active_session() else {
+        return;
+    };
+    app.commands.push(UiCommand::Act {
+        kind: picker.kind,
+        verb,
+        value,
+        session: session.id.clone(),
+    });
+    app.overlay = None;
 }
 
 fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
@@ -1057,6 +1143,119 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
             candidates,
             selected,
         } => handle_autocomplete_overlay(app, candidates, selected, key),
+        Overlay::Picker(picker) => handle_picker_overlay(app, picker, key),
+        Overlay::Info { .. } => match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
+                app.overlay = None;
+                true
+            }
+            _ => true,
+        },
+        Overlay::Prompt {
+            title,
+            hint,
+            mut editor,
+            action,
+        } => {
+            let session_id = app.active_session().map(|view| view.id.clone());
+            match key.code {
+                KeyCode::Esc => {
+                    app.overlay = None;
+                    true
+                }
+                KeyCode::Enter => {
+                    let text = editor.text().trim().to_owned();
+                    if text.is_empty() {
+                        // An empty line commits nothing: the panel stays up with its hint.
+                        app.overlay = Some(Overlay::Prompt {
+                            title,
+                            hint: "type something first".to_owned(),
+                            editor,
+                            action,
+                        });
+                        return true;
+                    }
+                    if let Some(session) = session_id {
+                        let command = match action {
+                            PromptAction::SetModel => UiCommand::SlashCommand {
+                                session,
+                                command: "model".to_owned(),
+                                args: text,
+                            },
+                            PromptAction::AddAllowRule => UiCommand::SlashCommand {
+                                session,
+                                command: "allow".to_owned(),
+                                args: format!("add {text}"),
+                            },
+                        };
+                        app.commands.push(command);
+                    }
+                    app.overlay = None;
+                    true
+                }
+                KeyCode::Backspace => {
+                    editor.backspace();
+                    app.overlay = Some(Overlay::Prompt {
+                        title,
+                        hint,
+                        editor,
+                        action,
+                    });
+                    true
+                }
+                KeyCode::Left => {
+                    editor.move_left();
+                    app.overlay = Some(Overlay::Prompt {
+                        title,
+                        hint,
+                        editor,
+                        action,
+                    });
+                    true
+                }
+                KeyCode::Right => {
+                    editor.move_right();
+                    app.overlay = Some(Overlay::Prompt {
+                        title,
+                        hint,
+                        editor,
+                        action,
+                    });
+                    true
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    editor.insert_str(&c.to_string());
+                    app.overlay = Some(Overlay::Prompt {
+                        title,
+                        hint,
+                        editor,
+                        action,
+                    });
+                    true
+                }
+                _ => {
+                    app.overlay = Some(Overlay::Prompt {
+                        title,
+                        hint,
+                        editor,
+                        action,
+                    });
+                    true
+                }
+            }
+        }
+        Overlay::Confirm { yes, .. } => match key.code {
+            KeyCode::Enter | KeyCode::Char('y') => {
+                app.commands.push(*yes);
+                app.overlay = None;
+                true
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+                app.overlay = None;
+                true
+            }
+            _ => true,
+        },
         Overlay::Skills => match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 app.overlay = None;
@@ -1428,5 +1627,287 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Esc));
         assert!(app.suggestions.is_none());
         assert_eq!(app.active_session().unwrap().editor.text(), "/");
+    }
+
+    fn picker_of(app: &App) -> &Picker {
+        match app.overlay.as_ref() {
+            Some(Overlay::Picker(picker)) => picker,
+            other => panic!("expected a picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_lone_slash_opens_the_palette_naming_every_command_in_the_table() {
+        let mut app = app_with_session();
+        handle_key(&mut app, key(KeyCode::Char('/')));
+        handle_key(&mut app, key(KeyCode::Enter));
+        let picker = picker_of(&app);
+        assert_eq!(picker.kind, PickerKind::Command);
+        assert_eq!(picker.items.len(), commands::COMMANDS.len());
+        assert!(
+            picker.items.iter().any(|item| item.value == "model"),
+            "the palette has to reach /model"
+        );
+        assert!(app.take_commands().is_empty(), "/ alone is not a message");
+    }
+
+    #[test]
+    fn typing_in_the_palette_filters_and_enter_emits_the_choice_not_the_text() {
+        let mut app = app_with_session();
+        handle_key(&mut app, key(KeyCode::Char('/')));
+        handle_key(&mut app, key(KeyCode::Enter));
+        for ch in "mdl".chars() {
+            handle_key(&mut app, key(KeyCode::Char(ch)));
+        }
+        assert_eq!(picker_of(&app).selected_item().unwrap().value, "model");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.overlay.is_none());
+        let commands = app.take_commands();
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            &commands[0],
+            UiCommand::Act { kind: PickerKind::Command, value, .. } if value == "model"
+        ));
+    }
+
+    #[test]
+    fn escape_leaves_the_chooser_without_choosing_anything() {
+        let mut app = app_with_session();
+        handle_key(&mut app, key(KeyCode::Char('/')));
+        handle_key(&mut app, key(KeyCode::Enter));
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(app.overlay.is_none());
+        assert!(app.take_commands().is_empty());
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_cannot_be_chosen() {
+        let mut app = app_with_session();
+        handle_key(&mut app, key(KeyCode::Char('/')));
+        handle_key(&mut app, key(KeyCode::Enter));
+        for ch in "zzz".chars() {
+            handle_key(&mut app, key(KeyCode::Char(ch)));
+        }
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.take_commands().is_empty(), "no row, no instruction");
+        assert!(
+            matches!(app.overlay, Some(Overlay::Picker(_))),
+            "the panel stays up"
+        );
+    }
+
+    #[test]
+    fn a_lone_at_opens_the_file_chooser_and_choosing_inserts_a_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        let mut app = app_with_session();
+        app.sessions[0].cwd = dir.path().to_path_buf();
+        handle_key(&mut app, key(KeyCode::Char('@')));
+        handle_key(&mut app, key(KeyCode::Enter));
+        let picker = picker_of(&app);
+        assert_eq!(picker.kind, PickerKind::File);
+        assert!(picker.items.iter().any(|item| item.value == "main.rs"));
+        handle_key(&mut app, key(KeyCode::Enter));
+        let command = app
+            .take_commands()
+            .pop()
+            .expect("a file choice is a command");
+        assert!(matches!(
+            command,
+            UiCommand::Act { kind: PickerKind::File, ref value, .. } if value == "main.rs"
+        ));
+    }
+
+    #[test]
+    fn a_lone_bang_opens_the_shell_chooser_with_the_common_commands() {
+        let mut app = app_with_session();
+        handle_key(&mut app, key(KeyCode::Char('!')));
+        handle_key(&mut app, key(KeyCode::Enter));
+        let picker = picker_of(&app);
+        assert_eq!(picker.kind, PickerKind::Shell);
+        assert!(picker.items.iter().any(|item| item.value == "git status"));
+    }
+
+    #[test]
+    fn filtering_for_mode_does_not_put_model_on_the_cursor() {
+        let mut app = app_with_session();
+        handle_key(&mut app, key(KeyCode::Char('/')));
+        handle_key(&mut app, key(KeyCode::Enter));
+        for ch in "mode".chars() {
+            handle_key(&mut app, key(KeyCode::Char(ch)));
+        }
+        assert_eq!(picker_of(&app).selected_item().unwrap().value, "mode");
+        handle_key(&mut app, key(KeyCode::Enter));
+        let command = app.take_commands().pop().expect("a choice");
+        assert!(matches!(
+            command,
+            UiCommand::Act { kind: PickerKind::Command, ref value, .. } if value == "mode"
+        ));
+    }
+
+    #[test]
+    fn ctrl_c_leaves_a_panel_and_stops_instead_of_being_swallowed_by_it() {
+        let mut app = app_with_session();
+        handle_key(&mut app, key(KeyCode::Char('/')));
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(matches!(app.overlay, Some(Overlay::Picker(_))));
+        handle_key(&mut app, ctrl(KeyCode::Char('c')));
+        assert!(app.overlay.is_none(), "a panel must not trap the stop key");
+        assert!(app.should_quit);
+        assert!(matches!(
+            app.take_commands().pop(),
+            Some(UiCommand::Quit)
+        ));
+    }
+
+    fn panel(kind: PickerKind, rows: &[(&str, &str)]) -> Overlay {
+        let items = rows
+            .iter()
+            .map(|(label, value)| PickerItem::new(*label, String::new(), *value))
+            .collect();
+        Overlay::Picker(Picker::new(kind, "test", items))
+    }
+
+    fn act_of(app: &mut App) -> Option<(PickerKind, crate::widgets::Verb, String)> {
+        match app.take_commands().pop() {
+            Some(UiCommand::Act { kind, verb, value, .. }) => Some((kind, verb, value)),
+            other => {
+                assert!(other.is_none(), "expected no command, got {other:?}");
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn each_panel_answers_its_own_verbs_and_only_those() {
+        use crate::widgets::Verb;
+        let cases = [
+            (PickerKind::Model, 't', Verb::Prompt),
+            (PickerKind::Allow, 'a', Verb::Prompt),
+            (PickerKind::Bot, 'n', Verb::New),
+            (PickerKind::Session, 'r', Verb::Rename),
+            (PickerKind::Session, 'x', Verb::Close),
+            (PickerKind::Memory, 'd', Verb::Remove),
+        ];
+        for (kind, key, verb) in cases {
+            let mut app = app_with_session();
+            app.overlay = Some(panel(kind, &[("row", "value")]));
+            handle_key(&mut app, ctrl(KeyCode::Char(key)));
+            let got = act_of(&mut app).expect("a declared verb has to reach the host");
+            assert_eq!(got.0, kind, "ctrl+{key} on {}", kind.as_str());
+            assert_eq!(got.1, verb, "ctrl+{key} on {}", kind.as_str());
+        }
+    }
+
+    #[test]
+    fn a_letter_the_panel_does_not_declare_still_types_into_the_filter() {
+        use crate::widgets::Verb;
+        let mut app = app_with_session();
+        app.overlay = Some(panel(PickerKind::Model, &[("gpt-5.2", "gpt-5.2")]));
+        handle_key(&mut app, key(KeyCode::Char('x')));
+        assert!(act_of(&mut app).is_none(), "`x` is not a model verb");
+        let Overlay::Picker(picker) = app.overlay.as_ref().unwrap() else {
+            panic!("panel closed");
+        };
+        assert_eq!(picker.query, "x");
+        assert_eq!(PickerKind::Model.primary_verb(), Verb::Choose);
+    }
+
+    #[test]
+    fn a_verb_with_no_row_to_act_on_does_nothing_at_all() {
+        let mut app = app_with_session();
+        app.overlay = Some(panel(PickerKind::Session, &[]));
+        handle_key(&mut app, ctrl(KeyCode::Char('x')));
+        assert!(act_of(&mut app).is_none(), "no row, no instruction");
+        assert!(matches!(app.overlay, Some(Overlay::Picker(_))), "panel stays open");
+    }
+
+    #[test]
+    fn the_wheel_and_page_keys_move_through_a_long_panel() {
+        let rows: Vec<(String, String)> = (0..30)
+            .map(|i| (format!("row-{i:02}"), format!("row-{i:02}")))
+            .collect();
+        let items = rows
+            .iter()
+            .map(|(label, value)| PickerItem::new(label.clone(), String::new(), value.clone()))
+            .collect();
+        let mut app = app_with_session();
+        app.overlay = Some(Overlay::Picker(Picker::new(
+            PickerKind::Command,
+            "test",
+            items,
+        )));
+        for _ in 0..5 {
+            handle_key(&mut app, key(KeyCode::PageDown));
+        }
+        let Overlay::Picker(picker) = app.overlay.as_ref().unwrap() else {
+            panic!("panel closed");
+        };
+        assert_eq!(picker.selected, 25, "five pages of five rows");
+        handle_key(&mut app, key(KeyCode::Home));
+        let Overlay::Picker(picker) = app.overlay.as_ref().unwrap() else {
+            panic!("panel closed");
+        };
+        assert_eq!(picker.selected, 0);
+        handle_key(&mut app, key(KeyCode::End));
+        let Overlay::Picker(picker) = app.overlay.as_ref().unwrap() else {
+            panic!("panel closed");
+        };
+        assert_eq!(picker.selected, 29, "End lands on the last row");
+    }
+
+    #[test]
+    fn every_command_in_the_table_reaches_the_host_instead_of_being_rejected() {
+        for command in commands::COMMANDS {
+            let mut app = app_with_session();
+            for ch in format!("/{}", command.name).chars() {
+                handle_key(&mut app, key(KeyCode::Char(ch)));
+            }
+            handle_key(&mut app, key(KeyCode::Enter));
+            let sent = app.take_commands();
+            assert_eq!(sent.len(), 1, "/{} sent {sent:?}", command.name);
+            assert!(
+                matches!(&sent[0], UiCommand::SlashCommand { command: sent_name, .. } if sent_name == command.name),
+                "/{} sent {sent:?}",
+                command.name
+            );
+        }
+    }
+
+    #[test]
+    fn tab_completes_only_to_a_command_the_dispatcher_accepts() {
+        let mut app = app_with_session();
+        for ch in "/mo".chars() {
+            handle_key(&mut app, key(KeyCode::Char(ch)));
+        }
+        handle_key(&mut app, key(KeyCode::Tab));
+        let text = app.active_session().unwrap().editor.text();
+        let word = text.trim().trim_start_matches('/');
+        assert!(
+            commands::find(word).is_some(),
+            "Tab produced `{text}`, which is not a command"
+        );
+    }
+
+    #[test]
+    fn the_completion_list_is_the_command_table_and_never_offers_a_ghost() {
+        let candidates: Vec<String> = commands::starting_with("m")
+            .into_iter()
+            .map(|command| format!("/{}", command.name))
+            .collect();        assert_eq!(
+            candidates,
+            vec![
+                "/model".to_owned(),
+                "/mode".to_owned(),
+                "/memory".to_owned(),
+                "/mcp".to_owned()
+            ]
+        );
+        for candidate in &candidates {
+            assert!(
+                commands::find(candidate).is_some(),
+                "{candidate} is offered"
+            );
+        }
     }
 }

@@ -22,12 +22,13 @@ const AGENT_NAME_CAP: usize = 14;
 const AGENT_LINE_CAP: usize = 34;
 const DIALOG_WIDTH: u16 = 62;
 
-const HELP_ROWS: [(&str, &str); 18] = [
+const HELP_ROWS: [(&str, &str); 19] = [
     ("Enter", "send the message"),
     ("Shift+Enter", "insert a newline"),
     ("Ctrl+N", "new session"),
     ("Ctrl+Tab", "next session"),
     ("Ctrl+B", "toggle the BOTS panel"),
+    ("Ctrl+T", "show or fold the thinking"),
     ("Ctrl+O", "approvals"),
     ("Ctrl+R", "rename the session"),
     ("r", "resume selected bot"),
@@ -551,10 +552,16 @@ pub fn shortcuts(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     );
 }
 
-pub fn overlay(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let Some(current) = app.overlay.as_ref() else {
+pub fn overlay(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
+    // The overlay is cloned for the frame so the draw can write the click regions back into the
+    // same `App` it is reading. A panel is small; a borrow that outlives the draw is not.
+    let Some(current) = app.overlay.clone() else {
+        app.picker_rows.clear();
+        app.picker_x = None;
         return;
     };
+    app.picker_rows.clear();
+    app.picker_x = None;
 
     if let Overlay::Autocomplete {
         candidates,
@@ -580,7 +587,7 @@ pub fn overlay(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let style = if i == *selected {
+                let style = if i == selected {
                     Style::default()
                         .fg(theme.accent)
                         .add_modifier(Modifier::BOLD)
@@ -594,7 +601,40 @@ pub fn overlay(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         return;
     }
 
-    let (title, lines) = overlay_content(app, current, theme);
+    if let Overlay::Picker(picker) = &current {
+        // A chooser gets its own width: a model name and its detail do not fit in a 62-column
+        // dialog, and a clipped row is a row the operator cannot tell apart from another.
+        let lines = crate::widgets::picker_lines(picker, theme);
+        let height = (lines.len() as u16 + 2).min(area.height);
+        let width = DIALOG_WIDTH.max(72).min(area.width);
+        let rect = centered(area, width, height);
+        frame.render_widget(Clear, rect);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent))
+            .title(Line::from(Span::styled(
+                format!(" {} ", crate::widgets::picker_title(picker)),
+                Style::default()
+                    .fg(theme.accent_dim)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        frame.render_widget(Paragraph::new(lines), inner);
+
+        // The rows, so a click can name one. The filter line is first, then the optional note;
+        // everything after that is a row in the order `window()` returned.
+        let note_rows = usize::from(picker.note.is_some());
+        let (rows, _) = picker.window();
+        for position in 0..rows.len() {
+            let y = inner.y + 1 + note_rows as u16 + position as u16;
+            app.picker_rows.push((y, position));
+        }
+        app.picker_x = Some((rect.x, rect.x + rect.width));
+        return;
+    }
+
+    let (title, lines) = overlay_content(&*app, &current, theme);
     let height = (lines.len() as u16 + 2).min(area.height);
     let width = DIALOG_WIDTH.min(area.width);
     let rect = centered(area, width, height);
@@ -637,7 +677,53 @@ fn overlay_content(app: &App, overlay: &Overlay, theme: &Theme) -> (String, Vec<
         Overlay::RenameSession { editor } => rename_lines(app, editor, theme),
         Overlay::Autocomplete { .. } => ("Autocomplete".to_owned(), vec![]),
         Overlay::Skills => skills_lines(app, theme),
+        Overlay::Info { title, lines } => (title.clone(), info_lines(lines, theme)),
+        Overlay::Prompt {
+            title,
+            hint,
+            editor,
+            ..
+        } => {
+            let mut lines = vec![Line::from(Span::styled(
+                format!("  {hint}"),
+                theme.muted(),
+            ))];
+            lines.push(Line::from(vec![
+                Span::styled("  › ", theme.accent),
+                Span::styled(
+                    editor.text(),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("▌", theme.muted()),
+            ]));
+            (title.clone(), lines)
+        }
+        Overlay::Confirm { title, lines, .. } => {
+            let mut rendered = info_lines(lines, theme);
+            rendered.push(Line::from(Span::styled(
+                "  enter confirms · esc keeps it as it is",
+                theme.muted(),
+            )));
+            (title.clone(), rendered)
+        }
+        // Drawn by `overlay` before this point; the arm exists so the match stays total.
+        Overlay::Picker(_) => ("Choose".to_owned(), Vec::new()),
     }
+}
+
+fn info_lines(lines: &[String], theme: &Theme) -> Vec<Line<'static>> {
+    lines
+        .iter()
+        .map(|line| {
+            if let Some(rest) = line.strip_prefix("! ") {
+                Line::from(Span::styled(format!("  {rest}"), theme.muted()))
+            } else {
+                Line::from(Span::styled(format!("  {line}"), theme.secondary()))
+            }
+        })
+        .collect()
 }
 
 fn approval_lines(app: &App, theme: &Theme) -> (String, Vec<Line<'static>>) {
@@ -1236,7 +1322,7 @@ mod tests {
         let mut app = app_with_default_bots();
         app.overlay = Some(Overlay::Help);
         let rendered = draw(80, 24, |frame| {
-            overlay(frame, frame.area(), &app, &Theme::new(false))
+            overlay(frame, frame.area(), &mut app, &Theme::new(false))
         });
         assert!(rendered.contains("Keys"), "got {rendered}");
         assert!(rendered.contains("Ctrl+O"), "got {rendered}");
@@ -1256,7 +1342,7 @@ mod tests {
         });
         app.overlay = Some(Overlay::Approvals);
         let rendered = draw(80, 24, |frame| {
-            overlay(frame, frame.area(), &app, &Theme::new(false))
+            overlay(frame, frame.area(), &mut app, &Theme::new(false))
         });
         assert!(rendered.contains("fs.write"), "got {rendered}");
         assert!(rendered.contains("/etc/**"), "got {rendered}");
@@ -1268,7 +1354,7 @@ mod tests {
         let mut app = app_with_default_bots();
         app.overlay = Some(Overlay::Inspector(InspectorKind::SubAgents));
         let idle = draw(80, 24, |frame| {
-            overlay(frame, frame.area(), &app, &Theme::new(false))
+            overlay(frame, frame.area(), &mut app, &Theme::new(false))
         });
         assert!(
             idle.contains("none spawned"),
@@ -1279,7 +1365,7 @@ mod tests {
         app.agents[1].state = AgentState::Running;
         app.agents[1].current_task = Some("review the diff".to_owned());
         let busy = draw(80, 24, |frame| {
-            overlay(frame, frame.area(), &app, &Theme::new(false))
+            overlay(frame, frame.area(), &mut app, &Theme::new(false))
         });
         assert!(busy.contains("Karma"), "spawned agent missing: {busy}");
         assert!(busy.contains("review the diff"), "task missing: {busy}");
@@ -1297,7 +1383,7 @@ mod tests {
         });
         app.overlay = Some(Overlay::Inspector(InspectorKind::Background));
         let rendered = draw(80, 24, |frame| {
-            overlay(frame, frame.area(), &app, &Theme::new(false))
+            overlay(frame, frame.area(), &mut app, &Theme::new(false))
         });
         assert!(rendered.contains("cargo nextest"), "got {rendered}");
         assert!(rendered.contains("running"), "got {rendered}");
@@ -1308,7 +1394,7 @@ mod tests {
         let mut app = app_with_default_bots();
         app.overlay = Some(Overlay::Inspector(InspectorKind::Context));
         let rendered = draw(80, 24, |frame| {
-            overlay(frame, frame.area(), &app, &Theme::new(false))
+            overlay(frame, frame.area(), &mut app, &Theme::new(false))
         });
         assert!(rendered.contains("has not reported"), "got {rendered}");
     }
@@ -1318,7 +1404,7 @@ mod tests {
         let mut app = app_with_default_bots();
         app.overlay = Some(Overlay::AddAgent { selected: 1 });
         let rendered = draw(80, 24, |frame| {
-            overlay(frame, frame.area(), &app, &Theme::new(false))
+            overlay(frame, frame.area(), &mut app, &Theme::new(false))
         });
         assert!(rendered.contains("Spawn a bot"), "got {rendered}");
         for name in ["Rudra", "Karma", "Verifier"] {
@@ -1333,7 +1419,7 @@ mod tests {
             editor: crate::editor::Editor::from_text("Renamed"),
         });
         let rendered = draw(80, 24, |frame| {
-            overlay(frame, frame.area(), &app, &Theme::new(false))
+            overlay(frame, frame.area(), &mut app, &Theme::new(false))
         });
         assert!(rendered.contains("now: First"), "got {rendered}");
         assert!(rendered.contains("Renamed"), "got {rendered}");
@@ -1406,4 +1492,110 @@ fn skills_lines(_app: &App, theme: &Theme) -> (String, Vec<Line<'static>>) {
         theme.muted(),
     ));
     (format!("Skills {}", count), lines)
+}
+
+#[cfg(test)]
+mod picker_panel_tests {
+    use super::*;
+    use crate::widgets::{Picker, PickerItem, PickerKind};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use vikram_contracts::Message;
+    use vikram_runtime::types::{SessionSnapshot, TurnState};
+
+    fn draw(width: u16, height: u16, render: impl FnOnce(&mut Frame)) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal.draw(render).expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn app() -> App {
+        let mut app = App::new(false);
+        app.sessions
+            .push(crate::app::SessionView::from_snapshot(SessionSnapshot {
+                id: vikram_contracts::SessionId::generate(),
+                title: "First".to_owned(),
+                cwd: "/work".into(),
+                model: Some("nvidia/nemotron-3.5-ultra-550b-a55b".to_owned()),
+                messages: vec![Message::user("hi")],
+                turn: TurnState::Idle,
+                tokens: Default::default(),
+                created_ms: 0,
+                updated_ms: 0,
+                agent: None,
+                queued: 0,
+            }));
+        app
+    }
+
+    #[test]
+    fn a_long_model_name_is_not_clipped_by_the_dialog_width() {
+        let mut app = app();
+        app.open_picker(Picker::new(
+            PickerKind::Model,
+            "Model",
+            vec![
+                PickerItem::new(
+                    "nvidia/nemotron-3.5-ultra-550b-a55b",
+                    "",
+                    "nvidia/nemotron-3.5-ultra-550b-a55b",
+                )
+                .as_current(),
+                PickerItem::new("qwen3-coder", "128k context", "qwen3-coder"),
+            ],
+        ));
+        let rendered = draw(120, 30, |frame| {
+            overlay(frame, frame.area(), &mut app, &Theme::new(false))
+        });
+        assert!(
+            rendered.contains("nemotron-3.5-ultra-550b-a55b"),
+            "the row the runtime acts on has to be readable: {rendered}"
+        );
+        assert!(rendered.contains("(current)"), "got {rendered}");
+        assert!(rendered.contains("enter choose"), "got {rendered}");
+        assert!(
+            rendered.contains("ctrl+t type a name"),
+            "the model panel has to advertise its own verb: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_info_panel_draws_what_the_host_read_from_the_runtime() {
+        let mut app = app();
+        app.open_info(
+            "Context",
+            vec![
+                "used: 1024 tokens".to_owned(),
+                "window: not known for this model".to_owned(),
+            ],
+        );
+        let rendered = draw(90, 20, |frame| {
+            overlay(frame, frame.area(), &mut app, &Theme::new(false))
+        });
+        assert!(rendered.contains("Context"), "got {rendered}");
+        assert!(rendered.contains("1024"), "got {rendered}");
+        assert!(rendered.contains("not known"), "got {rendered}");
+    }
+
+    #[test]
+    fn a_confirm_panel_says_what_would_change_and_how_to_keep_it() {
+        let mut app = app();
+        app.open_confirm(
+            "Forget a rule",
+            vec!["allow fs write resource=src/**".to_owned()],
+            crate::app::UiCommand::Unallow { index: 0 },
+        );
+        let rendered = draw(90, 20, |frame| {
+            overlay(frame, frame.area(), &mut app, &Theme::new(false))
+        });
+        assert!(rendered.contains("fs write"), "got {rendered}");
+        assert!(rendered.contains("enter confirms"), "got {rendered}");
+        assert!(rendered.contains("esc keeps"), "got {rendered}");
+    }
 }

@@ -1391,6 +1391,54 @@ impl Tool for WebSearch {
         }
 
         if results.is_empty() {
+            // Fallback: DuckDuckGo instant-answer JSON API (more stable than HTML scraping).
+            let api_url = format!(
+                "https://api.duckduckgo.com/?q={encoded}&format=json&no_html=1&skip_disambig=1"
+            );
+            if let Ok(resp) = client.get(&api_url).send() {
+                if let Ok(text) = resp.text() {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(abs) = json.get("AbstractText").and_then(|v| v.as_str()) {
+                            if !abs.is_empty() {
+                                results.push((
+                                    json.get("Heading")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("Result")
+                                        .to_string(),
+                                    abs.to_string(),
+                                    json.get("AbstractURL")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                        if results.is_empty() {
+                            if let Some(topics) = json.get("RelatedTopics").and_then(|v| v.as_array()) {
+                                for t in topics {
+                                    if let Some(text) = t.get("Text").and_then(|v| v.as_str()) {
+                                        if text.is_empty() {
+                                            continue;
+                                        }
+                                        let url = t
+                                            .get("FirstURL")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        results.push((text.to_string(), String::new(), url));
+                                        if results.len() >= limit {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if results.is_empty() {
             return Ok(ToolOutput {
                 content: "No results found".into(),
                 ok: true,

@@ -430,7 +430,9 @@ pub fn resolve_within(root: &Path, candidate: &Path) -> Option<PathBuf> {
 /// while a runtime is being built, so every test that touches either takes turns on this one lock.
 pub(crate) static SECURITY_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Clear every environment input, then hold the lock for the calling test.
+/// Clear every environment input, then hold the lock for the calling test. A test that sets one of
+/// these without clearing it itself leaks into whichever test runs next in the same process — the
+/// list is the backstop, not the test's own hygiene.
 #[cfg(test)]
 pub(crate) fn lock_security_env() -> std::sync::MutexGuard<'static, ()> {
     let guard = SECURITY_ENV.lock().unwrap_or_else(|err| err.into_inner());
@@ -441,6 +443,7 @@ pub(crate) fn lock_security_env() -> std::sync::MutexGuard<'static, ()> {
         "VIKRAM_DISABLE_AUTO_APPROVE",
         "VIKRAM_DISABLE_ALWAYS_ALLOW",
         "VIKRAM_ALLOWED_MODES",
+        "VIKRAM_TEST_KEY",
     ] {
         unsafe { std::env::remove_var(name) };
     }

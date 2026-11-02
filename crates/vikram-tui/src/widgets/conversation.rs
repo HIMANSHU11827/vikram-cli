@@ -22,6 +22,8 @@ const TOOL_LINE_CAP: usize = 12;
 const SEPARATOR_CAP: usize = 72;
 /// Argument summaries are compacted to one short line.
 const ARGUMENT_CAP: usize = 80;
+/// A folded thinking block previews at most this much of one line.
+const THOUGHT_PREVIEW_CAP: usize = 64;
 
 pub fn conversation(
     frame: &mut Frame,
@@ -63,9 +65,13 @@ pub fn conversation_lines(
 
     for message in &session.messages {
         match message.role {
-            Role::User => push_user(&mut lines, message, width, theme),
-            Role::Assistant => push_assistant(&mut lines, message, width, theme),
-            Role::System => push_system(&mut lines, message, width, theme),
+            Role::User => push_user(&mut lines, message, session.expanded_thought, width, theme),
+            Role::Assistant => {
+                push_assistant(&mut lines, message, session.expanded_thought, width, theme)
+            }
+            Role::System => {
+                push_system(&mut lines, message, session.expanded_thought, width, theme)
+            }
             Role::Tool => push_tool(&mut lines, message, width, theme),
         }
     }
@@ -86,11 +92,14 @@ pub fn conversation_lines(
         lines.push(Line::from(""));
         lines.push(Line::styled("VIKRAM", theme.title()));
         if let Some(thought) = &session.streaming_thought {
-            lines.push(Line::styled(
-                "💭 Thought",
-                Style::default().fg(theme.accent_dim),
-            ));
-            lines.extend(markdown::markdown_lines(thought, width, theme));
+            push_reasoning(
+                &mut lines,
+                thought,
+                session.expanded_thought,
+                true,
+                width,
+                theme,
+            );
         }
         if let Some(stream) = &session.streaming {
             lines.extend(markdown::markdown_lines(&stream.text, width, theme));
@@ -139,7 +148,13 @@ fn push_question_prompt(
 // roles
 // ---------------------------------------------------------------------------
 
-fn push_user(lines: &mut Vec<Line<'static>>, message: &Message, width: usize, theme: &Theme) {
+fn push_user(
+    lines: &mut Vec<Line<'static>>,
+    message: &Message,
+    expanded_thought: bool,
+    width: usize,
+    theme: &Theme,
+) {
     let base = Style::default().fg(theme.user);
     lines.push(Line::from(""));
     lines.push(Line::styled(
@@ -152,7 +167,7 @@ fn push_user(lines: &mut Vec<Line<'static>>, message: &Message, width: usize, th
                 lines.extend(markdown::markdown_lines_styled(text, width, theme, base))
             }
             Block::Reasoning { text, .. } => {
-                lines.extend(markdown::markdown_lines(text, width, theme))
+                push_reasoning(lines, text, expanded_thought, false, width, theme)
             }
             Block::ToolCall { call } => push_tool_call(lines, call, width, theme),
             Block::ToolResult { content, ok, .. } => {
@@ -170,19 +185,20 @@ fn push_user(lines: &mut Vec<Line<'static>>, message: &Message, width: usize, th
     lines.push(separator_line(width, theme));
 }
 
-fn push_assistant(lines: &mut Vec<Line<'static>>, message: &Message, width: usize, theme: &Theme) {
+fn push_assistant(
+    lines: &mut Vec<Line<'static>>,
+    message: &Message,
+    expanded_thought: bool,
+    width: usize,
+    theme: &Theme,
+) {
     lines.push(Line::from(""));
     lines.push(Line::styled("VIKRAM", theme.title()));
     for block in &message.blocks {
         match block {
             Block::Text { text, .. } => lines.extend(markdown::markdown_lines(text, width, theme)),
             Block::Reasoning { text, .. } => {
-                lines.push(Line::from(""));
-                lines.push(Line::styled(
-                    "💭 Thought",
-                    Style::default().fg(theme.accent_dim),
-                ));
-                lines.extend(markdown::markdown_lines(text, width, theme));
+                push_reasoning(lines, text, expanded_thought, false, width, theme)
             }
             Block::ToolCall { call } => push_tool_call(lines, call, width, theme),
             Block::ToolResult { content, ok, .. } => {
@@ -192,7 +208,13 @@ fn push_assistant(lines: &mut Vec<Line<'static>>, message: &Message, width: usiz
     }
 }
 
-fn push_system(lines: &mut Vec<Line<'static>>, message: &Message, width: usize, theme: &Theme) {
+fn push_system(
+    lines: &mut Vec<Line<'static>>,
+    message: &Message,
+    expanded_thought: bool,
+    width: usize,
+    theme: &Theme,
+) {
     lines.push(Line::from(""));
     lines.push(Line::styled(dim_label(theme, "system"), theme.muted()));
     let style = theme.muted();
@@ -202,7 +224,7 @@ fn push_system(lines: &mut Vec<Line<'static>>, message: &Message, width: usize, 
                 lines.extend(markdown::markdown_lines_styled(text, width, theme, style))
             }
             Block::Reasoning { text, .. } => {
-                lines.extend(markdown::markdown_lines(text, width, theme))
+                push_reasoning(lines, text, expanded_thought, false, width, theme)
             }
             Block::ToolCall { call } => push_tool_call(lines, call, width, theme),
             Block::ToolResult { content, ok, .. } => {
@@ -231,6 +253,54 @@ fn push_tool(lines: &mut Vec<Line<'static>>, message: &Message, width: usize, th
         }
     }
     push_tool_body(lines, &contents, ok, width, theme);
+}
+
+/// A thinking block, folded to the one line it should have taken in the first place.
+///
+/// Reasoning is the longest and least actionable text in a transcript, so it does not get to push
+/// the answer off the screen. Folded, the line names the block, previews one line of it and says
+/// what opens it; `Ctrl+T` renders the whole block. Nothing is discarded — the text stays on the
+/// message either way. `live` previews the newest line of a stream rather than its opening, so a
+/// folded thought still reads as moving.
+fn push_reasoning(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    expanded: bool,
+    live: bool,
+    width: usize,
+    theme: &Theme,
+) {
+    let label = Style::default().fg(theme.accent_dim);
+    if text.trim().is_empty() {
+        return;
+    }
+    if expanded {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} Thoughts", theme.thought_glyph()), label),
+            Span::styled(format!(" {} Ctrl+T folds", theme.bullet()), theme.muted()),
+        ]));
+        lines.extend(markdown::markdown_lines(text, width, theme));
+        return;
+    }
+    let mut row = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let preview = if live {
+        row.next_back().unwrap_or_default()
+    } else {
+        row.next().unwrap_or_default()
+    };
+    let count = text.lines().filter(|line| !line.trim().is_empty()).count();
+    let mut detail = truncate(preview, THOUGHT_PREVIEW_CAP, ellipsis(theme));
+    if count > 1 {
+        detail.push_str(&format!(" {} {count} lines", theme.bullet()));
+    }
+    detail.push_str(&format!(" {} Ctrl+T opens", theme.bullet()));
+    lines.push(Line::from(vec![
+        Span::styled(format!("{} Thought", theme.thought_glyph()), label),
+        Span::styled(format!("  {detail}"), theme.muted()),
+    ]));
 }
 
 /// A tool result is dim-labelled, indented, tinted by outcome, and capped in length.
@@ -910,6 +980,118 @@ mod tests {
         let theme = Theme::new(false);
         let all = transcript(&conversation_lines(&app, &session, 76, &theme)).join("\n");
         assert!(!all.contains("Answer:"), "{all}");
+    }
+
+    /// An assistant turn that thought at length and then answered.
+    fn thinking_then_answer(lines: usize) -> Message {
+        let thought = (1..=lines)
+            .map(|i| format!("thought line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Message {
+            role: Role::Assistant,
+            blocks: vec![
+                Block::Reasoning {
+                    text: thought,
+                    trust: Trust::Model,
+                },
+                Block::Text {
+                    text: "the answer".into(),
+                    trust: Trust::Model,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn thinking_is_folded_so_it_cannot_push_the_answer_off_the_screen() {
+        let app = App::new(false);
+        let mut session = sample_session();
+        session.messages.push(thinking_then_answer(24));
+        let theme = Theme::new(false);
+        let all = transcript(&conversation_lines(&app, &session, 76, &theme)).join("\n");
+
+        assert!(all.contains("Ctrl+T opens"), "no way to open it: {all}");
+        assert!(all.contains("24 lines"), "the fold hides how big it is: {all}");
+        assert!(
+            all.contains("thought line 1"),
+            "the preview should show what it is thinking about: {all}"
+        );
+        assert!(
+            !all.contains("thought line 7"),
+            "a folded block must not print its body: {all}"
+        );
+        assert_eq!(
+            all.lines().filter(|line| line.contains("thought line")).count(),
+            1,
+            "folding is one line per block, not one per thought: {all}"
+        );
+        assert!(all.contains("the answer"), "the answer must survive: {all}");
+    }
+
+    #[test]
+    fn opening_the_thinking_shows_all_of_it_and_says_how_to_fold_it_again() {
+        let app = App::new(false);
+        let mut session = sample_session();
+        session.expanded_thought = true;
+        session.messages.push(thinking_then_answer(24));
+        let theme = Theme::new(false);
+        let all = transcript(&conversation_lines(&app, &session, 76, &theme)).join("\n");
+
+        assert!(all.contains("thought line 24"), "not the whole block: {all}");
+        assert!(all.contains("Ctrl+T folds"), "no way to close it: {all}");
+        assert!(!all.contains("Ctrl+T opens"), "{all}");
+    }
+
+    #[test]
+    fn a_folded_live_thought_shows_the_newest_line_rather_than_the_whole_stream() {
+        let app = App::new(false);
+        let mut session = sample_session();
+        session.streaming_thought = Some(
+            "oldest line\nsecond thought line of the stream\nweighing the third option here"
+                .into(),
+        );
+        let theme = Theme::new(false);
+        let all = transcript(&conversation_lines(&app, &session, 76, &theme)).join("\n");
+
+        assert!(
+            all.contains("weighing the third option here"),
+            "a folded thought still has to move: {all}"
+        );
+        assert!(
+            !all.contains("oldest line") && !all.contains("second thought line"),
+            "the whole buffer leaked through the fold: {all}"
+        );
+        assert!(all.contains("3 lines"), "{all}");
+    }
+
+    #[test]
+    fn thinking_that_said_nothing_draws_no_header() {
+        let mut session = sample_session();
+        session.streaming = Some(Streaming {
+            turn: TurnId::generate(),
+            text: "the answer".into(),
+        });
+        for blank in ["", "   ", "\n\n"] {
+            session.streaming_thought = Some(blank.into());
+            let theme = Theme::new(false);
+            let all = transcript(&conversation_lines(&App::new(false), &session, 76, &theme))
+                .join("\n");
+            assert!(!all.contains("Thought"), "empty thinking drew a header: {all}");
+            assert!(all.contains("the answer"), "{all}");
+        }
+    }
+
+    #[test]
+    fn a_short_thought_does_not_claim_to_have_more_lines_than_it_has() {
+        let app = App::new(false);
+        let mut session = sample_session();
+        session.messages.push(thinking_then_answer(1));
+        let theme = Theme::new(false);
+        let all = transcript(&conversation_lines(&app, &session, 76, &theme)).join("\n");
+
+        assert!(!all.contains("1 lines"), "singular counted as plural: {all}");
+        assert!(all.contains("thought line 1"), "{all}");
     }
 }
 

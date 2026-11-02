@@ -74,6 +74,10 @@ pub(crate) struct RuntimeInner {
     pub questions: Mutex<HashMap<String, PendingQuestion>>,
     /// The posture in force right now: how the runtime treats a request the rules only prompted for.
     pub mode: Mutex<PermissionMode>,
+    /// The model in force right now. Live because `/model` picks one: the provider object is built
+    /// once from the endpoint and the key, while the name is a field of every request, so choosing
+    /// a model is a decision the runtime can take at any moment without rebuilding anything.
+    pub model: Mutex<String>,
     /// Which postures the layers above this runtime refuse to let it take.
     pub availability: ModeAvailability,
     /// Permissions a human granted once and asked to keep.
@@ -145,6 +149,12 @@ impl RuntimeInner {
 
     pub fn mode(&self) -> PermissionMode {
         *self.mode.lock().expect("mode lock")
+    }
+
+    /// The model name every request is built with. Live, because the interface can pick one at any
+    /// moment; the provider object owns the endpoint and the key, not the choice.
+    pub fn model(&self) -> String {
+        self.model.lock().expect("model lock").clone()
     }
 
     /// The whole decision for one request, in one place: the evaluator answers what the rules say,
@@ -229,12 +239,14 @@ impl RuntimeInner {
         let mcp = self.mcp.lock().expect("mcp lock");
         let plugins = self.plugins.lock().expect("plugins lock");
         Metrics {
-            model: self
-                .provider
-                .as_ref()
-                .map(|p| p.model().to_owned())
-                .filter(|m| !m.is_empty())
-                .or_else(|| sessions.iter().find_map(|s| s.model())),
+            model: {
+                let live = self.model();
+                if live.is_empty() {
+                    sessions.iter().find_map(|s| s.model())
+                } else {
+                    Some(live)
+                }
+            },
             provider: self.provider.as_ref().map(|p| p.name().to_owned()),
             context_used,
             context_window,
@@ -286,16 +298,13 @@ impl RuntimeInner {
             let count = self.session_list().len() + 1;
             format!("Session {count}")
         });
+        let model = self.model();
         let row = self
             .store
             .create_session(
                 &title,
                 &self.workspace_root,
-                if self.config.model.is_empty() {
-                    None
-                } else {
-                    Some(self.config.model.as_str())
-                },
+                if model.is_empty() { None } else { Some(&model) },
                 now,
             )
             .map_err(|e| RuntimeError::Store(e.to_string()))?;
@@ -412,6 +421,8 @@ impl Runtime {
             availability.fallback_mode()
         };
 
+        let model_name = config.model.clone();
+
         let inner = Arc::new(RuntimeInner {
             config,
             store,
@@ -433,6 +444,7 @@ impl Runtime {
             approvals: Mutex::new(HashMap::new()),
             questions: Mutex::new(HashMap::new()),
             mode: Mutex::new(mode),
+            model: Mutex::new(model_name),
             availability,
             rules: Mutex::new(RuleBook::open()),
             workspace_root,
@@ -544,6 +556,53 @@ impl RuntimeHandle {
         &self.inner.mcp_visibility
     }
 
+    /// The configuration this process started with. Read-only: a live edit here would change what
+    /// the running provider was built from without rebuilding it, so `set_model` is the one live
+    /// change and everything else needs a restart.
+    pub fn config(&self) -> &Config {
+        &self.inner.config
+    }
+
+    /// Flip one MCP server between private and public and return the new state as a label. The
+    /// decision lives here because the runtime owns the manager and the file it persists to; an
+    /// interface that flipped a copy would report a change that never happened.
+    pub fn toggle_mcp_visibility(&self, server: &str) -> Result<String> {
+        use vikram_mcp::visibility::Visibility;
+        let mut manager = self.inner.mcp_visibility.lock().map_err(|_| {
+            crate::error::RuntimeError::InvalidState("mcp visibility is locked".into())
+        })?;
+        let current = manager
+            .get(server)
+            .map(|entry| entry.visibility.clone())
+            .unwrap_or_default();
+        let next = match current {
+            Visibility::Public => Visibility::Private,
+            Visibility::Private => Visibility::Public,
+        };
+        manager.set_visibility(server, next.clone());
+        Ok(next.label().to_owned())
+    }
+
+    /// The MCP servers this process knows about, as `(name, visibility label, exposed tools)`.
+    pub fn mcp_servers(&self) -> Vec<(String, String, usize)> {
+        let Ok(manager) = self.inner.mcp_visibility.lock() else {
+            return Vec::new();
+        };
+        let mut servers: Vec<(String, String, usize)> = manager
+            .list()
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.server_name.clone(),
+                    entry.visibility.label().to_owned(),
+                    entry.exposed_tools.len(),
+                )
+            })
+            .collect();
+        servers.sort_by(|a, b| a.0.cmp(&b.0));
+        servers
+    }
+
     pub fn mcp_private_runtime(&self) -> &std::sync::Mutex<PrivateRuntime> {
         &self.inner.mcp_private_runtime
     }
@@ -605,7 +664,12 @@ impl RuntimeHandle {
                 "approvals cannot be saved: {layer} sets `{rule}`"
             )));
         }
-        let saved = self.inner.rules.lock().expect("rules lock").add_amendment(amendment)?;
+        let saved = self
+            .inner
+            .rules
+            .lock()
+            .expect("rules lock")
+            .add_amendment(amendment)?;
         self.inner.journal(
             session,
             RecordKind::Policy,
@@ -647,6 +711,117 @@ impl RuntimeHandle {
         }
         crate::turn::spawn_turn(Arc::clone(&self.inner), session, text, None);
         Ok(())
+    }
+
+    /// Run a command the operator typed at the `!` prompt. It is gated, approved and journaled by
+    /// the same path a model-issued tool call takes; the only difference is provenance — this one
+    /// is authored by the human at the keyboard, so it carries `Trust::User`.
+    ///
+    /// Returns as soon as the command is accepted. The `$ command` line, any approval prompt and
+    /// the output all arrive on the event stream, so the interface never blocks on the process.
+    pub fn run_user_command(&self, session: &SessionId, command: String) -> Result<()> {
+        let Some(session) = self.inner.session(session) else {
+            return Err(RuntimeError::SessionNotFound(session.clone()));
+        };
+        if command.trim().is_empty() {
+            return Err(RuntimeError::InvalidState("no command to run".into()));
+        }
+        let inner = Arc::clone(&self.inner);
+        let session_id = session.id.clone();
+        inner.emit(RuntimeEvent::MessageCommitted {
+            session: session_id.clone(),
+            message: Message::system(format!("$ {command}")),
+        });
+        let call =
+            vikram_contracts::ToolCall::new("shell.run", serde_json::json!({ "command": command }));
+        tokio::spawn(async move {
+            let (content, ok) = crate::turn::run_operator_tool(&inner, &session, &call).await;
+            // A command that produced no output needs no transcript line; a refusal always does.
+            if !ok || !content.trim().is_empty() {
+                let text = if ok {
+                    content
+                } else {
+                    format!("error: {content}")
+                };
+                inner.emit(RuntimeEvent::MessageCommitted {
+                    session: session_id,
+                    message: Message::system(text),
+                });
+            }
+        });
+        Ok(())
+    }
+
+    /// Choose the model every later request carries, and keep the choice: the live name, the
+    /// session row, `$VIKRAM_HOME/config.json` and the journal all move together, so a restart
+    /// starts on the model that was picked rather than on the one that happened to be configured.
+    pub fn set_model(&self, session: &SessionId, model: String) -> Result<()> {
+        let model = model.trim().to_owned();
+        if model.is_empty() {
+            return Err(RuntimeError::InvalidState(
+                "a model name cannot be empty".into(),
+            ));
+        }
+        let Some(session) = self.inner.session(session) else {
+            return Err(RuntimeError::SessionNotFound(session.clone()));
+        };
+        let now = now_ms();
+        *self.inner.model.lock().expect("model lock") = model.clone();
+        session.set_model(Some(model.clone()), now);
+        self.inner
+            .store
+            .set_session_model(&session.id, Some(&model), now)
+            .map_err(|err| RuntimeError::Store(err.to_string()))?;
+
+        let mut config = self.inner.config.clone();
+        config.model = model.clone();
+        config.save()?;
+
+        self.inner.journal(
+            &session.id,
+            RecordKind::Status,
+            serde_json::json!({ "model": model, "set_by": "command" }),
+        );
+        self.inner.publish_session(&session);
+        self.inner.publish_metrics();
+        if self.inner.provider.is_none() {
+            self.inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!(
+                    "model set to `{model}`; no endpoint is configured yet, so a turn cannot start"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Read the endpoint's own model list without holding up the interface: the answer arrives as
+    /// [`RuntimeEvent::ModelsListed`], including when the endpoint refuses or cannot be reached.
+    pub fn refresh_models(&self) {
+        let inner = Arc::clone(&self.inner);
+        let base_url = inner.config.base_url.clone();
+        let api_key = inner.config.api_key();
+        tokio::spawn(async move {
+            let outcome = if base_url.trim().is_empty() {
+                Err("no endpoint is configured (`base_url`)".to_owned())
+            } else {
+                match api_key {
+                    // The listing is a read of the operator's own endpoint, so it needs the key the
+                    // config names — a local server accepts any bearer token, but the variable is
+                    // still what says which key to send.
+                    None => Err(format!(
+                        "no key found: `${}` is empty",
+                        inner.config.api_key_env
+                    )),
+                    Some(key) => crate::openai::list_models(&base_url, &key).await,
+                }
+            };
+            let (models, error) = match outcome {
+                Ok(models) => (models, None),
+                Err(err) => (Vec::new(), Some(err)),
+            };
+            inner.emit(RuntimeEvent::ModelsListed { models, error });
+        });
     }
 
     pub fn queue(&self, session: &SessionId, text: String) -> Result<()> {
@@ -950,6 +1125,12 @@ impl RuntimeHandle {
         self.inner.memory.list(scope)
     }
 
+    /// Every remembered key, as `(scope, key, value)`. The panel lists them all because a scope the
+    /// operator cannot see is a scope they cannot ask about.
+    pub fn memory_list_all(&self) -> Vec<(String, String, String)> {
+        self.inner.memory.list_all()
+    }
+
     pub fn memory_delete<K, S>(&self, key: K, scope: S) -> Result<bool>
     where
         K: AsRef<str>,
@@ -1002,7 +1183,7 @@ fn truncate(text: &str, limit: usize) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use vikram_contracts::{SideEffect, Trust};
+    use vikram_contracts::{Block, SideEffect, Trust};
 
     /// `VIKRAM_HOME` and the security switches are process-global, so a test that points the home at
     /// a temporary directory holds the shared guard for its whole body.
@@ -1169,7 +1350,9 @@ mod tests {
         );
 
         // unattended refuses a prompt without ever emitting it.
-        handle.set_mode(&session, PermissionMode::Unattended).unwrap();
+        handle
+            .set_mode(&session, PermissionMode::Unattended)
+            .unwrap();
         assert!(
             matches!(inner.judge(&command), Decision::Deny { reason } if reason.contains("do not retry")),
             "a headless posture answers its own prompts with no"
@@ -1184,7 +1367,9 @@ mod tests {
         let handle = runtime.handle();
         let session = handle.create_session(Some("listed".into())).unwrap();
         let inner = &handle.inner;
-        handle.set_mode(&session, PermissionMode::AllowList).unwrap();
+        handle
+            .set_mode(&session, PermissionMode::AllowList)
+            .unwrap();
 
         let read = PermissionRequest::new(
             ActionKind::Read,
@@ -1232,7 +1417,11 @@ mod tests {
             err.to_string().contains("disable_yolo"),
             "the refusal names the rule: {err}"
         );
-        assert_eq!(handle.mode(), PermissionMode::Ask, "a refusal changes nothing");
+        assert_eq!(
+            handle.mode(),
+            PermissionMode::Ask,
+            "a refusal changes nothing"
+        );
         assert!(
             !handle.modes().contains(&PermissionMode::Yolo),
             "and it is not offered either"
@@ -1241,7 +1430,10 @@ mod tests {
         let saved = handle
             .allow(&session, "allow execute shell.run resource=cargo test *")
             .expect_err("disable_always_allow forbids keeping permissions");
-        assert!(saved.to_string().contains("disable_always_allow"), "{saved}");
+        assert!(
+            saved.to_string().contains("disable_always_allow"),
+            "{saved}"
+        );
         assert!(handle.allow_list().is_empty());
     }
 
@@ -1312,5 +1504,261 @@ mod tests {
         handle.unallow(0).unwrap();
         assert!(!inner.policy().has_allow(&cargo));
         assert!(handle.unallow(0).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_typed_command_beside_a_running_turn_leaves_that_turn_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let session = handle.snapshot().sessions[0].id.clone();
+        handle.set_mode(&session, PermissionMode::Yolo).unwrap();
+        let live = handle.inner.session(&session).unwrap();
+        live.set_turn(crate::types::TurnState::Streaming);
+
+        let mut rec = Recorder::new(&handle);
+        handle
+            .run_user_command(&session, "echo beside-a-turn".into())
+            .unwrap();
+        assert!(
+            rec.wait_until(|texts, _| texts.iter().any(|t| t.contains("beside-a-turn")))
+                .await,
+            "the command still runs while a turn is in flight"
+        );
+        assert_eq!(
+            live.turn(),
+            crate::types::TurnState::Streaming,
+            "a side command must not claim to own the state of a turn already running"
+        );
+    }
+
+    #[tokio::test]
+    async fn choosing_a_model_moves_the_live_choice_and_everything_that_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let session = handle.snapshot().sessions[0].id.clone();
+
+        handle
+            .set_model(&session, "qwen2.5-coder:32b".into())
+            .unwrap();
+
+        // The name a turn is built with, the row the session was stored under, and the file a
+        // restart reads are one decision, not three places that can disagree.
+        assert_eq!(handle.inner.model(), "qwen2.5-coder:32b");
+        assert_eq!(
+            handle.snapshot().metrics.model.as_deref(),
+            Some("qwen2.5-coder:32b")
+        );
+        let saved: Config = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("home").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved.model, "qwen2.5-coder:32b");
+        assert_eq!(
+            handle.snapshot().sessions[0].model.as_deref(),
+            Some("qwen2.5-coder:32b"),
+            "the session row carries the model it is on"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blank_model_name_is_refused_instead_of_becoming_the_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let session = handle.snapshot().sessions[0].id.clone();
+
+        assert!(handle.set_model(&session, "   ".into()).is_err());
+        assert_eq!(handle.inner.model(), "test-model");
+    }
+
+    /// What the runtime published about a command. The `$ command` line, the outcome and any
+    /// approval all arrive on the event stream, because the command itself runs on its own task.
+    struct Recorder {
+        events: broadcast::Receiver<RuntimeEvent>,
+        texts: Vec<String>,
+        approvals: Vec<ApprovalId>,
+    }
+
+    impl Recorder {
+        fn new(handle: &RuntimeHandle) -> Self {
+            Self {
+                events: handle.events(),
+                texts: Vec::new(),
+                approvals: Vec::new(),
+            }
+        }
+
+        /// Drain until `stop` is satisfied or five seconds pass, so a test waits on the evidence it
+        /// asserts rather than on a fixed sleep.
+        async fn wait_until(&mut self, stop: impl Fn(&[String], &[ApprovalId]) -> bool) -> bool {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !stop(&self.texts, &self.approvals) {
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                let Ok(Ok(event)) =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), self.events.recv())
+                        .await
+                else {
+                    continue;
+                };
+                match event {
+                    RuntimeEvent::MessageCommitted { message, .. } => {
+                        if let Some(Block::Text { text, .. }) = message.blocks.first() {
+                            self.texts.push(text.clone());
+                        }
+                    }
+                    RuntimeEvent::ApprovalRequested(prompt) => self.approvals.push(prompt.approval),
+                    _ => {}
+                }
+            }
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn a_typed_command_stops_at_the_prompt_and_then_really_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let session = handle.snapshot().sessions[0].id.clone();
+        let mut rec = Recorder::new(&handle);
+
+        handle
+            .run_user_command(&session, "touch before-approval".into())
+            .unwrap();
+
+        assert!(
+            rec.wait_until(|_, approvals| !approvals.is_empty()).await,
+            "`ask` mode must put a typed command to the human"
+        );
+        assert!(
+            !dir.path().join("before-approval").exists(),
+            "a command that is still awaiting approval must not have run"
+        );
+
+        let approval = rec.approvals[0].clone();
+        handle.answer_approval(&approval, true, false).unwrap();
+        assert!(
+            rec.wait_until(|_, _| dir.path().join("before-approval").exists())
+                .await,
+            "answering yes has to run the command for real, not report that it did"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_saved_deny_rule_refuses_a_typed_command_without_asking() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let session = handle.snapshot().sessions[0].id.clone();
+        handle
+            .allow(&session, "deny execute shell.run resource=touch *")
+            .unwrap();
+
+        let mut rec = Recorder::new(&handle);
+        handle
+            .run_user_command(&session, "touch refused".into())
+            .unwrap();
+
+        assert!(
+            rec.wait_until(|texts, _| texts.iter().any(|t| t.contains("permission denied")))
+                .await,
+            "the refusal has to reach the transcript, not vanish into a task"
+        );
+        assert!(
+            rec.approvals.is_empty(),
+            "a refusal is not something to approve around"
+        );
+        assert!(!dir.path().join("refused").exists());
+    }
+
+    #[tokio::test]
+    async fn the_posture_in_force_decides_what_a_typed_command_costs() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let session = handle.snapshot().sessions[0].id.clone();
+
+        handle.set_mode(&session, PermissionMode::Plan).unwrap();
+        let mut rec = Recorder::new(&handle);
+        handle
+            .run_user_command(&session, "touch in-plan".into())
+            .unwrap();
+        assert!(
+            rec.wait_until(|texts, _| texts.iter().any(|t| t.contains("plan mode is read-only")))
+                .await,
+            "plan is read-only for the human's own commands too"
+        );
+        assert!(rec.approvals.is_empty(), "plan refuses, it does not ask");
+        assert!(!dir.path().join("in-plan").exists());
+
+        handle.set_mode(&session, PermissionMode::Yolo).unwrap();
+        let mut rec = Recorder::new(&handle);
+        handle
+            .run_user_command(&session, "touch in-yolo".into())
+            .unwrap();
+        assert!(
+            rec.wait_until(|_, _| dir.path().join("in-yolo").exists())
+                .await,
+            "`yolo` means the typed command runs without a prompt"
+        );
+        assert!(rec.approvals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn keeping_a_typed_command_on_the_list_stops_the_next_one_asking() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let session = handle.snapshot().sessions[0].id.clone();
+        let mut rec = Recorder::new(&handle);
+
+        handle
+            .run_user_command(&session, "touch kept-1".into())
+            .unwrap();
+        assert!(
+            rec.wait_until(|_, approvals| !approvals.is_empty()).await,
+            "the first one asks"
+        );
+        let approval = rec.approvals[0].clone();
+        handle.answer_approval(&approval, true, true).unwrap();
+        assert!(
+            rec.wait_until(|_, _| dir.path().join("kept-1").exists())
+                .await,
+            "keeping it still has to run this one"
+        );
+        assert_eq!(
+            handle
+                .allow_list()
+                .iter()
+                .filter(|rule| rule.verb_prefix.as_deref() == Some("shell.run"))
+                .count(),
+            1,
+            "the kept shape is a rule on the shell verb, not on the whole machine"
+        );
+
+        handle
+            .run_user_command(&session, "touch kept-2".into())
+            .unwrap();
+        assert!(
+            rec.wait_until(|_, _| dir.path().join("kept-2").exists())
+                .await,
+            "the same shape must not ask twice"
+        );
+        assert_eq!(
+            rec.approvals.len(),
+            1,
+            "a kept command is on the list; nothing re-prompts"
+        );
     }
 }
