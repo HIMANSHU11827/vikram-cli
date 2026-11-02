@@ -819,7 +819,7 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                 ));
             }
             items.push(PickerItem::new(
-                "! /mode changes the posture · /allow forgets a rule".to_owned(),
+                "! /permissions changes the posture · /allow forgets a rule".to_owned(),
                 String::new(),
                 "hint".to_owned(),
             ));

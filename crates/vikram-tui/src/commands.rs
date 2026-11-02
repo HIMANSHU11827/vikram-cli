@@ -48,7 +48,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "permissions",
-        aliases: &["mode"],
+        aliases: &[],
         description: "Choose the approval posture",
         outcome: Outcome::Picker(PickerKind::Mode),
     },
@@ -369,8 +369,8 @@ mod tests {
             "an alias is matched exactly, so it cannot also widen the popup"
         );
         assert!(
-            find("/mode").is_some_and(|command| command.name == "permissions"),
-            "the old spelling still answers"
+            find("/mode").is_none(),
+            "the old spelling is gone, not aliased"
         );
     }
 
