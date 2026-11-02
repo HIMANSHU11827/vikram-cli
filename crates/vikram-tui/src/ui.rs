@@ -60,7 +60,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     if app.overlay.is_some() {
-        widgets::overlay(frame, area, app, &theme);
+        // Panels dock onto the last rows of the transcript, directly above the input box, so the
+        // conversation they act on stays readable while they are open.
+        widgets::overlay(frame, regions.conversation, app, &theme);
     }
 
     if let Some(selection) = app.selection {

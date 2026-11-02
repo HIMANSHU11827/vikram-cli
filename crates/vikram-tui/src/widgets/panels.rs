@@ -574,7 +574,7 @@ pub fn overlay(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         let width = 40u16.min(area.width);
         let rect = Rect::new(
             area.x + 2,
-            area.y + area.height.saturating_sub(height + 4),
+            area.y + area.height.saturating_sub(height),
             width,
             height,
         );
@@ -608,7 +608,7 @@ pub fn overlay(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         let lines = crate::widgets::picker_lines(picker, theme);
         let height = (lines.len() as u16 + 2).min(area.height);
         let width = DIALOG_WIDTH.max(72).min(area.width);
-        let rect = centered(area, width, height);
+        let rect = docked(area, width, height);
         frame.render_widget(Clear, rect);
         let block = Block::default()
             .borders(Borders::ALL)
@@ -638,7 +638,7 @@ pub fn overlay(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     let (title, lines) = overlay_content(&*app, &current, theme);
     let height = (lines.len() as u16 + 2).min(area.height);
     let width = DIALOG_WIDTH.min(area.width);
-    let rect = centered(area, width, height);
+    let rect = docked(area, width, height);
 
     frame.render_widget(Clear, rect);
     let block = Block::default()
@@ -1071,15 +1071,40 @@ fn clip(text: &str, width: usize, ascii: bool) -> String {
     out
 }
 
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
+fn docked(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
     Rect::new(
         area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
+        area.y + area.height.saturating_sub(height),
         width,
         height,
     )
+}
+
+#[cfg(test)]
+mod dock_tests {
+    use super::*;
+
+    #[test]
+    fn a_panel_sits_on_the_last_rows_of_its_region() {
+        let region = Rect::new(0, 1, 100, 20);
+        let rect = docked(region, 72, 6);
+
+        assert_eq!(rect.y + rect.height, region.y + region.height);
+        assert_eq!(rect.y, 15, "a docked panel hangs from the bottom edge");
+        assert_eq!(rect.width, 72);
+    }
+
+    #[test]
+    fn a_panel_larger_than_its_region_is_clipped_to_it() {
+        let region = Rect::new(0, 0, 40, 5);
+        let rect = docked(region, 72, 30);
+
+        assert_eq!(rect.height, 5);
+        assert_eq!(rect.width, 40);
+        assert_eq!(rect.y, 0);
+    }
 }
 
 /// Paint the drag that is selecting text. Reversing the cells is the terminal's own way of marking
