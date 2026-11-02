@@ -172,9 +172,40 @@ fn conversation_lines_with_hits(
         .map(|approval| approval.verb.as_str())
         .collect();
 
+    // An idle turn re-reports the same call twice: once when it is dispatched and once when it
+    // returns. Only the last report of a call is drawn, so a search reads as one row.
+    let mut latest_report: HashMap<String, usize> = HashMap::new();
+    for (position, activity) in session.activity.iter().enumerate() {
+        if activity.kind == ActivityKind::Tool {
+            let key = activity
+                .call
+                .as_ref()
+                .map(|call| call.to_string())
+                .unwrap_or_else(|| activity.text.clone());
+            latest_report.insert(key, position);
+        }
+    }
+    let current: HashSet<usize> = latest_report.values().copied().collect();
+    let activities: Vec<(usize, &Activity)> = session
+        .activity
+        .iter()
+        .enumerate()
+        .filter(|(position, activity)| {
+            activity.kind != ActivityKind::Tool || current.contains(position)
+        })
+        .collect();
+
+    // What the turn did belongs above what it answered, not piled under the transcript. The rows
+    // go right after the request that started the turn.
+    let turn_start = session
+        .messages
+        .iter()
+        .rposition(|message| message.role == Role::User);
+
     // An empty session renders nothing: the interface does not fabricate a greeting or sample
     // conversation. Real content arrives through the runtime's message stream.
 
+    let mut drew_activities = false;
     for (message_index, message) in session.messages.iter().enumerate() {
         match message.role {
             Role::User => push_user(
@@ -208,22 +239,43 @@ fn conversation_lines_with_hits(
             ),
             Role::Tool => push_tool(&mut lines, message, &index, width, theme),
         }
+
+        if turn_start == Some(message_index) {
+            drew_activities = true;
+            for (position, activity) in &activities {
+                push_activity(
+                    &mut lines,
+                    app,
+                    activity,
+                    &index,
+                    session,
+                    &mut marks,
+                    width,
+                    theme,
+                    *position,
+                    session.selected_activity,
+                );
+            }
+        }
     }
 
-    for (idx, activity) in session.activity.iter().enumerate() {
-        push_activity(
-            &mut lines,
-            app,
-            activity,
-            &index,
-            session,
-            &mut marks,
-            width,
-            theme,
-            idx,
-            session.selected_activity,
-        );
+    if !drew_activities {
+        for (position, activity) in &activities {
+            push_activity(
+                &mut lines,
+                app,
+                activity,
+                &index,
+                session,
+                &mut marks,
+                width,
+                theme,
+                *position,
+                session.selected_activity,
+            );
+        }
     }
+
 
     if session.streaming.is_some() || session.streaming_thought.is_some() {
         lines.push(Line::from(""));
@@ -1558,6 +1610,54 @@ mod tests {
 
         assert!(!all.contains("1 lines"), "singular counted as plural: {all}");
         assert!(all.contains("thought line 1"), "{all}");
+    }
+
+    #[test]
+    fn a_turn_reports_its_calls_above_the_answer_and_only_once() {
+        let mut session = sample_session();
+        session.messages.push(Message::user("do a web search"));
+        // The same call, reported once on dispatch and once on return.
+        let call = ToolCallId::generate();
+        session.activity.push(Activity {
+            kind: ActivityKind::Tool,
+            text: "web.search".to_owned(),
+            call: Some(call.clone()),
+            ok: None,
+            expanded: false,
+        });
+        session.activity.push(Activity {
+            kind: ActivityKind::Tool,
+            text: "web.search  limit=10 query=todays news".to_owned(),
+            call: Some(call.clone()),
+            ok: Some(true),
+            expanded: false,
+        });
+        session
+            .messages
+            .push(Message::tool_result(call, "first hit", true));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "here is the answer", Trust::Model));
+
+        let rows = transcript(&conversation_lines(&App::new(false), &session, 80, &Theme::new(false)));
+        let row = rows
+            .iter()
+            .position(|line| line.contains("Web search"))
+            .expect("the call is reported");
+        let answer = rows
+            .iter()
+            .position(|line| line.contains("here is the answer"))
+            .expect("the answer is drawn");
+        assert!(
+            row < answer,
+            "the call belongs above the answer it produced: {rows:#?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|line| line.contains("Web search")).count(),
+            1,
+            "one call is one row: {rows:#?}"
+        );
+        assert!(rows[row].contains("todays news"), "got {}", rows[row]);
     }
 
     #[test]
