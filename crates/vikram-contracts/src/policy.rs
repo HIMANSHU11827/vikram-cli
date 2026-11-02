@@ -142,16 +142,30 @@ impl PermissionMode {
         }
     }
 
+    /// What a person reads. `as_str` stays the spelling the config and journal store, so renaming
+    /// a posture here never rewrites anyone's saved settings.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Ask => "Ask",
+            Self::AcceptEdits => "Accept edits",
+            Self::Plan => "Plan",
+            Self::Smart => "Smart",
+            Self::Unattended => "Deny",
+            Self::Yolo => "Bypass",
+            Self::AllowList => "Allow list",
+        }
+    }
+
     /// Every posture, in the order an interface should list them.
     pub fn all() -> [PermissionMode; 7] {
         [
             Self::Ask,
             Self::AcceptEdits,
-            Self::Plan,
+            Self::AllowList,
             Self::Smart,
             Self::Unattended,
             Self::Yolo,
-            Self::AllowList,
+            Self::Plan,
         ]
     }
 

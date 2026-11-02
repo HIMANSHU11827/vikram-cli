@@ -1782,19 +1782,22 @@ mod tests {
     }
 
     #[test]
-    fn filtering_for_mode_does_not_put_model_on_the_cursor() {
+    fn filtering_for_permissions_does_not_put_model_on_the_cursor() {
         let mut app = app_with_session();
         handle_key(&mut app, key(KeyCode::Char('/')));
         handle_key(&mut app, key(KeyCode::Enter));
-        for ch in "mode".chars() {
+        for ch in "permis".chars() {
             handle_key(&mut app, key(KeyCode::Char(ch)));
         }
-        assert_eq!(picker_of(&app).selected_item().unwrap().value, "mode");
+        assert_eq!(
+            picker_of(&app).selected_item().unwrap().value,
+            "permissions"
+        );
         handle_key(&mut app, key(KeyCode::Enter));
         let command = app.take_commands().pop().expect("a choice");
         assert!(matches!(
             command,
-            UiCommand::Act { kind: PickerKind::Command, ref value, .. } if value == "mode"
+            UiCommand::Act { kind: PickerKind::Command, ref value, .. } if value == "permissions"
         ));
     }
 
@@ -1952,7 +1955,6 @@ mod tests {
             candidates,
             vec![
                 "/model".to_owned(),
-                "/mode".to_owned(),
                 "/memory".to_owned(),
                 "/mcp".to_owned()
             ]

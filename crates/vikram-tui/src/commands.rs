@@ -47,8 +47,8 @@ pub const COMMANDS: &[Command] = &[
         outcome: Outcome::Picker(PickerKind::Model),
     },
     Command {
-        name: "mode",
-        aliases: &[],
+        name: "permissions",
+        aliases: &["mode"],
         description: "Choose the approval posture",
         outcome: Outcome::Picker(PickerKind::Mode),
     },
@@ -59,7 +59,7 @@ pub const COMMANDS: &[Command] = &[
         outcome: Outcome::Picker(PickerKind::Provider),
     },
     Command {
-        name: "permissions",
+        name: "policy",
         aliases: &[],
         description: "The policy in force and the saved allow-list",
         outcome: Outcome::Picker(PickerKind::Permissions),
@@ -363,10 +363,14 @@ mod tests {
     #[test]
     fn the_popup_prefix_matches_names_and_never_aliases() {
         let mo: Vec<&str> = starting_with("/mo").into_iter().map(|c| c.name).collect();
-        assert_eq!(mo, vec!["model", "mode"], "table order, not alphabetical");
+        assert_eq!(mo, vec!["model"], "the renamed command no longer widens the popup");
         assert!(
             starting_with("bots").is_empty(),
             "an alias is matched exactly, so it cannot also widen the popup"
+        );
+        assert!(
+            find("/mode").is_some_and(|command| command.name == "permissions"),
+            "the old spelling still answers"
         );
     }
 

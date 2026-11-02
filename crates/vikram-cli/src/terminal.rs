@@ -516,7 +516,7 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                 .modes()
                 .into_iter()
                 .map(|mode| {
-                    let item = PickerItem::new(mode.as_str(), "", mode.as_str());
+                    let item = PickerItem::new(mode.label(), mode.as_str(), mode.as_str());
                     if mode == active {
                         item.as_current()
                     } else {
