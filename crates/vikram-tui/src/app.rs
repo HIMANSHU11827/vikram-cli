@@ -32,6 +32,9 @@ pub struct SuggestionPopup {
 #[derive(Clone, Debug)]
 pub struct TabHit {
     pub session: SessionId,
+    /// The row the tabs were drawn on. A click names a row as well as a column, or every press in
+    /// the left-hand columns would be read as a tab press.
+    pub row: u16,
     pub tab_x_start: u16,
     pub tab_x_end: u16,
     pub close_x_start: u16,
@@ -446,7 +449,8 @@ pub struct App {
     /// Hit regions for session tabs and their close buttons, recomputed each draw.
     pub tab_hits: Vec<TabHit>,
     /// X range (start, end) of the "+ New" control, if rendered.
-    pub new_session_x: Option<(u16, u16)>,
+    /// The `+ New` control: its row, then the column range it spans.
+    pub new_session_x: Option<(u16, u16, u16)>,
     /// Live `/`, `@`, `!` suggestion popup.
     pub suggestions: Option<SuggestionPopup>,
     /// Workspace root reported by the runtime; used to resolve `@` paths.

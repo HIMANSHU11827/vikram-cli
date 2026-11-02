@@ -64,7 +64,7 @@ pub fn session_tabs(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme)
         x += hint.width() as u16;
         // + New control
         let new_label = "  + New";
-        app.new_session_x = Some((x, x + new_label.width() as u16));
+        app.new_session_x = Some((area.y, x, x + new_label.width() as u16));
         spans.push(Span::styled(new_label, Style::default().fg(theme.accent)));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
         return;
@@ -119,6 +119,7 @@ pub fn session_tabs(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme)
         let tab_end = x;
         app.tab_hits.push(TabHit {
             session: session.id.clone(),
+            row: area.y,
             tab_x_start: tab_start,
             tab_x_end: tab_end,
             close_x_start: close_start,
@@ -133,7 +134,7 @@ pub fn session_tabs(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme)
     x += sw;
     let new_label = "+ New";
     let new_w = new_label.width() as u16;
-    app.new_session_x = Some((x, x + new_w));
+    app.new_session_x = Some((area.y, x, x + new_w));
     spans.push(Span::styled(new_label, Style::default().fg(theme.accent)));
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);

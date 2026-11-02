@@ -193,40 +193,50 @@ fn apply_terminal_event(app: &mut App, event: Event) {
                         }
                     }
                 }
-                // + New
-                if let Some((start, end)) = app.new_session_x {
-                    if x >= start && x < end {
-                        app.commands.push(UiCommand::NewSession);
-                        return;
+                // The tab strip and `+ New` live on one row. Matching on the column alone would
+                // swallow every press below them, so the row is part of the hit.
+                if app.overlay.is_none() {
+                    if let Some((row, start, end)) = app.new_session_x {
+                        if mouse.row == row && x >= start && x < end {
+                            app.commands.push(UiCommand::NewSession);
+                            return;
+                        }
                     }
-                }
-                // close buttons
-                for hit in app.tab_hits.clone() {
-                    if x >= hit.close_x_start && x < hit.close_x_end {
-                        app.commands.push(UiCommand::CloseSession {
-                            session: hit.session,
-                        });
-                        return;
+                    // close buttons
+                    for hit in app.tab_hits.clone() {
+                        if mouse.row == hit.row
+                            && x >= hit.close_x_start
+                            && x < hit.close_x_end
+                        {
+                            app.commands.push(UiCommand::CloseSession {
+                                session: hit.session,
+                            });
+                            return;
+                        }
                     }
-                }
-                // tab bodies
-                for hit in app.tab_hits.clone() {
-                    if x >= hit.tab_x_start
-                        && x < hit.tab_x_end
-                        && !(x >= hit.close_x_start && x < hit.close_x_end)
-                    {
-                        app.commands.push(UiCommand::SwitchSession {
-                            session: hit.session,
-                        });
-                        return;
+                    // tab bodies
+                    for hit in app.tab_hits.clone() {
+                        if mouse.row == hit.row
+                            && x >= hit.tab_x_start
+                            && x < hit.tab_x_end
+                            && !(x >= hit.close_x_start && x < hit.close_x_end)
+                        {
+                            app.commands.push(UiCommand::SwitchSession {
+                                session: hit.session,
+                            });
+                            return;
+                        }
                     }
                 }
                 // A header folds its own thinking block. This is checked before a selection starts
-                // so a click on the label does not leave a one-cell drag behind.
+                // so a click on the label does not leave a one-cell drag behind. The fold belongs
+                // to the session on screen, which an agent pane can show without making it active.
                 if app.overlay.is_none() {
                     if let Some(key) = app.thought_at(x, mouse.row) {
-                        if let Some(session) = app.active_session_mut() {
-                            session.toggle_thought(key);
+                        if let Some(id) = app.display_session().map(|session| session.id.clone()) {
+                            if let Some(index) = app.session_index(&id) {
+                                app.sessions[index].toggle_thought(key);
+                            }
                         }
                         return;
                     }
@@ -1616,4 +1626,112 @@ fn base64(input: &[u8]) -> String {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use vikram_contracts::{Block, Message, Role, Trust};
+    use vikram_runtime::types::TurnState;
+    use vikram_runtime::types::SessionSnapshot;
+    use vikram_tui::app::SessionView;
+
+    fn app_with_one_thought() -> App {
+        let mut app = App::new(false);
+        app.sessions.push(SessionView::from_snapshot(SessionSnapshot {
+            id: SessionId::generate(),
+            title: "Session 1".to_owned(),
+            cwd: "/work".into(),
+            model: None,
+            messages: vec![Message {
+                role: Role::Assistant,
+                blocks: vec![
+                    Block::Reasoning {
+                        text: "The user said hello.".to_owned(),
+                        trust: Trust::Model,
+                    },
+                    Block::Text {
+                        text: "Hello!".to_owned(),
+                        trust: Trust::Model,
+                    },
+                ],
+            }],
+            turn: TurnState::Idle,
+            tokens: Default::default(),
+            created_ms: 0,
+            updated_ms: 0,
+            agent: None,
+            queued: 0,
+        }));
+        app
+    }
+
+    fn draw(app: &mut App) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        terminal
+            .draw(|frame| ui::draw(frame, app))
+            .expect("the frame draws");
+        terminal
+    }
+
+    #[test]
+    fn a_click_on_a_drawn_thought_header_folds_that_block() {
+        let mut app = app_with_one_thought();
+        let _terminal = draw(&mut app);
+        let hit = *app
+            .thought_hits
+            .first()
+            .expect("the drawn frame records where the header landed");
+
+        apply_terminal_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: hit.x_start + 1,
+                row: hit.row,
+                modifiers: KeyModifiers::empty(),
+            }),
+        );
+
+        let session = app.active_session().expect("a session is shown");
+        assert!(
+            session.thought_expanded(hit.key),
+            "clicking the header opens exactly that block"
+        );
+        assert!(app.selection.is_none(), "a header click is not a drag");
+    }
+
+    #[test]
+    fn a_click_on_the_tab_row_still_switches_sessions_and_does_not_fold() {
+        let mut app = app_with_one_thought();
+        let _terminal = draw(&mut app);
+        let hit = app.tab_hits.first().cloned().expect("the tabs were drawn");
+        let thought_rows: Vec<u16> = app.thought_hits.iter().map(|thought| thought.row).collect();
+        assert!(
+            !thought_rows.contains(&hit.row),
+            "the tabs and the transcript must not claim the same row"
+        );
+
+        apply_terminal_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: hit.tab_x_start + 1,
+                row: hit.row,
+                modifiers: KeyModifiers::empty(),
+            }),
+        );
+
+        assert!(matches!(
+            app.commands.as_slice(),
+            [UiCommand::SwitchSession { .. }]
+        ));
+        let session = app.active_session().expect("a session is shown");
+        assert!(
+            !session.thought_expanded((0, 0)),
+            "a tab click is not a fold"
+        );
+    }
 }
