@@ -1107,20 +1107,48 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
                 return true;
             }
             let last = app.approvals.len() - 1;
+            let actions = crate::widgets::APPROVAL_ACTIONS.len();
             match key.code {
                 KeyCode::Esc => {
                     app.overlay = None;
                     true
                 }
-                KeyCode::Up => {
+                // One request means the arrows belong to the answers; several mean they pick
+                // which request to answer, and tab moves between the answers.
+                KeyCode::Up if app.approvals.len() > 1 => {
                     app.approval_selection = app.approval_selection.saturating_sub(1);
                     true
                 }
-                KeyCode::Down => {
+                KeyCode::Down if app.approvals.len() > 1 => {
                     app.approval_selection = (app.approval_selection + 1).min(last);
                     true
                 }
-                KeyCode::Enter | KeyCode::Char('a') => {
+                KeyCode::Up => {
+                    app.approval_action = (app.approval_action + actions - 1) % actions;
+                    true
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    app.approval_action = (app.approval_action + 1) % actions;
+                    true
+                }
+                KeyCode::BackTab | KeyCode::Right => {
+                    app.approval_action = (app.approval_action + 1) % actions;
+                    true
+                }
+                KeyCode::Left => {
+                    app.approval_action = (app.approval_action + actions - 1) % actions;
+                    true
+                }
+                KeyCode::Enter => {
+                    let (allow, persist) = match app.approval_action {
+                        1 => (false, false),
+                        2 => (true, true),
+                        _ => (true, false),
+                    };
+                    answer_approval(app, allow, persist);
+                    true
+                }
+                KeyCode::Char('a') => {
                     answer_approval(app, true, false);
                     true
                 }
@@ -1932,5 +1960,67 @@ mod tests {
                 "{candidate} is offered"
             );
         }
+    }
+
+    fn app_with_approvals(count: usize) -> App {
+        use vikram_runtime::types::ApprovalPrompt;
+        let mut app = app_with_session();
+        let session = app.sessions[0].id.clone();
+        for n in 0..count {
+            app.approvals.push(ApprovalPrompt {
+                approval: vikram_contracts::ApprovalId::generate(),
+                session: session.clone(),
+                verb: "fs.write".to_owned(),
+                resource: format!("/etc/hosts{n}"),
+                reason: "outside the workspace".to_owned(),
+                amendment: None,
+            });
+        }
+        app.overlay = Some(Overlay::Approvals);
+        app.approval_selection = 0;
+        app.approval_action = 0;
+        app
+    }
+
+    fn answered(app: &App) -> (bool, bool) {
+        match app.commands.as_slice() {
+            [UiCommand::AnswerApproval { allow, persist, .. }] => (*allow, *persist),
+            other => panic!("expected one answer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_arrows_pick_a_different_answer_and_enter_gives_it() {
+        let mut app = app_with_approvals(1);
+        assert_eq!(app.approval_action, 0);
+        assert!(handle_overlay(&mut app, key(KeyCode::Down)));
+        assert_eq!(app.approval_action, 1);
+        assert!(handle_overlay(&mut app, key(KeyCode::Enter)));
+        assert_eq!(answered(&app), (false, false), "the second answer denies");
+        assert!(app.overlay.is_none());
+
+        let mut app = app_with_approvals(1);
+        assert!(handle_overlay(&mut app, key(KeyCode::Down)));
+        assert!(handle_overlay(&mut app, key(KeyCode::Down)));
+        assert_eq!(app.approval_action, 2);
+        assert!(handle_overlay(&mut app, key(KeyCode::Enter)));
+        assert_eq!(answered(&app), (true, true), "the third keeps it on the list");
+    }
+
+    #[test]
+    fn the_first_answer_is_the_one_enter_gives_by_default() {
+        let mut app = app_with_approvals(1);
+        assert!(handle_overlay(&mut app, key(KeyCode::Enter)));
+        assert_eq!(answered(&app), (true, false), "allow once, nothing kept");
+    }
+
+    #[test]
+    fn the_arrows_pick_the_request_when_more_than_one_waits() {
+        let mut app = app_with_approvals(2);
+        assert!(handle_overlay(&mut app, key(KeyCode::Down)));
+        assert_eq!(app.approval_selection, 1, "down moved the request");
+        assert_eq!(app.approval_action, 0, "not the answer");
+        assert!(handle_overlay(&mut app, key(KeyCode::Tab)));
+        assert_eq!(app.approval_action, 1, "tab still moves the answer");
     }
 }

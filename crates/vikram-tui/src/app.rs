@@ -458,6 +458,8 @@ pub struct App {
     /// The approval posture the runtime reported, so the status bar labels what it is running under.
     pub mode: PermissionMode,
     pub approval_selection: usize,
+    /// Which of the three answers the approval panel has highlighted: allow once, deny, keep.
+    pub approval_action: usize,
     pub agent_selection: usize,
     /// The question the runtime is currently blocked on, if any.
     pub pending_question: Option<PendingQuestion>,
@@ -513,6 +515,7 @@ impl App {
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             mode: PermissionMode::default(),
             approval_selection: 0,
+            approval_action: 0,
             agent_selection: 0,
             pending_question: None,
             pending_answers: Vec::new(),
@@ -941,6 +944,7 @@ impl App {
                 self.approvals.push(prompt);
                 self.overlay = Some(Overlay::Approvals);
                 self.approval_selection = 0;
+                self.approval_action = 0;
             }
             RuntimeEvent::ApprovalResolved { approval, allowed } => {
                 self.approvals.retain(|a| a.approval != approval);

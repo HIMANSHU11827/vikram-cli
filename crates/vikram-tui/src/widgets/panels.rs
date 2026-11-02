@@ -727,6 +727,9 @@ fn info_lines(lines: &[String], theme: &Theme) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// The three answers the approval panel offers, in the order it draws them.
+pub const APPROVAL_ACTIONS: [&str; 3] = ["Allow once", "Deny", "Keep on the list"];
+
 fn approval_lines(app: &App, theme: &Theme) -> (String, Vec<Line<'static>>) {
     let mut lines: Vec<Line> = Vec::new();
     if app.approvals.is_empty() {
@@ -759,8 +762,24 @@ fn approval_lines(app: &App, theme: &Theme) -> (String, Vec<Line<'static>>) {
         }
     }
     lines.push(Line::from(""));
+    // Three answers, laid out so the arrow keys can land on any of them.
+    for (index, label) in APPROVAL_ACTIONS.iter().enumerate() {
+        let selected = index == app.approval_action;
+        let marker = if selected { theme.chevron() } else { " " };
+        let style = if selected {
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker} "), style),
+            Span::styled((*label).to_owned(), style),
+        ]));
+    }
     lines.push(Line::styled(
-        "  a allow once · p keep on the list · d deny",
+        "  ↑↓ choose · enter confirm · a allow · d deny · p keep",
         theme.muted(),
     ));
     (format!("Approvals {}", app.approvals.len()), lines)
@@ -1399,7 +1418,9 @@ mod tests {
         });
         assert!(rendered.contains("fs.write"), "got {rendered}");
         assert!(rendered.contains("/etc/**"), "got {rendered}");
-        assert!(rendered.contains("keep on the list"), "got {rendered}");
+        assert!(rendered.contains("Keep on the list"), "got {rendered}");
+        assert!(rendered.contains("Allow once"), "got {rendered}");
+        assert!(rendered.contains("Deny"), "got {rendered}");
     }
 
     #[test]
