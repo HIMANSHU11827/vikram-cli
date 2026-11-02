@@ -20,7 +20,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::broadcast::error::RecvError;
 use vikram_contracts::{AgentId, PermissionMode, SessionId};
 use vikram_runtime::config::Config;
-use vikram_runtime::types::NoticeLevel;
+use vikram_runtime::types::{NoticeLevel, TurnState};
 use vikram_runtime::{AgentControl, Runtime, RuntimeHandle};
 use vikram_tui::app::{AgentAction, App, Focus, Overlay, UiCommand};
 use vikram_tui::commands::{self, Outcome};
@@ -278,6 +278,12 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
         UiCommand::Submit { session, text } => {
             if let Err(err) = handle.submit(&session, text) {
                 report(app, err);
+            } else if let Some(view) = app.session_by_id_mut(&session) {
+                // The clock starts when the operator presses enter, not when the first token lands:
+                // a turn that is thinking has been running for that whole time.
+                view.turn = TurnState::Streaming;
+                view.mark_working();
+                view.follow = true;
             }
         }
         UiCommand::Queue { session, text } => {
@@ -341,6 +347,40 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
             Ok(rule) => app.push_notice(NoticeLevel::Info, format!("forgot {}", rule.describe())),
             Err(err) => report(app, err),
         },
+        UiCommand::AllowRule { session, rule } => {
+            match handle.allow(&session, rule.trim()) {
+                Ok(()) => app.push_notice(NoticeLevel::Info, format!("saved: {}", rule.trim())),
+                Err(err) => report(app, err),
+            }
+        }
+        UiCommand::DeleteSkill { name } => {
+            match handle.skill_delete(&name) {
+                Ok(()) => app.push_notice(NoticeLevel::Info, format!("deleted skill `{name}` (moved to trash)")),
+                Err(err) => report(app, err),
+            }
+        }
+        UiCommand::CreateSkill { session: _, text } => {
+            // parse "name: description"
+            let (name, desc) = match text.split_once(':') {
+                Some((n, d)) => (n.trim(), d.trim()),
+                None => (text.trim(), ""),
+            };
+            if name.is_empty() {
+                app.push_notice(NoticeLevel::Warn, "skill name is required");
+                return;
+            }
+            let description = if desc.is_empty() { name } else { desc };
+            match handle.skill_create(name, description, "") {
+                Ok(()) => app.push_notice(NoticeLevel::Info, format!("created skill `{name}`")),
+                Err(err) => report(app, err),
+            }
+        }
+        UiCommand::ImportSkill { session: _, path } => {
+            match handle.skill_import(path.trim()) {
+                Ok(()) => app.push_notice(NoticeLevel::Info, format!("imported skill from `{}`", path.trim())),
+                Err(err) => report(app, err),
+            }
+        }
         UiCommand::Act {
             kind,
             verb,
@@ -715,11 +755,11 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
             app.open_picker(Picker::new(kind, "HIVE teams", items));
         }
         PickerKind::Skill => {
-            let metrics = handle.snapshot().metrics;
             let snapshot = handle.snapshot();
+            let skills = handle.skill_list();
             let mut items = vec![
                 PickerItem::new(
-                    format!("{} discovered · {} loaded this turn", metrics.skills_discovered, metrics.skills_loaded),
+                    format!("{} discovered · {} loaded this turn", snapshot.metrics.skills_discovered, snapshot.metrics.skills_loaded),
                     String::new(),
                     "summary".to_owned(),
                 ),
@@ -729,15 +769,24 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                     "hint".to_owned(),
                 ),
             ];
-            for skill in &snapshot.skills {
-                items.push(PickerItem::new(skill.clone(), String::new(), skill.clone()));
-            }
-            if snapshot.skills.is_empty() {
+            if skills.is_empty() {
                 items.push(PickerItem::new(
                     "no skill directories found".to_owned(),
                     String::new(),
                     "empty".to_owned(),
                 ));
+            } else {
+                for skill in &skills {
+                    let status = if skill.enabled { "on" } else { "off" };
+                    let detail = if skill.description.is_empty() {
+                        format!("{} · {}", skill.scope, status)
+                    } else {
+                        format!("{} · {} · {}", skill.description, skill.scope, status)
+                    };
+                    let item = PickerItem::new(skill.name.clone(), detail, skill.name.clone());
+                    let item = if skill.enabled { item } else { item };
+                    items.push(item);
+                }
             }
             app.open_picker(Picker::new(kind, "Skills", items));
         }
@@ -824,7 +873,7 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                 ));
             }
             items.push(PickerItem::new(
-                "! /permissions changes the posture · /allow forgets a rule".to_owned(),
+                "! enter changes the posture · ctrl+a saves a rule".to_owned(),
                 String::new(),
                 "hint".to_owned(),
             ));
@@ -859,7 +908,19 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                 "count".to_owned(),
             )];
             for name in names {
-                items.push(PickerItem::new(name.clone(), String::new(), name.clone()));
+                let enabled = handle.tools().is_enabled(&name);
+                let desc = handle
+                    .tools()
+                    .get(&name)
+                    .map(|t| t.spec().description)
+                    .unwrap_or_default();
+                let status = if enabled { "on" } else { "off" };
+                let detail = if desc.is_empty() {
+                    status.to_owned()
+                } else {
+                    format!("{} · {}", desc, status)
+                };
+                items.push(PickerItem::new(name.clone(), detail, name.clone()));
             }
             app.open_picker(Picker::new(kind, "Tools", items));
         }
@@ -1330,8 +1391,32 @@ fn apply_act(
         (PickerKind::Plugins, _) => {
             // Info panel - just close
         }
-        (PickerKind::Tools, _) => {
-            // Info panel - just close
+        (PickerKind::Tools, Verb::Choose) => {
+            if let Some(tool) = handle.tools().get(&value) {
+                let spec = tool.spec();
+                let mut lines = Vec::new();
+                if !spec.description.is_empty() {
+                    lines.push(spec.description.clone());
+                }
+                let schema = serde_json::to_string_pretty(&spec.schema).unwrap_or_default();
+                if !schema.is_empty() && schema != "null" {
+                    lines.push(String::new());
+                    lines.push(schema);
+                }
+                app.open_info(format!("Tool · {}", spec.name), lines);
+            } else {
+                app.push_notice(NoticeLevel::Warn, format!("tool `{value}` not found"));
+            }
+        }
+        (PickerKind::Tools, Verb::Toggle) => {
+            let enabled = handle.tools().is_enabled(&value);
+            if enabled {
+                handle.tools().tool_disable(&value);
+                app.push_notice(NoticeLevel::Info, format!("tool `{value}` disabled"));
+            } else {
+                handle.tools().tool_enable(&value);
+                app.push_notice(NoticeLevel::Info, format!("tool `{value}` enabled"));
+            }
         }
         (PickerKind::Status, _) => {
             // Info panel - just close
@@ -1351,8 +1436,68 @@ fn apply_act(
         (PickerKind::Team, _) => {
             // Info panel - just close
         }
-        (PickerKind::Skill, _) => {
-            // Info panel - just close
+        (PickerKind::Skill, Verb::Choose) => {
+            if let Some(skill) = handle.skill_get(&value) {
+                let mut lines = Vec::new();
+                if !skill.description.is_empty() {
+                    lines.push(skill.description.clone());
+                }
+                lines.push(format!("scope: {} · enabled: {}", skill.scope, if skill.enabled { "yes" } else { "no" }));
+                lines.push(format!("loaded: {}", skill.loaded));
+                if !skill.instructions.is_empty() {
+                    lines.push(String::new());
+                    lines.push(skill.instructions.clone());
+                } else {
+                    // load body on demand
+                    if let Some(full) = handle.skill_get(&value) {
+                        if !full.instructions.is_empty() {
+                            lines.push(String::new());
+                            lines.push(full.instructions.clone());
+                        }
+                    }
+                }
+                app.open_info(format!("Skill · {}", skill.name), lines);
+            } else {
+                app.push_notice(NoticeLevel::Warn, format!("skill `{value}` not found"));
+            }
+        }
+        (PickerKind::Skill, Verb::Toggle) => {
+            // determine current enabled state
+            let enabled = handle.skill_list().iter().find(|s| s.name == value).map(|s| s.enabled).unwrap_or(true);
+            let res = if enabled {
+                handle.skill_disable(&value)
+            } else {
+                handle.skill_enable(&value)
+            };
+            match res {
+                Ok(()) => app.push_notice(NoticeLevel::Info, format!("skill `{value}` {}", if enabled { "disabled" } else { "enabled" })),
+                Err(err) => report(app, err),
+            }
+        }
+        (PickerKind::Skill, Verb::New) => {
+            app.open_prompt(
+                "New skill",
+                "name: description (e.g. my-skill: what it does)",
+                vikram_tui::app::PromptAction::CreateSkill,
+            );
+        }
+        (PickerKind::Skill, Verb::Prompt) => {
+            app.open_prompt(
+                "Import skill",
+                "path to a skill directory",
+                vikram_tui::app::PromptAction::ImportSkill,
+            );
+        }
+        (PickerKind::Skill, Verb::Remove) => {
+            let desc = handle.skill_get(&value).map(|s| s.description).unwrap_or_default();
+            app.open_confirm(
+                "Delete a skill",
+                vec![
+                    value.clone(),
+                    if desc.is_empty() { "moves it to trash; recoverable".to_owned() } else { desc },
+                ],
+                UiCommand::DeleteSkill { name: value.clone() },
+            );
         }
         (PickerKind::Keys, _) => {
             // Info panel - just close

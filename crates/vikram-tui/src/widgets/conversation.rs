@@ -20,6 +20,7 @@ use crate::app::{
 };
 use crate::theme::Theme;
 use crate::widgets::markdown;
+use crate::widgets::payload;
 
 /// A tool result longer than this is elided: the transcript is a summary, not a log file.
 const TOOL_LINE_CAP: usize = 12;
@@ -32,7 +33,7 @@ const THOUGHT_PREVIEW_CAP: usize = 64;
 
 /// The one agent that speaks in a transcript. There is exactly one speaker per conversation, so
 /// the name is a constant: a second name in the same transcript would read as a second agent.
-const AGENT: &str = "Rudra";
+const AGENT: &str = "VIKRAM";
 
 /// A folding header: where it was drawn, how wide its label is, which block it folds, and whether
 /// that block is a tool call or a thinking block. Both live in the same key space but fold
@@ -42,6 +43,10 @@ type Mark = (usize, u16, ThoughtKey, bool);
 /// Activity rows fold in their own key space so a tool row and a thinking block never share a
 /// fold. The first half of the key is a marker no message index can reach.
 const ACTIVITY_TOOL: usize = usize::MAX - 1;
+
+/// Where a turn's own work is folded away. One key per transcript, because the header is one line
+/// per turn and the turn on screen is the one being timed.
+const ACTIVITY_TURN: usize = usize::MAX - 3;
 
 /// What the tool blocks already say, so a call and its result can be drawn as one row.
 ///
@@ -54,6 +59,8 @@ struct ToolIndex<'a> {
     /// The runtime reports a call through an activity row, not through a `ToolCall` block, so a
     /// result is only an orphan when neither names it.
     activity: HashMap<&'a ToolCallId, &'a Activity>,
+    /// Where that report sits in the activity list, which is what its fold key is built from.
+    positions: HashMap<&'a ToolCallId, usize>,
 }
 
 impl<'a> ToolIndex<'a> {
@@ -61,9 +68,11 @@ impl<'a> ToolIndex<'a> {
         let mut results = HashMap::new();
         let mut called = HashSet::new();
         let mut live = HashMap::new();
-        for entry in activity {
+        let mut positions = HashMap::new();
+        for (position, entry) in activity.iter().enumerate() {
             if let Some(call) = &entry.call {
                 live.insert(call, entry);
+                positions.insert(call, position);
             }
         }
         for message in messages {
@@ -85,6 +94,7 @@ impl<'a> ToolIndex<'a> {
             results,
             called,
             activity: live,
+            positions,
         }
     }
 
@@ -94,6 +104,11 @@ impl<'a> ToolIndex<'a> {
 
     fn outcome(&self, call: &ToolCallId) -> Option<(&'a str, bool)> {
         self.results.get(call).copied()
+    }
+
+    /// The activity list position of the call, so a message can ask for the row it belongs to.
+    fn position(&self, call: &ToolCallId) -> Option<usize> {
+        self.positions.get(call).copied()
     }
 
     fn result(&self, call: &ToolCallId) -> Option<(&'a str, bool)> {
@@ -111,32 +126,74 @@ pub fn conversation(
     theme: &Theme,
 ) -> Vec<ThoughtHit> {
     let width = area.width.saturating_sub(2) as usize;
-    let (lines, marks) = conversation_lines_with_hits(app, session, width, theme);
+    let (mut lines, marks) = conversation_lines_with_hits(app, session, width, theme);
+
+    // While the turn is running, its header is pinned to the top of the viewport. The work it
+    // reports grows downwards, so a header that scrolled with the work would leave the screen
+    // exactly when there is something to read. It is drawn once, from the top, and taken out of
+    // the body so it cannot appear twice.
+    let pinned = if session.busy() {
+        marks
+            .iter()
+            .rev()
+            .find(|(_, _, key, _)| key.0 == ACTIVITY_TURN)
+            .map(|(line, _, _, _)| *line)
+            .filter(|line| *line < lines.len())
+    } else {
+        None
+    };
+    let header = pinned.map(|index| lines.remove(index));
+    let body = if header.is_some() {
+        Rect {
+            y: area.y.saturating_add(1),
+            height: area.height.saturating_sub(1),
+            ..area
+        }
+    } else {
+        area
+    };
+
     let total = clamp_u16(lines.len());
-    let height = area.height;
     let offset = if session.follow {
-        total.saturating_sub(height)
+        total.saturating_sub(body.height)
     } else {
         total
-            .saturating_sub(height)
+            .saturating_sub(body.height)
             .saturating_sub(clamp_u16(session.scroll))
     };
     frame.render_widget(
         Paragraph::new(lines)
             .scroll((offset, 0))
             .style(theme.body()),
-        area,
+        body,
     );
+    if let Some(header) = header {
+        frame.render_widget(
+            Paragraph::new(header).style(theme.body()),
+            Rect { height: 1, ..area },
+        );
+    }
 
     marks
         .into_iter()
         .filter_map(|(line, label_width, key, tool)| {
-            let rel = (line as i64) - (offset as i64);
-            if rel < 0 || rel >= height as i64 {
-                return None;
-            }
+            // The pinned header keeps its own row, and every line under it moved up by one.
+            let row = match pinned {
+                Some(index) if line == index => area.y,
+                _ => {
+                    let line = match pinned {
+                        Some(index) if line > index => line - 1,
+                        _ => line,
+                    };
+                    let rel = (line as i64) - (offset as i64);
+                    if rel < 0 || rel >= body.height as i64 {
+                        return None;
+                    }
+                    body.y + rel as u16
+                }
+            };
             Some(ThoughtHit {
-                row: area.y + rel as u16,
+                row,
                 x_start: area.x,
                 x_end: area.x + label_width.saturating_sub(1),
                 key,
@@ -249,17 +306,22 @@ fn conversation_lines_with_hits(
         }
 
         if turn_start == Some(message_index) {
-            drew_turn = push_turn(
-                &mut lines,
-                app,
+            let ctx = TurnCtx {
                 session,
-                &index,
-                &waiting,
-                &activities,
-                message_index,
-                &mut marks,
+                waiting: &waiting,
                 width,
                 theme,
+                // Filled in by `push_turn`, which is the only caller that knows where the turn ends.
+                answer: None,
+            };
+            drew_turn = push_turn(
+                &mut lines,
+                &mut marks,
+                &ctx,
+                &index,
+                app,
+                &activities,
+                message_index,
             );
         }
     }
@@ -267,7 +329,7 @@ fn conversation_lines_with_hits(
     // Reports with no request to hang on — a resumed transcript, or a turn whose message has not
     // landed yet. They still draw, once, under the same speaker line.
     if !drew_turn && !activities.is_empty() {
-        push_turn_header(&mut lines, theme);
+        push_turn_header(&mut lines, &mut marks, session, theme, "", false);
         for (position, activity) in &activities {
             push_activity(
                 &mut lines,
@@ -289,7 +351,9 @@ fn conversation_lines_with_hits(
         // The turn list above already named the speaker when it had rows; naming it again here
         // would read as a second agent joining.
         if !drew_turn {
-            push_turn_header(&mut lines, theme);
+            let clock = turn_clock(app, session, theme);
+            let settled = !session.busy() && session.turn_elapsed_ms > 0;
+            push_turn_header(&mut lines, &mut marks, session, theme, &clock, settled);
         }
         if let Some(thought) = &session.streaming_thought {
             push_reasoning(
@@ -304,17 +368,13 @@ fn conversation_lines_with_hits(
             );
         }
         if let Some(stream) = &session.streaming {
-            lines.extend(markdown::markdown_lines(&stream.text, width, theme));
+            // Words the model is saying right now. They go through the same speaker row as the
+            // committed ones, so the operator sees VIKRAM talking the moment it starts talking
+            // instead of waiting for a tool call to break the silence.
+            push_speech(&mut lines, &stream.text, width, theme, true);
         }
-        // The turn is in flight whenever either stream is open, including the stretch before the
-        // first token arrives: a spinner with nothing under it still tells you it is thinking.
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {} ", app.thinking_frame()),
-                Style::default().fg(theme.accent),
-            ),
-            Span::styled("Working", Style::default().fg(theme.accent)),
-        ]));
+        // No status line down here: the header at the top of the turn already carries the state and
+        // the clock, and a second "Working" at the foot of the screen reads as a second turn.
     }
 
     if let Some(pending) = &app.pending_question {
@@ -410,13 +470,25 @@ fn push_assistant(
     width: usize,
     theme: &Theme,
 ) {
-    push_turn_header(lines, theme);
+    let answer = message
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(block_index, block)| match block {
+            Block::Text { text, .. } if !text.trim().is_empty() => Some((message_index, block_index)),
+            _ => None,
+        })
+        .next_back();
     let ctx = TurnCtx {
         session,
         waiting,
         width,
         theme,
+        answer,
     };
+    // A turn that is no longer the last one keeps its speaker line but not a clock: it is not
+    // being timed, and inventing a duration for it would be a lie about the transcript.
+    push_turn_header(lines, marks, session, theme, "", false);
     push_blocks(lines, marks, &ctx, index, message, message_index);
 }
 
@@ -428,6 +500,9 @@ struct TurnCtx<'a> {
     waiting: &'a HashSet<&'a str>,
     width: usize,
     theme: &'a Theme,
+    /// The block that is the turn's answer, which is the last thing it said. Everything the turn
+    /// said before that was progress, and progress is labelled with the speaker's name.
+    answer: Option<(usize, usize)>,
 }
 
 /// The body of one assistant message: what it thought, what it ran, and what it said.
@@ -446,7 +521,14 @@ fn push_blocks(
     for (block_index, block) in message.blocks.iter().enumerate() {
         let key = (message_index, block_index);
         match block {
-            Block::Text { text, .. } => push_speech(lines, text, width, theme),
+            Block::Text { text, .. } => {
+                // The turn's last words are its answer, and the header above them already says who
+                // is speaking, so the answer is drawn without a second name. Everything the turn
+                // said before that was progress, and progress keeps the name so it reads as one
+                // voice between the rows.
+                let answer = ctx.answer == Some(key);
+                push_speech(lines, text, width, theme, ctx.session.busy() || !answer);
+            }
             Block::Reasoning { text, .. } => push_reasoning(
                 lines,
                 text,
@@ -497,31 +579,111 @@ fn push_turn(
     start: usize,
 ) -> bool {
     let turn = &ctx.session.messages[start + 1..];
-    if activities.is_empty() && turn.iter().all(|message| message.blocks.is_empty()) {
+    let live = ctx.session.busy()
+        || ctx.session.streaming.is_some()
+        || ctx.session.streaming_thought.is_some();
+    if activities.is_empty() && turn.iter().all(|message| message.blocks.is_empty()) && !live {
         return false;
     }
-    push_turn_header(lines, ctx.theme);
-    for (position, activity) in activities {
-        push_activity(
-            lines,
-            app,
-            activity,
-            index,
-            ctx.session,
-            marks,
-            ctx.width,
-            ctx.theme,
-            *position,
-            ctx.session.selected_activity,
-        );
+    // The turn's answer is its last words, found once so every earlier sentence knows it is not it.
+    let answer = turn
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == Role::Assistant)
+        .flat_map(|(offset, message)| {
+            message
+                .blocks
+                .iter()
+                .enumerate()
+                .filter_map(move |(block_index, block)| match block {
+                    Block::Text { text, .. } if !text.trim().is_empty() => {
+                        Some((start + 1 + offset, block_index))
+                    }
+                    _ => None,
+                })
+        })
+        .next_back();
+    let ctx = TurnCtx {
+        session: ctx.session,
+        waiting: ctx.waiting,
+        width: ctx.width,
+        theme: ctx.theme,
+        answer,
+    };
+    let clock = turn_clock(app, ctx.session, ctx.theme);
+    let settled = !ctx.session.busy() && ctx.session.turn_elapsed_ms > 0;
+    let folded = push_turn_header(lines, marks, ctx.session, ctx.theme, &clock, settled);
+    if folded {
+        // The fold hides the work, never the answer: the turn's last spoken block is the one line
+        // that survives, and it survives in full.
+        if let Some((text, message_index, block_index)) = turn
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.role == Role::Assistant)
+            .flat_map(|(offset, message)| {
+                message
+                    .blocks
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(block_index, block)| match block {
+                        Block::Text { text, .. } if !text.trim().is_empty() => {
+                            Some((text.as_str(), start + 1 + offset, block_index))
+                        }
+                        _ => None,
+                    })
+            })
+            .next_back()
+        {
+            let _ = (message_index, block_index);
+            push_speech(lines, text, ctx.width, ctx.theme, false);
+        }
+        return true;
     }
+    let mut drawn: HashSet<usize> = HashSet::new();
     for (offset, message) in turn.iter().enumerate() {
         let message_index = start + 1 + offset;
         match message.role {
             Role::Assistant => {
-                push_blocks(lines, marks, ctx, index, message, message_index);
+                push_blocks(lines, marks, &ctx, index, message, message_index);
             }
-            Role::Tool => push_tool(lines, message, index, ctx.width, ctx.theme),
+            // A tool message is the moment its call returned, so the row naming that call belongs
+            // here — between the sentences that came before and after it — instead of in a block
+            // at the top of the turn. This is what makes a turn read in the order it happened.
+            Role::Tool => {
+                for block in &message.blocks {
+                    let Block::ToolResult {
+                        call, content, ok, ..
+                    } = block
+                    else {
+                        continue;
+                    };
+                    let activity = index
+                        .position(call)
+                        .and_then(|position| {
+                            activities
+                                .iter()
+                                .find(|(at, _)| *at == position)
+                                .map(|(at, activity)| (*at, *activity))
+                        });
+                    if let Some((position, activity)) = activity {
+                        push_activity(
+                            lines,
+                            app,
+                            activity,
+                            index,
+                            ctx.session,
+                            marks,
+                            ctx.width,
+                            ctx.theme,
+                            position,
+                            ctx.session.selected_activity,
+                        );
+                        drawn.insert(position);
+                        continue;
+                    }
+                    push_tool_payload(lines, content, *ok, ctx.width, ctx.theme);
+                }
+            }
             Role::System => push_system(
                 lines,
                 message,
@@ -535,27 +697,137 @@ fn push_turn(
             Role::User => {}
         }
     }
+    // Reports with no message of their own — a call still running, or a notice that is not a tool
+    // — close the list so nothing the runtime reported is lost.
+    for (position, activity) in activities {
+        if drawn.contains(position) {
+            continue;
+        }
+        // A call that already returned has a result message in the transcript, where its row was
+        // drawn under the request that ran it. Drawing it again here would move an old receipt
+        // under a new request.
+        if activity
+            .call
+            .as_ref()
+            .is_some_and(|call| index.result(call).is_some())
+        {
+            continue;
+        }
+        push_activity(
+            lines,
+            app,
+            activity,
+            index,
+            ctx.session,
+            marks,
+            ctx.width,
+            ctx.theme,
+            *position,
+            ctx.session.selected_activity,
+        );
+    }
     true
 }
 
-/// `● Rudra` — the speaker line a turn's rows hang from. One per turn, never per message.
-fn push_turn_header(lines: &mut Vec<Line<'static>>, theme: &Theme) {
+/// The state word the header carries: working with a clock while the turn is live, done with the
+/// time it took once it is not, and nothing at all for a turn that was never timed. The turn state
+/// lives on the header and nowhere else, so the bottom of the screen never repeats it.
+fn turn_clock(app: &App, session: &SessionView, theme: &Theme) -> String {
+    if session.busy() {
+        format!(
+            "{} Working · {}s",
+            app.thinking_frame(),
+            session.turn_seconds()
+        )
+    } else if session.turn_elapsed_ms > 0 {
+        format!("{} Worked · {}s", theme.check(), session.turn_seconds())
+    } else {
+        String::new()
+    }
+}
+
+/// `● VIKRAM  ✳ Working · 12s  ▾` — the speaker line a turn's rows hang from, and the one control
+/// that folds the whole turn away. One per turn, never per message, and the clock on it is the
+/// answer to "how long has this been going".
+///
+/// Returns whether the operator has folded the turn, in which case only the answer is drawn.
+fn push_turn_header(
+    lines: &mut Vec<Line<'static>>,
+    marks: &mut Vec<Mark>,
+    session: &SessionView,
+    theme: &Theme,
+    clock: &str,
+    settled: bool,
+) -> bool {
+    let folded = session.thought_expanded((ACTIVITY_TURN, 0));
+    let chevron = if folded { ellipsis_pointing(theme, false) } else { ellipsis_pointing(theme, true) };
+
+    // A finished turn is a receipt, not a speaker: `✓ Worked · 10s` says what happened and how
+    // long it took, and the answer under it needs no second name. A running turn still has to say
+    // who is running, so it keeps the name.
+    let mut spans = Vec::new();
+    let mut label = String::new();
+    if settled {
+        spans.push(Span::styled(clock.to_string(), theme.title()));
+        label.push_str(clock);
+    } else {
+        spans.push(Span::styled(format!("{} ", theme.filled_dot()), theme.title()));
+        spans.push(Span::styled(AGENT, theme.title()));
+        label = format!("{} {}", theme.filled_dot(), AGENT);
+        if !clock.is_empty() {
+            spans.push(Span::raw("   "));
+            spans.push(Span::styled(clock.to_string(), theme.muted()));
+            label.push_str("   ");
+            label.push_str(clock);
+        }
+    }
+    spans.push(Span::raw("   "));
+    spans.push(Span::styled(chevron, theme.muted()));
+    label.push_str("   ");
+    label.push_str(chevron);
+
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled(format!("{} ", theme.filled_dot()), theme.title()),
-        Span::styled(AGENT, theme.title()),
-    ]));
+    let row = lines.len();
+    lines.push(Line::from(spans));
+    let end = UnicodeWidthStr::width(label.as_str()).saturating_sub(1) as u16;
+    marks.push((row, end, (ACTIVITY_TURN, 0), false));
+    folded
+}
+
+/// The row's fold arrow: open, or shut. Named rather than spelled at each call site because the
+/// ascii fallback has to stay in step with it.
+fn ellipsis_pointing(theme: &Theme, open: bool) -> &'static str {
+    match (theme.ascii, open) {
+        (true, true) => "v",
+        (true, false) => ">",
+        (false, true) => "▼",
+        (false, false) => "▶",
+    }
 }
 
 /// What the agent says mid-work, as a person would say it: a name, then short lines.
 ///
 /// Speech is never folded — it is the part of a turn the operator is meant to read — and it is
 /// not a thought: nothing here is hidden reasoning.
-fn push_speech(lines: &mut Vec<Line<'static>>, text: &str, width: usize, theme: &Theme) {
+/// The agent's own words. `speaker` prints the `💬 VIKRAM` line above them; it is false for the
+/// answer of a finished turn, whose speaker is already the header at the top of the turn, and
+/// printing the name twice was the second `VIKRAM` line the operator asked to have removed.
+fn push_speech(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    width: usize,
+    theme: &Theme,
+    speaker: bool,
+) {
     if text.trim().is_empty() {
         return;
     }
-    lines.push(Line::styled(format!("{} {AGENT}", speech_glyph(theme)), theme.title()));
+    if speaker {
+        lines.push(Line::styled(
+            format!("{} {AGENT}", speech_glyph(theme)),
+            theme.title(),
+        ));
+    }
     let inner = width.saturating_sub(3).max(1);
     for line in markdown::markdown_lines(text, inner, theme) {
         lines.push(indent(line, "   "));
@@ -916,8 +1188,7 @@ fn push_reasoning(
     if expanded {
         lines.push(Line::from(vec![
             Span::styled(heading_text, label),
-            Span::styled(format!(" {} Ctrl+T folds", theme.bullet()), theme.muted()),
-            Span::styled(" · click", Style::default().fg(theme.faint)),
+            Span::styled(format!("   {}", ellipsis_pointing(theme, true)), theme.muted()),
         ]));
         lines.extend(markdown::markdown_lines(text, width, theme));
         return;
@@ -931,16 +1202,13 @@ fn push_reasoning(
     } else {
         row.next().unwrap_or_default()
     };
-    let count = text.lines().filter(|line| !line.trim().is_empty()).count();
+    // What was thought, and the way to open the rest of it. Counting the lines was a third thing
+    // on a one-line row and pushed the fold away from the preview it belongs to.
     let mut detail = truncate(preview, THOUGHT_PREVIEW_CAP, ellipsis(theme));
-    if count > 1 {
-        detail.push_str(&format!(" {} {count} lines", theme.bullet()));
-    }
-    detail.push_str(&format!(" {} Ctrl+T opens", theme.bullet()));
+    detail.push_str(&format!("   {}", ellipsis_pointing(theme, false)));
     lines.push(Line::from(vec![
         Span::styled(heading_text, label),
         Span::styled(format!("  {detail}"), theme.muted()),
-        Span::styled(" · click", Style::default().fg(theme.faint)),
     ]));
 }
 
@@ -991,6 +1259,31 @@ fn push_activity(
         // The activity IS the call: the runtime never stores a `ToolCall` block, so this row is
         // the only place a real turn can say what ran. It draws once, with its payload folded.
         if activity.kind == ActivityKind::Tool {
+            let key = (ACTIVITY_TOOL, position);
+            // The row draws what the runtime actually reported for this call: its arguments, its
+            // output, how long it took. When that report exists it is the whole row.
+            if let Some(payload) = session.payload(Some(call)) {
+                let waiting = app
+                    .approvals
+                    .iter()
+                    .any(|prompt| prompt.verb == activity_first_word(&activity.text));
+                payload::push_row(
+                    lines,
+                    marks,
+                    payload::Row {
+                        payload,
+                        key,
+                        position,
+                        open: session.tool_expanded(key),
+                        ok: activity.ok,
+                        waiting,
+                        width,
+                        session,
+                        theme,
+                    },
+                );
+                return;
+            }
             if let Some((content, ok)) = tool_index.result(call) {
                 let key = (ACTIVITY_TOOL, position);
                 let waiting = app
@@ -1428,6 +1721,7 @@ mod tests {
             turn: TurnId::generate(),
             text: "partial answer".into(),
         });
+        session.turn = TurnState::Streaming;
         session.activity.push(Activity {
             kind: ActivityKind::Tool,
             text: "shell · ls".into(),
@@ -1657,8 +1951,11 @@ mod tests {
         let theme = Theme::new(false);
         let all = transcript(&conversation_lines(&app, &session, 76, &theme)).join("\n");
 
-        assert!(all.contains("Ctrl+T opens"), "no way to open it: {all}");
-        assert!(all.contains("24 lines"), "the fold hides how big it is: {all}");
+        assert!(all.contains('▶'), "no way to open it: {all}");
+        assert!(
+            !all.contains("lines"),
+            "the fold is a chevron, not a line count: {all}"
+        );
         assert!(
             all.contains("thought line 1"),
             "the preview should show what it is thinking about: {all}"
@@ -1685,8 +1982,7 @@ mod tests {
         let all = transcript(&conversation_lines(&app, &session, 76, &theme)).join("\n");
 
         assert!(all.contains("thought line 24"), "not the whole block: {all}");
-        assert!(all.contains("Ctrl+T folds"), "no way to close it: {all}");
-        assert!(!all.contains("Ctrl+T opens"), "{all}");
+        assert!(all.contains('▼'), "no way to close it: {all}");
     }
 
     #[test]
@@ -1708,7 +2004,7 @@ mod tests {
             !all.contains("oldest line") && !all.contains("second thought line"),
             "the whole buffer leaked through the fold: {all}"
         );
-        assert!(all.contains("3 lines"), "{all}");
+        assert!(all.contains('▶'), "no way to open it: {all}");
     }
 
     #[test]
@@ -1909,6 +2205,10 @@ mod tests {
             ],
         });
 
+        // Speech is what the agent says while it is still working: the answer of a finished turn
+        // is drawn under the header without a second name.
+        session.turn = TurnState::Streaming;
+
         let theme = Theme::new(false);
         let rows = transcript(&conversation_lines(&app, &session, 80, &theme));
         let speech_row = format!("{} {AGENT}", speech_glyph(&theme));
@@ -2018,7 +2318,7 @@ mod tests {
         assert!(
             folded
                 .iter()
-                .any(|row| row.contains("Thought") && row.contains("Ctrl+T opens")),
+                .any(|row| row.contains("Thought") && row.contains('▶')),
             "the thought row starts folded: {folded:#?}"
         );
         assert!(
@@ -2046,8 +2346,74 @@ mod tests {
             "the clicked tool row opened: {both_open:#?}"
         );
         assert!(
-            both_open.iter().any(|row| row.contains("Ctrl+T folds")),
+            both_open.iter().any(|row| row.contains("thought line 2")),
             "the thought is still open, so its tool row click did not fold it: {both_open:#?}"
+        );
+    }
+
+    #[test]
+    fn a_turn_with_text_still_arriving_reads_as_working_before_the_state_catches_up() {
+        let mut session = sample_session();
+        session.messages = vec![Message::user("say hi")];
+        // The stream buffer can hold text before the turn state reports it, and the header has to
+        // follow what is on screen rather than the lagging field.
+        session.turn = TurnState::Idle;
+        session.streaming = Some(Streaming {
+            turn: TurnId::generate(),
+            text: "hello".to_owned(),
+        });
+        session.turn_started_ms =
+            Some(vikram_runtime::types::now_ms().saturating_sub(3_000));
+        let app = App::new(false);
+        let theme = Theme::new(false);
+        let all = transcript(&conversation_lines(&app, &session, 80, &theme)).join("\n");
+        assert!(
+            all.contains("Working"),
+            "a turn with text arriving is working: {all}"
+        );
+        assert!(
+            !all.contains("Worked"),
+            "a turn that has not finished has no receipt: {all}"
+        );
+    }
+
+    #[test]
+    fn a_settled_turn_keeps_its_duration_even_with_no_state_of_its_own() {
+        let mut session = sample_session();
+        session.messages = vec![
+            Message::user("say hi"),
+            Message::text(Role::Assistant, "hi there", vikram_contracts::Trust::External),
+        ];
+        session.turn = TurnState::Idle;
+        session.turn_started_ms = None;
+        session.turn_elapsed_ms = 4_200;
+        assert!(!session.busy());
+        assert_eq!(session.turn_seconds(), 4);
+        let app = App::new(false);
+        let theme = Theme::new(false);
+        let all = transcript(&conversation_lines(&app, &session, 80, &theme)).join("\n");
+        assert!(all.contains("Worked · 4s"), "the receipt keeps the time: {all}");
+    }
+
+    #[test]
+    fn a_finished_turn_reads_as_a_duration_and_not_as_a_name() {
+        let mut session = sample_session();
+        session.messages = vec![
+            Message::user("say hi"),
+            Message::text(Role::Assistant, "hi there", vikram_contracts::Trust::External),
+        ];
+        session.turn = TurnState::Idle;
+        session.turn_elapsed_ms = 10_000;
+        let app = App::new(false);
+        let theme = Theme::new(false);
+        let all = transcript(&conversation_lines(&app, &session, 80, &theme)).join("\n");
+        assert!(
+            all.contains("Worked"),
+            "a finished turn says how long it worked: {all}"
+        );
+        assert!(
+            !all.contains("VIKRAM"),
+            "a finished turn is a receipt, not a speaker: {all}"
         );
     }
 }

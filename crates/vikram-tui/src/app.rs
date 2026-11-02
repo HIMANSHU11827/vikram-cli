@@ -141,6 +141,19 @@ pub struct Activity {
     pub expanded: bool,
 }
 
+/// What a tool was asked and what it answered. Kept beside the activity row rather than inside it:
+/// the row is the label, this is the receipts, and a call that never reports keeps an empty one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Payload {
+    /// The registered tool name, which decides how the row draws itself.
+    pub name: String,
+    pub resource: String,
+    pub arguments: String,
+    pub content: String,
+    pub cwd: String,
+    pub duration_ms: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Streaming {
     pub turn: TurnId,
@@ -223,6 +236,10 @@ pub enum PromptAction {
     SetModel,
     /// The typed text is an allow-list rule to save.
     AddAllowRule,
+    /// The typed text is "name: description" for a new skill.
+    CreateSkill,
+    /// The typed text is a path to a skill directory to import.
+    ImportSkill,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,6 +311,25 @@ pub enum UiCommand {
     Unallow {
         index: usize,
     },
+    /// Delete a skill (moves to trash).
+    DeleteSkill {
+        name: String,
+    },
+    /// Create a skill from "name: description" text.
+    CreateSkill {
+        session: SessionId,
+        text: String,
+    },
+    /// Import a skill from a directory path.
+    ImportSkill {
+        session: SessionId,
+        path: String,
+    },
+    /// Save one allow-list rule the operator typed, bypassing the removed /allow command.
+    AllowRule {
+        session: SessionId,
+        rule: String,
+    },
     /// Stop a background task by id, which is what the tasks panel shows.
     StopTask {
         id: String,
@@ -339,6 +375,13 @@ pub struct SessionView {
     /// Tool rows carry their payload hidden. Unlike thinking, a tool row starts closed and a
     /// click opens exactly the one that was clicked.
     pub tool_folds: HashMap<ThoughtKey, bool>,
+    /// Receipts for the calls the activity rows name, keyed by call.
+    pub payloads: HashMap<ToolCallId, Payload>,
+    /// When the turn on screen started, so the header can count while it works. `None` means no
+    /// turn is being timed, which is not the same as a turn that took no time.
+    pub turn_started_ms: Option<u64>,
+    /// How long the last finished turn took. Kept after the turn ends, because the header says so.
+    pub turn_elapsed_ms: u64,
     pub unread: usize,
 }
 
@@ -367,6 +410,9 @@ impl SessionView {
             expanded_thought: false,
             thought_folds: HashMap::new(),
             tool_folds: HashMap::new(),
+            payloads: HashMap::new(),
+            turn_started_ms: None,
+            turn_elapsed_ms: 0,
             unread: 0,
         }
     }
@@ -395,6 +441,11 @@ impl SessionView {
     pub fn toggle_tool(&mut self, key: ThoughtKey) {
         let next = !self.tool_expanded(key);
         self.tool_folds.insert(key, next);
+    }
+
+    /// The receipts for one row, if the runtime reported any.
+    pub fn payload(&self, call: Option<&ToolCallId>) -> Option<&Payload> {
+        call.and_then(|call| self.payloads.get(call))
     }
 
     pub fn is_busy(&self) -> bool {
@@ -433,7 +484,47 @@ impl SessionView {
         }
     }
 
+    /// Whether a turn is in flight, which is what the header's clock and spinner read.
+    pub fn working(&self) -> bool {
+        matches!(
+            self.turn,
+            TurnState::Streaming | TurnState::Tooling | TurnState::WaitingApproval
+        )
+    }
+
+    /// Whether anything is visibly in flight. The turn state and the live buffers can disagree for
+    /// a moment — text arrives before the state catches up — and the header has to read what is on
+    /// screen, not the lagging field, or a working turn renders as an idle one.
+    pub fn busy(&self) -> bool {
+        self.working() || self.streaming.is_some() || self.streaming_thought.is_some()
+    }
+
+    /// Start timing a turn if one is not already being timed. Idempotent: a turn reports itself
+    /// many times and must be timed once.
+    pub fn mark_working(&mut self) {
+        if self.turn_started_ms.is_none() {
+            self.turn_started_ms = Some(now_ms());
+        }
+    }
+
+    /// Stop the clock and keep the duration. A turn that never started is left alone rather than
+    /// credited with a duration it did not have.
+    pub fn mark_settled(&mut self) {
+        if let Some(started) = self.turn_started_ms.take() {
+            self.turn_elapsed_ms = now_ms().saturating_sub(started);
+        }
+    }
+
+    /// Seconds the turn on screen has run, live while it works and final once it is done.
+    pub fn turn_seconds(&self) -> u64 {
+        match self.turn_started_ms {
+            Some(started) => now_ms().saturating_sub(started) / 1000,
+            None => self.turn_elapsed_ms / 1000,
+        }
+    }
+
     pub fn apply_snapshot(&mut self, snapshot: SessionSnapshot) {
+        let was_working = self.working();
         self.title = snapshot.title;
         self.cwd = snapshot.cwd;
         self.model = snapshot.model;
@@ -443,6 +534,15 @@ impl SessionView {
         self.updated_ms = snapshot.updated_ms;
         self.agent = snapshot.agent;
         self.queued = snapshot.queued;
+        // The turn state is the only authority on whether work is happening. Reading it after the
+        // copy makes both transitions fire exactly once: `mark_working` is a no-op when a start is
+        // already recorded, and `mark_settled` is a no-op when nothing is being timed.
+        let _ = was_working;
+        if self.working() {
+            self.mark_working();
+        } else {
+            self.mark_settled();
+        }
     }
 }
 
@@ -824,6 +924,8 @@ impl App {
                 let active_id = self.active_session().map(|s| s.id.clone());
                 if let Some(view) = self.session_by_id(&session) {
                     view.messages.push(Message::user(text));
+                    // A request is the moment the clock starts, even before the first token.
+                    view.mark_working();
                     view.follow = true;
                     if active_id.as_ref() != Some(&session) {
                         view.unread += 1;
@@ -837,6 +939,7 @@ impl App {
                         text: String::new(),
                     });
                     view.turn = TurnState::Streaming;
+                    view.mark_working();
                     view.follow = true;
                 }
             }
@@ -889,16 +992,41 @@ impl App {
                 call,
                 name,
                 summary,
+                resource,
+                arguments,
+                cwd,
             } => {
                 if let Some(view) = self.session_by_id(&session) {
                     view.turn = TurnState::Tooling;
-                    view.push_activity(Activity {
-                        kind: ActivityKind::Tool,
-                        text: format!("{name} · {summary}"),
-                        call: Some(call),
-                        ok: None,
-                        expanded: false,
-                    });
+                    view.mark_working();
+                    view.payloads.insert(
+                        call.clone(),
+                        Payload {
+                            name: name.clone(),
+                            resource,
+                            arguments,
+                            content: String::new(),
+                            cwd,
+                            duration_ms: 0,
+                        },
+                    );
+                    // A call that asks for approval announces itself twice. It is one piece of work
+                    // and gets one row: the second announcement only sharpens its label.
+                    match view
+                        .activity
+                        .iter_mut()
+                        .rev()
+                        .find(|a| a.call.as_ref() == Some(&call))
+                    {
+                        Some(activity) => activity.text = format!("{name} · {summary}"),
+                        None => view.push_activity(Activity {
+                            kind: ActivityKind::Tool,
+                            text: format!("{name} · {summary}"),
+                            call: Some(call),
+                            ok: None,
+                            expanded: false,
+                        }),
+                    }
                 }
             }
             RuntimeEvent::ToolFinished {
@@ -907,8 +1035,24 @@ impl App {
                 name,
                 ok,
                 summary,
+                content,
+                resource,
+                arguments,
+                cwd,
+                duration_ms,
             } => {
                 if let Some(view) = self.session_by_id(&session) {
+                    view.payloads.insert(
+                        call.clone(),
+                        Payload {
+                            name: name.clone(),
+                            resource,
+                            arguments,
+                            content,
+                            cwd,
+                            duration_ms,
+                        },
+                    );
                     let existing = view
                         .activity
                         .iter_mut()
@@ -939,6 +1083,7 @@ impl App {
                     view.streaming = None;
                     view.streaming_thought = None;
                     view.follow = true;
+                    view.mark_settled();
                 }
             }
             RuntimeEvent::AgentChanged(agent) => {

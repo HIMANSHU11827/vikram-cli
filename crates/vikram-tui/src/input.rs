@@ -1235,10 +1235,17 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
                                 command: "model".to_owned(),
                                 args: text,
                             },
-                            PromptAction::AddAllowRule => UiCommand::SlashCommand {
+                            PromptAction::AddAllowRule => UiCommand::AllowRule {
                                 session,
-                                command: "allow".to_owned(),
-                                args: format!("add {text}"),
+                                rule: text,
+                            },
+                            PromptAction::CreateSkill => UiCommand::CreateSkill {
+                                session,
+                                text,
+                            },
+                            PromptAction::ImportSkill => UiCommand::ImportSkill {
+                                session,
+                                path: text,
                             },
                         };
                         app.commands.push(command);

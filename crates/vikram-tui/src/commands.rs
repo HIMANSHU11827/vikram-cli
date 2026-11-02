@@ -59,18 +59,6 @@ pub const COMMANDS: &[Command] = &[
         outcome: Outcome::Picker(PickerKind::Provider),
     },
     Command {
-        name: "policy",
-        aliases: &[],
-        description: "The policy in force and the saved allow-list",
-        outcome: Outcome::Picker(PickerKind::Permissions),
-    },
-    Command {
-        name: "allow",
-        aliases: &[],
-        description: "Saved allow-list rules; choosing one forgets it",
-        outcome: Outcome::Picker(PickerKind::Allow),
-    },
-    Command {
         name: "sessions",
         aliases: &["resume", "switch"],
         description: "Switch to another conversation",

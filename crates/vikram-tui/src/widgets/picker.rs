@@ -128,16 +128,25 @@ impl PickerKind {
             Self::Memory => &[(Verb::Choose, '\n', "read"), (Verb::Remove, 'd', "forget")],
             Self::Setting => &[(Verb::Toggle, '\n', "flip")],
             Self::Mcp => &[(Verb::Toggle, '\n', "flip visibility")],
+            Self::Skill => &[
+                (Verb::Choose, '\n', "read"),
+                (Verb::Toggle, 't', "enable/disable"),
+                (Verb::New, 'n', "new skill"),
+                (Verb::Remove, 'd', "delete"),
+                (Verb::Prompt, 'i', "import path"),
+            ],
+            Self::Tools => &[
+                (Verb::Choose, '\n', "inspect"),
+                (Verb::Toggle, 't', "enable/disable"),
+            ],
             Self::File => &[(Verb::Choose, '\n', "reference it")],
             Self::Shell => &[(Verb::Choose, '\n', "run it")],
             Self::Command => &[(Verb::Choose, '\n', "open")],
             Self::Provider
             | Self::Team
-            | Self::Skill
             | Self::Settings
             | Self::Permissions
             | Self::Plugins
-            | Self::Tools
             | Self::Status
             | Self::Usage
             | Self::Context

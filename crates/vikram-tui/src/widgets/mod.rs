@@ -3,10 +3,12 @@
 
 pub mod conversation;
 pub mod markdown;
+pub mod payload;
 pub mod panels;
 pub mod picker;
 
 pub use conversation::{conversation, conversation_lines, extract_file_path};
+pub use payload::{ACTIVITY_SECTION, push_row};
 pub use panels::{
     APPROVAL_ACTIONS, bots_panel, hive_panel, overlay, plasma, selection_overlay, session_tabs,
     shortcuts, status_bar, suggestions_popup,
