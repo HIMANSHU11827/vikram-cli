@@ -68,7 +68,7 @@ pub(crate) struct RuntimeInner {
     pub mcp_visibility: std::sync::Mutex<VisibilityManager>,
     pub mcp_private_runtime: std::sync::Mutex<PrivateRuntime>,
     pub plugins: Mutex<PluginRegistry>,
-    pub skills: SkillRegistry,
+    pub skills: std::sync::Mutex<SkillRegistry>,
     pub approvals: Mutex<HashMap<ApprovalId, PendingApproval>>,
     /// `ask_user` requests awaiting an operator answer, keyed by request id.
     pub questions: Mutex<HashMap<String, PendingQuestion>>,
@@ -409,6 +409,7 @@ impl Runtime {
             .workspace_root
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let workspace_root = std::fs::canonicalize(&workspace_root).unwrap_or(workspace_root);
 
         let agents = AgentManager::new();
         match store.list_agents() {
@@ -428,7 +429,7 @@ impl Runtime {
 
         let mcp = McpRegistry::load(McpConfig::load());
         let plugins = PluginRegistry::from_default_dir();
-        let skills = SkillRegistry::for_workspace(&workspace_root);
+        let skills = std::sync::Mutex::new(SkillRegistry::for_workspace(&workspace_root));
 
         // The layers above this runtime can refuse a posture; a config that asked for one of those
         // starts on the most permissive thing still available rather than failing to boot.
@@ -667,6 +668,13 @@ impl RuntimeHandle {
                 mode,
             });
         }
+        // A posture is a standing choice, not a per-turn one. It is written down the same way the
+        // model is, so a restart starts on what the operator picked instead of on the default.
+        // The file is re-read first: the running copy predates any model chosen since boot, and
+        // saving that copy would quietly undo it.
+        let mut config = crate::config::Config::load()?;
+        config.mode = mode;
+        config.save()?;
         Ok(())
     }
 
@@ -1163,15 +1171,80 @@ impl RuntimeHandle {
     }
 
     pub fn skill_list(&self) -> Vec<Skill> {
-        self.inner.skills.list()
+        self.inner.skills.lock().expect("skills lock").list()
     }
 
     pub fn skill_get(&self, name: &str) -> Option<Skill> {
-        self.inner.skills.get(name)
+        self.inner.skills.lock().expect("skills lock").get(name)
     }
 
     pub fn skill_count(&self) -> usize {
-        self.inner.skills.count()
+        self.inner.skills.lock().expect("skills lock").count()
+    }
+
+    /// Enable a skill by name (removes it from the disabled list). Re-discovers afterwards.
+    pub fn skill_enable(&self, name: &str) -> Result<()> {
+        let mgr = vikram_skills::Manager::new();
+        mgr.enable(name).map_err(|e| RuntimeError::Store(e.to_string()))?;
+        self.rescan_skills();
+        self.inner.emit(RuntimeEvent::SkillsChanged {
+            discovered: self.skill_count(),
+            loaded: 0,
+        });
+        Ok(())
+    }
+
+    /// Disable a skill by name (adds it to the disabled list). Re-discovers afterwards.
+    pub fn skill_disable(&self, name: &str) -> Result<()> {
+        let mgr = vikram_skills::Manager::new();
+        mgr.disable(name).map_err(|e| RuntimeError::Store(e.to_string()))?;
+        self.rescan_skills();
+        self.inner.emit(RuntimeEvent::SkillsChanged {
+            discovered: self.skill_count(),
+            loaded: 0,
+        });
+        Ok(())
+    }
+
+    /// Delete a skill (moves it to trash). Re-discovers afterwards.
+    pub fn skill_delete(&self, name: &str) -> Result<()> {
+        let mgr = vikram_skills::Manager::new();
+        mgr.delete(name).map_err(|e| RuntimeError::Store(e.to_string()))?;
+        self.rescan_skills();
+        self.inner.emit(RuntimeEvent::SkillsChanged {
+            discovered: self.skill_count(),
+            loaded: 0,
+        });
+        Ok(())
+    }
+
+    /// Create a new skill with name + description + body. Re-discovers afterwards.
+    pub fn skill_create(&self, name: &str, description: &str, body: &str) -> Result<()> {
+        let mgr = vikram_skills::Manager::new();
+        mgr.create(name, description, body).map_err(|e| RuntimeError::Store(e.to_string()))?;
+        self.rescan_skills();
+        self.inner.emit(RuntimeEvent::SkillsChanged {
+            discovered: self.skill_count(),
+            loaded: 0,
+        });
+        Ok(())
+    }
+
+    /// Import a skill from a directory path. Re-discovers afterwards.
+    pub fn skill_import(&self, path: &str) -> Result<()> {
+        let mgr = vikram_skills::Manager::new();
+        mgr.import(std::path::Path::new(path)).map_err(|e| RuntimeError::Store(e.to_string()))?;
+        self.rescan_skills();
+        self.inner.emit(RuntimeEvent::SkillsChanged {
+            discovered: self.skill_count(),
+            loaded: 0,
+        });
+        Ok(())
+    }
+
+    fn rescan_skills(&self) {
+        let reg = SkillRegistry::for_workspace(&self.inner.workspace_root);
+        *self.inner.skills.lock().expect("skills lock") = reg;
     }
 
     pub fn shutdown(&self) {
@@ -1581,6 +1654,32 @@ mod tests {
             handle.snapshot().sessions[0].model.as_deref(),
             Some("qwen2.5-coder:32b"),
             "the session row carries the model it is on"
+        );
+    }
+
+    #[tokio::test]
+    async fn choosing_a_posture_is_remembered_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let session = handle.snapshot().sessions[0].id.clone();
+
+        handle
+            .set_mode(&session, PermissionMode::AcceptEdits)
+            .unwrap();
+
+        // The live posture, the one a view draws, and the file a restart reads are one decision.
+        assert_eq!(handle.inner.mode(), PermissionMode::AcceptEdits);
+        assert_eq!(handle.snapshot().mode, PermissionMode::AcceptEdits);
+        let saved: Config = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("home").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            saved.mode,
+            PermissionMode::AcceptEdits,
+            "a restart starts on the posture the operator picked, not on the default"
         );
     }
 

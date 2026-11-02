@@ -311,6 +311,12 @@ pub enum RuntimeEvent {
         call: ToolCallId,
         name: String,
         summary: String,
+        /// What the call is aimed at, taken from the tool's own permission request.
+        resource: String,
+        /// The arguments as JSON text, so a row can say what it was asked to do.
+        arguments: String,
+        /// The directory the tool runs in. A command means nothing without it.
+        cwd: String,
     },
     ToolFinished {
         session: SessionId,
@@ -318,6 +324,12 @@ pub enum RuntimeEvent {
         name: String,
         ok: bool,
         summary: String,
+        /// The tool's output, which is what the row opens into.
+        content: String,
+        resource: String,
+        arguments: String,
+        cwd: String,
+        duration_ms: u64,
     },
     TurnFinished {
         session: SessionId,

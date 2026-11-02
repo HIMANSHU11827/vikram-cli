@@ -47,11 +47,22 @@ pub trait Tool: Send + Sync {
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: std::sync::Mutex<BTreeMap<String, Arc<dyn Tool>>>,
+    disabled: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self::default()
+        let home = crate::config::vikram_home();
+        let path = home.join("disabled_tools.json");
+        let disabled = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default();
+        Self {
+            tools: std::sync::Mutex::new(BTreeMap::new()),
+            disabled: std::sync::Mutex::new(disabled),
+        }
     }
 
     /// The default set. Registering a tool is the only way to make it callable; there is no
@@ -140,10 +151,12 @@ impl ToolRegistry {
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
+        let disabled = self.disabled.lock().expect("disabled lock").clone();
         self.tools
             .lock()
             .expect("tools lock")
             .values()
+            .filter(|t| !disabled.contains(&t.spec().name))
             .map(|t| t.spec())
             .collect()
     }
@@ -155,6 +168,27 @@ impl ToolRegistry {
             .keys()
             .cloned()
             .collect()
+    }
+
+    pub fn is_enabled(&self, name: &str) -> bool {
+        !self.disabled.lock().expect("disabled lock").contains(name)
+    }
+
+    pub fn tool_enable(&self, name: &str) {
+        self.disabled.lock().expect("disabled lock").remove(name);
+        self.persist_disabled();
+    }
+
+    pub fn tool_disable(&self, name: &str) {
+        self.disabled.lock().expect("disabled lock").insert(name.to_owned());
+        self.persist_disabled();
+    }
+
+    fn persist_disabled(&self) {
+        let disabled: Vec<String> = self.disabled.lock().expect("disabled lock").iter().cloned().collect();
+        let path = crate::config::vikram_home().join("disabled_tools.json");
+        let _ = std::fs::create_dir_all(crate::config::vikram_home());
+        let _ = std::fs::write(&path, serde_json::to_string(&disabled).unwrap_or_default());
     }
 
     /// Iterate over registered tools (snapshot of Arcs).
@@ -336,9 +370,10 @@ impl Tool for WriteFile {
                 });
             }
         }
+        let bytes = content.len();
         match std::fs::write(&path, content) {
             Ok(()) => Ok(ToolOutput {
-                content: format!("wrote {} bytes to {}", raw.len(), path.display()),
+                content: format!("wrote {} bytes to {}", bytes, path.display()),
                 ok: true,
             }),
             Err(e) => Ok(ToolOutput {
@@ -649,6 +684,9 @@ fn run_shell_command(command: &str, ctx: &ToolContext, timeout_ms: u64) -> ToolO
     if body.trim().is_empty() {
         body = format!("(no output, exit {:?})", output.status.code());
     }
+    // The exit code is the one fact a command's row must not guess at, and the platform only hands
+    // it over here, so it travels with the output instead of being inferred later.
+    body.push_str(&format!("\n[exit {}]", output.status.code().unwrap_or(-1)));
     ToolOutput {
         content: truncated(body),
         ok: output.status.success(),
@@ -761,6 +799,7 @@ impl Tool for RunShell {
         if body.trim().is_empty() {
             body = format!("(no output, exit {:?})", output.status.code());
         }
+        body.push_str(&format!("\n[exit {}]", output.status.code().unwrap_or(-1)));
         Ok(ToolOutput {
             content: truncated(body),
             ok: output.status.success(),
@@ -818,7 +857,8 @@ impl Tool for TerminalTool {
                     .unwrap_or_else(|| ctx.workspace_root.to_string_lossy().into_owned());
                 let rows = args.get("rows").and_then(Value::as_u64).unwrap_or(24) as u16;
                 let cols = args.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16;
-                crate::pty::open(shell, Some(&cwd), rows, cols)
+                let name = args.get("session").and_then(Value::as_str);
+                crate::pty::open_named(name, shell, Some(&cwd), rows, cols)
                     .map(|id| format!("opened terminal session `{id}` in {cwd}"))
             }
             "write" => {
@@ -1451,7 +1491,7 @@ impl Tool for SkillSearch {
             .iter()
             .map(|s| format!("{}: {}", s.name, s.description))
             .collect::<Vec<_>>()
-            .join("\\n");
+            .join("\n");
         Ok(ToolOutput {
             content: truncated(body),
             ok: true,
@@ -5602,5 +5642,227 @@ mod tests {
             out.content
         );
         assert!(out.content.contains("VIKRAM_LSP_TXT"), "{}", out.content);
+    }
+
+    // Real execution, not shape checks: each of these runs the tool and then looks at what it did
+    // to the filesystem, the shell or the network, so a tool that answers but does nothing fails.
+    #[test]
+    fn the_file_tools_create_edit_list_and_delete_for_real() {
+        let (dir, ctx) = ctx();
+        let written = WriteFile
+            .run(&json!({"path": "notes/todo.md", "content": "# one\n"}), &ctx)
+            .unwrap();
+        assert!(written.ok, "{}", written.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("notes/todo.md")).unwrap(),
+            "# one\n",
+            "the bytes are on disk, not only in the answer"
+        );
+
+        let edited = EditFile
+            .run(
+                &json!({"path": "notes/todo.md", "old_string": "# one", "new_string": "# two"}),
+                &ctx,
+            )
+            .unwrap();
+        assert!(edited.ok, "{}", edited.content);
+        assert_eq!(
+            ReadFile
+                .run(&json!({"path": "notes/todo.md"}), &ctx)
+                .unwrap()
+                .content,
+            "# two\n",
+            "reading back shows the edit, not the original"
+        );
+
+        let listed = ListDir.run(&json!({"path": "notes"}), &ctx).unwrap();
+        assert!(listed.content.contains("todo.md"), "{}", listed.content);
+
+        let deleted = DeleteFile
+            .run(&json!({"path": "notes/todo.md"}), &ctx)
+            .unwrap();
+        assert!(deleted.ok, "{}", deleted.content);
+        assert!(
+            !dir.path().join("notes/todo.md").exists(),
+            "the file is gone from disk, not just from the answer"
+        );
+    }
+
+    #[test]
+    fn an_edit_that_cannot_find_its_old_string_fails_instead_of_guessing() {
+        let (dir, ctx) = ctx();
+        WriteFile
+            .run(&json!({"path": "a.txt", "content": "alpha\n"}), &ctx)
+            .unwrap();
+        let out = EditFile.run(
+            &json!({"path": "a.txt", "old_string": "nothing like this", "new_string": "beta"}),
+            &ctx,
+        );
+        let failed = match out {
+            Err(_) => true,
+            Ok(output) => !output.ok,
+        };
+        assert!(failed, "an edit with no match must not report success");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "alpha\n",
+            "a failed edit leaves the file alone"
+        );
+    }
+
+    #[test]
+    fn a_shell_command_returns_its_real_output_and_exit_code() {
+        let (_dir, ctx) = ctx();
+        let out = RunShell
+            .run(&json!({"command": "printf hello; exit 3"}), &ctx)
+            .unwrap();
+        assert!(out.content.contains("hello"), "{}", out.content);
+        assert!(out.content.contains("[exit 3]"), "{}", out.content);
+        assert!(!out.ok, "a non-zero exit is a failure, not a success");
+    }
+
+    #[test]
+    fn search_finds_the_text_the_file_tools_wrote() {
+        let (_dir, ctx) = ctx();
+        WriteFile
+            .run(
+                &json!({"path": "src/lib.rs", "content": "pub fn marker_xyz() {}\n"}),
+                &ctx,
+            )
+            .unwrap();
+        let out = SearchText.run(&json!({"query": "marker_xyz"}), &ctx).unwrap();
+        assert!(out.ok, "{}", out.content);
+        assert!(out.content.contains("lib.rs"), "{}", out.content);
+    }
+
+    #[test]
+    fn git_status_runs_against_a_real_repository() {
+        let (dir, ctx) = ctx();
+        let init = RunShell
+            .run(&json!({"command": "git init -q ."}), &ctx)
+            .unwrap();
+        assert!(init.ok, "{}", init.content);
+        WriteFile
+            .run(&json!({"path": "untracked.txt", "content": "x"}), &ctx)
+            .unwrap();
+        let out = Git.run(&json!({"subcommand": "status"}), &ctx).unwrap();
+        assert!(out.ok, "{}", out.content);
+        assert!(
+            out.content.contains("untracked.txt"),
+            "status lists the file that is not committed yet: {}",
+            out.content
+        );
+        assert!(dir.path().join(".git").exists());
+    }
+
+    #[test]
+    fn the_terminal_tool_drives_a_real_pty() {
+        let (_dir, ctx) = ctx();
+        let opened = TerminalTool
+            .run(&json!({"action": "open", "session": "smoke"}), &ctx)
+            .unwrap();
+        assert!(opened.ok, "{}", opened.content);
+        TerminalTool
+            .run(
+                &json!({"action": "write", "session": "smoke", "input": "echo pty-works\n"}),
+                &ctx,
+            )
+            .unwrap();
+        let mut seen = String::new();
+        for _ in 0..40 {
+            let read = TerminalTool
+                .run(&json!({"action": "read", "session": "smoke"}), &ctx)
+                .unwrap();
+            seen.push_str(&read.content);
+            if seen.contains("pty-works") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = TerminalTool.run(&json!({"action": "close", "session": "smoke"}), &ctx);
+        assert!(
+            seen.contains("pty-works"),
+            "a real PTY echoes back what was typed: {seen}"
+        );
+    }
+
+    #[test]
+    fn web_search_returns_sources_or_says_why_it_could_not() {
+        let (_dir, ctx) = ctx();
+        let out = WebSearch
+            .run(&json!({"query": "rust programming language", "limit": 3}), &ctx)
+            .unwrap();
+        if out.ok {
+            assert!(
+                out.content.contains("http"),
+                "a successful search carries links: {}",
+                out.content
+            );
+        } else {
+            assert!(
+                out.content.trim().len() > 10,
+                "a failed search explains itself: {}",
+                out.content
+            );
+        }
+    }
+
+    #[test]
+    fn memory_and_tasks_round_trip_through_their_own_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = crate::config::lock_security_env();
+        unsafe { std::env::set_var("VIKRAM_HOME", dir.path().join("home")) };
+        let ctx = ToolContext {
+            workspace_root: dir.path().to_path_buf(),
+        };
+
+        let saved = MemorySave
+            .run(&json!({"key": "tool-probe", "value": "remembered"}), &ctx)
+            .unwrap();
+        assert!(saved.ok, "{}", saved.content);
+        let found = MemorySearch
+            .run(&json!({"query": "remembered"}), &ctx)
+            .unwrap();
+        assert!(
+            found.content.contains("tool-probe"),
+            "a saved key is findable by what it says: {}",
+            found.content
+        );
+        let listed = MemoryList.run(&json!({}), &ctx).unwrap();
+        assert!(listed.content.contains("tool-probe"), "{}", listed.content);
+        let removed = MemoryDelete
+            .run(&json!({"key": "tool-probe"}), &ctx)
+            .unwrap();
+        assert!(removed.ok, "{}", removed.content);
+        let after = MemoryList.run(&json!({}), &ctx).unwrap();
+        assert!(
+            !after.content.contains("tool-probe"),
+            "a deleted key is gone from the listing: {}",
+            after.content
+        );
+
+        let created = Task
+            .run(&json!({"action": "create", "title": "probe"}), &ctx)
+            .unwrap();
+        assert!(created.ok, "{}", created.content);
+        let tasks = Task.run(&json!({"action": "list"}), &ctx).unwrap();
+        assert!(tasks.content.contains("probe"), "{}", tasks.content);
+    }
+
+    #[test]
+    fn the_host_inspection_tools_answer_without_a_model() {
+        let (_dir, ctx) = ctx();
+        let answers = vec![
+            (
+                "process",
+                Process.run(&json!({"action": "list"}), &ctx).unwrap(),
+            ),
+            ("skill.list", SkillList.run(&json!({}), &ctx).unwrap()),
+            ("plugin.list", PluginList.run(&json!({}), &ctx).unwrap()),
+        ];
+        for (name, out) in answers {
+            assert!(out.ok, "{name} failed: {}", out.content);
+            assert!(!out.content.trim().is_empty(), "{name} answered nothing");
+        }
     }
 }

@@ -50,6 +50,19 @@ pub fn open(
     rows: u16,
     cols: u16,
 ) -> Result<String, String> {
+    open_named(None, shell, cwd, rows, cols)
+}
+
+/// The same terminal, under a name the caller chose. A session a model can name twice — open
+/// `build`, then write to `build` — is the difference between a second call working and an
+/// `unknown session` answer, so the name is taken at open time rather than parsed out of prose.
+pub fn open_named(
+    name: Option<&str>,
+    shell: Option<&str>,
+    cwd: Option<&str>,
+    rows: u16,
+    cols: u16,
+) -> Result<String, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -110,10 +123,17 @@ pub fn open(
     });
 
     let seq = counter().fetch_add(1, Ordering::Relaxed);
-    let id = format!("term-{}-{}", std::process::id(), seq);
     let cwd = cwd.map(|c| c.to_owned()).unwrap_or_else(|| ".".to_owned());
+    let mut reg = registry().lock().expect("terminal registry");
+    let id = match name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) if reg.contains_key(name) => {
+            return Err(format!("session `{name}` is already open"));
+        }
+        Some(name) => name.to_owned(),
+        None => format!("term-{}-{}", std::process::id(), seq),
+    };
 
-    registry().lock().expect("terminal registry").insert(
+    reg.insert(
         id.clone(),
         TerminalSession {
             id: id.clone(),
@@ -125,6 +145,7 @@ pub fn open(
             output,
         },
     );
+    drop(reg);
 
     Ok(id)
 }

@@ -271,8 +271,9 @@ impl MandatoryFloor {
         if req.side_effect != vikram_contracts::SideEffect::None
             && let Some(root) = &self.workspace_root
         {
+            let root = root.trim_end_matches('/');
             let outside = req.action == ActionKind::Write
-                && req.resource != *root
+                && req.resource != root
                 && !req.resource.starts_with(&format!("{root}/"));
             if outside {
                 return Some(format!(
@@ -344,11 +345,14 @@ impl Policy {
     }
 
     pub fn evaluate_at_depth(&self, req: &PermissionRequest, depth: u32) -> Decision {
-        if let Some(reason) = self.floor.veto(req, depth) {
+        // Normalise a workspace-relative resource against the floor's root so callers that report a
+        // relative path are evaluated against the same scope as absolute ones.
+        let req = self.normalize_request(req);
+        if let Some(reason) = self.floor.veto(&req, depth) {
             return Decision::Deny { reason };
         }
 
-        let decided = Self::scan(&self.rules, req).or_else(|| Self::scan(&self.defaults, req));
+        let decided = Self::scan(&self.rules, &req).or_else(|| Self::scan(&self.defaults, &req));
 
         decided.unwrap_or_else(|| Decision::Deny {
             reason: format!("no rule permits `{}` on `{}`", req.verb, req.resource),
@@ -392,12 +396,49 @@ impl Policy {
         None
     }
 
+    /// Resolve a workspace-relative resource against the floor's root, mirroring `resolve_within`
+    /// semantics for the policy layer. Non-file actions and already-absolute resources are kept.
+    fn normalize_request(&self, req: &PermissionRequest) -> PermissionRequest {
+        use vikram_contracts::ActionKind;
+        if !matches!(req.action, ActionKind::Read | ActionKind::Write) {
+            return req.clone();
+        }
+        let Some(root) = &self.floor.workspace_root else {
+            return req.clone();
+        };
+        let root = root.trim_end_matches('/');
+        if std::path::Path::new(&req.resource).is_absolute() {
+            return req.clone();
+        }
+        let mut normalized = std::path::PathBuf::new();
+        for component in std::path::Path::new(root)
+            .join(&req.resource)
+            .components()
+        {
+            use std::path::Component;
+            match component {
+                Component::ParentDir => {
+                    normalized.pop();
+                }
+                Component::CurDir => {}
+                other => normalized.push(other.as_os_str()),
+            }
+        }
+        if normalized.starts_with(root) {
+            let mut out = req.clone();
+            out.resource = normalized.to_string_lossy().into_owned();
+            out
+        } else {
+            req.clone()
+        }
+    }
     /// Whether a rule the operator wrote permits this request. `allow-list` mode asks exactly this:
     /// a default that allows is not enough, the human has to have saved the shape.
     pub fn has_allow(&self, req: &PermissionRequest) -> bool {
+        let req = self.normalize_request(req);
         self.rules
             .iter()
-            .any(|rule| rule.outcome == RuleOutcome::Allow && rule.applies_to(req))
+            .any(|rule| rule.outcome == RuleOutcome::Allow && rule.applies_to(&req))
     }
 }
 

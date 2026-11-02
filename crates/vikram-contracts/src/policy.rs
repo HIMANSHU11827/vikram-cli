@@ -316,7 +316,10 @@ impl std::fmt::Display for PermissionMode {
 fn within_root(resource: &str, root: Option<&str>) -> bool {
     match root {
         None => false,
-        Some(root) => resource == root || resource.starts_with(&format!("{root}/")),
+        Some(root) => {
+            let root = root.trim_end_matches('/');
+            resource == root || resource.starts_with(&format!("{root}/"))
+        }
     }
 }
 

@@ -21,6 +21,10 @@ pub struct Skill {
     pub path: PathBuf,
     /// Whether the skill's frontmatter validated.
     pub loaded: bool,
+    /// Whether the skill is enabled (not in the disabled list).
+    pub enabled: bool,
+    /// Discovery scope (user / project / compat).
+    pub scope: String,
 }
 
 /// Registry of discovered skills.
@@ -192,6 +196,8 @@ impl SkillRegistry {
             instructions,
             path,
             loaded: summary.valid,
+            enabled: summary.enabled,
+            scope: format!("{:?}", summary.scope).to_lowercase(),
         }
     }
 }

@@ -11,7 +11,7 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 use vikram_contracts::policy::Decision;
 use vikram_contracts::{
-    ApprovalId, Block, Message, PermissionMode, PermissionRequest, RecordKind, Role, ToolCall,
+    ActionKind, ApprovalId, Block, Message, PermissionMode, PermissionRequest, RecordKind, Role, ToolCall,
     ToolCallId, Trust, TurnId,
 };
 
@@ -56,6 +56,17 @@ impl Origin {
         }
     }
 }
+
+/// Said to the model on every turn, in its own system message. The transcript prints these lines
+/// between the tool rows as the agent's voice, so they are part of the interface and not decoration:
+/// one or two sentences, present tense, naming the file, command or question in hand.
+const PREAMBLE: &str = "\
+You are VIKRAM, working in a terminal. Alongside your tool calls, write one or two short sentences \
+of progress in the present tense: what you are about to do and why, naming the file, command or \
+question involved. Write one before you start a piece of work, and again whenever what you are \
+doing changes, for example when one thing finished and another begins. These lines are shown to \
+the operator as your voice between the tool rows, so each must stand alone. Do not narrate every \
+step, do not repeat a line you already wrote, and never describe your private reasoning.";
 
 pub(crate) fn spawn_turn(
     inner: Arc<RuntimeInner>,
@@ -153,6 +164,9 @@ pub(crate) async fn run_turn(
         if !catalog_text.trim().is_empty() {
             request_messages.push(Message::text(Role::System, catalog_text, Trust::External));
         }
+        // The operator sees the model's own words between the tool rows, so the model has to be
+        // told that those words exist and what shape they take.
+        request_messages.push(Message::text(Role::System, PREAMBLE, Trust::External));
         request_messages.extend(session.messages());
 
         let request = CompletionRequest {
@@ -228,16 +242,22 @@ pub(crate) async fn run_turn(
             break;
         }
         if stream_failed {
-            if !text_buffer.is_empty() {
+            if !text_buffer.is_empty() || !reasoning_buffer.is_empty() {
                 commit_assistant_text(&inner, &session, &text_buffer, &reasoning_buffer);
+                text_buffer.clear();
                 reasoning_buffer.clear();
             }
             outcome = TurnState::Failed;
             break;
         }
 
-        if !text_buffer.is_empty() {
+        // Whatever the model said or thought before it reached for a tool belongs at this point in
+        // the transcript, not at the end of the turn. Committing only when there was text left a
+        // reasoning-only step buffered until some later message carried it, which is how thoughts
+        // ended up piled under the answer. Both buffers are cleared because they were just spent.
+        if !text_buffer.is_empty() || !reasoning_buffer.is_empty() {
             commit_assistant_text(&inner, &session, &text_buffer, &reasoning_buffer);
+            text_buffer.clear();
             reasoning_buffer.clear();
         }
 
@@ -440,6 +460,11 @@ async fn run_tool(
     agent: &Option<AgentRun>,
     origin: Origin,
 ) -> (String, bool) {
+    let started = std::time::Instant::now();
+    let cwd = inner.tool_context().workspace_root.display().to_string();
+    let arguments_text = truncate(&call.arguments.to_string(), 8_000);
+    let elapsed = move || started.elapsed().as_millis() as u64;
+
     let Some(tool) = inner.tools.get(&call.name) else {
         inner.emit(RuntimeEvent::ToolFinished {
             session: session.id.clone(),
@@ -447,13 +472,31 @@ async fn run_tool(
             name: call.name.clone(),
             ok: false,
             summary: "not registered".into(),
+            content: format!("tool `{}` is not registered", call.name),
+            resource: String::new(),
+            arguments: arguments_text.clone(),
+            cwd: cwd.clone(),
+            duration_ms: elapsed(),
         });
         return (format!("tool `{}` is not registered", call.name), false);
     };
 
-    let request = match tool.permission(&call.arguments) {
-        // A tool prices its own model-authored call; the operator typing the same command at the
-        // keyboard is the same request with different provenance, and nothing else.
+    if !inner.tools.is_enabled(&call.name) {
+        inner.emit(RuntimeEvent::ToolFinished {
+            session: session.id.clone(),
+            call: call.id.clone(),
+            name: call.name.clone(),
+            ok: false,
+            summary: "disabled".into(),
+            content: format!("tool `{}` is disabled", call.name),
+            resource: String::new(),
+            arguments: arguments_text.clone(),
+            cwd: cwd.clone(),
+            duration_ms: elapsed(),
+        });
+        return (format!("tool `{}` is disabled", call.name), false);
+    }
+    let mut request = match tool.permission(&call.arguments) {
         Ok(request) => PermissionRequest {
             originating_trust: origin.trust(),
             ..request
@@ -465,10 +508,24 @@ async fn run_tool(
                 name: call.name.clone(),
                 ok: false,
                 summary: err.to_string(),
+                content: err.to_string(),
+            resource: String::new(),
+            arguments: arguments_text.clone(),
+            cwd: cwd.clone(),
+            duration_ms: elapsed(),
             });
             return (err.to_string(), false);
         }
     };
+
+    // Tools report workspace-relative (or arbitrary) paths; resolve them against the workspace root
+    // so the policy floor and scope checks see a canonical absolute path, and escapes are refused.
+    if matches!(request.action, ActionKind::Read | ActionKind::Write) {
+        let root = &inner.workspace_root;
+        if let Some(resolved) = crate::config::resolve_within(root, std::path::Path::new(&request.resource)) {
+            request.resource = resolved.to_string_lossy().into_owned();
+        }
+    }
 
     let raw = inner.policy().evaluate(&request);
     let decision = inner.judge(&request);
@@ -500,6 +557,11 @@ async fn run_tool(
                 name: call.name.clone(),
                 ok: false,
                 summary: format!("denied: {reason}"),
+            content: format!("permission denied: {reason}"),
+            resource: request.resource.clone(),
+            arguments: arguments_text.clone(),
+            cwd: cwd.clone(),
+            duration_ms: elapsed(),
             });
             return (format!("permission denied: {reason}"), false);
         }
@@ -534,10 +596,25 @@ async fn run_tool(
                 call: call.id.clone(),
                 name: call.name.clone(),
                 summary: format!("{} {} · awaiting approval", request.verb, request.resource),
+                resource: request.resource.clone(),
+                arguments: arguments_text.clone(),
+                cwd: cwd.clone(),
             });
 
             let allowed = wait_for_approval(rx, cancel).await;
             if cancel.is_cancelled() {
+                inner.emit(RuntimeEvent::ToolFinished {
+                    session: session.id.clone(),
+                    call: call.id.clone(),
+                    name: call.name.clone(),
+                    ok: false,
+                    summary: "cancelled · awaiting approval".into(),
+                    content: "cancelled while awaiting approval".into(),
+                    resource: request.resource.clone(),
+                    arguments: arguments_text.clone(),
+                    cwd: cwd.clone(),
+                    duration_ms: elapsed(),
+                });
                 return ("cancelled while awaiting approval".into(), false);
             }
             inner.journal(
@@ -557,6 +634,11 @@ async fn run_tool(
                     name: call.name.clone(),
                     ok: false,
                     summary: "denied by operator".into(),
+            content: "permission denied by operator".into(),
+            resource: request.resource.clone(),
+            arguments: arguments_text.clone(),
+            cwd: cwd.clone(),
+            duration_ms: elapsed(),
                 });
                 return ("permission denied by operator".into(), false);
             }
@@ -583,6 +665,9 @@ async fn run_tool(
         call: call.id.clone(),
         name: call.name.clone(),
         summary: summary.clone(),
+        resource: request.resource.clone(),
+        arguments: arguments_text.clone(),
+        cwd: cwd.clone(),
     });
     if owns_turn {
         session.set_turn(TurnState::Tooling);
@@ -649,6 +734,11 @@ async fn run_tool(
         } else {
             format!("failed · {summary}")
         },
+            content: truncate(&content, 8_000),
+            resource: request.resource.clone(),
+            arguments: arguments_text.clone(),
+            cwd: cwd.clone(),
+            duration_ms: elapsed(),
     });
 
     (content, ok)
