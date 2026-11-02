@@ -21,6 +21,7 @@ pub mod provider;
 pub mod pty;
 pub mod runtime;
 pub mod rules;
+pub mod search;
 pub mod session;
 pub mod skills;
 pub mod teams;
@@ -30,7 +31,9 @@ pub mod types;
 
 pub use agents::{AgentManager, ManagedAgent, TaskManager};
 pub use bus::EventBus;
-pub use config::{Config, McpConfig, McpServerConfig, database_path, vikram_home};
+pub use config::{
+    Config, McpConfig, McpServerConfig, SearchBackend, SearchConfig, database_path, vikram_home,
+};
 pub use error::{Result, RuntimeError};
 pub use lsp::{LspClient, LspError, LspPool, ServerCommand};
 pub use mcp::McpRegistry;

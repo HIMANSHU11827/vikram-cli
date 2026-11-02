@@ -20,6 +20,9 @@ pub struct Config {
     pub model: String,
     /// Environment variable holding the bearer token.
     pub api_key_env: String,
+    /// Which backend answers `web.search`, and where it lives.
+    #[serde(default)]
+    pub search: SearchConfig,
     /// Context window advertised by the chosen model, if the operator knows it.
     pub context_window: Option<u64>,
     /// Root that writes are confined to. Defaults to the process working directory.
@@ -71,6 +74,45 @@ impl SecurityConfig {
             return Some("`security.allowed_modes`");
         }
         None
+    }
+}
+
+/// Which backend answers `web.search`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchBackend {
+    /// The keyed backend when its key is present, the keyless HTML backend otherwise.
+    #[default]
+    Auto,
+    /// Brave's JSON API. Needs a key.
+    Brave,
+    /// Bing's HTML endpoint. Needs no key.
+    Bing,
+}
+
+/// Search settings. Defaults are usable without any key: the keyless backend answers, and a key
+/// only switches the traffic to the JSON API.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchConfig {
+    /// `auto`, `brave`, or `bing`.
+    pub backend: SearchBackend,
+    /// Environment variable holding the keyed backend's key. Read at call time, never stored here.
+    pub api_key_env: String,
+    /// Brave's web-search endpoint. Overridable for a mirror or a labelled proxy.
+    pub brave_endpoint: String,
+    /// Bing's HTML search endpoint.
+    pub bing_endpoint: String,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            backend: SearchBackend::Auto,
+            api_key_env: "VIKRAM_SEARCH_API_KEY".into(),
+            brave_endpoint: "https://api.search.brave.com/res/v1/web/search".into(),
+            bing_endpoint: "https://www.bing.com/search".into(),
+        }
     }
 }
 
@@ -211,6 +253,7 @@ impl Default for Config {
             base_url: "https://api.openai.com/v1".into(),
             model: String::new(),
             api_key_env: "OPENAI_API_KEY".into(),
+            search: SearchConfig::default(),
             context_window: None,
             workspace_root: None,
             max_steps: 24,
@@ -258,15 +301,13 @@ impl Config {
     /// The key plus the place it was found in, so diagnostics can name the source instead of
     /// guessing from the variable name.
     pub fn api_key_with_source(&self) -> Option<(String, &'static str)> {
-        let from_env = std::env::var(&self.api_key_env).ok();
-        if let Some(value) = from_env.filter(|v| !v.trim().is_empty()) {
-            return Some((value, "environment"));
-        }
-        home_dotenv()
-            .get(&self.api_key_env)
-            .cloned()
-            .filter(|v| !v.trim().is_empty())
-            .map(|value| (value, "$VIKRAM_HOME/.env"))
+        key_with_source(&self.api_key_env)
+    }
+
+    /// The keyed search backend's key, resolved exactly like the model key: the environment first,
+    /// then `$VIKRAM_HOME/.env`. `None` means the keyless backend is the only one available.
+    pub fn search_api_key_with_source(&self) -> Option<(String, &'static str)> {
+        key_with_source(&self.search.api_key_env)
     }
 
     /// The key is read at call time and never persisted by us. It comes from the environment
@@ -287,6 +328,19 @@ impl Config {
     pub fn is_model_configured(&self) -> bool {
         !self.model.trim().is_empty() && self.api_key().is_some()
     }
+}
+
+/// Read a key named by a config field, reporting which of the two allowed places it came from.
+fn key_with_source(name: &str) -> Option<(String, &'static str)> {
+    let from_env = std::env::var(name).ok();
+    if let Some(value) = from_env.filter(|v| !v.trim().is_empty()) {
+        return Some((value, "environment"));
+    }
+    home_dotenv()
+        .get(name)
+        .cloned()
+        .filter(|v| !v.trim().is_empty())
+        .map(|value| (value, "$VIKRAM_HOME/.env"))
 }
 
 /// Root for runtime state: `$VIKRAM_HOME`, else `~/.vikram`.
@@ -444,6 +498,7 @@ pub(crate) fn lock_security_env() -> std::sync::MutexGuard<'static, ()> {
         "VIKRAM_DISABLE_ALWAYS_ALLOW",
         "VIKRAM_ALLOWED_MODES",
         "VIKRAM_TEST_KEY",
+        "VIKRAM_SEARCH_API_KEY",
     ] {
         unsafe { std::env::remove_var(name) };
     }
@@ -575,6 +630,30 @@ mod tests {
         let config = Config::load().unwrap();
         assert_eq!(config.mode, PermissionMode::Ask);
         assert_eq!(config.security, SecurityConfig::default());
+        assert_eq!(config.search, SearchConfig::default());
+    }
+
+    #[test]
+    fn the_search_key_is_read_like_the_model_key_and_never_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        std::fs::write(
+            dir.path().join(".env"),
+            "VIKRAM_SEARCH_API_KEY=from-the-file\n",
+        )
+        .unwrap();
+        unsafe { std::env::remove_var("VIKRAM_SEARCH_API_KEY") };
+
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.search_api_key_with_source().map(|(_, source)| source),
+            Some("$VIKRAM_HOME/.env")
+        );
+        unsafe { std::env::set_var("VIKRAM_SEARCH_API_KEY", "from-the-environment") };
+        assert_eq!(
+            cfg.search_api_key_with_source().map(|(_, source)| source),
+            Some("environment")
+        );
     }
 
     #[test]

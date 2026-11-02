@@ -15,7 +15,7 @@ use vikram_contracts::{ActionKind, AgentId, PermissionRequest, SideEffect, Trust
 use crate::MemoryStore;
 use crate::PluginRegistry;
 use crate::SkillRegistry;
-use crate::config::{database_path, resolve_within};
+use crate::config::{Config, database_path, resolve_within};
 use crate::lsp::{LspClient, LspError, LspPool};
 use crate::mcp::McpRegistry;
 use crate::teams::TeamManager;
@@ -1242,7 +1242,7 @@ impl Tool for WebSearch {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "web.search".into(),
-            description: "Search the web via DuckDuckGo and return result snippets.".into(),
+            description: "Search the web (Bing HTML, or Brave when a key is configured) and return result snippets.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -1274,207 +1274,51 @@ impl Tool for WebSearch {
             .filter(|&n| n > 0)
             .unwrap_or(5);
 
-        let encoded =
-            percent_encoding::utf8_percent_encode(&query, percent_encoding::NON_ALPHANUMERIC)
-                .to_string();
-        let url = format!("https://html.duckduckgo.com/html/?q={encoded}");
-
-        let client = match reqwest::blocking::Client::builder()
-            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            .timeout(Duration::from_secs(20))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
+        let config = match Config::load() {
+            Ok(config) => config,
+            Err(err) => {
                 return Ok(ToolOutput {
-                    content: format!("http client error: {e}"),
+                    content: format!("web search is not configured: {err}"),
+                    ok: false,
+                });
+            }
+        };
+        let api_key = config.search_api_key_with_source().map(|(value, _)| value);
+        let client = match crate::search::client() {
+            Ok(client) => client,
+            Err(err) => {
+                return Ok(ToolOutput {
+                    content: format!("web search failed: {err}"),
                     ok: false,
                 });
             }
         };
 
-        let response = match client.get(&url).send() {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(ToolOutput {
-                    content: format!("http request failed: {e}"),
-                    ok: false,
-                });
-            }
-        };
-
-        if !response.status().is_success() {
-            return Ok(ToolOutput {
-                content: format!("http error: {}", response.status()),
-                ok: false,
-            });
-        }
-
-        let body = match response.text() {
-            Ok(t) => t,
-            Err(e) => {
-                return Ok(ToolOutput {
-                    content: format!("failed to read response body: {e}"),
-                    ok: false,
-                });
-            }
-        };
-
-        let document = scraper::Html::parse_document(&body);
-
-        // Collect result containers; fall back to whole document.
-        let container_selector = scraper::Selector::parse("div.result, div.web-result, li.result")
-            .unwrap_or_else(|_| scraper::Selector::parse("body").unwrap());
-        let title_selector = scraper::Selector::parse("a.result__a").unwrap();
-        let snippet_selector = scraper::Selector::parse(
-            "a.result__snippet, div.result__snippet, span.result__snippet",
-        )
-        .unwrap_or_else(|_| scraper::Selector::parse("p").unwrap());
-
-        let mut results: Vec<(String, String, String)> = Vec::new();
-
-        let containers: Vec<_> = document.select(&container_selector).collect();
-        let iter_containers: Vec<scraper::ElementRef> = if containers.is_empty() {
-            vec![document.root_element()]
-        } else {
-            containers
-        };
-
-        for container in iter_containers {
-            let title_el = match container.select(&title_selector).next() {
-                Some(e) => e,
-                None => continue,
-            };
-            let title = title_el.text().collect::<String>().trim().to_string();
-            if title.is_empty() {
-                continue;
-            }
-            let href = title_el.value().attr("href").unwrap_or("").to_string();
-            let url = resolve_ddg_url(&href);
-
-            let snippet = container
-                .select(&snippet_selector)
-                .next()
-                .map(|e| e.text().collect::<String>().trim().to_string())
-                .unwrap_or_default();
-
-            // Avoid duplicate entries.
-            if results.iter().any(|r| r.0 == title && r.2 == url) {
-                continue;
-            }
-            results.push((title, snippet, url));
-            if results.len() >= limit {
-                break;
-            }
-        }
-
-        // Fallback: if no containers matched, try zipping all title links with snippets.
-        if results.is_empty() {
-            let titles: Vec<_> = document.select(&title_selector).collect();
-            let snippets: Vec<_> = document.select(&snippet_selector).collect();
-            for (i, title_el) in titles.iter().enumerate() {
-                let title = title_el.text().collect::<String>().trim().to_string();
-                if title.is_empty() {
-                    continue;
-                }
-                let href = title_el.value().attr("href").unwrap_or("").to_string();
-                let url = resolve_ddg_url(&href);
-                let snippet = snippets
-                    .get(i)
-                    .map(|e| e.text().collect::<String>().trim().to_string())
-                    .unwrap_or_default();
-                results.push((title, snippet, url));
-                if results.len() >= limit {
-                    break;
-                }
-            }
-        }
-
-        if results.is_empty() {
-            // Fallback: DuckDuckGo instant-answer JSON API (more stable than HTML scraping).
-            let api_url = format!(
-                "https://api.duckduckgo.com/?q={encoded}&format=json&no_html=1&skip_disambig=1"
-            );
-            if let Ok(resp) = client.get(&api_url).send() {
-                if let Ok(text) = resp.text() {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if let Some(abs) = json.get("AbstractText").and_then(|v| v.as_str()) {
-                            if !abs.is_empty() {
-                                results.push((
-                                    json.get("Heading")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("Result")
-                                        .to_string(),
-                                    abs.to_string(),
-                                    json.get("AbstractURL")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string(),
-                                ));
-                            }
-                        }
-                        if results.is_empty() {
-                            if let Some(topics) = json.get("RelatedTopics").and_then(|v| v.as_array()) {
-                                for t in topics {
-                                    if let Some(text) = t.get("Text").and_then(|v| v.as_str()) {
-                                        if text.is_empty() {
-                                            continue;
-                                        }
-                                        let url = t
-                                            .get("FirstURL")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        results.push((text.to_string(), String::new(), url));
-                                        if results.len() >= limit {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if results.is_empty() {
-            return Ok(ToolOutput {
-                content: "No results found".into(),
-                ok: true,
-            });
-        }
-
-        let mut content = String::new();
-        for (i, (title, snippet, url)) in results.iter().take(limit).enumerate() {
-            content.push_str(&format!(
-                "{i}. {title}\n   {snippet}\n   URL: {url}\n",
-                i = i + 1
-            ));
-        }
-        Ok(ToolOutput {
-            content: truncated(content),
-            ok: true,
-        })
+        let outcome =
+            crate::search::search(&config.search, api_key.as_deref(), &client, &query, limit);
+        Ok(search_tool_output(outcome))
     }
 }
 
-fn resolve_ddg_url(href: &str) -> String {
-    if href.is_empty() {
-        return String::new();
+/// Map a backend outcome onto a tool result. A backend that answered with nothing usable is a
+/// failure: an empty success would tell the model a search happened when it did not.
+fn search_tool_output(
+    outcome: Result<Vec<crate::search::SearchResult>, crate::search::SearchError>,
+) -> ToolOutput {
+    match outcome {
+        Ok(results) if !results.is_empty() => ToolOutput {
+            content: truncated(crate::search::render(&results)),
+            ok: true,
+        },
+        Ok(_) => ToolOutput {
+            content: "web search failed: the backend answered with zero results".into(),
+            ok: false,
+        },
+        Err(err) => ToolOutput {
+            content: format!("web search failed: {err}"),
+            ok: false,
+        },
     }
-    if let Some(idx) = href.find("uddg=") {
-        let rest = &href[idx + 5..];
-        let end = rest.find('&').unwrap_or(rest.len());
-        let raw = &rest[..end];
-        return percent_encoding::percent_decode_str(raw)
-            .decode_utf8_lossy()
-            .to_string();
-    }
-    if href.starts_with("//") {
-        return format!("https:{href}");
-    }
-    href.to_string()
 }
 
 struct SkillList;
@@ -4943,6 +4787,42 @@ mod tests {
         assert_eq!(req.verb, "web.search");
         assert_eq!(req.resource, "rust");
         assert_eq!(req.side_effect, SideEffect::None);
+    }
+
+    #[test]
+    fn web_search_reports_a_backend_failure_instead_of_an_empty_success() {
+        let out = search_tool_output(Err(crate::search::SearchError::Status {
+            backend: "bing",
+            status: 503,
+            detail: "service unavailable".into(),
+        }));
+        assert!(!out.ok);
+        assert!(out.content.contains("503"), "{}", out.content);
+        assert!(out.content.contains("web search failed"), "{}", out.content);
+    }
+
+    #[test]
+    fn web_search_treats_zero_parsed_results_as_a_failure() {
+        let out = search_tool_output(Ok(Vec::new()));
+        assert!(!out.ok, "{}", out.content);
+        assert!(out.content.contains("zero results"), "{}", out.content);
+    }
+
+    #[test]
+    fn web_search_renders_title_url_and_snippet_for_the_model() {
+        let out = search_tool_output(Ok(vec![crate::search::SearchResult {
+            title: "Rust".into(),
+            url: "https://www.rust-lang.org/".into(),
+            snippet: "A fast language.".into(),
+        }]));
+        assert!(out.ok, "{}", out.content);
+        assert!(out.content.contains("1. Rust"), "{}", out.content);
+        assert!(
+            out.content.contains("URL: https://www.rust-lang.org/"),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("A fast language."), "{}", out.content);
     }
 
     #[test]
