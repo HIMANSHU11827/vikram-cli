@@ -35,6 +35,10 @@ const THOUGHT_PREVIEW_CAP: usize = 64;
 /// different maps, so the flag travels with the mark.
 type Mark = (usize, u16, ThoughtKey, bool);
 
+/// Activity rows fold in their own key space so a tool row and a thinking block never share a
+/// fold. The first half of the key is a marker no message index can reach.
+const ACTIVITY_TOOL: usize = usize::MAX - 1;
+
 /// What the tool blocks already say, so a call and its result can be drawn as one row.
 ///
 /// The runtime emits a call block, then a result block carrying the same id, then a `Role::Tool`
@@ -43,12 +47,21 @@ type Mark = (usize, u16, ThoughtKey, bool);
 struct ToolIndex<'a> {
     results: HashMap<&'a ToolCallId, (&'a str, bool)>,
     called: HashSet<&'a ToolCallId>,
+    /// The runtime reports a call through an activity row, not through a `ToolCall` block, so a
+    /// result is only an orphan when neither names it.
+    activity: HashMap<&'a ToolCallId, &'a Activity>,
 }
 
 impl<'a> ToolIndex<'a> {
-    fn scan(messages: &'a [Message]) -> Self {
+    fn scan(messages: &'a [Message], activity: &'a [Activity]) -> Self {
         let mut results = HashMap::new();
         let mut called = HashSet::new();
+        let mut live = HashMap::new();
+        for entry in activity {
+            if let Some(call) = &entry.call {
+                live.insert(call, entry);
+            }
+        }
         for message in messages {
             for block in &message.blocks {
                 match block {
@@ -64,7 +77,11 @@ impl<'a> ToolIndex<'a> {
                 }
             }
         }
-        Self { results, called }
+        Self {
+            results,
+            called,
+            activity: live,
+        }
     }
 
     fn paired(&self, call: &ToolCallId) -> bool {
@@ -72,6 +89,10 @@ impl<'a> ToolIndex<'a> {
     }
 
     fn outcome(&self, call: &ToolCallId) -> Option<(&'a str, bool)> {
+        self.results.get(call).copied()
+    }
+
+    fn result(&self, call: &ToolCallId) -> Option<(&'a str, bool)> {
         self.results.get(call).copied()
     }
 }
@@ -142,7 +163,7 @@ fn conversation_lines_with_hits(
     let width = width.max(4);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut marks: Vec<Mark> = Vec::new();
-    let index = ToolIndex::scan(&session.messages);
+    let index = ToolIndex::scan(&session.messages, &session.activity);
     // A call with no result yet may be waiting on a permission answer; the row says so rather
     // than reading as a call that is still running.
     let waiting: HashSet<&str> = app
@@ -195,6 +216,8 @@ fn conversation_lines_with_hits(
             app,
             activity,
             &index,
+            session,
+            &mut marks,
             width,
             theme,
             idx,
@@ -415,7 +438,7 @@ fn push_tool(
     for block in &message.blocks {
         match block {
             Block::ToolResult { call, content, ok, .. } => {
-                if index.paired(call) {
+                if index.paired(call) || index.activity.contains_key(call) {
                     continue;
                 }
                 push_tool_payload(lines, content, *ok, width, theme);
@@ -509,6 +532,103 @@ fn push_tool_row(
         if let Some((content, ok)) = outcome {
             push_tool_payload(lines, content, ok, width, theme);
         }
+    }
+}
+
+/// A tool row drawn from an activity instead of a call block.
+fn push_activity_tool_row(
+    lines: &mut Vec<Line<'static>>,
+    activity: &Activity,
+    content: &str,
+    ok: bool,
+    waiting: bool,
+    expanded: bool,
+    key: ThoughtKey,
+    marks: &mut Vec<Mark>,
+    width: usize,
+    theme: &Theme,
+) {
+    let (glyph, style) = match activity.ok {
+        Some(true) => (theme.check().to_owned(), Style::default().fg(theme.tool)),
+        Some(false) => (theme.cross().to_owned(), Style::default().fg(theme.error)),
+        None if waiting => (
+            if theme.ascii { "!" } else { "⏸" }.to_owned(),
+            Style::default().fg(theme.accent),
+        ),
+        None => (
+            if theme.ascii { "->" } else { "→" }.to_owned(),
+            theme.secondary(),
+        ),
+    };
+    let label = tool_label_from_text(&activity.text, theme);
+    let head = format!("{glyph} {}", label.name);
+    marks.push((lines.len(), head.width() as u16, key, true));
+    let mut spans = vec![
+        Span::styled(format!("{glyph} "), style),
+        Span::styled(label.name, Style::default().fg(theme.text)),
+    ];
+    if let Some(detail) = label.detail {
+        spans.push(Span::styled(format!("  {detail}"), theme.muted()));
+    }
+    spans.push(Span::styled(
+        if expanded { " · click folds" } else { " · click" },
+        Style::default().fg(theme.faint),
+    ));
+    lines.push(Line::from(spans));
+    if expanded {
+        push_tool_payload(lines, content, ok, width, theme);
+    }
+}
+
+fn activity_first_word(text: &str) -> &str {
+    text.split_whitespace().next().unwrap_or_default()
+}
+
+/// The same sentence `tool_label` builds, recovered from the activity text, which holds the tool
+/// name followed by its arguments as `key=value` pairs.
+fn tool_label_from_text(text: &str, theme: &Theme) -> ToolLabel {
+    let mut parts = text.splitn(2, char::is_whitespace);
+    let name = parts.next().unwrap_or_default();
+    let rest = parts.next().unwrap_or_default().trim();
+    let friendly = match name {
+        "web.search" | "web_search" => "Web search",
+        "fs.read" | "read_file" => "Read",
+        "fs.edit" | "fs.write" => "Edited",
+        "fs.delete" => "Deleted",
+        "shell.run" | "shell" => "Ran",
+        "skill" => "Skill",
+        "ask_user" => "Asked",
+        other => {
+            let detail = if rest.is_empty() {
+                None
+            } else {
+                Some(truncate(rest, ARGUMENT_CAP, ellipsis(theme)))
+            };
+            return ToolLabel {
+                name: humanize(other),
+                detail,
+            };
+        }
+    };
+    let detail = ["query", "q", "path", "file", "command", "cmd", "name"]
+        .iter()
+        .find_map(|key| {
+            let needle = format!("{key}=");
+            rest.find(&needle)
+                .map(|at| rest[at + needle.len()..].trim())
+                .filter(|value| !value.is_empty())
+                .map(|value| truncate(value, ARGUMENT_CAP, ellipsis(theme)))
+        })
+        .map(|value| {
+            if name.starts_with("web") {
+                format!("\"{value}\"")
+            } else {
+                value
+            }
+        });
+    ToolLabel {
+        name: friendly.to_owned(),
+        detail,
     }
 }
 
@@ -675,6 +795,8 @@ fn push_activity(
     app: &App,
     activity: &Activity,
     tool_index: &ToolIndex,
+    session: &SessionView,
+    marks: &mut Vec<Mark>,
     width: usize,
     theme: &Theme,
     position: usize,
@@ -685,6 +807,30 @@ fn push_activity(
     if let Some(call) = &activity.call {
         if tool_index.paired(call) {
             return;
+        }
+        // The activity IS the call: the runtime never stores a `ToolCall` block, so this row is
+        // the only place a real turn can say what ran. It draws once, with its payload folded.
+        if activity.kind == ActivityKind::Tool {
+            if let Some((content, ok)) = tool_index.result(call) {
+                let key = (ACTIVITY_TOOL, position);
+                let waiting = app
+                    .approvals
+                    .iter()
+                    .any(|prompt| prompt.verb == activity_first_word(&activity.text));
+                push_activity_tool_row(
+                    lines,
+                    activity,
+                    content,
+                    ok,
+                    waiting,
+                    session.tool_expanded(key),
+                    key,
+                    marks,
+                    width,
+                    theme,
+                );
+                return;
+            }
         }
     }
     let selected = selected_activity == Some(position);
@@ -1412,6 +1558,49 @@ mod tests {
 
         assert!(!all.contains("1 lines"), "singular counted as plural: {all}");
         assert!(all.contains("thought line 1"), "{all}");
+    }
+
+    #[test]
+    fn an_activity_call_and_its_result_draw_one_folded_row() {
+        let mut session = sample_session();
+        let id = ToolCall::new("web.search", serde_json::json!({ "query": "todays news" })).id;
+        session
+            .messages
+            .push(Message::tool_result(id.clone(), "1. first hit\n2. second hit", true));
+        session.activity.push(Activity {
+            kind: ActivityKind::Tool,
+            text: "web.search  limit=10 query=todays news".to_owned(),
+            call: Some(id),
+            ok: Some(true),
+            expanded: false,
+        });
+        let app = App::new(false);
+
+        let folded = transcript(&conversation_lines(&app, &session, 80, &Theme::new(false)));
+        let rows: Vec<&String> = folded
+            .iter()
+            .filter(|row| row.contains("Web search"))
+            .collect();
+        assert_eq!(rows.len(), 1, "one call draws one row: {folded:#?}");
+        assert!(
+            rows[0].contains("todays news"),
+            "the argument is the label: {rows:#?}"
+        );
+        assert!(
+            !folded.iter().any(|row| row.contains("second hit")),
+            "the payload stays folded: {folded:#?}"
+        );
+        assert!(
+            !folded.iter().any(|row| row.contains("· tool")),
+            "the old heading is gone: {folded:#?}"
+        );
+
+        session.toggle_tool((ACTIVITY_TOOL, 0));
+        let open = transcript(&conversation_lines(&app, &session, 80, &Theme::new(false)));
+        assert!(
+            open.iter().any(|row| row.contains("second hit")),
+            "clicking the row reveals the payload: {open:#?}"
+        );
     }
 
     #[test]
