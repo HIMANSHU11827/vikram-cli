@@ -974,9 +974,11 @@ impl RuntimeHandle {
                 "approval is no longer pending".into(),
             ));
         };
-        if allow && persist {
+        if persist {
             // Keep exactly the scope the prompt proposed. Nothing here widens a permission: the
-            // saved rule is an operator-tier rule, still under the mandatory floor.
+            // saved rule is an operator-tier rule, still under the mandatory floor. Denying this
+            // call while saving the rule is a real answer: settle this one as a refusal, and stop
+            // asking about the same shape of request next time.
             match pending.prompt.amendment.as_deref() {
                 Some(amendment) => self.allow(&pending.prompt.session, amendment)?,
                 None => self.inner.emit(RuntimeEvent::Notice {
@@ -1760,5 +1762,48 @@ mod tests {
             1,
             "a kept command is on the list; nothing re-prompts"
         );
+    }
+
+    #[tokio::test]
+    async fn adding_to_the_list_without_approving_refuses_this_one_and_saves_the_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let session = handle.snapshot().sessions[0].id.clone();
+        let mut rec = Recorder::new(&handle);
+
+        handle
+            .run_user_command(&session, "touch remembered-1".into())
+            .unwrap();
+        assert!(
+            rec.wait_until(|_, approvals| !approvals.is_empty()).await,
+            "the first one asks"
+        );
+        let approval = rec.approvals[0].clone();
+        handle.answer_approval(&approval, false, true).unwrap();
+        assert!(
+            !dir.path().join("remembered-1").exists(),
+            "saving the rule must not run the command it refused"
+        );
+        assert_eq!(
+            handle
+                .allow_list()
+                .iter()
+                .filter(|rule| rule.verb_prefix.as_deref() == Some("shell.run"))
+                .count(),
+            1,
+            "the rule is saved anyway, so the next shape stops asking"
+        );
+
+        handle
+            .run_user_command(&session, "touch remembered-2".into())
+            .unwrap();
+        assert!(
+            rec.wait_until(|_, _| dir.path().join("remembered-2").exists())
+                .await,
+            "the saved rule lets the next one through"
+        );
+        assert_eq!(rec.approvals.len(), 1, "and it does not ask again");
     }
 }

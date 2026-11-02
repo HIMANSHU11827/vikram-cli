@@ -1139,10 +1139,13 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
                     app.approval_action = (app.approval_action + actions - 1) % actions;
                     true
                 }
+                // The answers line up with `APPROVAL_ACTIONS`: approve, deny, remember without
+                // running it, and approve while remembering.
                 KeyCode::Enter => {
                     let (allow, persist) = match app.approval_action {
                         1 => (false, false),
-                        2 => (true, true),
+                        2 => (false, true),
+                        3 => (true, true),
                         _ => (true, false),
                     };
                     answer_approval(app, allow, persist);
@@ -2004,7 +2007,19 @@ mod tests {
         assert!(handle_overlay(&mut app, key(KeyCode::Down)));
         assert_eq!(app.approval_action, 2);
         assert!(handle_overlay(&mut app, key(KeyCode::Enter)));
-        assert_eq!(answered(&app), (true, true), "the third keeps it on the list");
+        assert_eq!(
+            answered(&app),
+            (false, true),
+            "adding the rule without running this call still refuses this call"
+        );
+
+        let mut app = app_with_approvals(1);
+        for _ in 0..3 {
+            assert!(handle_overlay(&mut app, key(KeyCode::Down)));
+        }
+        assert_eq!(app.approval_action, 3);
+        assert!(handle_overlay(&mut app, key(KeyCode::Enter)));
+        assert_eq!(answered(&app), (true, true), "the fourth approves and keeps");
     }
 
     #[test]

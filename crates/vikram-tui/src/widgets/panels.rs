@@ -728,7 +728,12 @@ fn info_lines(lines: &[String], theme: &Theme) -> Vec<Line<'static>> {
 }
 
 /// The three answers the approval panel offers, in the order it draws them.
-pub const APPROVAL_ACTIONS: [&str; 3] = ["Allow once", "Deny", "Keep on the list"];
+pub const APPROVAL_ACTIONS: [&str; 4] = [
+    "Approve",
+    "Deny",
+    "Add to the allow list",
+    "Approve and add to the allow list",
+];
 
 fn approval_lines(app: &App, theme: &Theme) -> (String, Vec<Line<'static>>) {
     let mut lines: Vec<Line> = Vec::new();
@@ -779,10 +784,10 @@ fn approval_lines(app: &App, theme: &Theme) -> (String, Vec<Line<'static>>) {
         ]));
     }
     lines.push(Line::styled(
-        "  ↑↓ choose · enter confirm · a allow · d deny · p keep",
+        "  ↑↓ choose · enter confirm · a approve · d deny · p add",
         theme.muted(),
     ));
-    (format!("Approvals {}", app.approvals.len()), lines)
+    (format!("Permissions {}", app.approvals.len()), lines)
 }
 
 fn inspector_title(kind: &InspectorKind) -> &'static str {
@@ -1421,8 +1426,9 @@ mod tests {
         });
         assert!(rendered.contains("fs.write"), "got {rendered}");
         assert!(rendered.contains("/etc/**"), "got {rendered}");
-        assert!(rendered.contains("Keep on the list"), "got {rendered}");
-        assert!(rendered.contains("Allow once"), "got {rendered}");
+        assert!(rendered.contains("Permissions 1"), "got {rendered}");
+        assert!(rendered.contains("Approve and add to the allow list"), "got {rendered}");
+        assert!(rendered.contains("Add to the allow list"), "got {rendered}");
         assert!(rendered.contains("Deny"), "got {rendered}");
     }
 
