@@ -777,6 +777,16 @@ fn assistant_with_calls(text: &str, calls: Vec<ToolCall>) -> Message {
 #[cfg(test)]
 mod tests {
     use super::parse_question;
+    use super::*;
+    use crate::config::Config;
+    use crate::provider::{Provider, ProviderStream, ToolSpec};
+    use crate::runtime::Runtime;
+    use crate::tools::{Tool, ToolContext, ToolOutput};
+    use std::collections::VecDeque;
+    use std::path::Path;
+    use std::sync::Mutex;
+    use tokio::sync::broadcast;
+    use vikram_contracts::{ActionKind, PermissionRequest, SideEffect, VikramError};
 
     #[test]
     fn an_ask_user_reply_yields_the_request_id_the_question_and_the_choices() {
@@ -803,5 +813,339 @@ mod tests {
         assert!(parse_question("hello").is_none());
         assert!(parse_question("").is_none());
         assert!(parse_question("QUESTION:\nq").is_none());
+    }
+
+    /// What a connected interface is handed, in the order it is handed over: committed speech, the
+    /// row for a tool that started, the row for the tool that finished, the result that re-enters
+    /// the conversation.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Seen {
+        Speech(String),
+        ToolStarted(String),
+        ToolFinished(String, bool),
+        ToolResult(ToolCallId, String),
+    }
+
+    /// A provider that replays one canned stream per request. Running out of script yields an empty
+    /// stream, which ends the turn the same way a model that says nothing more would.
+    struct ScriptedProvider {
+        script: Mutex<VecDeque<Vec<ProviderEvent>>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(batches: Vec<Vec<ProviderEvent>>) -> Self {
+            Self {
+                script: Mutex::new(batches.into()),
+            }
+        }
+    }
+
+    impl Provider for ScriptedProvider {
+        fn name(&self) -> &str {
+            "scripted"
+        }
+
+        fn model(&self) -> &str {
+            "test-model"
+        }
+
+        fn context_window(&self) -> Option<u64> {
+            Some(8192)
+        }
+
+        fn stream(&self, _request: CompletionRequest) -> ProviderStream {
+            let batch = self
+                .script
+                .lock()
+                .expect("script lock")
+                .pop_front()
+                .unwrap_or_default();
+            Box::pin(futures_util::stream::iter(
+                batch.into_iter().map(Ok::<_, VikramError>),
+            ))
+        }
+    }
+
+    /// A tool that declares a plain read, so the gate allows it in a temporary workspace, and whose
+    /// only effect is to say it ran.
+    struct ProbeTool;
+
+    impl Tool for ProbeTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "probe".into(),
+                description: "records that it ran".into(),
+                schema: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+
+        fn permission(&self, _args: &serde_json::Value) -> Result<PermissionRequest, VikramError> {
+            Ok(PermissionRequest::new(
+                ActionKind::Read,
+                "probe.run",
+                "probe",
+                SideEffect::None,
+                Trust::Model,
+            ))
+        }
+
+        fn run(
+            &self,
+            _args: &serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolOutput, VikramError> {
+            Ok(ToolOutput {
+                content: "probe: done".into(),
+                ok: true,
+            })
+        }
+    }
+
+    /// `VIKRAM_HOME` is process-global, so a test that points it at a temporary directory holds the
+    /// shared guard for its whole body.
+    fn isolated_home(dir: &Path) -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::config::lock_security_env();
+        unsafe { std::env::set_var("VIKRAM_HOME", dir.join("home")) };
+        guard
+    }
+
+    fn config_for(dir: &Path) -> Config {
+        Config {
+            model: "test-model".into(),
+            workspace_root: Some(dir.to_path_buf()),
+            ..Config::default()
+        }
+    }
+
+    /// Drain one turn's events into the sequence the interface would draw, stopping at the end of
+    /// the turn. Five seconds bounds a hung loop instead of letting the test hang with it.
+    async fn record(events: &mut broadcast::Receiver<RuntimeEvent>) -> Vec<Seen> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut seen = Vec::new();
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the turn never finished; saw {seen:?}");
+            }
+            let Ok(Ok(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), events.recv()).await
+            else {
+                continue;
+            };
+            match event {
+                RuntimeEvent::MessageCommitted { message, .. } => match message.role {
+                    Role::Assistant => {
+                        for block in &message.blocks {
+                            if let Block::Text { text, .. } = block {
+                                seen.push(Seen::Speech(text.clone()));
+                            }
+                        }
+                    }
+                    Role::Tool => {
+                        for block in &message.blocks {
+                            if let Block::ToolResult {
+                                call, content, ok, ..
+                            } = block
+                            {
+                                assert!(*ok, "the probe tool always succeeds");
+                                seen.push(Seen::ToolResult(call.clone(), content.clone()));
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                RuntimeEvent::ToolStarted { name, .. } => seen.push(Seen::ToolStarted(name)),
+                RuntimeEvent::ToolFinished { name, ok, .. } => {
+                    seen.push(Seen::ToolFinished(name, ok))
+                }
+                RuntimeEvent::TurnFinished { .. } => return seen,
+                _ => {}
+            }
+        }
+    }
+
+    /// Run one turn against a scripted provider. Returns the published order and the durable
+    /// conversation the next request would carry.
+    async fn run_scripted(script: Vec<Vec<ProviderEvent>>) -> (Vec<Seen>, Vec<Message>) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::new(ScriptedProvider::new(script)),
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        handle.inner.tools.register(Box::new(ProbeTool));
+        let mut events = handle.events();
+        let session = handle.snapshot().sessions[0].id.clone();
+        handle
+            .submit(&session, "audit the code".into())
+            .expect("the turn is accepted");
+        let seen = record(&mut events).await;
+        let messages = handle
+            .inner
+            .session(&session)
+            .expect("the session survives the turn")
+            .messages();
+        (seen, messages)
+    }
+
+    #[tokio::test]
+    async fn speech_arriving_before_a_tool_call_is_committed_before_the_call_runs() {
+        let call = ToolCall::new("probe", serde_json::json!({}));
+        let call_id = call.id.clone();
+        let (seen, messages) = run_scripted(vec![
+            vec![
+                ProviderEvent::TextDelta("The security review is running".into()),
+                ProviderEvent::TextDelta(" in the background.".into()),
+                ProviderEvent::ToolCall(call),
+                ProviderEvent::Finished {
+                    input_tokens: Some(10),
+                    output_tokens: Some(8),
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("It found nothing.".into()),
+                ProviderEvent::Finished {
+                    input_tokens: None,
+                    output_tokens: None,
+                },
+            ],
+        ])
+        .await;
+
+        assert_eq!(
+            seen,
+            vec![
+                Seen::Speech("The security review is running in the background.".into()),
+                Seen::ToolStarted("probe".into()),
+                Seen::ToolFinished("probe".into(), true),
+                Seen::ToolResult(call_id, "probe: done".into()),
+                Seen::Speech("It found nothing.".into()),
+            ],
+            "the first sentence must be published before the tool row, not folded into the answer"
+        );
+
+        // Two turns of speech, one result, in order: the second sentence is not appended to the
+        // first, and neither is repeated.
+        let roles: Vec<Role> = messages.iter().map(|m| m.role.clone()).collect();
+        assert_eq!(
+            roles,
+            vec![Role::User, Role::Assistant, Role::Tool, Role::Assistant]
+        );
+        let speech: Vec<String> = messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .map(Message::text_body)
+            .collect();
+        assert_eq!(
+            speech,
+            vec![
+                "The security review is running in the background.".to_owned(),
+                "It found nothing.".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn every_batch_that_calls_tools_commits_its_own_sentence_first() {
+        let first = ToolCall::new("probe", serde_json::json!({"step": 1}));
+        let first_id = first.id.clone();
+        let second = ToolCall::new("probe", serde_json::json!({"step": 2}));
+        let second_id = second.id.clone();
+        let (seen, messages) = run_scripted(vec![
+            vec![
+                ProviderEvent::TextDelta("Checking the dependencies.".into()),
+                ProviderEvent::ToolCall(first),
+                ProviderEvent::Finished {
+                    input_tokens: None,
+                    output_tokens: None,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("Checking the tests.".into()),
+                ProviderEvent::ToolCall(second),
+                ProviderEvent::Finished {
+                    input_tokens: None,
+                    output_tokens: None,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("Both are clean.".into()),
+                ProviderEvent::Finished {
+                    input_tokens: None,
+                    output_tokens: None,
+                },
+            ],
+        ])
+        .await;
+
+        assert_eq!(
+            seen,
+            vec![
+                Seen::Speech("Checking the dependencies.".into()),
+                Seen::ToolStarted("probe".into()),
+                Seen::ToolFinished("probe".into(), true),
+                Seen::ToolResult(first_id, "probe: done".into()),
+                Seen::Speech("Checking the tests.".into()),
+                Seen::ToolStarted("probe".into()),
+                Seen::ToolFinished("probe".into(), true),
+                Seen::ToolResult(second_id, "probe: done".into()),
+                Seen::Speech("Both are clean.".into()),
+            ]
+        );
+        let speech: Vec<String> = messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .map(Message::text_body)
+            .collect();
+        assert_eq!(
+            speech,
+            vec![
+                "Checking the dependencies.".to_owned(),
+                "Checking the tests.".to_owned(),
+                "Both are clean.".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_ends_in_speech_commits_it_once() {
+        let (seen, messages) = run_scripted(vec![vec![
+            ProviderEvent::TextDelta("Nothing to do.".into()),
+            ProviderEvent::Finished {
+                input_tokens: None,
+                output_tokens: None,
+            },
+        ]])
+        .await;
+
+        assert_eq!(seen, vec![Seen::Speech("Nothing to do.".into())]);
+        let roles: Vec<Role> = messages.iter().map(|m| m.role.clone()).collect();
+        assert_eq!(roles, vec![Role::User, Role::Assistant]);
+    }
+
+    #[tokio::test]
+    async fn a_batch_with_no_text_publishes_no_speech() {
+        let call = ToolCall::new("probe", serde_json::json!({}));
+        let (seen, _) = run_scripted(vec![
+            vec![
+                ProviderEvent::ToolCall(call),
+                ProviderEvent::Finished {
+                    input_tokens: None,
+                    output_tokens: None,
+                },
+            ],
+            vec![ProviderEvent::Finished {
+                input_tokens: None,
+                output_tokens: None,
+            }],
+        ])
+        .await;
+
+        assert!(
+            !seen.iter().any(|item| matches!(item, Seen::Speech(_))),
+            "a silent tool call must not gain a progress sentence: {seen:?}"
+        );
     }
 }

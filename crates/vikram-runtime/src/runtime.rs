@@ -385,6 +385,21 @@ pub struct Runtime {
 
 impl Runtime {
     pub async fn start(config: Config) -> Result<Self> {
+        Self::boot(config, None).await
+    }
+
+    /// Boot with a provider the caller supplies instead of the one configuration builds. Only the
+    /// turn loop's tests use it: a scripted stream is the only way to prove the order in which a
+    /// turn publishes speech, tool rows and tool results without a network.
+    #[cfg(test)]
+    pub(crate) async fn start_with_provider(
+        config: Config,
+        provider: Arc<dyn Provider>,
+    ) -> Result<Self> {
+        Self::boot(config, Some(provider)).await
+    }
+
+    async fn boot(config: Config, provider_override: Option<Arc<dyn Provider>>) -> Result<Self> {
         ensure_home()?;
         let store =
             Store::open(&database_path()).map_err(|e| RuntimeError::Store(e.to_string()))?;
@@ -405,8 +420,11 @@ impl Runtime {
             Err(err) => return Err(RuntimeError::Store(err.to_string())),
         }
 
-        let provider = crate::openai::OpenAiProvider::from_config(&config)?
-            .map(|p| Arc::new(p) as Arc<dyn Provider>);
+        let provider = match provider_override {
+            Some(provider) => Some(provider),
+            None => crate::openai::OpenAiProvider::from_config(&config)?
+                .map(|p| Arc::new(p) as Arc<dyn Provider>),
+        };
 
         let mcp = McpRegistry::load(McpConfig::load());
         let plugins = PluginRegistry::from_default_dir();
