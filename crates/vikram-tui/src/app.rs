@@ -54,6 +54,9 @@ pub struct ThoughtHit {
     pub x_start: u16,
     pub x_end: u16,
     pub key: ThoughtKey,
+    /// A tool call folds its own payload; a thinking block folds its prose. Both share the key
+    /// space, so the click has to say which map the fold belongs in.
+    pub tool: bool,
 }
 
 /// A drag across the transcript. Screen coordinates, not transcript lines: the anchor names the
@@ -333,6 +336,9 @@ pub struct SessionView {
     /// Folds the operator set by clicking a header, keyed by block. `expanded_thought` stays the
     /// default, so `Ctrl+T` still folds or unfolds every block at once.
     pub thought_folds: HashMap<ThoughtKey, bool>,
+    /// Tool rows carry their payload hidden. Unlike thinking, a tool row starts closed and a
+    /// click opens exactly the one that was clicked.
+    pub tool_folds: HashMap<ThoughtKey, bool>,
     pub unread: usize,
 }
 
@@ -360,6 +366,7 @@ impl SessionView {
             selected_activity: None,
             expanded_thought: false,
             thought_folds: HashMap::new(),
+            tool_folds: HashMap::new(),
             unread: 0,
         }
     }
@@ -377,6 +384,17 @@ impl SessionView {
     pub fn toggle_thought(&mut self, key: ThoughtKey) {
         let next = !self.thought_expanded(key);
         self.thought_folds.insert(key, next);
+    }
+
+    /// Whether one tool row shows its payload. There is no session-wide default: a payload is
+    /// noise until someone asks for it.
+    pub fn tool_expanded(&self, key: ThoughtKey) -> bool {
+        self.tool_folds.get(&key).copied().unwrap_or(false)
+    }
+
+    pub fn toggle_tool(&mut self, key: ThoughtKey) {
+        let next = !self.tool_expanded(key);
+        self.tool_folds.insert(key, next);
     }
 
     pub fn is_busy(&self) -> bool {
@@ -596,10 +614,15 @@ impl App {
 
     /// The folding header a click landed on, if it landed on one.
     pub fn thought_at(&self, x: u16, y: u16) -> Option<ThoughtKey> {
+        self.fold_at(x, y).map(|(key, _)| key)
+    }
+
+    /// The same hit, saying whether it belongs to a tool row or a thinking block.
+    pub fn fold_at(&self, x: u16, y: u16) -> Option<(ThoughtKey, bool)> {
         self.thought_hits
             .iter()
             .find(|hit| hit.row == y && x >= hit.x_start && x <= hit.x_end)
-            .map(|hit| hit.key)
+            .map(|hit| (hit.key, hit.tool))
     }
 
     /// Open the one-line field. The editor starts empty; the hint says what Enter will do, because a
@@ -1290,17 +1313,21 @@ mod selection_and_folds {
                 x_start: 0,
                 x_end: 8,
                 key: (0, 0),
+                tool: false,
             },
             ThoughtHit {
                 row: 9,
                 x_start: 0,
                 x_end: 8,
                 key: (2, 1),
+                tool: true,
             },
         ];
         assert_eq!(app.thought_at(3, 4), Some((0, 0)));
         assert_eq!(app.thought_at(3, 7), None, "the row beyond the label is text");
         assert_eq!(app.thought_at(3, 9), Some((2, 1)));
+        assert_eq!(app.fold_at(3, 9), Some(((2, 1), true)), "a tool row knows it is a tool");
+        assert_eq!(app.fold_at(3, 4), Some(((0, 0), false)));
 
         let mut session = SessionView::from_snapshot(SessionSnapshot {
             id: SessionId::generate(),

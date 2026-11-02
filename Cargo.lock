@@ -2693,6 +2693,7 @@ dependencies = [
  "crossterm",
  "insta",
  "ratatui",
+ "serde_json",
  "tempfile",
  "unicode-width",
  "vikram-contracts",

@@ -4,13 +4,15 @@
 //! command, or invents information. In particular there is no clock anywhere — a transcript line
 //! says who spoke and what was said, never when.
 
+use std::collections::{HashMap, HashSet};
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-use vikram_contracts::{Block, Message, Role};
+use vikram_contracts::{Block, Message, Role, ToolCallId};
 
 use crate::app::{
     Activity, ActivityKind, App, PendingQuestion, SessionView, ThoughtHit, ThoughtKey,
@@ -27,6 +29,52 @@ const SEPARATOR_CAP: usize = 72;
 const ARGUMENT_CAP: usize = 80;
 /// A folded thinking block previews at most this much of one line.
 const THOUGHT_PREVIEW_CAP: usize = 64;
+
+/// A folding header: where it was drawn, how wide its label is, which block it folds, and whether
+/// that block is a tool call or a thinking block. Both live in the same key space but fold
+/// different maps, so the flag travels with the mark.
+type Mark = (usize, u16, ThoughtKey, bool);
+
+/// What the tool blocks already say, so a call and its result can be drawn as one row.
+///
+/// The runtime emits a call block, then a result block carrying the same id, then a `Role::Tool`
+/// message that repeats it. Reading the transcript once up front is what makes one row per call
+/// possible; without it every tool payload renders twice under a `tool` heading.
+struct ToolIndex<'a> {
+    results: HashMap<&'a ToolCallId, (&'a str, bool)>,
+    called: HashSet<&'a ToolCallId>,
+}
+
+impl<'a> ToolIndex<'a> {
+    fn scan(messages: &'a [Message]) -> Self {
+        let mut results = HashMap::new();
+        let mut called = HashSet::new();
+        for message in messages {
+            for block in &message.blocks {
+                match block {
+                    Block::ToolCall { call } => {
+                        called.insert(&call.id);
+                    }
+                    Block::ToolResult {
+                        call, content, ok, ..
+                    } => {
+                        results.insert(call, (content.as_str(), *ok));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Self { results, called }
+    }
+
+    fn paired(&self, call: &ToolCallId) -> bool {
+        self.called.contains(call)
+    }
+
+    fn outcome(&self, call: &ToolCallId) -> Option<(&'a str, bool)> {
+        self.results.get(call).copied()
+    }
+}
 
 /// Draw the transcript, and report where each folding header landed so the mouse can name the
 /// block it was clicked on. Geometry is decided here because only the draw knows the scroll offset.
@@ -57,7 +105,7 @@ pub fn conversation(
 
     marks
         .into_iter()
-        .filter_map(|(line, label_width, key)| {
+        .filter_map(|(line, label_width, key, tool)| {
             let rel = (line as i64) - (offset as i64);
             if rel < 0 || rel >= height as i64 {
                 return None;
@@ -67,6 +115,7 @@ pub fn conversation(
                 x_start: area.x,
                 x_end: area.x + label_width.saturating_sub(1),
                 key,
+                tool,
             })
         })
         .collect()
@@ -89,10 +138,18 @@ fn conversation_lines_with_hits(
     session: &SessionView,
     width: usize,
     theme: &Theme,
-) -> (Vec<Line<'static>>, Vec<(usize, u16, ThoughtKey)>) {
+) -> (Vec<Line<'static>>, Vec<Mark>) {
     let width = width.max(4);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut marks: Vec<(usize, u16, ThoughtKey)> = Vec::new();
+    let mut marks: Vec<Mark> = Vec::new();
+    let index = ToolIndex::scan(&session.messages);
+    // A call with no result yet may be waiting on a permission answer; the row says so rather
+    // than reading as a call that is still running.
+    let waiting: HashSet<&str> = app
+        .approvals
+        .iter()
+        .map(|approval| approval.verb.as_str())
+        .collect();
 
     // An empty session renders nothing: the interface does not fabricate a greeting or sample
     // conversation. Real content arrives through the runtime's message stream.
@@ -113,6 +170,8 @@ fn conversation_lines_with_hits(
                 message,
                 message_index,
                 session,
+                &index,
+                &waiting,
                 &mut marks,
                 width,
                 theme,
@@ -121,12 +180,12 @@ fn conversation_lines_with_hits(
                 &mut lines,
                 message,
                 message_index,
-                session,
+                &index,
                 &mut marks,
                 width,
                 theme,
             ),
-            Role::Tool => push_tool(&mut lines, message, width, theme),
+            Role::Tool => push_tool(&mut lines, message, &index, width, theme),
         }
     }
 
@@ -135,6 +194,7 @@ fn conversation_lines_with_hits(
             &mut lines,
             app,
             activity,
+            &index,
             width,
             theme,
             idx,
@@ -144,7 +204,10 @@ fn conversation_lines_with_hits(
 
     if session.streaming.is_some() || session.streaming_thought.is_some() {
         lines.push(Line::from(""));
-        lines.push(Line::styled("VIKRAM", theme.title()));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", theme.filled_dot()), theme.title()),
+            Span::styled("VIKRAM", theme.title()),
+        ]));
         if let Some(thought) = &session.streaming_thought {
             push_reasoning(
                 &mut lines,
@@ -159,14 +222,16 @@ fn conversation_lines_with_hits(
         }
         if let Some(stream) = &session.streaming {
             lines.extend(markdown::markdown_lines(&stream.text, width, theme));
-            lines.push(Line::from(vec![
-                Span::styled(
-                    app.thinking_frame().to_owned(),
-                    Style::default().fg(theme.accent),
-                ),
-                Span::styled(" Working...", Style::default().fg(theme.accent)),
-            ]));
         }
+        // The turn is in flight whenever either stream is open, including the stretch before the
+        // first token arrives: a spinner with nothing under it still tells you it is thinking.
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {} ", app.thinking_frame()),
+                Style::default().fg(theme.accent),
+            ),
+            Span::styled("Working", Style::default().fg(theme.accent)),
+        ]));
     }
 
     if let Some(pending) = &app.pending_question {
@@ -209,7 +274,7 @@ fn push_user(
     message: &Message,
     message_index: usize,
     session: &SessionView,
-    marks: &mut Vec<(usize, u16, ThoughtKey)>,
+    marks: &mut Vec<Mark>,
     width: usize,
     theme: &Theme,
 ) {
@@ -256,7 +321,9 @@ fn push_assistant(
     message: &Message,
     message_index: usize,
     session: &SessionView,
-    marks: &mut Vec<(usize, u16, ThoughtKey)>,
+    index: &ToolIndex,
+    waiting: &HashSet<&str>,
+    marks: &mut Vec<Mark>,
     width: usize,
     theme: &Theme,
 ) {
@@ -276,9 +343,22 @@ fn push_assistant(
                 width,
                 theme,
             ),
-            Block::ToolCall { call } => push_tool_call(lines, call, width, theme),
-            Block::ToolResult { content, ok, .. } => {
-                push_tool_body(lines, &[content.as_str()], *ok, width, theme);
+            Block::ToolCall { call } => push_tool_row(
+                lines,
+                call,
+                index.outcome(&call.id),
+                awaiting_answer(waiting, call),
+                session.tool_expanded(key),
+                key,
+                marks,
+                width,
+                theme,
+            ),
+            Block::ToolResult { call, content, ok, .. } => {
+                // The row above already renders this result; a paired block adds nothing.
+                if !index.paired(call) {
+                    push_tool_payload(lines, content, *ok, width, theme);
+                }
             }
         }
     }
@@ -288,8 +368,8 @@ fn push_system(
     lines: &mut Vec<Line<'static>>,
     message: &Message,
     message_index: usize,
-    session: &SessionView,
-    marks: &mut Vec<(usize, u16, ThoughtKey)>,
+    index: &ToolIndex,
+    marks: &mut Vec<Mark>,
     width: usize,
     theme: &Theme,
 ) {
@@ -302,43 +382,210 @@ fn push_system(
             Block::Text { text, .. } => {
                 lines.extend(markdown::markdown_lines_styled(text, width, theme, style))
             }
-            Block::Reasoning { text, .. } => push_reasoning(
+            Block::Reasoning { text, .. } => push_reasoning(lines, text, false, false, key, marks, width, theme),
+            Block::ToolCall { call } => push_tool_row(
                 lines,
-                text,
-                session.thought_expanded(key),
+                call,
+                index.outcome(&call.id),
+                false,
                 false,
                 key,
                 marks,
                 width,
                 theme,
             ),
-            Block::ToolCall { call } => push_tool_call(lines, call, width, theme),
-            Block::ToolResult { content, ok, .. } => {
-                push_tool_body(lines, &[content.as_str()], *ok, width, theme);
+            Block::ToolResult { call, content, ok, .. } => {
+                if !index.paired(call) {
+                    push_tool_payload(lines, content, *ok, width, theme);
+                }
             }
         }
     }
 }
 
-fn push_tool(lines: &mut Vec<Line<'static>>, message: &Message, width: usize, theme: &Theme) {
-    let mut contents: Vec<&str> = Vec::new();
-    let mut ok = true;
+/// Results the transcript has no call for — a resumed session, or a tool the runtime answered on
+/// its own. They have no row to hang from, so each gets one line of its own.
+fn push_tool(
+    lines: &mut Vec<Line<'static>>,
+    message: &Message,
+    index: &ToolIndex,
+    width: usize,
+    theme: &Theme,
+) {
     for block in &message.blocks {
         match block {
-            Block::ToolResult {
-                content,
-                ok: success,
-                ..
-            } => {
-                ok &= *success;
-                contents.push(content.as_str());
+            Block::ToolResult { call, content, ok, .. } => {
+                if index.paired(call) {
+                    continue;
+                }
+                push_tool_payload(lines, content, *ok, width, theme);
             }
-            Block::Text { text, .. } => contents.push(text.as_str()),
-            Block::Reasoning { text, .. } => contents.push(text.as_str()),
-            Block::ToolCall { call } => push_tool_call(lines, call, width, theme),
+            Block::Text { text, .. } | Block::Reasoning { text, .. } => {
+                if !text.trim().is_empty() {
+                    lines.extend(markdown::markdown_lines_styled(
+                        text,
+                        width,
+                        theme,
+                        theme.muted(),
+                    ));
+                }
+            }
+            Block::ToolCall { call } => {
+                let label = tool_label(call, theme);
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{} ", theme.chevron()), theme.secondary()),
+                    Span::styled(label.name, Style::default().fg(theme.tool)),
+                ]));
+            }
         }
     }
-    push_tool_body(lines, &contents, ok, width, theme);
+}
+
+/// A call whose answer has not come back yet but which the host is holding a permission question
+/// for. The row says `waiting` instead of spinning forever.
+fn awaiting_answer(waiting: &HashSet<&str>, call: &vikram_contracts::ToolCall) -> bool {
+    waiting.contains(call.name.as_str())
+}
+
+/// What a tool call is called on screen, split from what it was called with.
+struct ToolLabel {
+    name: String,
+    detail: Option<String>,
+}
+
+/// One row per call.
+///
+/// The runtime's punctuation is not what a person reads: `web.search {"query": "news"}` is a
+/// search for the news, and `fs.read {"path": "Cargo.toml"}` is reading that file. The arguments
+/// become the sentence and the payload is folded behind the row, so a turn with four tools is
+/// four lines rather than four screens.
+fn push_tool_row(
+    lines: &mut Vec<Line<'static>>,
+    call: &vikram_contracts::ToolCall,
+    outcome: Option<(&str, bool)>,
+    waiting: bool,
+    expanded: bool,
+    key: ThoughtKey,
+    marks: &mut Vec<Mark>,
+    width: usize,
+    theme: &Theme,
+) {
+    let (glyph, style) = match outcome {
+        Some((_, true)) => (theme.check().to_owned(), Style::default().fg(theme.tool)),
+        Some((_, false)) => (theme.cross().to_owned(), Style::default().fg(theme.error)),
+        None if waiting => (
+            if theme.ascii { "!" } else { "⏸" }.to_owned(),
+            Style::default().fg(theme.accent),
+        ),
+        None => (
+            if theme.ascii { "->" } else { "→" }.to_owned(),
+            theme.secondary(),
+        ),
+    };
+    let label = tool_label(call, theme);
+    let head = format!("{glyph} {}", label.name);
+    marks.push((lines.len(), head.width() as u16, key, true));
+
+    let mut spans = vec![
+        Span::styled(format!("{glyph} "), style),
+        Span::styled(label.name, Style::default().fg(theme.text)),
+    ];
+    if let Some(detail) = label.detail {
+        spans.push(Span::styled(format!("  {detail}"), theme.muted()));
+    }
+    if outcome.is_some() {
+        spans.push(Span::styled(
+            if expanded {
+                " · click folds"
+            } else {
+                " · click"
+            },
+            Style::default().fg(theme.faint),
+        ));
+    }
+    lines.push(Line::from(spans));
+
+    if expanded {
+        if let Some((content, ok)) = outcome {
+            push_tool_payload(lines, content, ok, width, theme);
+        }
+    }
+}
+
+fn tool_label(call: &vikram_contracts::ToolCall, theme: &Theme) -> ToolLabel {
+    let arg = |keys: &[&str]| string_arg(&call.arguments, keys, ARGUMENT_CAP, ellipsis(theme));
+    let (name, detail) = match call.name.as_str() {
+        "web.search" | "web_search" => (
+            "Web search".to_owned(),
+            arg(&["query", "q"]).map(|query| format!("\"{query}\"")),
+        ),
+        "fs.read" | "read_file" => ("Read".to_owned(), arg(&["path", "file", "filename"])),
+        "fs.edit" | "fs.write" => ("Edited".to_owned(), arg(&["path", "file"])),
+        "fs.delete" => ("Deleted".to_owned(), arg(&["path", "file"])),
+        "shell.run" | "shell" => ("Ran".to_owned(), arg(&["command", "cmd"])),
+        "skill" => ("Skill".to_owned(), arg(&["name", "skill"])),
+        "ask_user" => ("Asked".to_owned(), arg(&["question"])),
+        other => {
+            let summary = argument_summary(&call.arguments, ARGUMENT_CAP, ellipsis(theme));
+            let detail = if summary.is_empty() { None } else { Some(summary) };
+            (humanize(other), detail)
+        }
+    };
+    ToolLabel { name, detail }
+}
+
+fn string_arg(
+    arguments: &serde_json::Value,
+    keys: &[&str],
+    max: usize,
+    suffix: &str,
+) -> Option<String> {
+    keys.iter().find_map(|key| {
+        arguments
+            .get(*key)
+            .and_then(|value| value.as_str())
+            .map(|value| truncate(value, max, suffix))
+    })
+}
+
+fn humanize(name: &str) -> String {
+    let spaced = name.replace(['.', '_'], " ");
+    let mut characters = spaced.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => spaced,
+    }
+}
+
+/// The payload behind a tool row, shown only when that row is opened.
+fn push_tool_payload(
+    lines: &mut Vec<Line<'static>>,
+    content: &str,
+    ok: bool,
+    width: usize,
+    theme: &Theme,
+) {
+    let inner = width.saturating_sub(4).max(1);
+    let style = if ok {
+        Style::default().fg(theme.tool)
+    } else {
+        Style::default().fg(theme.error)
+    };
+    let body = markdown::markdown_lines_styled(content, inner, theme, style);
+    let total = body.len();
+    for line in body.into_iter().take(TOOL_LINE_CAP) {
+        lines.push(indent(line, "    "));
+    }
+    if total > TOOL_LINE_CAP {
+        lines.push(Line::styled(
+            format!(
+                "    {} ({} more lines)",
+                ellipsis(theme),
+                total - TOOL_LINE_CAP
+            ),
+            theme.muted(),
+        ));
+    }
 }
 
 /// A thinking block, folded to the one line it should have taken in the first place.
@@ -354,7 +601,7 @@ fn push_reasoning(
     expanded: bool,
     live: bool,
     key: ThoughtKey,
-    marks: &mut Vec<(usize, u16, ThoughtKey)>,
+    marks: &mut Vec<Mark>,
     width: usize,
     theme: &Theme,
 ) {
@@ -365,7 +612,7 @@ fn push_reasoning(
     let heading = if expanded { "Thoughts" } else { "Thought" };
     let heading_text = format!("{} {heading}", theme.thought_glyph());
     // Only the label folds the block, so a drag that starts on the text after it is still a copy.
-    marks.push((lines.len(), heading_text.width() as u16, key));
+    marks.push((lines.len(), heading_text.width() as u16, key, false));
     if expanded {
         lines.push(Line::from(vec![
             Span::styled(heading_text, label),
@@ -395,46 +642,6 @@ fn push_reasoning(
         Span::styled(format!("  {detail}"), theme.muted()),
         Span::styled(" · click", Style::default().fg(theme.faint)),
     ]));
-}
-
-/// A tool result is dim-labelled, indented, tinted by outcome, and capped in length.
-fn push_tool_body(
-    lines: &mut Vec<Line<'static>>,
-    contents: &[&str],
-    ok: bool,
-    width: usize,
-    theme: &Theme,
-) {
-    lines.push(Line::from(""));
-    lines.push(Line::styled(dim_label(theme, "tool"), theme.muted()));
-
-    let style = if ok {
-        Style::default().fg(theme.tool)
-    } else {
-        Style::default().fg(theme.error)
-    };
-    let inner = width.saturating_sub(2).max(1);
-    let mut rendered: Vec<Line<'static>> = Vec::new();
-    for content in contents {
-        rendered.extend(markdown::markdown_lines_styled(
-            content, inner, theme, style,
-        ));
-    }
-
-    let total = rendered.len();
-    for line in rendered.into_iter().take(TOOL_LINE_CAP) {
-        lines.push(indent(line, "  "));
-    }
-    if total > TOOL_LINE_CAP {
-        lines.push(Line::styled(
-            format!(
-                "  {} ({} more lines)",
-                ellipsis(theme),
-                total - TOOL_LINE_CAP
-            ),
-            theme.muted(),
-        ));
-    }
 }
 
 fn push_tool_call(
@@ -467,12 +674,20 @@ fn push_activity(
     lines: &mut Vec<Line<'static>>,
     app: &App,
     activity: &Activity,
+    tool_index: &ToolIndex,
     width: usize,
     theme: &Theme,
-    index: usize,
+    position: usize,
     selected_activity: Option<usize>,
 ) {
-    let selected = selected_activity == Some(index);
+    // A tool that already has a call block in the transcript is drawn there, as one row. Its
+    // activity line is the same event a second time, so it is dropped rather than repeated.
+    if let Some(call) = &activity.call {
+        if tool_index.paired(call) {
+            return;
+        }
+    }
+    let selected = selected_activity == Some(position);
     let toggle = if activity.expanded {
         if theme.ascii { "v" } else { "▼" }
     } else {
@@ -748,7 +963,7 @@ mod tests {
     use crate::app::Streaming;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use vikram_contracts::{SessionId, ToolCallId, Trust, TurnId};
+    use vikram_contracts::{SessionId, ToolCall, ToolCallId, Trust, TurnId};
     use vikram_runtime::types::{SessionSnapshot, TurnState};
 
     fn sample_session() -> SessionView {
@@ -843,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn a_system_and_a_tool_message_render_dim_and_indented() {
+    fn a_system_message_and_an_orphan_result_render_dim_and_indented() {
         let app = App::new(false);
         let mut session = sample_session();
         session.messages.push(Message::system("policy loaded"));
@@ -859,10 +1074,13 @@ mod tests {
         let all = transcript(&lines).join("\n");
 
         assert!(all.contains("· system"), "system label missing: {all}");
-        assert!(all.contains("· tool"), "tool label missing: {all}");
+        assert!(
+            !all.contains("· tool"),
+            "a result with no call must not reopen the old tool heading: {all}"
+        );
         assert!(all.contains("policy loaded"));
         assert!(all.contains("(18 more lines)"), "cap missing: {all}");
-        assert!(all.contains("  row 0"));
+        assert!(all.contains("row 0"));
 
         // The failed tool result is tinted with the error colour, not the tool colour.
         let row = lines
@@ -896,7 +1114,7 @@ mod tests {
         let all = lines.join("\n");
 
         assert!(all.contains("partial answer"), "stream text missing: {all}");
-        assert!(all.contains("Working..."), "working line missing: {all}");
+        assert!(all.contains("Working"), "working line missing: {all}");
         assert!(all.contains("VIKRAM"), "stream label missing: {all}");
         assert!(
             all.contains(app.thinking_frame().to_owned().as_str()),
@@ -1195,5 +1413,49 @@ mod tests {
         assert!(!all.contains("1 lines"), "singular counted as plural: {all}");
         assert!(all.contains("thought line 1"), "{all}");
     }
-}
 
+    #[test]
+    fn a_call_and_its_result_draw_one_row_and_keep_the_payload_folded() {
+        let app = App::new(false);
+        let mut session = sample_session();
+        let call = ToolCall::new("fs.read", serde_json::json!({"path": "Cargo.toml"}));
+        let id = call.id.clone();
+        session.messages.push(Message {
+            role: Role::Assistant,
+            blocks: vec![Block::ToolCall { call }],
+        });
+        session.messages.push(Message {
+            role: Role::Assistant,
+            blocks: vec![Block::ToolResult {
+                call: id.clone(),
+                content: "line one\nline two".into(),
+                trust: Trust::Host,
+                ok: true,
+            }],
+        });
+        session
+            .messages
+            .push(Message::tool_result(id, "line one\nline two", true));
+
+        let theme = Theme::new(false);
+        let rows = transcript(&conversation_lines(&app, &session, 76, &theme));
+        let calls: Vec<&String> = rows.iter().filter(|row| row.contains("Read")).collect();
+        assert_eq!(calls.len(), 1, "one call is one row: {rows:?}");
+        assert!(calls[0].contains("Cargo.toml"), "label names the file: {rows:?}");
+        assert!(
+            !rows.iter().any(|row| row.contains("line two")),
+            "the payload starts folded: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("· tool")),
+            "the old tool heading is gone: {rows:?}"
+        );
+
+        session.toggle_tool((0, 0));
+        let opened = transcript(&conversation_lines(&app, &session, 76, &theme));
+        assert!(
+            opened.iter().any(|row| row.contains("line two")),
+            "folding the row opens the payload: {opened:?}"
+        );
+    }
+}

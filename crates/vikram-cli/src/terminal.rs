@@ -232,10 +232,15 @@ fn apply_terminal_event(app: &mut App, event: Event) {
                 // so a click on the label does not leave a one-cell drag behind. The fold belongs
                 // to the session on screen, which an agent pane can show without making it active.
                 if app.overlay.is_none() {
-                    if let Some(key) = app.thought_at(x, mouse.row) {
+                    if let Some((key, tool)) = app.fold_at(x, mouse.row) {
                         if let Some(id) = app.display_session().map(|session| session.id.clone()) {
                             if let Some(index) = app.session_index(&id) {
-                                app.sessions[index].toggle_thought(key);
+                                let session = &mut app.sessions[index];
+                                if tool {
+                                    session.toggle_tool(key);
+                                } else {
+                                    session.toggle_thought(key);
+                                }
                             }
                         }
                         return;
