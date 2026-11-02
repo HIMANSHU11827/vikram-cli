@@ -93,9 +93,10 @@ async fn event_loop(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        terminal
+        let completed = terminal
             .draw(|frame| ui::draw(frame, app))
             .map_err(|err| format!("draw: {err}"))?;
+        app.capture_screen(completed.buffer);
 
         for command in app.take_commands() {
             execute(handle, app, command);
@@ -134,6 +135,12 @@ async fn event_loop(
             _ = ticker.tick() => {
                 app.tick = app.tick.wrapping_add(1);
             }
+        }
+
+        // A copy is finished here rather than inside the key handler: the interface only says what
+        // the text is, and the host is what knows how to reach the clipboard.
+        if let Some(text) = app.take_clipboard() {
+            copy_to_clipboard(&text);
         }
     }
 
@@ -212,6 +219,35 @@ fn apply_terminal_event(app: &mut App, event: Event) {
                             session: hit.session,
                         });
                         return;
+                    }
+                }
+                // A header folds its own thinking block. This is checked before a selection starts
+                // so a click on the label does not leave a one-cell drag behind.
+                if app.overlay.is_none() {
+                    if let Some(key) = app.thought_at(x, mouse.row) {
+                        if let Some(session) = app.active_session_mut() {
+                            session.toggle_thought(key);
+                        }
+                        return;
+                    }
+                }
+                // Nothing else claimed the press, so it starts a drag. A press that never moves
+                // selects nothing and copies nothing.
+                app.selection = Some(vikram_tui::app::Selection::new((x, mouse.row)));
+            }
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                if let Some(selection) = &mut app.selection {
+                    selection.cursor = (mouse.column, mouse.row);
+                }
+            }
+            MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                // The highlight stays after the drag so the operator can see what was taken; a
+                // plain click clears it.
+                if let Some(selection) = app.selection {
+                    if selection.is_click() {
+                        app.selection = None;
+                    } else {
+                        app.copy_selection();
                     }
                 }
             }
@@ -376,9 +412,15 @@ fn open_command(
     args: &str,
 ) {
     let Some(command) = commands::find(word) else {
+        // A near miss is the commonest reason a command "does nothing". Name the command the
+        // operator almost typed instead of only saying the word was wrong.
+        let hint = match commands::nearest(word) {
+            Some(near) => format!(" — did you mean `/{}`?", near.name),
+            None => " — type `/` and Enter to browse what exists".to_owned(),
+        };
         app.push_notice(
             NoticeLevel::Warn,
-            format!("`/{word}` is not a command — type `/` and Enter to browse what exists"),
+            format!("`/{word}` is not a command{hint}"),
         );
         return;
     };
@@ -1512,4 +1554,66 @@ fn run_action(app: &mut App, session: &SessionId, name: &str) {
 #[allow(dead_code)]
 pub fn press(app: &mut App, key: KeyEvent) {
     input::handle_key(app, key);
+}
+
+/// Hand text to the system clipboard. Wayland first, then X11, then the terminal's own OSC 52 —
+/// the last one works over SSH, where no display exists at all. A copy that fails everywhere says
+/// so in the transcript instead of pretending it happened.
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let piped = ["wl-copy", "xclip"].iter().find_map(|program| {
+        let mut command = Command::new(program);
+        if *program == "xclip" {
+            command.args(["-selection", "clipboard"]);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        stdin.write_all(text.as_bytes()).ok()?;
+        drop(stdin);
+        let status = child.wait().ok()?;
+        status.success().then_some(())
+    });
+    if piped.is_some() {
+        return;
+    }
+
+    let encoded = base64(text.as_bytes());
+    let mut stdout = io::stdout();
+    let _ = write!(stdout, "\x1b]52;c;{encoded}\x07");
+    let _ = stdout.flush();
+}
+
+/// Standard base64, because a clipboard escape takes it and the workspace has no encoder.
+fn base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
 }

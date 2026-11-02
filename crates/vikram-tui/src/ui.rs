@@ -14,6 +14,7 @@ use crate::widgets;
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let theme = Theme::new(app.ascii);
     let area = frame.area();
+    app.thought_hits.clear();
 
     if area.width < 24 || area.height < 6 {
         let message =
@@ -32,10 +33,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     widgets::session_tabs(frame, regions.tabs, app, &theme);
 
-    match app.display_session() {
+    let thought_hits = match app.display_session() {
         Some(session) => widgets::conversation(frame, regions.conversation, app, session, &theme),
-        None => render_empty(frame, regions.conversation, &theme),
-    }
+        None => {
+            render_empty(frame, regions.conversation, &theme);
+            Vec::new()
+        }
+    };
+    app.thought_hits = thought_hits;
 
     if let Some(hive_area) = regions.hive {
         widgets::hive_panel(frame, hive_area, app, &theme);
@@ -56,6 +61,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.overlay.is_some() {
         widgets::overlay(frame, area, app, &theme);
+    }
+
+    if let Some(selection) = app.selection {
+        widgets::selection_overlay(frame, selection);
     }
 }
 

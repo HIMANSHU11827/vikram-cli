@@ -12,7 +12,10 @@ use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use vikram_contracts::{Block, Message, Role};
 
-use crate::app::{Activity, ActivityKind, App, PendingQuestion, SessionView};
+use crate::app::{
+    Activity, ActivityKind, App, PendingQuestion, SessionView, ThoughtHit, ThoughtKey,
+    STREAMING_THOUGHT,
+};
 use crate::theme::Theme;
 use crate::widgets::markdown;
 
@@ -25,15 +28,17 @@ const ARGUMENT_CAP: usize = 80;
 /// A folded thinking block previews at most this much of one line.
 const THOUGHT_PREVIEW_CAP: usize = 64;
 
+/// Draw the transcript, and report where each folding header landed so the mouse can name the
+/// block it was clicked on. Geometry is decided here because only the draw knows the scroll offset.
 pub fn conversation(
     frame: &mut Frame,
     area: Rect,
     app: &App,
     session: &SessionView,
     theme: &Theme,
-) {
+) -> Vec<ThoughtHit> {
     let width = area.width.saturating_sub(2) as usize;
-    let lines = conversation_lines(app, session, width, theme);
+    let (lines, marks) = conversation_lines_with_hits(app, session, width, theme);
     let total = clamp_u16(lines.len());
     let height = area.height;
     let offset = if session.follow {
@@ -49,6 +54,22 @@ pub fn conversation(
             .style(theme.body()),
         area,
     );
+
+    marks
+        .into_iter()
+        .filter_map(|(line, label_width, key)| {
+            let rel = (line as i64) - (offset as i64);
+            if rel < 0 || rel >= height as i64 {
+                return None;
+            }
+            Some(ThoughtHit {
+                row: area.y + rel as u16,
+                x_start: area.x,
+                x_end: area.x + label_width.saturating_sub(1),
+                key,
+            })
+        })
+        .collect()
 }
 
 pub fn conversation_lines(
@@ -57,21 +78,54 @@ pub fn conversation_lines(
     width: usize,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
+    conversation_lines_with_hits(app, session, width, theme).0
+}
+
+/// The transcript and every folding header's line index and label width. The public wrapper drops
+/// the marks; the draw keeps them.
+#[allow(clippy::type_complexity)]
+fn conversation_lines_with_hits(
+    app: &App,
+    session: &SessionView,
+    width: usize,
+    theme: &Theme,
+) -> (Vec<Line<'static>>, Vec<(usize, u16, ThoughtKey)>) {
     let width = width.max(4);
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut marks: Vec<(usize, u16, ThoughtKey)> = Vec::new();
 
     // An empty session renders nothing: the interface does not fabricate a greeting or sample
     // conversation. Real content arrives through the runtime's message stream.
 
-    for message in &session.messages {
+    for (message_index, message) in session.messages.iter().enumerate() {
         match message.role {
-            Role::User => push_user(&mut lines, message, session.expanded_thought, width, theme),
-            Role::Assistant => {
-                push_assistant(&mut lines, message, session.expanded_thought, width, theme)
-            }
-            Role::System => {
-                push_system(&mut lines, message, session.expanded_thought, width, theme)
-            }
+            Role::User => push_user(
+                &mut lines,
+                message,
+                message_index,
+                session,
+                &mut marks,
+                width,
+                theme,
+            ),
+            Role::Assistant => push_assistant(
+                &mut lines,
+                message,
+                message_index,
+                session,
+                &mut marks,
+                width,
+                theme,
+            ),
+            Role::System => push_system(
+                &mut lines,
+                message,
+                message_index,
+                session,
+                &mut marks,
+                width,
+                theme,
+            ),
             Role::Tool => push_tool(&mut lines, message, width, theme),
         }
     }
@@ -95,8 +149,10 @@ pub fn conversation_lines(
             push_reasoning(
                 &mut lines,
                 thought,
-                session.expanded_thought,
+                session.thought_expanded(STREAMING_THOUGHT),
                 true,
+                STREAMING_THOUGHT,
+                &mut marks,
                 width,
                 theme,
             );
@@ -117,7 +173,7 @@ pub fn conversation_lines(
         push_question_prompt(&mut lines, pending, width, theme);
     }
 
-    lines
+    (lines, marks)
 }
 
 /// A pending `ask_user` question, drawn at the foot of the transcript because the runtime is
@@ -151,7 +207,9 @@ fn push_question_prompt(
 fn push_user(
     lines: &mut Vec<Line<'static>>,
     message: &Message,
-    expanded_thought: bool,
+    message_index: usize,
+    session: &SessionView,
+    marks: &mut Vec<(usize, u16, ThoughtKey)>,
     width: usize,
     theme: &Theme,
 ) {
@@ -161,14 +219,22 @@ fn push_user(
         format!("{} User", theme.prompt()),
         theme.muted(),
     ));
-    for block in &message.blocks {
+    for (block_index, block) in message.blocks.iter().enumerate() {
+        let key = (message_index, block_index);
         match block {
             Block::Text { text, .. } => {
                 lines.extend(markdown::markdown_lines_styled(text, width, theme, base))
             }
-            Block::Reasoning { text, .. } => {
-                push_reasoning(lines, text, expanded_thought, false, width, theme)
-            }
+            Block::Reasoning { text, .. } => push_reasoning(
+                lines,
+                text,
+                session.thought_expanded(key),
+                false,
+                key,
+                marks,
+                width,
+                theme,
+            ),
             Block::ToolCall { call } => push_tool_call(lines, call, width, theme),
             Block::ToolResult { content, ok, .. } => {
                 let style = if *ok {
@@ -188,18 +254,28 @@ fn push_user(
 fn push_assistant(
     lines: &mut Vec<Line<'static>>,
     message: &Message,
-    expanded_thought: bool,
+    message_index: usize,
+    session: &SessionView,
+    marks: &mut Vec<(usize, u16, ThoughtKey)>,
     width: usize,
     theme: &Theme,
 ) {
     lines.push(Line::from(""));
     lines.push(Line::styled("VIKRAM", theme.title()));
-    for block in &message.blocks {
+    for (block_index, block) in message.blocks.iter().enumerate() {
+        let key = (message_index, block_index);
         match block {
             Block::Text { text, .. } => lines.extend(markdown::markdown_lines(text, width, theme)),
-            Block::Reasoning { text, .. } => {
-                push_reasoning(lines, text, expanded_thought, false, width, theme)
-            }
+            Block::Reasoning { text, .. } => push_reasoning(
+                lines,
+                text,
+                session.thought_expanded(key),
+                false,
+                key,
+                marks,
+                width,
+                theme,
+            ),
             Block::ToolCall { call } => push_tool_call(lines, call, width, theme),
             Block::ToolResult { content, ok, .. } => {
                 push_tool_body(lines, &[content.as_str()], *ok, width, theme);
@@ -211,21 +287,31 @@ fn push_assistant(
 fn push_system(
     lines: &mut Vec<Line<'static>>,
     message: &Message,
-    expanded_thought: bool,
+    message_index: usize,
+    session: &SessionView,
+    marks: &mut Vec<(usize, u16, ThoughtKey)>,
     width: usize,
     theme: &Theme,
 ) {
     lines.push(Line::from(""));
     lines.push(Line::styled(dim_label(theme, "system"), theme.muted()));
     let style = theme.muted();
-    for block in &message.blocks {
+    for (block_index, block) in message.blocks.iter().enumerate() {
+        let key = (message_index, block_index);
         match block {
             Block::Text { text, .. } => {
                 lines.extend(markdown::markdown_lines_styled(text, width, theme, style))
             }
-            Block::Reasoning { text, .. } => {
-                push_reasoning(lines, text, expanded_thought, false, width, theme)
-            }
+            Block::Reasoning { text, .. } => push_reasoning(
+                lines,
+                text,
+                session.thought_expanded(key),
+                false,
+                key,
+                marks,
+                width,
+                theme,
+            ),
             Block::ToolCall { call } => push_tool_call(lines, call, width, theme),
             Block::ToolResult { content, ok, .. } => {
                 push_tool_body(lines, &[content.as_str()], *ok, width, theme);
@@ -267,6 +353,8 @@ fn push_reasoning(
     text: &str,
     expanded: bool,
     live: bool,
+    key: ThoughtKey,
+    marks: &mut Vec<(usize, u16, ThoughtKey)>,
     width: usize,
     theme: &Theme,
 ) {
@@ -274,10 +362,15 @@ fn push_reasoning(
     if text.trim().is_empty() {
         return;
     }
+    let heading = if expanded { "Thoughts" } else { "Thought" };
+    let heading_text = format!("{} {heading}", theme.thought_glyph());
+    // Only the label folds the block, so a drag that starts on the text after it is still a copy.
+    marks.push((lines.len(), heading_text.width() as u16, key));
     if expanded {
         lines.push(Line::from(vec![
-            Span::styled(format!("{} Thoughts", theme.thought_glyph()), label),
+            Span::styled(heading_text, label),
             Span::styled(format!(" {} Ctrl+T folds", theme.bullet()), theme.muted()),
+            Span::styled(" · click", Style::default().fg(theme.faint)),
         ]));
         lines.extend(markdown::markdown_lines(text, width, theme));
         return;
@@ -298,8 +391,9 @@ fn push_reasoning(
     }
     detail.push_str(&format!(" {} Ctrl+T opens", theme.bullet()));
     lines.push(Line::from(vec![
-        Span::styled(format!("{} Thought", theme.thought_glyph()), label),
+        Span::styled(heading_text, label),
         Span::styled(format!("  {detail}"), theme.muted()),
+        Span::styled(" · click", Style::default().fg(theme.faint)),
     ]));
 }
 
@@ -860,15 +954,15 @@ mod tests {
         let theme = Theme::new(false);
         let long = "shell · ls -la /very/long/path/that/wraps/to/two/lines/and/beyond";
 
-        let mut collapsed = App::new(false);
+        let collapsed_app = App::new(false);
         let mut s1 = sample_session();
         s1.activity.push(Activity { kind: ActivityKind::Tool, text: long.into(), call: None, ok: Some(true), expanded: false });
-        let collapsed = conversation_lines(&collapsed, &s1, 40, &theme);
+        let collapsed = conversation_lines(&collapsed_app, &s1, 40, &theme);
 
-        let mut expanded = App::new(false);
+        let expanded_app = App::new(false);
         let mut s2 = sample_session();
         s2.activity.push(Activity { kind: ActivityKind::Tool, text: long.into(), call: None, ok: Some(true), expanded: true });
-        let expanded = conversation_lines(&expanded, &s2, 40, &theme);
+        let expanded = conversation_lines(&expanded_app, &s2, 40, &theme);
 
         assert!(
             expanded.len() > collapsed.len(),
@@ -899,7 +993,9 @@ mod tests {
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| conversation(frame, frame.area(), &app, &session, &theme))
+            .draw(|frame| {
+                conversation(frame, frame.area(), &app, &session, &theme);
+            })
             .expect("draw");
     }
 
@@ -918,7 +1014,9 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| conversation(frame, frame.area(), &app, &session, &theme))
+            .draw(|frame| {
+                conversation(frame, frame.area(), &app, &session, &theme);
+            })
             .expect("draw");
         let buffer = terminal.backend().buffer().clone();
         let rendered: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
@@ -935,7 +1033,9 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| conversation(frame, frame.area(), &app, &session, &theme))
+            .draw(|frame| {
+                conversation(frame, frame.area(), &app, &session, &theme);
+            })
             .expect("draw");
 
         let mut scrolled = sample_session();
@@ -949,7 +1049,9 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| conversation(frame, frame.area(), &app, &scrolled, &theme))
+            .draw(|frame| {
+                conversation(frame, frame.area(), &app, &scrolled, &theme);
+            })
             .expect("draw");
     }
 

@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use vikram_runtime::types::TaskState;
 
-use crate::app::{ActivityKind, App, Focus, InspectorKind, Overlay, TabHit};
+use crate::app::{ActivityKind, App, Focus, InspectorKind, Overlay, Selection, TabHit};
 use crate::theme::{StatusSegment, Theme};
 
 /// A tab is a reminder of what exists, not a synopsis of the session.
@@ -1079,6 +1079,33 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         width,
         height,
     )
+}
+
+/// Paint the drag that is selecting text. Reversing the cells is the terminal's own way of marking
+/// a selection, so no colour is invented and the text stays readable under any theme.
+pub fn selection_overlay(frame: &mut Frame, selection: Selection) {
+    if selection.is_click() {
+        return;
+    }
+    let buffer = frame.buffer_mut();
+    let area = buffer.area;
+    let ((_, sy), (_, ey)) = selection.ordered();
+    let last_row = area.y + area.height.saturating_sub(1);
+    let last_col = area.x + area.width.saturating_sub(1);
+    for row in sy.max(area.y)..=ey.min(last_row) {
+        let Some((start, end)) = selection.span(row) else {
+            continue;
+        };
+        let start = start.max(area.x);
+        let end = end.min(last_col);
+        if start > end {
+            continue;
+        }
+        for x in start..=end {
+            let cell = &mut buffer[(x, row)];
+            cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+        }
+    }
 }
 
 #[cfg(test)]

@@ -43,6 +43,23 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
+    // Copy comes before stop: `Ctrl+Shift+C` with a drag on screen is the operator taking the text,
+    // and a stop here would throw the turn away instead.
+    if ctrl
+        && shift
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        if app.selection.is_some_and(|s| !s.is_click()) {
+            app.copy_selection();
+        } else {
+            app.push_notice(
+                vikram_runtime::types::NoticeLevel::Info,
+                "drag to select text first",
+            );
+        }
+        return true;
+    }
+
     // ---- global shortcuts ------------------------------------------------
     match key.code {
         KeyCode::Char('c') if ctrl => {
@@ -102,6 +119,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 return true;
             };
             session.expanded_thought = !session.expanded_thought;
+            // A block the operator folded by hand keeps its own answer only until the session-wide
+            // toggle is asked for; then every block follows the one switch again.
+            session.thought_folds.clear();
             let state = if session.expanded_thought {
                 "thinking shown"
             } else {
@@ -1001,12 +1021,14 @@ fn handle_picker_overlay(app: &mut App, mut picker: Picker, key: KeyEvent) -> bo
             app.overlay = Some(Overlay::Picker(picker));
             true
         }
-        KeyCode::Char('d') if ctrl => {
+        // A panel's own verb wins over the page-scroll shortcut, otherwise a declared key such as
+        // the memory panel's `Ctrl+D` could never reach the host.
+        KeyCode::Char('d') if ctrl && picker.kind.verb_for_key('d').is_none() => {
             picker.move_by(5);
             app.overlay = Some(Overlay::Picker(picker));
             true
         }
-        KeyCode::Char('u') if ctrl => {
+        KeyCode::Char('u') if ctrl && picker.kind.verb_for_key('u').is_none() => {
             picker.move_by(-5);
             app.overlay = Some(Overlay::Picker(picker));
             true
@@ -1793,7 +1815,8 @@ mod tests {
             let mut app = app_with_session();
             app.overlay = Some(panel(kind, &[("row", "value")]));
             handle_key(&mut app, ctrl(KeyCode::Char(key)));
-            let got = act_of(&mut app).expect("a declared verb has to reach the host");
+            let got = act_of(&mut app)
+                .unwrap_or_else(|| panic!("ctrl+{key} on {} reached nobody", kind.as_str()));
             assert_eq!(got.0, kind, "ctrl+{key} on {}", kind.as_str());
             assert_eq!(got.1, verb, "ctrl+{key} on {}", kind.as_str());
         }

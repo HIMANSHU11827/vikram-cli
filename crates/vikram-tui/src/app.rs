@@ -5,7 +5,7 @@
 //! applies to the runtime; runtime observations arrive as [`RuntimeEvent`]s and are folded in here.
 
 use crate::editor::Editor;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use vikram_contracts::{
     AgentId, ApprovalId, Message, PermissionMode, SessionId, ToolCallId, TurnId,
@@ -36,6 +36,64 @@ pub struct TabHit {
     pub tab_x_end: u16,
     pub close_x_start: u16,
     pub close_x_end: u16,
+}
+
+/// Which thinking block a fold belongs to: its message and the index of the block inside it.
+/// A stream that has not been committed to a message yet gets [`STREAMING_THOUGHT`].
+pub type ThoughtKey = (usize, usize);
+pub const STREAMING_THOUGHT: ThoughtKey = (usize::MAX, 0);
+
+/// The header line of a thinking block, as it was drawn. The draw writes it and the mouse reads it,
+/// so a click names the block it landed on instead of guessing at the geometry.
+#[derive(Clone, Copy, Debug)]
+pub struct ThoughtHit {
+    pub row: u16,
+    pub x_start: u16,
+    pub x_end: u16,
+    pub key: ThoughtKey,
+}
+
+/// A drag across the transcript. Screen coordinates, not transcript lines: the anchor names the
+/// cell the press landed on, so a selection survives the transcript scrolling under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: (u16, u16),
+    pub cursor: (u16, u16),
+}
+
+impl Selection {
+    pub fn new(anchor: (u16, u16)) -> Self {
+        Self {
+            anchor,
+            cursor: anchor,
+        }
+    }
+
+    /// Anchor and cursor in drawing order, so a drag up-left reads the same as one down-right.
+    pub fn ordered(&self) -> ((u16, u16), (u16, u16)) {
+        let (a, c) = (self.anchor, self.cursor);
+        if (a.1, a.0) <= (c.1, c.0) {
+            (a, c)
+        } else {
+            (c, a)
+        }
+    }
+
+    /// A press that never moved. It selects nothing, so it must not clobber the clipboard.
+    pub fn is_click(&self) -> bool {
+        self.anchor == self.cursor
+    }
+
+    /// The columns highlighted on `row`, or `None` when the row is outside the drag.
+    pub fn span(&self, row: u16) -> Option<(u16, u16)> {
+        let ((sx, sy), (ex, ey)) = self.ordered();
+        if row < sy || row > ey {
+            return None;
+        }
+        let start = if row == sy { sx } else { 0 };
+        let end = if row == ey { ex } else { u16::MAX };
+        Some((start, end))
+    }
 }
 
 pub const THINKING_FRAMES: [&str; 6] = ["·", "✢", "✳", "✶", "✻", "✽"];
@@ -269,6 +327,9 @@ pub struct SessionView {
     pub expanded_activities: std::collections::HashSet<usize>,
     pub selected_activity: Option<usize>,
     pub expanded_thought: bool,
+    /// Folds the operator set by clicking a header, keyed by block. `expanded_thought` stays the
+    /// default, so `Ctrl+T` still folds or unfolds every block at once.
+    pub thought_folds: HashMap<ThoughtKey, bool>,
     pub unread: usize,
 }
 
@@ -295,8 +356,24 @@ impl SessionView {
             expanded_activities: std::collections::HashSet::new(),
             selected_activity: None,
             expanded_thought: false,
+            thought_folds: HashMap::new(),
             unread: 0,
         }
+    }
+
+    /// Whether one thinking block is open. A block the operator clicked answers for itself; every
+    /// other block follows the session-wide default.
+    pub fn thought_expanded(&self, key: ThoughtKey) -> bool {
+        self.thought_folds
+            .get(&key)
+            .copied()
+            .unwrap_or(self.expanded_thought)
+    }
+
+    /// Flip one block, leaving the others where they were.
+    pub fn toggle_thought(&mut self, key: ThoughtKey) {
+        let next = !self.thought_expanded(key);
+        self.thought_folds.insert(key, next);
     }
 
     pub fn is_busy(&self) -> bool {
@@ -395,6 +472,16 @@ pub struct App {
     /// draw writes it and the mouse reads it, which is the only way a click can name a row.
     pub picker_rows: Vec<(u16, usize)>,
     pub picker_x: Option<(u16, u16)>,
+    /// Where each thinking block's header was drawn, recomputed each draw. Cleared with the rest of
+    /// the hit regions so a stale row can never fold the wrong block.
+    pub thought_hits: Vec<ThoughtHit>,
+    /// The drag in progress, if any. Screen coordinates, so it survives scrolling underneath.
+    pub selection: Option<Selection>,
+    /// The last drawn frame as plain text, one string per row. A drag copies from this, because the
+    /// cells on screen are exactly what the operator pointed at.
+    pub screen: Vec<String>,
+    /// Text a copy produced, waiting for the host to hand it to the system clipboard.
+    pub clipboard: Option<String>,
 }
 
 impl App {
@@ -432,7 +519,80 @@ impl App {
             pending_agent: None,
             picker_rows: Vec::new(),
             picker_x: None,
+            thought_hits: Vec::new(),
+            selection: None,
+            screen: Vec::new(),
+            clipboard: None,
         }
+    }
+
+    /// Remember the frame that was just drawn. The host calls this right after drawing, so a drag
+    /// copies the cells the operator actually sees rather than a re-render that may have moved.
+    pub fn capture_screen(&mut self, buffer: &ratatui::buffer::Buffer) {
+        let area = buffer.area;
+        self.screen.clear();
+        self.screen.reserve(area.height as usize);
+        for y in area.y..area.y.saturating_add(area.height) {
+            let mut row = String::with_capacity(area.width as usize);
+            for x in area.x..area.x.saturating_add(area.width) {
+                row.push_str(buffer[(x, y)].symbol());
+            }
+            self.screen.push(row);
+        }
+    }
+
+    /// The selected cells as text, with trailing blanks trimmed and a blank row dropped at each end
+    /// of a multi-row drag. `None` when nothing is selected or the drag covers only spaces.
+    pub fn selection_text(&self) -> Option<String> {
+        let selection = self.selection?;
+        if selection.is_click() {
+            return None;
+        }
+        let ((_, sy), (_, ey)) = selection.ordered();
+        let mut rows: Vec<String> = Vec::new();
+        for y in sy..=ey {
+            let Some((start, end)) = selection.span(y) else {
+                continue;
+            };
+            let Some(line) = self.screen.get(y as usize) else {
+                continue;
+            };
+            let len = line.chars().count();
+            let start = (start as usize).min(len);
+            let end = (end as usize).saturating_add(1).min(len);
+            if start >= end {
+                continue;
+            }
+            let slice: String = line.chars().skip(start).take(end - start).collect();
+            rows.push(slice.trim_end().to_string());
+        }
+        let text = rows.join("\n");
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    /// Ask the host to copy the selection. The interface never touches the clipboard itself.
+    pub fn copy_selection(&mut self) {
+        if let Some(text) = self.selection_text() {
+            let chars = text.chars().count();
+            self.clipboard = Some(text);
+            self.push_notice(NoticeLevel::Info, format!("copied {chars} chars"));
+        }
+    }
+
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.clipboard.take()
+    }
+
+    /// The folding header a click landed on, if it landed on one.
+    pub fn thought_at(&self, x: u16, y: u16) -> Option<ThoughtKey> {
+        self.thought_hits
+            .iter()
+            .find(|hit| hit.row == y && x >= hit.x_start && x <= hit.x_end)
+            .map(|hit| hit.key)
     }
 
     /// Open the one-line field. The editor starts empty; the hint says what Enter will do, because a
@@ -1060,5 +1220,95 @@ mod tests {
         });
         assert!(app.overlay.is_none());
         assert_eq!(app.models, vec!["gpt-5.2".to_owned()]);
+    }
+}
+
+#[cfg(test)]
+mod selection_and_folds {
+    use super::*;
+
+    fn app_with_rows(rows: &[&str]) -> App {
+        let mut app = App::new(false);
+        app.screen = rows.iter().map(|row| (*row).to_owned()).collect();
+        app
+    }
+
+    #[test]
+    fn a_drag_copies_the_cells_it_covered_and_nothing_else() {
+        let mut app = app_with_rows(&["hello world", "second line here"]);
+        app.selection = Some(Selection {
+            anchor: (6, 0),
+            cursor: (3, 1),
+        });
+        assert_eq!(
+            app.selection_text().as_deref(),
+            Some("world\nseco")
+        );
+    }
+
+    #[test]
+    fn a_drag_upwards_reads_the_same_as_the_same_drag_downwards() {
+        let up = Selection {
+            anchor: (6, 0),
+            cursor: (3, 1),
+        };
+        let down = Selection {
+            anchor: (3, 1),
+            cursor: (6, 0),
+        };
+        assert_eq!(up.ordered(), down.ordered());
+        let mut app = app_with_rows(&["hello world", "second line here"]);
+        app.selection = Some(up);
+        let one = app.selection_text();
+        app.selection = Some(down);
+        assert_eq!(one, app.selection_text());
+    }
+
+    #[test]
+    fn a_press_that_never_moved_copies_nothing() {
+        let mut app = app_with_rows(&["hello"]);
+        app.selection = Some(Selection::new((2, 0)));
+        assert!(app.selection_text().is_none());
+        app.copy_selection();
+        assert!(app.take_clipboard().is_none());
+    }
+
+    #[test]
+    fn a_clicked_header_folds_only_its_own_block() {
+        let mut app = App::new(false);
+        app.thought_hits = vec![
+            ThoughtHit {
+                row: 4,
+                x_start: 0,
+                x_end: 8,
+                key: (0, 0),
+            },
+            ThoughtHit {
+                row: 9,
+                x_start: 0,
+                x_end: 8,
+                key: (2, 1),
+            },
+        ];
+        assert_eq!(app.thought_at(3, 4), Some((0, 0)));
+        assert_eq!(app.thought_at(3, 7), None, "the row beyond the label is text");
+        assert_eq!(app.thought_at(3, 9), Some((2, 1)));
+
+        let mut session = SessionView::from_snapshot(SessionSnapshot {
+            id: SessionId::generate(),
+            title: "s".to_owned(),
+            cwd: PathBuf::from("/"),
+            model: None,
+            messages: Vec::new(),
+            turn: TurnState::Idle,
+            tokens: Default::default(),
+            created_ms: 0,
+            updated_ms: 0,
+            agent: None,
+            queued: 0,
+        });
+        session.toggle_thought((0, 0));
+        assert!(session.thought_expanded((0, 0)));
+        assert!(!session.thought_expanded((2, 1)), "the other block is untouched");
     }
 }

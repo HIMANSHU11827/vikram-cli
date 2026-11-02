@@ -248,6 +248,18 @@ pub fn find(word: &str) -> Option<&'static Command> {
         .find(|command| command.name == word || command.aliases.contains(&word.as_str()))
 }
 
+/// The command the operator most likely meant when the word they typed is not one. A singular for a
+/// plural it knows, or a prefix of one: `/session` finds `/sessions`, `/ski` finds `/skills`.
+pub fn nearest(word: &str) -> Option<&'static Command> {
+    let word = word.trim().trim_start_matches('/').to_lowercase();
+    if word.is_empty() {
+        return None;
+    }
+    COMMANDS.iter().find(|command| {
+        command.name.starts_with(&word) || word.starts_with(command.name)
+    })
+}
+
 /// The commands whose name starts with `prefix`, in table order. Used by the inline `/` popup.
 pub fn starting_with(prefix: &str) -> Vec<&'static Command> {
     let prefix = prefix.trim().trim_start_matches('/').to_lowercase();
