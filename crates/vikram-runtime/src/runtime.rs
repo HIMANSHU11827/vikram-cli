@@ -297,10 +297,7 @@ impl RuntimeInner {
     }
 
     pub fn tool_context(&self) -> ToolContext {
-        ToolContext::new(
-            self.workspace_root.clone(),
-            &self.config.security.sandbox,
-        )
+        ToolContext::new(self.workspace_root.clone(), &self.config.security.sandbox)
     }
 
     pub fn tools(&self) -> &crate::tools::ToolRegistry {
@@ -1106,9 +1103,7 @@ impl RuntimeHandle {
                     *provider_slot = Some(Arc::new(provider) as Arc<dyn Provider>);
                     self.inner.emit(RuntimeEvent::Notice {
                         level: NoticeLevel::Info,
-                        text: format!(
-                            "provider connected for `{model}`; turns can start now"
-                        ),
+                        text: format!("provider connected for `{model}`; turns can start now"),
                     });
                 }
                 _ => {
@@ -1878,6 +1873,7 @@ impl RuntimeHandle {
         &self,
         hive: &vikram_contracts::HiveId,
         initial: &str,
+        parallel: bool,
     ) -> Result<Vec<vikram_store::HiveMessageRow>> {
         use futures_util::StreamExt;
         let _ = self
@@ -1914,19 +1910,29 @@ impl RuntimeHandle {
             .ok_or_else(|| RuntimeError::InvalidState("no provider configured".into()))?;
         let model = self.inner.model();
 
-        for ent in &entities {
-            let ctx = self.inner.context.load_agent_or_bot(ent);
+        // Shared transcript snapshot taken before this run (used by the parallel mode so every
+        // participant sees the same starting context).
+        let base_msgs = self
+            .inner
+            .hive
+            .messages(hive)
+            .map_err(RuntimeError::InvalidState)?;
+
+        // Helper: collect one participant's response given a transcript snapshot.
+        async fn collect_one(
+            inner: &Arc<RuntimeInner>,
+            provider: &Arc<dyn Provider>,
+            model: &str,
+            ent: &vikram_store::EntityRow,
+            msgs: &[vikram_store::HiveMessageRow],
+        ) -> String {
+            let ctx = inner.context.load_agent_or_bot(ent);
             let system_text = ctx.render();
-            let msgs = self
-                .inner
-                .hive
-                .messages(hive)
-                .map_err(RuntimeError::InvalidState)?;
             let mut request_messages: Vec<vikram_contracts::Message> = Vec::new();
             if !system_text.trim().is_empty() {
                 request_messages.push(vikram_contracts::Message::system(system_text));
             }
-            for m in &msgs {
+            for m in msgs {
                 let role = if m.sender == ent.name || m.sender == ent.slug {
                     vikram_contracts::Role::Assistant
                 } else {
@@ -1939,13 +1945,14 @@ impl RuntimeHandle {
                 ));
             }
             let request = crate::provider::CompletionRequest {
-                model: model.clone(),
+                model: model.to_owned(),
                 messages: request_messages,
                 tools: Vec::new(),
-                max_output_tokens: self.inner.config.max_output_tokens,
+                max_output_tokens: inner.config.max_output_tokens,
             };
             let mut stream = provider.stream(request);
             let mut collected = String::new();
+            use futures_util::StreamExt;
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(crate::provider::ProviderEvent::TextDelta(t)) => collected.push_str(&t),
@@ -1954,12 +1961,51 @@ impl RuntimeHandle {
                     Err(_) => break,
                 }
             }
-            if !collected.trim().is_empty() {
-                let ts = now_ms();
-                self.inner
+            collected
+        }
+
+        if parallel {
+            // Issue all participant requests concurrently, then append responses in order.
+            let mut handles = Vec::new();
+            for ent in &entities {
+                let inner = Arc::clone(&self.inner);
+                let provider = Arc::clone(&provider);
+                let model = model.clone();
+                let ent = ent.clone();
+                let msgs = base_msgs.clone();
+                handles.push(tokio::spawn(async move {
+                    collect_one(&inner, &provider, &model, &ent, &msgs).await
+                }));
+            }
+            let mut responses: Vec<String> = Vec::new();
+            for h in handles {
+                responses.push(h.await.unwrap_or_default());
+            }
+            for (ent, resp) in entities.iter().zip(responses.iter()) {
+                if !resp.trim().is_empty() {
+                    let ts = now_ms();
+                    self.inner
+                        .hive
+                        .append_message(hive, &ent.name, ent.kind.as_str(), resp, None, ts)
+                        .map_err(RuntimeError::InvalidState)?;
+                }
+            }
+        } else {
+            // Sequential: each participant sees prior responses.
+            for ent in &entities {
+                let msgs = self
+                    .inner
                     .hive
-                    .append_message(hive, &ent.name, ent.kind.as_str(), &collected, None, ts)
+                    .messages(hive)
                     .map_err(RuntimeError::InvalidState)?;
+                let resp = collect_one(&self.inner, &provider, &model, ent, &msgs).await;
+                if !resp.trim().is_empty() {
+                    let ts = now_ms();
+                    self.inner
+                        .hive
+                        .append_message(hive, &ent.name, ent.kind.as_str(), &resp, None, ts)
+                        .map_err(RuntimeError::InvalidState)?;
+                }
             }
         }
 

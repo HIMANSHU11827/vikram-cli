@@ -529,11 +529,27 @@ impl PluginRegistry {
         let args = args.to_args();
 
         let mut cmd = if entry.ends_with(".py") {
-            let mut c = std::process::Command::new("python3");
+            // Prefer python3, fall back to python (Windows often only has `python`).
+            let interpreter = if crate::computer::which("python3").is_some() {
+                "python3"
+            } else {
+                "python"
+            };
+            let mut c = std::process::Command::new(interpreter);
             c.arg(&entry_path);
             c
         } else if entry.ends_with(".sh") {
-            let mut c = std::process::Command::new("sh");
+            // Shell scripts need a POSIX shell; on Windows try bash (Git Bash/MSYS) then sh.
+            let interpreter = if cfg!(windows) {
+                if crate::computer::which("bash").is_some() {
+                    "bash"
+                } else {
+                    "sh"
+                }
+            } else {
+                "sh"
+            };
+            let mut c = std::process::Command::new(interpreter);
             c.arg(&entry_path);
             c
         } else if entry.ends_with(".js") {
@@ -1566,7 +1582,22 @@ fn is_executable(path: &Path) -> bool {
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        if !path.is_file() {
+            return false;
+        }
+        if cfg!(windows) {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| format!(".{}", e.to_uppercase()))
+                .unwrap_or_default();
+            if ext.is_empty() {
+                return true;
+            }
+            let pathext =
+                std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_owned());
+            return pathext.split(';').any(|e| e.eq_ignore_ascii_case(&ext));
+        }
         true
     }
 }

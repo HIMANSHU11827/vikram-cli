@@ -135,6 +135,11 @@ enum Command {
         #[command(subcommand)]
         action: TicketsAction,
     },
+    /// Manage learning proposals and policies.
+    Learning {
+        #[command(subcommand)]
+        action: LearningAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -203,12 +208,34 @@ enum HiveAction {
         sender: String,
         content: String,
     },
-    /// Run a Hive conversation (sequential) with an initial prompt.
-    Run { hive: String, message: String },
+    /// Run a Hive conversation with an initial prompt.
+    Run {
+        hive: String,
+        message: String,
+        #[arg(long)]
+        parallel: bool,
+    },
     /// Delete a Hive session.
     Rm { id: String },
 }
 
+#[derive(Debug, Subcommand)]
+enum LearningAction {
+    /// Show learning policies and counts.
+    Status,
+    /// List pending proposals.
+    Pending,
+    /// Show a proposal by id.
+    Show { id: String },
+    /// Approve a proposal (apply it).
+    Approve { id: String },
+    /// Reject a proposal.
+    Reject { id: String },
+    /// Show audit history.
+    History,
+    /// Set a policy: memory|skill <auto|approval|suggest|disabled>.
+    SetPolicy { kind: String, policy: String },
+}
 #[derive(Debug, Subcommand)]
 enum TicketsAction {
     /// List tickets.
@@ -439,6 +466,7 @@ fn main() -> std::process::ExitCode {
         Command::Profiles { action } => profiles(action),
         Command::Entities { action } => entities(action),
         Command::Hive { action } => run_async(hive(action)),
+        Command::Learning { action } => learning(action),
         Command::Tickets { action } => tickets(action),
     }
 }
@@ -1111,7 +1139,11 @@ async fn hive(action: HiveAction) -> Result<(), String> {
             store.append_hive_message(&msg).map_err(|e| e.to_string())?;
             println!("sent");
         }
-        HiveAction::Run { hive, message } => {
+        HiveAction::Run {
+            hive,
+            message,
+            parallel,
+        } => {
             // Run requires a live runtime/provider; use the runtime handle.
             let rt = vikram_runtime::Runtime::start(
                 vikram_runtime::Config::load().map_err(|e| e.to_string())?,
@@ -1121,7 +1153,7 @@ async fn hive(action: HiveAction) -> Result<(), String> {
             let handle = rt.handle();
             let hid = vikram_contracts::HiveId::new(hive);
             let transcript = handle
-                .hive_run(&hid, &message)
+                .hive_run(&hid, &message, parallel)
                 .await
                 .map_err(|e| e.to_string())?;
             for m in transcript {
@@ -1347,6 +1379,96 @@ fn tickets(action: TicketsAction) -> std::process::ExitCode {
     exit(result)
 }
 
+fn learning(action: LearningAction) -> std::process::ExitCode {
+    let result = (|| -> Result<(), String> {
+        let path = vikram_runtime::config::vikram_home().join("learning.json");
+        let mgr = vikram_runtime::LearningManager::open(Some(path.clone()));
+        match action {
+            LearningAction::Status => {
+                println!("memory policy: {}", mgr.policy_memory().as_str());
+                println!("skill policy: {}", mgr.policy_skill().as_str());
+                println!("pending proposals: {}", mgr.pending_proposals().len());
+                println!("audit entries: {}", mgr.audit_log().len());
+            }
+            LearningAction::Pending => {
+                let props = mgr.pending_proposals();
+                if props.is_empty() {
+                    println!("no pending proposals");
+                }
+                for p in props {
+                    println!("{}  {}  {}  {}", p.id, p.kind, p.target, p.action);
+                    println!("  reason: {}", p.reason);
+                    println!("  content: {}", p.content);
+                }
+            }
+            LearningAction::Show { id } => match mgr.find_proposal(&id) {
+                Some(p) => println!("{}", serde_json::to_string_pretty(&p).unwrap_or_default()),
+                None => println!("not found"),
+            },
+            LearningAction::Approve { id } => {
+                if let Some(p) = mgr.find_proposal(&id) {
+                    if p.kind == "memory" {
+                        let scope = if p.target == "user" { "user" } else { "memory" };
+                        let mem = vikram_runtime::MemoryStore::open(
+                            vikram_runtime::config::database_path(),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        mem.save(&p.key, &p.content, scope)
+                            .map_err(|e| e.to_string())?;
+                    } else if p.kind == "skill" {
+                        let m = vikram_skills::Manager::new();
+                        let name = if p.target.is_empty() {
+                            "learned-skill"
+                        } else {
+                            &p.target
+                        };
+                        let _ = m.create(name, &p.reason, &p.content);
+                    }
+                    mgr.set_proposal_status(&id, "approved");
+                    mgr.audit(vikram_runtime::LearningAuditEntry {
+                        ts_ms: vikram_runtime::types::now_ms(),
+                        session: p.session.clone(),
+                        kind: p.kind.clone(),
+                        action: p.action.clone(),
+                        target: p.target.clone(),
+                        outcome: "applied".to_owned(),
+                        detail: "approved via cli".to_owned(),
+                    });
+                    mgr.save();
+                    println!("approved and applied {id}");
+                } else {
+                    return Err("proposal not found".to_owned());
+                }
+            }
+            LearningAction::Reject { id } => {
+                mgr.set_proposal_status(&id, "rejected");
+                mgr.save();
+                println!("rejected {id}");
+            }
+            LearningAction::History => {
+                for e in mgr.audit_log() {
+                    println!(
+                        "{}  {}  {}  {}  {}",
+                        e.ts_ms, e.kind, e.action, e.target, e.outcome
+                    );
+                }
+            }
+            LearningAction::SetPolicy { kind, policy } => {
+                let pol = vikram_runtime::LearningPolicy::parse(&policy);
+                match kind.as_str() {
+                    "memory" => mgr.set_policy_memory(pol),
+                    "skill" => mgr.set_policy_skill(pol),
+                    _ => return Err(format!("unknown kind {kind}")),
+                }
+                mgr.save();
+                println!("set {kind} policy to {}", pol.as_str());
+            }
+        }
+        Ok(())
+    })();
+    exit(result)
+}
+
 async fn mcp(action: McpAction) -> Result<(), String> {
     match action {
         McpAction::List => {}
@@ -1390,10 +1512,8 @@ impl vikram_mcp::server::ToolExecutor for ServeExecutor {
             .get(name)
             .ok_or_else(|| format!("tool not found: {name}"))?;
         let _ = tool.permission(&arguments).map_err(|e| e.to_string())?;
-        let ctx = vikram_runtime::tools::ToolContext::new(
-            self.workspace_root.clone(),
-            &self.sandbox,
-        );
+        let ctx =
+            vikram_runtime::tools::ToolContext::new(self.workspace_root.clone(), &self.sandbox);
         let output = tool.run(&arguments, &ctx).map_err(|e| e.to_string())?;
         let mut result = serde_json::json!({ "text": output.content });
         if !output.ok {

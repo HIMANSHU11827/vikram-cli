@@ -131,7 +131,11 @@ impl Sandbox {
                 {
                     return;
                 }
-                rewrap(cmd, "/usr/bin/sandbox-exec", vec!["-f".to_string(), profile.display().to_string()]);
+                rewrap(
+                    cmd,
+                    "/usr/bin/sandbox-exec",
+                    vec!["-f".to_string(), profile.display().to_string()],
+                );
             }
             SandboxMechanism::PassThrough => {}
         }

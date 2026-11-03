@@ -82,7 +82,10 @@ impl GrantSet {
     /// The only way in. Held by the host, not by operations or plugins. The grant must be inside
     /// the scope the approved ticket carries; anything wider is refused, never truncated.
     pub fn widen(&mut self, ticket: &ApprovalTicket, grant: Grant) -> Result<(), VikramError> {
-        if ticket.grant_within(grant.action, grant.scope.clone()).is_none() {
+        if ticket
+            .grant_within(grant.action, grant.scope.clone())
+            .is_none()
+        {
             return Err(VikramError::InvalidState(format!(
                 "grant `{:?}` {} exceeds the approved scope `{:?}` {}",
                 grant.action,
@@ -296,14 +299,18 @@ mod tests {
         let mut set = GrantSet::new(vec![], 0);
         let mut broker = ApprovalBroker::new();
         let ticket = broker
-            .issue(req(ActionKind::Write, "/work", Trust::User), ApprovalSource::User)
+            .issue(
+                req(ActionKind::Write, "/work", Trust::User),
+                ApprovalSource::User,
+            )
             .expect("user approval");
         let err = set
             .widen(&ticket, Grant::new(ActionKind::Write, "/etc"))
             .expect_err("out-of-scope grant must be refused");
         assert!(!err.to_string().contains("/work/grant"), "{err}");
         assert!(
-            !set.snapshot().permits(&req(ActionKind::Write, "/etc/passwd", Trust::User)),
+            !set.snapshot()
+                .permits(&req(ActionKind::Write, "/etc/passwd", Trust::User)),
             "nothing may have been added"
         );
     }
@@ -317,12 +324,16 @@ mod tests {
         let ticket = ticket.clone();
         assert!(broker.get(&id).is_some());
         assert_eq!(broker.revoke(&id), true);
-        assert!(broker.get(&id).is_none(), "revoked tickets must not be returned");
+        assert!(
+            broker.get(&id).is_none(),
+            "revoked tickets must not be returned"
+        );
         assert_eq!(broker.revoke(&id), false, "double revoke is a no-op");
 
         let mut set = GrantSet::new(vec![], 0);
         assert!(
-            set.widen(&ticket, Grant::new(ActionKind::Write, "/work")).is_ok(),
+            set.widen(&ticket, Grant::new(ActionKind::Write, "/work"))
+                .is_ok(),
             "an in-flight ticket still proves what was approved"
         );
     }
@@ -331,13 +342,19 @@ mod tests {
     fn a_ticket_id_is_generated_and_stable() {
         let mut broker = ApprovalBroker::new();
         let t1 = broker
-            .issue(req(ActionKind::Read, "/work", Trust::User), ApprovalSource::User)
+            .issue(
+                req(ActionKind::Read, "/work", Trust::User),
+                ApprovalSource::User,
+            )
             .unwrap()
             .id()
             .clone();
         assert!(!t1.as_str().is_empty());
         let t2 = broker
-            .issue(req(ActionKind::Read, "/docs", Trust::User), ApprovalSource::User)
+            .issue(
+                req(ActionKind::Read, "/docs", Trust::User),
+                ApprovalSource::User,
+            )
             .unwrap()
             .id()
             .clone();
@@ -368,11 +385,7 @@ mod tests {
                 ApprovalSource::User,
             )
             .unwrap();
-        set
-            .widen(
-                ticket,
-                Grant::new(ActionKind::Write, "/work"),
-            )
+        set.widen(ticket, Grant::new(ActionKind::Write, "/work"))
             .expect("ticket covers this grant");
         assert_eq!(stale.delegation_depth(), 1);
         assert!(

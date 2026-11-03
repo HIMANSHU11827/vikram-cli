@@ -462,7 +462,10 @@ pub fn restore_context(
             }
             RecordKind::Approval => {
                 // A parked turn resumes still parked: the request is what a human must answer.
-                if record.payload.get("state").and_then(serde_json::Value::as_str)
+                if record
+                    .payload
+                    .get("state")
+                    .and_then(serde_json::Value::as_str)
                     != Some("pending")
                 {
                     continue;
@@ -472,12 +475,7 @@ pub fn restore_context(
                     .get("verb")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("");
-                if let Some(parked) = ctx
-                    .pending
-                    .iter()
-                    .find(|p| p.request.verb == verb)
-                    .cloned()
-                {
+                if let Some(parked) = ctx.pending.iter().find(|p| p.request.verb == verb).cloned() {
                     ctx.awaiting = Some(parked.request);
                 }
             }
@@ -1247,7 +1245,9 @@ mod tests {
             .issue(request, crate::grants::ApprovalSource::User)
             .unwrap();
         let grant = ticket.grant_within(ActionKind::Write, "/work").unwrap();
-        grants.widen(ticket, grant).expect("ticket covers this grant");
+        grants
+            .widen(ticket, grant)
+            .expect("ticket covers this grant");
 
         let mut handler2 = CountingHandler::default();
         let mut ctx2 = context(grants.clone());

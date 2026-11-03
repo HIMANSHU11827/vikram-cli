@@ -281,21 +281,17 @@ impl MandatoryFloor {
             } else {
                 std::path::Path::new(root).join(&path)
             };
-            let within_root =
-                canonical.starts_with(root) && !escapes_root(&canonical, root);
+            let within_root = canonical.starts_with(root) && !escapes_root(&canonical, root);
             let within_extra = self.extra_write_roots.iter().any(|extra| {
                 let extra = extra.trim_end_matches('/');
                 canonical == std::path::Path::new(extra)
-                    || canonical.starts_with(extra)
-                    && !escapes_root(&canonical, extra)
+                    || canonical.starts_with(extra) && !escapes_root(&canonical, extra)
             });
             let outside = !within_root && !within_extra;
             if outside {
                 return Some(format!(
                     "`{}` outside the workspace root `{root}` ({:?} {})",
-                    req.verb,
-                    req.action,
-                    req.resource,
+                    req.verb, req.action, req.resource,
                 ));
             }
         }
@@ -324,7 +320,7 @@ fn escapes_root(path: &std::path::Path, root: &str) -> bool {
     false
 }
 
-    /// The resource as a filesystem path, for actions whose side effects are confined to the
+/// The resource as a filesystem path, for actions whose side effects are confined to the
 /// workspace. `Execute` counts when the command itself is an absolute path (a bare program name
 /// like `cargo` is not a path and is not confinable this way); `Network` counts only for
 /// `file://` — remote hosts are outside any filesystem root by definition and are governed by
@@ -638,10 +634,10 @@ mod tests {
             vikram_contracts::SideEffect::LocalMutation,
             Trust::Model,
         );
-        assert!(matches!(
-            policy.evaluate(&req),
-            Decision::Deny { .. }
-        ), "/usr/bin/danger is not a workspace path");
+        assert!(
+            matches!(policy.evaluate(&req), Decision::Deny { .. }),
+            "/usr/bin/danger is not a workspace path"
+        );
     }
 
     #[test]
@@ -673,10 +669,7 @@ mod tests {
             vikram_contracts::SideEffect::LocalMutation,
             Trust::Model,
         );
-        assert!(matches!(
-            policy.evaluate(&req),
-            Decision::Deny { .. }
-        ));
+        assert!(matches!(policy.evaluate(&req), Decision::Deny { .. }));
     }
 
     #[test]
@@ -687,10 +680,7 @@ mod tests {
             resource: crate::ResourcePattern::Any,
             outcome: RuleOutcome::Allow,
         };
-        let policy = Policy::new(
-            vec![rule],
-            MandatoryFloor::default(),
-        );
+        let policy = Policy::new(vec![rule], MandatoryFloor::default());
         assert!(
             !matches!(
                 policy.evaluate(&fs_write("/work/a.txt", Trust::User)),

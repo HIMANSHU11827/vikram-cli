@@ -85,16 +85,8 @@ impl VerificationPlan {
     pub fn cargo() -> Self {
         Self {
             steps: vec![
-                PlanStep::new(
-                    "build",
-                    "cargo build --workspace",
-                    Duration::from_secs(600),
-                ),
-                PlanStep::new(
-                    "test",
-                    "cargo test --workspace",
-                    Duration::from_secs(600),
-                ),
+                PlanStep::new("build", "cargo build --workspace", Duration::from_secs(600)),
+                PlanStep::new("test", "cargo test --workspace", Duration::from_secs(600)),
             ],
         }
     }
@@ -190,7 +182,12 @@ fn shell_cmd(command: &str) -> Command {
 }
 
 fn wait_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process::Output> {
-    use std::io::Read;    let mut child = cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().ok()?;
+    use std::io::Read;
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(Some(_)) = child.try_wait() {
@@ -332,11 +329,7 @@ pub fn isolate_attempts(workspace_root: &Path, base: &str) -> Result<Option<Path
     if !ok {
         return Ok(None);
     }
-    let dir = std::env::temp_dir().join(format!(
-        "vikram-verify-{}-{}",
-        std::process::id(),
-        base
-    ));
+    let dir = std::env::temp_dir().join(format!("vikram-verify-{}-{}", std::process::id(), base));
     let out = Command::new("git")
         .arg("-C")
         .arg(workspace_root)
@@ -357,8 +350,12 @@ pub fn remove_isolation(isolate_dir: &Path) {
     let _ = Command::new("git")
         .arg("-C")
         .arg(isolate_dir)
-        .args(["worktree", "remove", "--force",
-            isolate_dir.to_string_lossy().as_ref()])
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            isolate_dir.to_string_lossy().as_ref(),
+        ])
         .output();
 }
 
@@ -392,18 +389,13 @@ mod tests {
         let counter = dir.join("attempts.txt");
         let counter_for_repair = counter.clone();
         let plan = VerificationPlan {
-            steps: vec![PlanStep::new(
-                "check",
-                "test -f marker.txt",
-                Duration::from_secs(5),
-            ),
-            PlanStep::new("all-ok", "true", Duration::from_secs(5))],
+            steps: vec![
+                PlanStep::new("check", "test -f marker.txt", Duration::from_secs(5)),
+                PlanStep::new("all-ok", "true", Duration::from_secs(5)),
+            ],
         };
         let outcome = verify(&dir, &plan, &Budget::attempts(3), |_, _| {
-            let seen = counter_for_repair
-                .metadata()
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let seen = counter_for_repair.metadata().map(|m| m.len()).unwrap_or(0);
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -451,17 +443,17 @@ mod tests {
                 Duration::from_secs(5),
             )],
         };
-        let outcome = verify(&dir, &plan, &Budget::attempts(5), |_, _| {
-            Some(Vec::new())
-        })
-        .unwrap();
+        let outcome = verify(&dir, &plan, &Budget::attempts(5), |_, _| Some(Vec::new())).unwrap();
         assert!(!outcome.ok);
         assert_eq!(outcome.attempts, 1, "no-change repair must not burn budget");
     }
 
     #[test]
     fn timeouts_are_classified_as_timeout() {
-        assert_eq!(FailureKind::classify("whatever", true), FailureKind::Timeout);
+        assert_eq!(
+            FailureKind::classify("whatever", true),
+            FailureKind::Timeout
+        );
         assert_eq!(
             FailureKind::classify("error[E0102]: dup", false),
             FailureKind::CompileError

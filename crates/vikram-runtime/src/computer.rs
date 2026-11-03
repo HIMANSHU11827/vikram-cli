@@ -85,9 +85,21 @@ pub fn which(name: &str) -> Option<PathBuf> {
         return None;
     }
     let path = std::env::var_os("PATH")?;
+    let candidates: Vec<String> = if cfg!(windows) && !name.contains('.') {
+        let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_owned());
+        std::iter::once(name.to_owned())
+            .chain(
+                exts.split(';')
+                    .filter(|e| !e.is_empty())
+                    .map(|e| format!("{name}{e}")),
+            )
+            .collect()
+    } else {
+        vec![name.to_owned()]
+    };
     std::env::split_paths(&path)
         .filter(|dir| !dir.as_os_str().is_empty())
-        .map(|dir| dir.join(name))
+        .flat_map(|dir| candidates.iter().map(move |c| dir.join(c)))
         .find(|candidate| is_executable(candidate))
 }
 
@@ -565,6 +577,10 @@ fn input_summary() -> String {
 
 /// A short report of which helpers exist and what they would be used for.
 pub fn status() -> String {
+    #[cfg(not(unix))]
+    {
+        return "desktop automation is not supported on this platform (Linux/X11/Wayland required).".to_owned();
+    }
     let detected = available();
     let missing: Vec<String> = HELPERS
         .iter()

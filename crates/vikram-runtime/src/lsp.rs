@@ -252,8 +252,13 @@ pub fn timeout_from_env() -> Duration {
 
 /// `file://` URI for a path, percent-encoding everything outside the unreserved set.
 pub fn path_to_uri(path: &Path) -> String {
+    // Normalise to a POSIX-style path so file:// URIs are valid on every OS.
+    let text = path.to_string_lossy().replace('\\', "/");
     let mut uri = String::from("file://");
-    let text = path.to_string_lossy();
+    // Windows drive letters need a leading slash: file:///C:/...
+    if cfg!(windows) && text.len() >= 2 && text.as_bytes()[1] == b':' {
+        uri.push('/');
+    }
     for byte in text.as_bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {

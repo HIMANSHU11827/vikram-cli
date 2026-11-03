@@ -13,6 +13,23 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// Output retained per session. Older bytes are dropped so a chatty process cannot exhaust memory.
 const MAX_BUFFER: usize = 256 * 1024;
 
+/// Platform-aware default interactive shell.
+fn default_shell() -> String {
+    #[cfg(windows)]
+    {
+        if let Ok(comspec) = std::env::var("COMSPEC") {
+            if !comspec.trim().is_empty() {
+                return comspec;
+            }
+        }
+        "powershell.exe".to_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        "sh".to_owned()
+    }
+}
+
 pub struct TerminalSession {
     pub id: String,
     pub shell: String,
@@ -77,7 +94,7 @@ pub fn open_named(
         .map(|s| s.to_owned())
         .or_else(|| std::env::var("SHELL").ok())
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "sh".to_owned());
+        .unwrap_or_else(default_shell);
 
     let mut cmd = CommandBuilder::new(&shell);
     cmd.env("TERM", "xterm-256color");

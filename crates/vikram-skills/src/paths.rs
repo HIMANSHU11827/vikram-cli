@@ -28,6 +28,13 @@ pub fn home() -> PathBuf {
             return path.join(".vikram");
         }
     }
+    // Windows fallback: USERPROFILE (mirrors vikram-runtime::config::vikram_home).
+    if let Some(value) = std::env::var_os("USERPROFILE") {
+        let path = PathBuf::from(value);
+        if !path.as_os_str().is_empty() {
+            return path.join(".vikram");
+        }
+    }
     PathBuf::from(".vikram")
 }
 
