@@ -2,9 +2,11 @@
 
 use crate::{McpError, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tokio::process::{Child, Command};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 /// Status of a managed server.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +28,8 @@ pub struct ServerInstance {
     pub pid: Option<u32>,
     pub started_at: Option<u64>,
     child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    stdout: Option<BufReader<ChildStdout>>,
 }
 
 impl ServerInstance {
@@ -44,6 +48,8 @@ impl ServerInstance {
             pid: None,
             started_at: None,
             child: None,
+            stdin: None,
+            stdout: None,
         }
     }
 
@@ -57,13 +63,13 @@ impl ServerInstance {
         let mut cmd = Command::new(&self.command);
         cmd.args(&self.args)
             .envs(&self.env)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true);
 
         match cmd.spawn() {
-            Ok(child) => {
+            Ok(mut child) => {
                 self.pid = child.id();
                 self.started_at = Some(
                     std::time::SystemTime::now()
@@ -71,6 +77,8 @@ impl ServerInstance {
                         .unwrap_or_default()
                         .as_secs(),
                 );
+                self.stdin = child.stdin.take();
+                self.stdout = child.stdout.take().map(BufReader::new);
                 self.child = Some(child);
                 self.status = ServerStatus::Running;
                 Ok(())
@@ -82,11 +90,79 @@ impl ServerInstance {
         }
     }
 
+    /// Send one newline-delimited JSON-RPC message over the child's stdin.
+    pub async fn send(&mut self, message: &Value) -> Result<()> {
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| McpError::Spawn(format!("{} is not running", self.name)))?;
+        let mut out = serde_json::to_string(message).map_err(|e| McpError::Spawn(e.to_string()))?;
+        out.push('\n');
+        stdin
+            .write_all(out.as_bytes())
+            .await
+            .map_err(|e| McpError::Spawn(e.to_string()))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| McpError::Spawn(e.to_string()))
+    }
+
+    /// Read the next newline-delimited JSON-RPC message from the child's stdout.
+    pub async fn read_message(&mut self) -> Result<Value> {
+        let stdout = self
+            .stdout
+            .as_mut()
+            .ok_or_else(|| McpError::Spawn(format!("{} is not running", self.name)))?;
+        let mut line = String::new();
+        stdout
+            .read_line(&mut line)
+            .await
+            .map_err(|e| McpError::Spawn(e.to_string()))?;
+        if line.is_empty() {
+            self.status = ServerStatus::Stopped;
+            return Err(McpError::Spawn(format!("{} closed its output", self.name)));
+        }
+        serde_json::from_str(line.trim())
+            .map_err(|e| McpError::Spawn(format!("{} sent invalid JSON: {e}", self.name)))
+    }
+
+    /// One request/response exchange over the pipes.
+    pub async fn send_and_receive(&mut self, request: Value, id: &Value) -> Result<Value> {
+        self.send(&request).await?;
+        loop {
+            let msg = self.read_message().await?;
+            if msg.get("id") == Some(id) {
+                return Ok(msg);
+            }
+            // notifications and interleaved messages are skipped; responses match by id
+        }
+    }
+
+    /// Cheap liveness probe: did the process exit without us noticing?
+    pub async fn health_check(&mut self) -> Result<bool> {
+        let alive = match self.child.as_mut() {
+            Some(child) => child
+                .try_wait()
+                .map_err(|e| McpError::Io(e.to_string()))?
+                .is_none(),
+            None => false,
+        };
+        if !alive && self.status == ServerStatus::Running {
+            self.status = ServerStatus::Stopped;
+            self.stdin = None;
+            self.stdout = None;
+        }
+        Ok(alive)
+    }
+
     pub async fn stop(&mut self) -> Result<()> {
         if let Some(ref mut child) = self.child {
             let _ = child.kill().await;
         }
         self.child = None;
+        self.stdin = None;
+        self.stdout = None;
         self.pid = None;
         self.status = ServerStatus::Stopped;
         Ok(())
@@ -152,6 +228,8 @@ fn futures_stop(inst: &mut ServerInstance) {
         let _ = child.start_kill();
     }
     inst.child = None;
+    inst.stdin = None;
+    inst.stdout = None;
     inst.pid = None;
     inst.status = ServerStatus::Stopped;
 }

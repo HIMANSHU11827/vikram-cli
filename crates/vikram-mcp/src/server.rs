@@ -8,6 +8,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Configuration for the MCP server.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct McpServerConfig {
@@ -15,6 +27,9 @@ pub struct McpServerConfig {
     pub version: String,
     pub approved_tools: Vec<String>,
     pub auth_required: bool,
+    /// Shared secret required when `auth_required` is set. Sent as `auth_token` in requests.
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 impl Default for McpServerConfig {
@@ -24,6 +39,7 @@ impl Default for McpServerConfig {
             version: env!("CARGO_PKG_VERSION").to_string(),
             approved_tools: Vec::new(),
             auth_required: false,
+            auth_token: None,
         }
     }
 }
@@ -157,6 +173,24 @@ impl McpServer {
         &self.config.approved_tools
     }
 
+    /// A request is authenticated when `auth_required` is off, or when it carries
+    /// `auth_token` (top level or in `params`) matching the configured secret.
+    fn authenticated(&self, request: &Value) -> bool {
+        let Some(expected) = self.config.auth_token.as_deref() else {
+            return false;
+        };
+        let supplied = request
+            .get("auth_token")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                request
+                    .get("params")
+                    .and_then(|p| p.get("auth_token"))
+                    .and_then(Value::as_str)
+            });
+        supplied.is_some_and(|s| constant_time_eq(s, expected))
+    }
+
     pub fn is_running(&self) -> bool {
         self.running
     }
@@ -165,6 +199,14 @@ impl McpServer {
     pub fn handle_request(&self, request: &Value) -> Value {
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+
+        if self.config.auth_required && !self.authenticated(request) {
+            return json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32001, "message": "unauthenticated: provide auth_token"}
+            });
+        }
 
         match method {
             "initialize" => {
@@ -226,10 +268,7 @@ impl McpServer {
                     });
                 }
 
-                // Check approved_tools filter
-                if !self.config.approved_tools.is_empty()
-                    && !self.config.approved_tools.contains(&name.to_string())
-                {
+                if !self.config.approved_tools.contains(&name.to_string()) {
                     return json!({
                         "jsonrpc": "2.0",
                         "id": id,

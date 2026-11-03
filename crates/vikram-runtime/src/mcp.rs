@@ -690,6 +690,7 @@ mod tests {
     fn configuring_servers_does_not_report_them_as_connected() {
         let registry = McpRegistry::load(McpConfig {
             servers: vec![server("fs"), server("git")],
+            ..Default::default()
         });
         assert_eq!(registry.configured_count(), 2);
         assert_eq!(registry.connected_count(), 0);

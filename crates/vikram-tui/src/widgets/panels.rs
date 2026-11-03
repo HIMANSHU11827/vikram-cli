@@ -685,10 +685,7 @@ fn overlay_content(app: &App, overlay: &Overlay, theme: &Theme) -> (String, Vec<
             editor,
             ..
         } => {
-            let mut lines = vec![Line::from(Span::styled(
-                format!("  {hint}"),
-                theme.muted(),
-            ))];
+            let mut lines = vec![Line::from(Span::styled(format!("  {hint}"), theme.muted()))];
             lines.push(Line::from(vec![
                 Span::styled("  › ", theme.accent),
                 Span::styled(
@@ -1193,6 +1190,8 @@ mod tests {
             updated_ms: 0,
             agent: None,
             queued: 0,
+            project_id: None,
+            status: "active".to_owned(),
         }
     }
 
@@ -1427,7 +1426,10 @@ mod tests {
         assert!(rendered.contains("fs.write"), "got {rendered}");
         assert!(rendered.contains("/etc/**"), "got {rendered}");
         assert!(rendered.contains("Permissions 1"), "got {rendered}");
-        assert!(rendered.contains("Approve and add to the allow list"), "got {rendered}");
+        assert!(
+            rendered.contains("Approve and add to the allow list"),
+            "got {rendered}"
+        );
         assert!(rendered.contains("Add to the allow list"), "got {rendered}");
         assert!(rendered.contains("Deny"), "got {rendered}");
     }
@@ -1613,6 +1615,8 @@ mod picker_panel_tests {
                 updated_ms: 0,
                 agent: None,
                 queued: 0,
+                project_id: None,
+                status: "active".to_owned(),
             }));
         app
     }

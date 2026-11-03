@@ -103,8 +103,10 @@ impl History {
         Ok(())
     }
 
-    pub fn latest(&self) -> Option<&Manifest> {
-        self.entries.last()
+    pub fn latest(&self) -> Option<Manifest> {
+        Self::load_in(&self.state_dir, &self.name)
+            .ok()
+            .and_then(|h| h.entries.into_iter().last())
     }
 
     /// The manifest before the newest one: what [`History::rollback`] would restore.
@@ -423,7 +425,7 @@ mod tests {
         let entry = manifest("alpha", "deadbeef", 7);
         history.record(entry.clone()).expect("record");
         let reloaded = History::load_in(tmp.path(), &id("alpha")).expect("reload");
-        assert_eq!(reloaded.latest(), Some(&entry));
+        assert_eq!(reloaded.latest(), Some(entry));
     }
 
     #[test]

@@ -112,9 +112,15 @@ impl PickerKind {
     /// `d` you type to narrow a list can never also delete something.
     pub fn verbs(self) -> &'static [(Verb, char, &'static str)] {
         match self {
-            Self::Model => &[(Verb::Choose, '\n', "choose"), (Verb::Prompt, 't', "type a name")],
+            Self::Model => &[
+                (Verb::Choose, '\n', "choose"),
+                (Verb::Prompt, 't', "type a name"),
+            ],
             Self::Mode => &[(Verb::Choose, '\n', "choose")],
-            Self::Allow => &[(Verb::Remove, '\n', "forget"), (Verb::Prompt, 'a', "add a rule")],
+            Self::Allow => &[
+                (Verb::Remove, '\n', "forget"),
+                (Verb::Prompt, 'a', "add a rule"),
+            ],
             Self::Bot => &[(Verb::Choose, '\n', "select"), (Verb::New, 'n', "new bot")],
             Self::Agent => &[(Verb::Choose, '\n', "act on it")],
             Self::AgentAction => &[(Verb::Choose, '\n', "apply")],
@@ -394,7 +400,7 @@ pub fn picker_lines(picker: &Picker, theme: &Theme) -> Vec<Line<'static>> {
     lines.push(Line::from(vec![
         Span::styled("  filter ", theme.muted()),
         Span::styled(
-            format!("{}", picker.query),
+            picker.query.to_string(),
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
@@ -522,7 +528,11 @@ mod tests {
             "mode",
             "`mode` contains `mode` and `model` contains `mode`; the exact name has to win"
         );
-        assert_eq!(picker.visible(), vec![1, 0], "both still offered, best first");
+        assert_eq!(
+            picker.visible(),
+            vec![1, 0],
+            "both still offered, best first"
+        );
     }
 
     #[test]

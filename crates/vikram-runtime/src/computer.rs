@@ -1027,6 +1027,7 @@ mod tests {
     fn ctx() -> ToolContext {
         ToolContext {
             workspace_root: PathBuf::from("."),
+            sandbox: crate::sandbox::Sandbox::disabled("test context"),
         }
     }
 

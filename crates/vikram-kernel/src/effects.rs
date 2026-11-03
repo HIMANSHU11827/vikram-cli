@@ -14,13 +14,15 @@ pub enum Effect {
     EmitMessage(Message),
 
     /// Ask the host to run a tool. Carries the policy shape, because the kernel must be able to
-    /// evaluate permission without knowing anything about the tool itself.
+    /// evaluate permission without knowing anything about the tool itself. `originating_trust` is
+    /// the trust of the actor that proposed the call; the kernel must not assume model-sourced.
     RequestTool {
         call: ToolCall,
         effect_id: EffectId,
         action: ActionKind,
         resource: String,
         side_effect: SideEffect,
+        originating_trust: vikram_contracts::Trust,
     },
 
     /// Incremental output for a connected interface.
@@ -49,23 +51,21 @@ impl Effect {
         }
     }
 
-    pub fn permission_request(
-        &self,
-        originating_trust: vikram_contracts::Trust,
-    ) -> Option<PermissionRequest> {
+    pub fn permission_request(&self) -> Option<PermissionRequest> {
         match self {
             Effect::RequestTool {
                 call,
                 action,
                 resource,
                 side_effect,
+                originating_trust,
                 ..
             } => Some(PermissionRequest::new(
                 *action,
                 call.name.clone(),
                 resource.clone(),
                 *side_effect,
-                originating_trust,
+                *originating_trust,
             )),
             _ => None,
         }
@@ -98,6 +98,7 @@ mod tests {
             action: ActionKind::Write,
             resource: "/tmp/a".into(),
             side_effect: SideEffect::LocalMutation,
+            originating_trust: Trust::Model,
         }
     }
 
@@ -122,12 +123,27 @@ mod tests {
     #[test]
     fn a_tool_effect_can_be_described_to_policy_without_the_tool_being_known() {
         let req = tool_effect()
-            .permission_request(Trust::Model)
+            .permission_request()
             .expect("tool effect yields a request");
         assert_eq!(req.action, ActionKind::Write);
         assert_eq!(req.verb, "fs.write");
         assert_eq!(req.resource, "/tmp/a");
         assert_eq!(req.originating_trust, Trust::Model);
+    }
+
+    #[test]
+    fn permission_requests_carry_the_originating_trust_not_a_hardcoded_default() {
+        let mut effect = tool_effect();
+        if let Effect::RequestTool {
+            originating_trust, ..
+        } = &mut effect
+        {
+            *originating_trust = Trust::User;
+        }
+        let req = effect
+            .permission_request()
+            .expect("tool effect yields a request");
+        assert_eq!(req.originating_trust, Trust::User);
     }
 
     #[test]

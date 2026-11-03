@@ -16,6 +16,7 @@ vikram-runtime.workspace = true
 vikram-skills.workspace = true
 vikram-tui.workspace = true
 vikram-store.workspace = true
+vikram-mcp.workspace = true
 clap.workspace = true
 tokio.workspace = true
 futures-util.workspace = true
@@ -23,6 +24,7 @@ crossterm.workspace = true
 ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
 
 [dev-dependencies]
 tempfile.workspace = true

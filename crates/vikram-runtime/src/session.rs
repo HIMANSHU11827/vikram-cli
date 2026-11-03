@@ -5,10 +5,10 @@
 //! snapshot does not drop the session.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use vikram_contracts::{AgentId, Message, SessionId};
+use vikram_contracts::{AgentId, Message, ProjectId, SessionId};
 use vikram_kernel::{CancellationToken, TokenMeter};
 use vikram_store::SessionRow;
 
@@ -34,6 +34,10 @@ pub struct SessionRuntime {
     pub turn_started_ms: Mutex<Option<u64>>,
     /// Per-session activity history (in-memory; for the main agent and session-level activities).
     pub activities: Mutex<Vec<ActivityEvent>>,
+    /// The project this session is associated with, if any. Restored on session switch.
+    pub project_id: Mutex<Option<ProjectId>>,
+    /// `active` or `archived`.
+    pub status: Mutex<String>,
 }
 
 impl SessionRuntime {
@@ -54,7 +58,32 @@ impl SessionRuntime {
             updated_ms: AtomicU64::new(row.updated_ms),
             turn_started_ms: Mutex::new(None),
             activities: Mutex::new(Vec::new()),
+            project_id: Mutex::new(row.project_id),
+            status: Mutex::new(row.status),
         }
+    }
+
+    pub fn project_id(&self) -> Option<ProjectId> {
+        self.project_id.lock().expect("project lock").clone()
+    }
+
+    pub fn set_cwd(&self, cwd: &Path, now_ms: u64) {
+        *self.cwd.lock().expect("cwd lock") = cwd.to_path_buf();
+        self.updated_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    pub fn set_project(&self, project: Option<ProjectId>, now_ms: u64) {
+        *self.project_id.lock().expect("project lock") = project;
+        self.updated_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    pub fn status(&self) -> String {
+        self.status.lock().expect("status lock").clone()
+    }
+
+    pub fn set_status(&self, status: &str, now_ms: u64) {
+        *self.status.lock().expect("status lock") = status.to_owned();
+        self.updated_ms.store(now_ms, Ordering::Relaxed);
     }
 
     pub fn title(&self) -> String {
@@ -192,6 +221,8 @@ impl SessionRuntime {
             updated_ms: self.updated_ms.load(Ordering::Relaxed),
             agent: self.agent(),
             queued: self.queue_len(),
+            project_id: self.project_id(),
+            status: self.status(),
         }
     }
 }
@@ -210,6 +241,8 @@ mod tests {
             agent: None,
             created_ms: 1,
             updated_ms: 1,
+            status: "active".into(),
+            project_id: None,
         })
     }
 

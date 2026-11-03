@@ -1,5 +1,10 @@
 # HIVE & BOTS — Implementation Plan
 
+> Status update (2026-11-03): a unified Ticket System has since been implemented
+> (see `docs/tickets.md` and `README.md`), providing the shared engine for Hive
+> teams, independent bots and sub-agents with conversations, participants,
+> permissions, assignments, reports and recovery.
+
 Mission: complete the HIVE (teams) and BOTS (agents) right-panel system inside the existing
 native Rust TUI, wired to the real runtime. No mocks, no duplicates, no hardcoded names.
 

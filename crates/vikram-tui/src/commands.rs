@@ -243,9 +243,9 @@ pub fn nearest(word: &str) -> Option<&'static Command> {
     if word.is_empty() {
         return None;
     }
-    COMMANDS.iter().find(|command| {
-        command.name.starts_with(&word) || word.starts_with(command.name)
-    })
+    COMMANDS
+        .iter()
+        .find(|command| command.name.starts_with(&word) || word.starts_with(command.name))
 }
 
 /// The commands whose name starts with `prefix`, in table order. Used by the inline `/` popup.
@@ -330,7 +330,11 @@ mod tests {
     fn no_command_is_listed_twice_and_no_alias_shadows_a_name() {
         let mut names = std::collections::HashSet::new();
         for command in COMMANDS {
-            assert!(names.insert(command.name), "/{} is listed twice", command.name);
+            assert!(
+                names.insert(command.name),
+                "/{} is listed twice",
+                command.name
+            );
         }
         for command in COMMANDS {
             for alias in command.aliases {
@@ -351,7 +355,11 @@ mod tests {
     #[test]
     fn the_popup_prefix_matches_names_and_never_aliases() {
         let mo: Vec<&str> = starting_with("/mo").into_iter().map(|c| c.name).collect();
-        assert_eq!(mo, vec!["model"], "the renamed command no longer widens the popup");
+        assert_eq!(
+            mo,
+            vec!["model"],
+            "the renamed command no longer widens the popup"
+        );
         assert!(
             starting_with("bots").is_empty(),
             "an alias is matched exactly, so it cannot also widen the popup"

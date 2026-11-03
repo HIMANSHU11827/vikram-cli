@@ -41,3 +41,15 @@ pub enum RuntimeError {
 }
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
+
+impl From<std::io::Error> for RuntimeError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e.to_string())
+    }
+}
+
+impl From<vikram_store::StoreError> for RuntimeError {
+    fn from(e: vikram_store::StoreError) -> Self {
+        Self::Store(e.to_string())
+    }
+}

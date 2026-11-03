@@ -40,17 +40,19 @@ impl RuleBook {
                 Ok(saved) => (saved.rules, None),
                 Err(err) => (
                     Vec::new(),
-                    Some(format!("{} is not readable as rules: {err}", path.display())),
+                    Some(format!(
+                        "{} is not readable as rules: {err}",
+                        path.display()
+                    )),
                 ),
             },
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => (Vec::new(), None),
-            Err(err) => (Vec::new(), Some(format!("cannot read {}: {err}", path.display()))),
+            Err(err) => (
+                Vec::new(),
+                Some(format!("cannot read {}: {err}", path.display())),
+            ),
         };
-        Self {
-            path,
-            rules,
-            error,
-        }
+        Self { path, rules, error }
     }
 
     pub fn path(&self) -> &Path {
@@ -154,10 +156,7 @@ mod tests {
     use vikram_policy::{MandatoryFloor, Policy, ResourcePattern};
 
     fn temp_book(name: &str) -> (RuleBook, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "vikram-rules-{}-{name}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("vikram-rules-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         (RuleBook::at(dir.join(FILE)), dir)

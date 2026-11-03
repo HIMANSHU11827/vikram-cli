@@ -49,6 +49,17 @@ id_type!(TeamId, "team");
 id_type!(EffectId, "eff");
 id_type!(ToolCallId, "call");
 id_type!(ApprovalId, "apv");
+id_type!(UserId, "user");
+id_type!(ProfileId, "prof");
+id_type!(EntityId, "ent");
+id_type!(HiveId, "hive");
+id_type!(HiveMessageId, "hmsg");
+id_type!(TicketId, "tkt");
+id_type!(AssignmentId, "asg");
+id_type!(TicketMessageId, "tmsg");
+id_type!(TicketEventId, "tev");
+id_type!(ProjectId, "proj");
+id_type!(WorkspaceId, "ws");
 
 #[cfg(test)]
 mod tests {

@@ -10,7 +10,6 @@
 //!   content that produced the request; an operation has no path to the grant set.
 
 use vikram_contracts::policy::PermissionPolicy;
-use vikram_contracts::trust::Trust;
 use vikram_contracts::{
     Appended, Decision, EffectId, JournalSink, Message, NewRecord, PermissionMode,
     PermissionRequest, Posture, RecordKind, SessionId, ToolCall, TurnId, VikramError,
@@ -216,7 +215,7 @@ impl<'a> Machine<'a> {
             Appended::Written(_) => {}
         }
 
-        if let Some(request) = effect.permission_request(Trust::Model) {
+        if let Some(request) = effect.permission_request() {
             let raw = self
                 .policy
                 .evaluate_at_depth(&request, ctx.grants.delegation_depth());
@@ -266,7 +265,7 @@ impl<'a> Machine<'a> {
             ctx.pending.push(PendingCall {
                 call: call.clone(),
                 request: effect
-                    .permission_request(Trust::Model)
+                    .permission_request()
                     .expect("tool effects always describe their own request"),
             });
         }
@@ -288,6 +287,7 @@ impl<'a> Machine<'a> {
                 report.effects_applied += 1;
             }
             Handled::Deferred => {
+                ctx.awaiting = effect.permission_request();
                 report.effects_deferred += 1;
             }
         }
@@ -418,13 +418,82 @@ fn tool_call_of(effect: &Effect) -> ToolCall {
     }
 }
 
+/// Rebuild a [`RunContext`] from the durable journal: messages, tool calls still pending, and
+/// any approval the turn was parked on. A crash mid-turn resumes from here instead of starting
+/// over; appended effects that already ran are skipped by their idempotency keys during normal
+/// dispatch, so reconstruction is read-only over what was journaled.
+pub fn restore_context(
+    journal: &dyn JournalSink,
+    session: SessionId,
+    turn: TurnId,
+    grants: GrantSnapshot,
+) -> Result<RunContext, VikramError> {
+    let mut ctx = RunContext::new(session.clone(), turn, grants);
+    let records = journal.read_after(&session, 0, usize::MAX)?;
+
+    for record in records {
+        match record.kind {
+            RecordKind::Message => {
+                if let Ok(message) = serde_json::from_value::<Message>(record.payload) {
+                    ctx.push_text(message);
+                }
+            }
+            RecordKind::ToolCall => {
+                let Ok(effect) = serde_json::from_value::<Effect>(record.payload) else {
+                    continue;
+                };
+                if let Effect::RequestTool { call, .. } = &effect
+                    && let Some(request) = effect.permission_request()
+                {
+                    ctx.pending.push(PendingCall {
+                        call: call.clone(),
+                        request,
+                    });
+                }
+            }
+            RecordKind::ToolResult => {
+                let Ok(message) = serde_json::from_value::<Message>(record.payload) else {
+                    continue;
+                };
+                for call in message.tool_calls() {
+                    ctx.pending.retain(|p| p.call.id != call.id);
+                }
+                ctx.push_text(message);
+            }
+            RecordKind::Approval => {
+                // A parked turn resumes still parked: the request is what a human must answer.
+                if record.payload.get("state").and_then(serde_json::Value::as_str)
+                    != Some("pending")
+                {
+                    continue;
+                }
+                let verb = record
+                    .payload
+                    .get("verb")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if let Some(parked) = ctx
+                    .pending
+                    .iter()
+                    .find(|p| p.request.verb == verb)
+                    .cloned()
+                {
+                    ctx.awaiting = Some(parked.request);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(ctx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::grants::Grant;
     use vikram_contracts::{
         ActionKind, ContractDecl, ContractDecl as Decl, InMemoryJournal, PermissionMode,
-        SideEffect, Versioned, version::EFFECT_HANDLER,
+        SideEffect, Versioned, trust::Trust, version::EFFECT_HANDLER,
     };
     use vikram_policy::{MandatoryFloor, Policy, ResourcePattern, Rule};
 
@@ -563,6 +632,7 @@ mod tests {
             action: ActionKind::Write,
             resource: resource.into(),
             side_effect: SideEffect::LocalMutation,
+            originating_trust: Trust::Model,
         }
     }
 
@@ -655,7 +725,11 @@ mod tests {
 
         // Inside the root an auto-approved edit needs no human; outside it, it does.
         let (report, calls) = dispatch(&rooted, PermissionMode::AcceptEdits, "/elsewhere/b.txt");
-        assert_eq!(calls, vec!["fs.write"], "a write in the workspace is the point");
+        assert_eq!(
+            calls,
+            vec!["fs.write"],
+            "a write in the workspace is the point"
+        );
         assert_eq!(report.effects_deferred, 0);
         let (report, calls) = dispatch(&rooted, PermissionMode::AcceptEdits, "/work/a.txt");
         assert!(
@@ -876,6 +950,7 @@ mod tests {
             action: ActionKind::Admin,
             resource: "*".into(),
             side_effect: SideEffect::ExternalChange,
+            originating_trust: Trust::Model,
         };
         let mut machine = Machine::new(
             vec![Box::new(EmitOnce {
@@ -995,6 +1070,59 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(approvals.len(), 1);
         assert_eq!(approvals[0].payload["state"], "pending");
+    }
+
+    #[test]
+    fn a_turn_parked_on_an_approval_resumes_from_the_journal() {
+        let journal = InMemoryJournal::new();
+        let policy = Policy::new(
+            vec![Rule::ask(
+                ActionKind::Write,
+                ResourcePattern::Subtree("/work".into()),
+                "review this mutation",
+            )],
+            MandatoryFloor::default(),
+        );
+        let mut handler = CountingHandler::default();
+        let mut grants = GrantSet::new(vec![crate::grants::Grant::new(ActionKind::Write, "*")], 0);
+        let clock = Fixed;
+        let session = SessionId::generate();
+        let turn = TurnId::generate();
+        let mut ctx = RunContext::new(
+            session.clone(),
+            turn.clone(),
+            GrantSet::new(vec![crate::grants::Grant::new(ActionKind::Write, "*")], 0).snapshot(),
+        );
+        let mut machine = Machine::new(
+            vec![Box::new(EmitOnce {
+                fired: false,
+                effect: write_effect("/work/parked.txt"),
+            })],
+            &journal,
+            &policy,
+            &mut handler,
+            &mut grants,
+            &clock,
+            Limits::default(),
+        );
+        let report = machine.run(&mut ctx).unwrap();
+        assert_eq!(report.effects_deferred, 1, "the turn parked");
+
+        // The crash: nothing survives except the journal. Reconstruction must find the parked
+        // call and the approval it waits on, without the machine's help.
+        let resumed = super::restore_context(
+            &journal,
+            session,
+            turn,
+            GrantSet::new(vec![crate::grants::Grant::new(ActionKind::Write, "*")], 0).snapshot(),
+        )
+        .unwrap();
+        assert_eq!(resumed.pending.len(), 1, "the pending call survives");
+        let Some(awaiting) = resumed.awaiting else {
+            panic!("the parked approval must be recoverable");
+        };
+        assert_eq!(awaiting.verb, "fs.write");
+        assert_eq!(awaiting.resource, "/work/parked.txt");
     }
 
     #[test]
@@ -1119,7 +1247,7 @@ mod tests {
             .issue(request, crate::grants::ApprovalSource::User)
             .unwrap();
         let grant = ticket.grant_within(ActionKind::Write, "/work").unwrap();
-        grants.widen(ticket, grant);
+        grants.widen(ticket, grant).expect("ticket covers this grant");
 
         let mut handler2 = CountingHandler::default();
         let mut ctx2 = context(grants.clone());

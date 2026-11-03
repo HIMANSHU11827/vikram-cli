@@ -256,8 +256,16 @@ mod tests {
         assert_eq!(
             all,
             vec![
-                ("global".to_owned(), "greeting".to_owned(), "hello".to_owned()),
-                ("project".to_owned(), "convention".to_owned(), "tabs".to_owned()),
+                (
+                    "global".to_owned(),
+                    "greeting".to_owned(),
+                    "hello".to_owned()
+                ),
+                (
+                    "project".to_owned(),
+                    "convention".to_owned(),
+                    "tabs".to_owned()
+                ),
             ],
             "ordered by scope then key, and both scopes present"
         );

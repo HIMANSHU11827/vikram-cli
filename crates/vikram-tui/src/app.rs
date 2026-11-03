@@ -1336,6 +1336,8 @@ mod tests {
                 updated_ms: 0,
                 agent: None,
                 queued: 0,
+                project_id: None,
+                status: "active".to_owned(),
             }));
         app
     }
@@ -1416,10 +1418,7 @@ mod selection_and_folds {
             anchor: (6, 0),
             cursor: (3, 1),
         });
-        assert_eq!(
-            app.selection_text().as_deref(),
-            Some("world\nseco")
-        );
+        assert_eq!(app.selection_text().as_deref(), Some("world\nseco"));
     }
 
     #[test]
@@ -1469,9 +1468,17 @@ mod selection_and_folds {
             },
         ];
         assert_eq!(app.thought_at(3, 4), Some((0, 0)));
-        assert_eq!(app.thought_at(3, 7), None, "the row beyond the label is text");
+        assert_eq!(
+            app.thought_at(3, 7),
+            None,
+            "the row beyond the label is text"
+        );
         assert_eq!(app.thought_at(3, 9), Some((2, 1)));
-        assert_eq!(app.fold_at(3, 9), Some(((2, 1), true)), "a tool row knows it is a tool");
+        assert_eq!(
+            app.fold_at(3, 9),
+            Some(((2, 1), true)),
+            "a tool row knows it is a tool"
+        );
         assert_eq!(app.fold_at(3, 4), Some(((0, 0), false)));
 
         let mut session = SessionView::from_snapshot(SessionSnapshot {
@@ -1486,9 +1493,14 @@ mod selection_and_folds {
             updated_ms: 0,
             agent: None,
             queued: 0,
+            project_id: None,
+            status: "active".to_owned(),
         });
         session.toggle_thought((0, 0));
         assert!(session.thought_expanded((0, 0)));
-        assert!(!session.thought_expanded((2, 1)), "the other block is untouched");
+        assert!(
+            !session.thought_expanded((2, 1)),
+            "the other block is untouched"
+        );
     }
 }

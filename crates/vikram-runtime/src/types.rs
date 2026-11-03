@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 use vikram_contracts::{
-    AgentId, ApprovalId, Message, PermissionMode, SessionId, TeamId, ToolCallId, TurnId,
+    AgentId, ApprovalId, Message, PermissionMode, ProjectId, SessionId, TeamId, ToolCallId, TurnId,
 };
 use vikram_kernel::TokenMeter;
 
@@ -184,6 +184,8 @@ pub struct SessionSnapshot {
     pub updated_ms: u64,
     pub agent: Option<AgentId>,
     pub queued: usize,
+    pub project_id: Option<ProjectId>,
+    pub status: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

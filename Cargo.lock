@@ -2594,6 +2594,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "vikram-contracts",
+ "vikram-mcp",
  "vikram-runtime",
  "vikram-skills",
  "vikram-store",
@@ -2606,6 +2607,17 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "vikram-evolution"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
 ]
 
@@ -2656,6 +2668,7 @@ dependencies = [
  "tokio",
  "tungstenite",
  "vikram-contracts",
+ "vikram-evolution",
  "vikram-kernel",
  "vikram-mcp",
  "vikram-policy",

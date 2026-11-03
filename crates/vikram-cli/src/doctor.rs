@@ -94,10 +94,9 @@ pub fn checks(config: &Config) -> Vec<Check> {
         availability.fallback_mode()
     };
     let detail = match availability.refusal(config.mode) {
-        Some((rule, layer)) if start != config.mode => format!(
-            " ({} refused by {layer}: {rule})",
-            config.mode.as_str()
-        ),
+        Some((rule, layer)) if start != config.mode => {
+            format!(" ({} refused by {layer}: {rule})", config.mode.as_str())
+        }
         Some((rule, layer)) => format!(" (restricted by {layer}: {rule})"),
         None => String::new(),
     };
@@ -165,7 +164,10 @@ pub fn checks(config: &Config) -> Vec<Check> {
         ),
     ));
 
-    out.push(Check::new(Level::Info, format!("terminal: {}", terminal_size())));
+    out.push(Check::new(
+        Level::Info,
+        format!("terminal: {}", terminal_size()),
+    ));
     out
 }
 

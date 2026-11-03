@@ -152,7 +152,10 @@ fn draw_head(
         if !detail.is_empty() {
             spans.push(Span::raw("  "));
             spans.push(Span::styled(
-                truncate(&redact(detail), row.width.saturating_sub(used).saturating_sub(4)),
+                truncate(
+                    &redact(detail),
+                    row.width.saturating_sub(used).saturating_sub(4),
+                ),
                 theme.muted(),
             ));
             used += 2 + UnicodeWidthStr::width(detail);
@@ -198,7 +201,12 @@ fn pointing(theme: &Theme, open: bool) -> &'static str {
     }
 }
 
-fn label_for(kind: Kind, payload: &Payload, args: &Value, theme: &Theme) -> (String, Option<String>) {
+fn label_for(
+    kind: Kind,
+    payload: &Payload,
+    args: &Value,
+    theme: &Theme,
+) -> (String, Option<String>) {
     let path = || path_of(args, payload);
     let pair = |name: &str, detail: String| (name.to_string(), Some(detail));
     match kind {
@@ -221,7 +229,8 @@ fn label_for(kind: Kind, payload: &Payload, args: &Value, theme: &Theme) -> (Str
             pair("Web Search", format!("\"{}\"", truncate(&query, 60)))
         }
         Kind::Delegated => {
-            let task = string(args, &["task", "prompt", "goal"]).unwrap_or_else(|| "delegate".into());
+            let task =
+                string(args, &["task", "prompt", "goal"]).unwrap_or_else(|| "delegate".into());
             let agent = string(args, &["agent", "to", "assignee"]);
             let detail = match agent {
                 Some(agent) => format!("{} to {}", truncate(&task, 44), agent),
@@ -284,8 +293,10 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     fn line(&mut self, text: impl Into<String>, style: Style) {
         let text = text.into();
-        self.lines
-            .push(Line::from(Span::styled(format!("{BODY_INDENT}{text}"), style)));
+        self.lines.push(Line::from(Span::styled(
+            format!("{BODY_INDENT}{text}"),
+            style,
+        )));
     }
 
     /// A labelled field: the name in the muted style, the value in the body style.
@@ -293,7 +304,11 @@ impl Ctx<'_> {
         if value.trim().is_empty() {
             return;
         }
-        let value = clip(&redact(value), self.width.saturating_sub(BODY_INDENT.len() + name.len() + 2));
+        let value = clip(
+            &redact(value),
+            self.width
+                .saturating_sub(BODY_INDENT.len() + name.len() + 2),
+        );
         let theme = self.theme;
         self.lines.push(Line::from(vec![
             Span::styled(format!("{BODY_INDENT}{name}  "), theme.muted()),
@@ -306,7 +321,10 @@ impl Ctx<'_> {
         let text = redact(text);
         let lines: Vec<&str> = text.lines().collect();
         for line in lines.iter().take(BODY_CAP) {
-            self.line(clip(line, self.width.saturating_sub(BODY_INDENT.len())), style);
+            self.line(
+                clip(line, self.width.saturating_sub(BODY_INDENT.len())),
+                style,
+            );
         }
         if lines.len() > BODY_CAP {
             let more = lines.len() - BODY_CAP;
@@ -329,7 +347,10 @@ impl Ctx<'_> {
                 format!(
                     "{:>numbers$}  {}",
                     offset + 1,
-                    clip(line, self.width.saturating_sub(numbers + BODY_INDENT.len() + 2)),
+                    clip(
+                        line,
+                        self.width.saturating_sub(numbers + BODY_INDENT.len() + 2)
+                    ),
                     numbers = numbers
                 ),
                 style,
@@ -398,7 +419,10 @@ impl Ctx<'_> {
             self.field("Exit code", &format!("{exit} · {verdict}"));
         }
         if payload.duration_ms > 0 {
-            self.field("Duration", &format!("{:.1}s", payload.duration_ms as f64 / 1000.0));
+            self.field(
+                "Duration",
+                &format!("{:.1}s", payload.duration_ms as f64 / 1000.0),
+            );
         }
         if !shell.stdout.trim().is_empty() {
             self.section(1, "Stdout", &shell.stdout);
@@ -428,7 +452,11 @@ impl Ctx<'_> {
         self.line(format!("{} results", results.len()), self.theme.muted());
         for (index, result) in results.iter().take(RESULT_CAP).enumerate() {
             self.line(
-                format!("{}. {}", index + 1, clip(&result.title, self.width.saturating_sub(6))),
+                format!(
+                    "{}. {}",
+                    index + 1,
+                    clip(&result.title, self.width.saturating_sub(6))
+                ),
                 Style::default().fg(self.theme.text),
             );
             if !result.url.is_empty() {
@@ -447,10 +475,21 @@ impl Ctx<'_> {
     fn delegated(&mut self, args: &Value, content: &str) {
         let task = string(args, &["task", "prompt", "goal"]).unwrap_or_default();
         let agent = string(args, &["agent", "to", "assignee"]).unwrap_or_default();
-        self.field("Agent", if agent.is_empty() { "unassigned" } else { &agent });
+        self.field(
+            "Agent",
+            if agent.is_empty() {
+                "unassigned"
+            } else {
+                &agent
+            },
+        );
         self.field("Task", &task);
         self.field("Assigned by", "VIKRAM");
-        let status = if content.trim().is_empty() { "Working" } else { "Reported" };
+        let status = if content.trim().is_empty() {
+            "Working"
+        } else {
+            "Reported"
+        };
         self.field("Status", status);
         if let Some(instructions) = string(args, &["instructions", "context", "shared_context"]) {
             self.section(1, "Instructions", &instructions);
@@ -471,9 +510,18 @@ impl Ctx<'_> {
     }
 
     fn mcp(&mut self, args: &Value, content: &str) {
-        self.field("Server", &string(args, &["server", "mcp"]).unwrap_or_else(|| "mcp".into()));
-        self.field("Action", &string(args, &["action", "tool", "method"]).unwrap_or_default());
-        self.field("Target", &string(args, &["target", "path", "resource"]).unwrap_or_default());
+        self.field(
+            "Server",
+            &string(args, &["server", "mcp"]).unwrap_or_else(|| "mcp".into()),
+        );
+        self.field(
+            "Action",
+            &string(args, &["action", "tool", "method"]).unwrap_or_default(),
+        );
+        self.field(
+            "Target",
+            &string(args, &["target", "path", "resource"]).unwrap_or_default(),
+        );
         if let Some(status) = content.lines().next() {
             self.field("Status", status);
         }
@@ -481,8 +529,14 @@ impl Ctx<'_> {
     }
 
     fn plugin(&mut self, args: &Value, content: &str) {
-        self.field("Plugin", &string(args, &["plugin", "name"]).unwrap_or_else(|| "plugin".into()));
-        self.field("Action", &string(args, &["action", "command"]).unwrap_or_default());
+        self.field(
+            "Plugin",
+            &string(args, &["plugin", "name"]).unwrap_or_else(|| "plugin".into()),
+        );
+        self.field(
+            "Action",
+            &string(args, &["action", "command"]).unwrap_or_default(),
+        );
         self.field(
             "Repository",
             &string(args, &["repository", "repo", "target"]).unwrap_or_default(),
@@ -568,7 +622,7 @@ fn parse_shell(content: &str) -> Shell {
     let mut body = content;
     let mut exit = None;
     if let Some((head, tail)) = content.rsplit_once("[exit ") {
-        if let Some(code) = tail.trim().trim_end_matches(']').parse::<i32>().ok() {
+        if let Ok(code) = tail.trim().trim_end_matches(']').parse::<i32>() {
             exit = Some(code);
         }
         body = head;
@@ -620,7 +674,7 @@ fn path_of(args: &Value, payload: &Payload) -> String {
 }
 
 fn humanize(name: &str) -> String {
-    let spaced = name.replace('.', " ").replace('_', " ");
+    let spaced = name.replace(['.', '_'], " ");
     let mut chars = spaced.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
@@ -775,9 +829,10 @@ fn is_secret(token: &str) -> bool {
     let parts: Vec<&str> = bare.split('.').collect();
     parts.len() == 3
         && bare.len() >= 40
-        && parts
-            .iter()
-            .all(|part| part.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'))
+        && parts.iter().all(|part| {
+            part.chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        })
 }
 
 #[cfg(test)]
@@ -787,7 +842,10 @@ mod tests {
     #[test]
     fn a_keyed_secret_loses_its_value_but_keeps_its_name() {
         assert_eq!(redact("export API_KEY=abc123"), "export API_KEY=[redacted]");
-        assert_eq!(redact("Authorization: Bearer abc"), "Authorization: [redacted]");
+        assert_eq!(
+            redact("Authorization: Bearer abc"),
+            "Authorization: [redacted]"
+        );
     }
 
     #[test]

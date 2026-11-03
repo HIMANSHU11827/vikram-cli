@@ -45,10 +45,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
 
     // Copy comes before stop: `Ctrl+Shift+C` with a drag on screen is the operator taking the text,
     // and a stop here would throw the turn away instead.
-    if ctrl
-        && shift
-        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
-    {
+    if ctrl && shift && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
         if app.selection.is_some_and(|s| !s.is_click()) {
             app.copy_selection();
         } else {
@@ -842,8 +839,9 @@ fn resolve_references(text: &str, cwd: std::path::PathBuf) -> String {
             }
             let full = cwd.join(path);
             if let Ok(content) = std::fs::read_to_string(&full) {
-                let snippet = if content.len() > 2000 {
-                    format!("{}... (truncated)", &content[..2000])
+                let snippet = if content.chars().count() > 2000 {
+                    let truncated: String = content.chars().take(2000).collect();
+                    format!("{}... (truncated)", truncated)
                 } else {
                     content
                 };
@@ -1239,10 +1237,7 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
                                 session,
                                 rule: text,
                             },
-                            PromptAction::CreateSkill => UiCommand::CreateSkill {
-                                session,
-                                text,
-                            },
+                            PromptAction::CreateSkill => UiCommand::CreateSkill { session, text },
                             PromptAction::ImportSkill => UiCommand::ImportSkill {
                                 session,
                                 path: text,
@@ -1500,6 +1495,8 @@ mod tests {
                 updated_ms: 0,
                 agent: None,
                 queued: 0,
+                project_id: None,
+                status: "active".to_owned(),
             }));
         app
     }
@@ -1817,10 +1814,7 @@ mod tests {
         handle_key(&mut app, ctrl(KeyCode::Char('c')));
         assert!(app.overlay.is_none(), "a panel must not trap the stop key");
         assert!(app.should_quit);
-        assert!(matches!(
-            app.take_commands().pop(),
-            Some(UiCommand::Quit)
-        ));
+        assert!(matches!(app.take_commands().pop(), Some(UiCommand::Quit)));
     }
 
     fn panel(kind: PickerKind, rows: &[(&str, &str)]) -> Overlay {
@@ -1833,7 +1827,9 @@ mod tests {
 
     fn act_of(app: &mut App) -> Option<(PickerKind, crate::widgets::Verb, String)> {
         match app.take_commands().pop() {
-            Some(UiCommand::Act { kind, verb, value, .. }) => Some((kind, verb, value)),
+            Some(UiCommand::Act {
+                kind, verb, value, ..
+            }) => Some((kind, verb, value)),
             other => {
                 assert!(other.is_none(), "expected no command, got {other:?}");
                 None
@@ -1883,7 +1879,10 @@ mod tests {
         app.overlay = Some(panel(PickerKind::Session, &[]));
         handle_key(&mut app, ctrl(KeyCode::Char('x')));
         assert!(act_of(&mut app).is_none(), "no row, no instruction");
-        assert!(matches!(app.overlay, Some(Overlay::Picker(_))), "panel stays open");
+        assert!(
+            matches!(app.overlay, Some(Overlay::Picker(_))),
+            "panel stays open"
+        );
     }
 
     #[test]
@@ -1958,13 +1957,10 @@ mod tests {
         let candidates: Vec<String> = commands::starting_with("m")
             .into_iter()
             .map(|command| format!("/{}", command.name))
-            .collect();        assert_eq!(
+            .collect();
+        assert_eq!(
             candidates,
-            vec![
-                "/model".to_owned(),
-                "/memory".to_owned(),
-                "/mcp".to_owned()
-            ]
+            vec!["/model".to_owned(), "/memory".to_owned(), "/mcp".to_owned()]
         );
         for candidate in &candidates {
             assert!(
@@ -2028,7 +2024,11 @@ mod tests {
         }
         assert_eq!(app.approval_action, 3);
         assert!(handle_overlay(&mut app, key(KeyCode::Enter)));
-        assert_eq!(answered(&app), (true, true), "the fourth approves and keeps");
+        assert_eq!(
+            answered(&app),
+            (true, true),
+            "the fourth approves and keeps"
+        );
     }
 
     #[test]

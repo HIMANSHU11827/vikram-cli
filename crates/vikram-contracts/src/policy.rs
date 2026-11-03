@@ -495,7 +495,9 @@ mod tests {
         // Enforcement, not prompting: a posture cannot be argued out of by a permissive evaluator.
         let req = gated(ActionKind::Write, "/work/a.txt", SideEffect::LocalMutation);
         match PermissionMode::Plan.resolve(Decision::Allow, &req, posture(Some("/work"))) {
-            Decision::Deny { reason } => assert!(reason.contains("plan mode is read-only"), "{reason}"),
+            Decision::Deny { reason } => {
+                assert!(reason.contains("plan mode is read-only"), "{reason}")
+            }
             other => panic!("plan must refuse mutations, got {other:?}"),
         }
         let read = gated(ActionKind::Read, "/work/a.txt", SideEffect::None);
@@ -516,7 +518,10 @@ mod tests {
         match PermissionMode::AllowList.resolve(Decision::Allow, &req, posture(Some("/work"))) {
             Decision::RequireApproval { reason, amendment } => {
                 assert!(reason.contains("not on the list"), "{reason}");
-                assert_eq!(amendment.as_deref(), Some(crate::amendment_for(&req).as_str()));
+                assert_eq!(
+                    amendment.as_deref(),
+                    Some(crate::amendment_for(&req).as_str())
+                );
             }
             other => panic!("an unlisted action must ask, got {other:?}"),
         }
@@ -525,8 +530,7 @@ mod tests {
     #[test]
     fn allow_list_runs_a_listed_action_quietly_and_still_obeyes_a_deny() {
         let req = gated(ActionKind::Execute, "cargo test", SideEffect::LocalMutation);
-        let after =
-            PermissionMode::AllowList.resolve(Decision::Allow, &req, listed(Some("/work")));
+        let after = PermissionMode::AllowList.resolve(Decision::Allow, &req, listed(Some("/work")));
         assert!(after.is_allowed());
         assert!(
             !PermissionMode::auto_resolved(&Decision::Allow, &after),
@@ -547,7 +551,11 @@ mod tests {
 
     #[test]
     fn unattended_denies_without_asking_and_tells_the_model_not_to_retry() {
-        let req = gated(ActionKind::Network, "https://example.com", SideEffect::ExternalChange);
+        let req = gated(
+            ActionKind::Network,
+            "https://example.com",
+            SideEffect::ExternalChange,
+        );
         match PermissionMode::Unattended.resolve(prompt(), &req, posture(Some("/work"))) {
             Decision::Deny { reason } => {
                 assert!(reason.contains("was not asked"), "{reason}");
@@ -573,7 +581,11 @@ mod tests {
             ),
             gated(ActionKind::Write, "/work/a.txt", SideEffect::Destructive),
             gated(ActionKind::Execute, "/work", SideEffect::LocalMutation),
-            gated(ActionKind::Network, "https://example.com", SideEffect::ExternalChange),
+            gated(
+                ActionKind::Network,
+                "https://example.com",
+                SideEffect::ExternalChange,
+            ),
         ] {
             let after = PermissionMode::AcceptEdits.resolve(prompt(), &req, posture(Some("/work")));
             assert!(
@@ -608,7 +620,11 @@ mod tests {
                 "destruction always asks",
             ),
             (
-                gated(ActionKind::Network, "https://example.com", SideEffect::ExternalChange),
+                gated(
+                    ActionKind::Network,
+                    "https://example.com",
+                    SideEffect::ExternalChange,
+                ),
                 false,
                 "the network leaves the machine",
             ),

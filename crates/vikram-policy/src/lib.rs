@@ -127,11 +127,7 @@ impl Rule {
         }
     }
 
-    pub fn deny(
-        action: ActionKind,
-        resource: ResourcePattern,
-        reason: impl Into<String>,
-    ) -> Self {
+    pub fn deny(action: ActionKind, resource: ResourcePattern, reason: impl Into<String>) -> Self {
         Self {
             actions: vec![action],
             verb_prefix: None,
@@ -180,7 +176,9 @@ impl Rule {
     }
 
     fn applies_to(&self, req: &PermissionRequest) -> bool {
-        if !self.actions.is_empty() && !self.actions.contains(&req.action) {
+        // An empty action list matches nothing: a rule that names no action never fires, instead
+        // of silently becoming a wildcard.
+        if self.actions.is_empty() || !self.actions.contains(&req.action) {
             return false;
         }
         if let Some(prefix) = &self.verb_prefix {
@@ -227,8 +225,12 @@ pub fn command_segments(command: &str) -> Vec<&str> {
 /// Constraints no rule may relax.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MandatoryFloor {
-    /// Mutations outside this root always need a human, whatever the rules say.
+    /// Mutations outside this root are always denied, whatever the rules say.
     pub workspace_root: Option<String>,
+    /// Additional roots the host itself declares writable (VIKRAM's own session workspaces under
+    /// its home). Fixed at boot from the runtime, never from rules or model content, so the floor
+    /// stays deny-first: it widens nothing the operator did not already own.
+    pub extra_write_roots: Vec<String>,
     /// Verbs that are never permitted from content the model or a tool produced.
     pub forbidden_from_untrusted: Vec<String>,
     /// How deep delegation may nest before it is refused outright.
@@ -239,6 +241,7 @@ impl Default for MandatoryFloor {
     fn default() -> Self {
         Self {
             workspace_root: None,
+            extra_write_roots: Vec::new(),
             forbidden_from_untrusted: vec!["grant.".into(), "policy.".into(), "self.".into()],
             max_delegation_depth: 3,
         }
@@ -270,20 +273,79 @@ impl MandatoryFloor {
 
         if req.side_effect != vikram_contracts::SideEffect::None
             && let Some(root) = &self.workspace_root
+            && let Some(path) = resource_path(req)
         {
             let root = root.trim_end_matches('/');
-            let outside = req.action == ActionKind::Write
-                && req.resource != root
-                && !req.resource.starts_with(&format!("{root}/"));
+            let canonical = if path.is_absolute() {
+                path.clone()
+            } else {
+                std::path::Path::new(root).join(&path)
+            };
+            let within_root =
+                canonical.starts_with(root) && !escapes_root(&canonical, root);
+            let within_extra = self.extra_write_roots.iter().any(|extra| {
+                let extra = extra.trim_end_matches('/');
+                canonical == std::path::Path::new(extra)
+                    || canonical.starts_with(extra)
+                    && !escapes_root(&canonical, extra)
+            });
+            let outside = !within_root && !within_extra;
             if outside {
                 return Some(format!(
-                    "`{}` writes outside the workspace root `{root}`",
-                    req.verb
+                    "`{}` outside the workspace root `{root}` ({:?} {})",
+                    req.verb,
+                    req.action,
+                    req.resource,
                 ));
             }
         }
 
         None
+    }
+}
+
+/// A path that joins to the root but climbs back out (`root/../etc`) is not within it.
+fn escapes_root(path: &std::path::Path, root: &str) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return true;
+    };
+    let mut depth: i64 = 0;
+    for component in rel.components() {
+        use std::path::Component;
+        match component {
+            Component::ParentDir => depth -= 1,
+            Component::Normal(_) => depth += 1,
+            _ => {}
+        }
+        if depth < 0 {
+            return true;
+        }
+    }
+    false
+}
+
+    /// The resource as a filesystem path, for actions whose side effects are confined to the
+/// workspace. `Execute` counts when the command itself is an absolute path (a bare program name
+/// like `cargo` is not a path and is not confinable this way); `Network` counts only for
+/// `file://` — remote hosts are outside any filesystem root by definition and are governed by
+/// network rules, not the floor.
+fn resource_path(req: &PermissionRequest) -> Option<std::path::PathBuf> {
+    match req.action {
+        ActionKind::Read | ActionKind::Write => {
+            let trimmed = req.resource.trim();
+            (!trimmed.is_empty()).then(|| std::path::PathBuf::from(trimmed))
+        }
+        ActionKind::Execute => {
+            let head = req.resource.trim().split_whitespace().next()?;
+            let path = std::path::PathBuf::from(head);
+            path.is_absolute().then_some(path)
+        }
+        ActionKind::Network => req
+            .resource
+            .trim()
+            .strip_prefix("file://")
+            .map(std::path::PathBuf::from),
+        _ => None,
     }
 }
 
@@ -377,10 +439,8 @@ impl Policy {
                 }
                 RuleOutcome::Ask { reason } => {
                     if pending_ask.is_none() {
-                        pending_ask = Some((
-                            reason.clone(),
-                            Some(vikram_contracts::amendment_for(req)),
-                        ));
+                        pending_ask =
+                            Some((reason.clone(), Some(vikram_contracts::amendment_for(req))));
                     }
                 }
                 RuleOutcome::Allow => pending_allow = true,
@@ -411,10 +471,7 @@ impl Policy {
             return req.clone();
         }
         let mut normalized = std::path::PathBuf::new();
-        for component in std::path::Path::new(root)
-            .join(&req.resource)
-            .components()
-        {
+        for component in std::path::Path::new(root).join(&req.resource).components() {
             use std::path::Component;
             match component {
                 Component::ParentDir => {
@@ -569,6 +626,78 @@ mod tests {
         );
         let decision = policy.evaluate(&fs_write("/etc/passwd", Trust::User));
         assert!(matches!(decision, Decision::Deny { .. }));
+    }
+
+    #[test]
+    fn the_floor_refuses_executing_an_absolute_binary_outside_the_root() {
+        let policy = Policy::empty();
+        let req = PermissionRequest::new(
+            ActionKind::Execute,
+            "exec",
+            "/usr/bin/danger",
+            vikram_contracts::SideEffect::LocalMutation,
+            Trust::Model,
+        );
+        assert!(matches!(
+            policy.evaluate(&req),
+            Decision::Deny { .. }
+        ), "/usr/bin/danger is not a workspace path");
+    }
+
+    #[test]
+    fn the_floor_ignores_bare_command_names_for_execute() {
+        let policy = Policy::empty();
+        let req = PermissionRequest::new(
+            ActionKind::Execute,
+            "shell.run",
+            "cargo",
+            vikram_contracts::SideEffect::LocalMutation,
+            Trust::Model,
+        );
+        let decision = policy.evaluate(&req);
+        if let Decision::Deny { reason } = decision {
+            assert!(
+                !reason.contains("workspace root"),
+                "a bare name is not a path the floor can confine: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_floor_refuses_file_urls_pointing_outside_the_root() {
+        let policy = Policy::empty();
+        let req = PermissionRequest::new(
+            ActionKind::Network,
+            "net.read",
+            "file:///etc/passwd",
+            vikram_contracts::SideEffect::LocalMutation,
+            Trust::Model,
+        );
+        assert!(matches!(
+            policy.evaluate(&req),
+            Decision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn a_rule_with_no_actions_matches_nothing() {
+        let rule = Rule {
+            actions: Vec::new(),
+            verb_prefix: None,
+            resource: crate::ResourcePattern::Any,
+            outcome: RuleOutcome::Allow,
+        };
+        let policy = Policy::new(
+            vec![rule],
+            MandatoryFloor::default(),
+        );
+        assert!(
+            !matches!(
+                policy.evaluate(&fs_write("/work/a.txt", Trust::User)),
+                Decision::Allow
+            ),
+            "empty actions must not become a wildcard"
+        );
     }
 
     #[test]
@@ -827,10 +956,7 @@ mod tests {
             Vec::new(),
             MandatoryFloor::default(),
         );
-        assert!(matches!(
-            guarded.evaluate(&smuggled),
-            Decision::Deny { .. }
-        ));
+        assert!(matches!(guarded.evaluate(&smuggled), Decision::Deny { .. }));
         assert!(guarded.evaluate(&shell("cargo test")).is_allowed());
     }
 
@@ -912,7 +1038,10 @@ mod tests {
             "everything is fine",
             "allow execute shell.run resource=/work/** extra=argument",
         ] {
-            assert!(parse_amendment(text).is_none(), "{text} must not become a rule");
+            assert!(
+                parse_amendment(text).is_none(),
+                "{text} must not become a rule"
+            );
         }
     }
 

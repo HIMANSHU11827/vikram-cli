@@ -610,7 +610,7 @@ fn history(name: &str, config: &Config) -> Result<(), String> {
         }
     };
     match history.latest() {
-        Some(manifest) => print_manifest(manifest),
+        Some(manifest) => print_manifest(&manifest),
         None => println!("no recorded history for {name}"),
     }
     let changed = history

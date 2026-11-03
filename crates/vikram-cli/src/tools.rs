@@ -36,7 +36,10 @@ fn list_tools(args: ListArgs) -> Result<(), String> {
     let registry = ToolRegistry::with_builtins();
     let all_specs = registry.specs();
     let filtered: Vec<&ToolSpec> = if let Some(ref q) = args.query {
-        all_specs.iter().filter(|s| s.name.contains(q.as_str())).collect()
+        all_specs
+            .iter()
+            .filter(|s| s.name.contains(q.as_str()))
+            .collect()
     } else {
         all_specs.iter().collect()
     };
@@ -51,7 +54,10 @@ fn list_tools(args: ListArgs) -> Result<(), String> {
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?
+        );
         return Ok(());
     }
 
@@ -61,13 +67,17 @@ fn list_tools(args: ListArgs) -> Result<(), String> {
     }
 
     // Column widths
-    let name_width = filtered.iter().map(|s| s.name.len()).max().unwrap_or(24).max(24);
+    let name_width = filtered
+        .iter()
+        .map(|s| s.name.len())
+        .max()
+        .unwrap_or(24)
+        .max(24);
     let desc_width = 60;
 
     println!(
-        "{:<name_width$}  {}",
+        "{:<name_width$}  DESCRIPTION",
         "NAME",
-        "DESCRIPTION",
         name_width = name_width
     );
     println!(
@@ -79,12 +89,18 @@ fn list_tools(args: ListArgs) -> Result<(), String> {
     );
     for spec in &filtered {
         let desc = spec.description.lines().next().unwrap_or("").trim();
-        let desc = if desc.len() > desc_width {
-            format!("{}...", &desc[..desc_width - 3])
+        let desc = if desc.chars().count() > desc_width {
+            let truncated: String = desc.chars().take(desc_width.saturating_sub(3)).collect();
+            format!("{}...", truncated)
         } else {
             desc.to_string()
         };
-        println!("{:<name_width$}  {}", spec.name, desc, name_width = name_width);
+        println!(
+            "{:<name_width$}  {}",
+            spec.name,
+            desc,
+            name_width = name_width
+        );
     }
 
     println!("\n{} tool(s)", filtered.len());
@@ -101,6 +117,9 @@ fn show_tool(name: &str) -> Result<(), String> {
 
     println!("name:        {}", spec.name);
     println!("description: {}", spec.description);
-    println!("schema:      {}", serde_json::to_string_pretty(&spec.schema).map_err(|e| e.to_string())?);
+    println!(
+        "schema:      {}",
+        serde_json::to_string_pretty(&spec.schema).map_err(|e| e.to_string())?
+    );
     Ok(())
 }

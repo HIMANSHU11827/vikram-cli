@@ -33,6 +33,26 @@ pub struct ToolOutput {
 #[derive(Clone, Debug)]
 pub struct ToolContext {
     pub workspace_root: PathBuf,
+    /// OS-level isolation for commands this tool spawns. Policy still gates both.
+    pub sandbox: crate::sandbox::Sandbox,
+}
+
+impl ToolContext {
+    /// The on-by-default context: sandbox resolved from the caller's settings.
+    pub fn new(workspace_root: PathBuf, settings: &crate::config::SandboxSettings) -> Self {
+        let sandbox = if settings.enabled {
+            crate::sandbox::Sandbox::detect(
+                settings.allow_network,
+                settings.read_only_paths.clone(),
+            )
+        } else {
+            crate::sandbox::Sandbox::disabled("disabled in config")
+        };
+        Self {
+            workspace_root,
+            sandbox,
+        }
+    }
 }
 
 pub use crate::provider::ToolSpec;
@@ -79,6 +99,7 @@ impl ToolRegistry {
         registry.register(Box::new(Git));
         registry.register(Box::new(BuildRun));
         registry.register(Box::new(TestRun));
+        registry.register(Box::new(VerifyRun));
         registry.register(Box::new(MemorySave));
         registry.register(Box::new(MemorySearch));
         registry.register(Box::new(MemoryList));
@@ -180,12 +201,21 @@ impl ToolRegistry {
     }
 
     pub fn tool_disable(&self, name: &str) {
-        self.disabled.lock().expect("disabled lock").insert(name.to_owned());
+        self.disabled
+            .lock()
+            .expect("disabled lock")
+            .insert(name.to_owned());
         self.persist_disabled();
     }
 
     fn persist_disabled(&self) {
-        let disabled: Vec<String> = self.disabled.lock().expect("disabled lock").iter().cloned().collect();
+        let disabled: Vec<String> = self
+            .disabled
+            .lock()
+            .expect("disabled lock")
+            .iter()
+            .cloned()
+            .collect();
         let path = crate::config::vikram_home().join("disabled_tools.json");
         let _ = std::fs::create_dir_all(crate::config::vikram_home());
         let _ = std::fs::write(&path, serde_json::to_string(&disabled).unwrap_or_default());
@@ -743,6 +773,7 @@ impl Tool for RunShell {
             c.args(["-c", &command]);
             c
         };
+        ctx.sandbox.wrap_command(&mut cmd, &ctx.workspace_root);
 
         let mut child = match cmd
             .current_dir(&ctx.workspace_root)
@@ -4270,6 +4301,73 @@ impl Tool for PluginDeps {
     }
 }
 
+struct VerifyRun;
+
+impl Tool for VerifyRun {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "verify".into(),
+            description: "Run the build+test verification loop and return structured pass/fail."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "max_attempts": {"type": "integer"}
+                }
+            }),
+        }
+    }
+
+    fn permission(&self, _args: &Value) -> Result<PermissionRequest, VikramError> {
+        Ok(PermissionRequest::new(
+            ActionKind::Execute,
+            "verify",
+            "cargo",
+            SideEffect::LocalMutation,
+            Trust::Model,
+        ))
+    }
+
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+        let max_attempts = args
+            .get("max_attempts")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .clamp(1, 10) as u32;
+        let budget = crate::verification::Budget::attempts(max_attempts);
+        let outcome = crate::verification::verify(
+            &ctx.workspace_root,
+            &crate::verification::VerificationPlan::cargo(),
+            &budget,
+            |_, _| None,
+        )?;
+        let steps = outcome
+            .steps
+            .iter()
+            .map(|s| json!({"name": s.name, "ok": s.ok, "duration_ms": s.duration_ms}))
+            .collect::<Vec<_>>();
+        let payload = json!({
+            "ok": outcome.ok,
+            "attempts": outcome.attempts,
+            "failure": outcome
+                .failure
+                .as_ref()
+                .map(|(n, k)| json!({"step": n, "kind": k.as_str()})),
+            "failure_output": outcome
+                .steps
+                .iter()
+                .rev()
+                .find(|s| !s.ok)
+                .map(|s| truncated(s.output.clone())),
+            "steps": steps,
+        });
+        Ok(ToolOutput {
+            content: truncated(payload.to_string()),
+            ok: outcome.ok,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4279,6 +4377,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = ToolContext {
             workspace_root: dir.path().to_path_buf(),
+            sandbox: crate::sandbox::Sandbox::disabled("test context"),
         };
         (dir, ctx)
     }
@@ -5650,7 +5749,10 @@ mod tests {
     fn the_file_tools_create_edit_list_and_delete_for_real() {
         let (dir, ctx) = ctx();
         let written = WriteFile
-            .run(&json!({"path": "notes/todo.md", "content": "# one\n"}), &ctx)
+            .run(
+                &json!({"path": "notes/todo.md", "content": "# one\n"}),
+                &ctx,
+            )
             .unwrap();
         assert!(written.ok, "{}", written.content);
         assert_eq!(
@@ -5730,7 +5832,9 @@ mod tests {
                 &ctx,
             )
             .unwrap();
-        let out = SearchText.run(&json!({"query": "marker_xyz"}), &ctx).unwrap();
+        let out = SearchText
+            .run(&json!({"query": "marker_xyz"}), &ctx)
+            .unwrap();
         assert!(out.ok, "{}", out.content);
         assert!(out.content.contains("lib.rs"), "{}", out.content);
     }
@@ -5790,7 +5894,10 @@ mod tests {
     fn web_search_returns_sources_or_says_why_it_could_not() {
         let (_dir, ctx) = ctx();
         let out = WebSearch
-            .run(&json!({"query": "rust programming language", "limit": 3}), &ctx)
+            .run(
+                &json!({"query": "rust programming language", "limit": 3}),
+                &ctx,
+            )
             .unwrap();
         if out.ok {
             assert!(
@@ -5814,6 +5921,7 @@ mod tests {
         unsafe { std::env::set_var("VIKRAM_HOME", dir.path().join("home")) };
         let ctx = ToolContext {
             workspace_root: dir.path().to_path_buf(),
+            sandbox: crate::sandbox::Sandbox::disabled("test context"),
         };
 
         let saved = MemorySave

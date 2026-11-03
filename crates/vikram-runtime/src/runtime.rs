@@ -29,12 +29,13 @@ use crate::rules::RuleBook;
 use crate::session::SessionRuntime;
 use crate::skills::{Skill, SkillRegistry};
 use crate::teams::{Team, TeamManager};
+use crate::tickets::TicketManager;
 use crate::tools::{McpTool, ToolContext, ToolRegistry};
 use crate::types::{
     AgentSnapshot, AgentState, ApprovalPrompt, BackgroundTask, Metrics, NoticeLevel, RuntimeEvent,
     RuntimeStatus, SessionSnapshot, StateSnapshot, TaskState, TeamSnapshot, now_ms,
 };
-use vikram_mcp::runtime::PrivateRuntime;
+use crate::workspace::WorkspaceManager;
 use vikram_mcp::visibility::VisibilityManager;
 
 pub(crate) struct PendingApproval {
@@ -57,18 +58,23 @@ pub(crate) struct RuntimeInner {
     pub config: Config,
     pub store: Store,
     pub memory: crate::MemoryStore,
+    pub context: Arc<crate::context::ContextLoader>,
+    pub hive: crate::HiveManager,
+    pub learning: crate::LearningManager,
     pub bus: EventBus,
     pub tools: ToolRegistry,
-    pub provider: Option<Arc<dyn Provider>>,
+    pub provider: std::sync::RwLock<Option<Arc<dyn Provider>>>,
     pub sessions: Mutex<Vec<Arc<SessionRuntime>>>,
     pub agents: AgentManager,
     pub tasks: TaskManager,
     pub teams: TeamManager,
+    pub tickets: TicketManager,
     pub mcp: std::sync::Arc<std::sync::Mutex<McpRegistry>>,
     pub mcp_visibility: std::sync::Mutex<VisibilityManager>,
-    pub mcp_private_runtime: std::sync::Mutex<PrivateRuntime>,
     pub plugins: Mutex<PluginRegistry>,
     pub skills: std::sync::Mutex<SkillRegistry>,
+    pub evolution: std::sync::Mutex<vikram_evolution::EvolutionEngine>,
+    pub workspace: WorkspaceManager,
     pub approvals: Mutex<HashMap<ApprovalId, PendingApproval>>,
     /// `ask_user` requests awaiting an operator answer, keyed by request id.
     pub questions: Mutex<HashMap<String, PendingQuestion>>,
@@ -126,6 +132,14 @@ impl RuntimeInner {
         let root = self.workspace_root.to_string_lossy().into_owned();
         let floor = MandatoryFloor {
             workspace_root: Some(root.clone()),
+            // VIKRAM's own session workspaces under its home are host-declared writable so a
+            // session can own its generated files. Fixed here, never from rules or model content.
+            extra_write_roots: vec![
+                crate::config::vikram_home()
+                    .join("sessions")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
             ..MandatoryFloor::default()
         };
         let defaults = vec![
@@ -228,6 +242,8 @@ impl RuntimeInner {
             .unwrap_or(0);
         let context_window = self
             .provider
+            .read()
+            .expect("provider lock")
             .as_ref()
             .and_then(|p| p.context_window())
             .or(self.config.context_window);
@@ -247,7 +263,12 @@ impl RuntimeInner {
                     Some(live)
                 }
             },
-            provider: self.provider.as_ref().map(|p| p.name().to_owned()),
+            provider: self
+                .provider
+                .read()
+                .expect("provider lock")
+                .as_ref()
+                .map(|p| p.name().to_owned()),
             context_used,
             context_window,
             turn_elapsed_ms,
@@ -262,7 +283,11 @@ impl RuntimeInner {
             skills_discovered: crate::skills::SkillRegistry::for_workspace(&self.workspace_root)
                 .skills()
                 .len(),
-            skills_loaded: 0,
+            skills_loaded: crate::skills::SkillRegistry::for_workspace(&self.workspace_root)
+                .skills()
+                .iter()
+                .filter(|s| s.loaded)
+                .count(),
             thinking: self.config.thinking,
         }
     }
@@ -272,26 +297,16 @@ impl RuntimeInner {
     }
 
     pub fn tool_context(&self) -> ToolContext {
-        ToolContext {
-            workspace_root: self.workspace_root.clone(),
-        }
+        ToolContext::new(
+            self.workspace_root.clone(),
+            &self.config.security.sandbox,
+        )
     }
 
     pub fn tools(&self) -> &crate::tools::ToolRegistry {
         &self.tools
     }
 
-    #[allow(dead_code)]
-    #[allow(dead_code)]
-    pub fn mcp_visibility(&self) -> &std::sync::Mutex<VisibilityManager> {
-        &self.mcp_visibility
-    }
-
-    #[allow(dead_code)]
-    #[allow(dead_code)]
-    pub fn mcp_private_runtime(&self) -> &std::sync::Mutex<PrivateRuntime> {
-        &self.mcp_private_runtime
-    }
     pub fn create_session(&self, title: Option<String>) -> Result<Arc<SessionRuntime>> {
         let now = now_ms();
         let title = title.unwrap_or_else(|| {
@@ -308,6 +323,18 @@ impl RuntimeInner {
                 now,
             )
             .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        // Stamp the ownership now so user/profile deletion cascades reach this session too.
+        let identity = self.store.get_active_identity().unwrap_or_default();
+        if let Some(user) = identity.user {
+            self.store
+                .set_session_user(&row.id, &user)
+                .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        }
+        if let Some(profile) = identity.profile {
+            self.store
+                .set_session_profile(&row.id, &profile)
+                .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        }
         let session = Arc::new(SessionRuntime::from_row(row));
         self.sessions
             .lock()
@@ -320,7 +347,7 @@ impl RuntimeInner {
     pub fn status(&self) -> RuntimeStatus {
         let busy =
             self.session_list().iter().any(|s| s.is_busy()) || self.agents.active_count() > 0;
-        if self.provider.is_none() {
+        if self.provider.read().expect("provider lock").is_none() {
             RuntimeStatus::Error("model not configured".into())
         } else if busy {
             RuntimeStatus::Active
@@ -411,6 +438,16 @@ impl Runtime {
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let workspace_root = std::fs::canonicalize(&workspace_root).unwrap_or(workspace_root);
 
+        let context = Arc::new(crate::context::ContextLoader::new(
+            crate::config::vikram_home(),
+            workspace_root.clone(),
+        ));
+
+        let hive = crate::HiveManager::new(std::sync::Arc::new(store.clone()));
+        let tickets = crate::TicketManager::new(std::sync::Arc::new(store.clone()));
+        let learning =
+            crate::LearningManager::open(Some(crate::config::vikram_home().join("learning.json")));
+
         let agents = AgentManager::new();
         match store.list_agents() {
             Ok(rows) => {
@@ -420,7 +457,6 @@ impl Runtime {
             }
             Err(err) => return Err(RuntimeError::Store(err.to_string())),
         }
-
         let provider = match provider_override {
             Some(provider) => Some(provider),
             None => crate::openai::OpenAiProvider::from_config(&config)?
@@ -430,6 +466,18 @@ impl Runtime {
         let mcp = McpRegistry::load(McpConfig::load());
         let plugins = PluginRegistry::from_default_dir();
         let skills = std::sync::Mutex::new(SkillRegistry::for_workspace(&workspace_root));
+        let evolution_skills_root = crate::config::vikram_home().join("skills");
+        let _ = std::fs::create_dir_all(&evolution_skills_root);
+        let evolution = vikram_evolution::EvolutionEngine::open(
+            crate::config::vikram_home().join("evolution.db"),
+            evolution_skills_root,
+        )
+        .unwrap_or_else(|_| {
+            vikram_evolution::EvolutionEngine::open_in_memory(
+                crate::config::vikram_home().join("skills"),
+            )
+            .expect("evolution in-memory")
+        });
 
         // The layers above this runtime can refuse a posture; a config that asked for one of those
         // starts on the most permissive thing still available rather than failing to boot.
@@ -442,24 +490,29 @@ impl Runtime {
 
         let model_name = config.model.clone();
 
+        let workspace = WorkspaceManager::new(store.clone(), crate::config::vikram_home());
+
         let inner = Arc::new(RuntimeInner {
             config,
             store,
             memory,
+            context,
+            hive,
+            tickets,
+            learning,
             bus: EventBus::new(),
             tools: ToolRegistry::with_builtins(),
-            provider,
+            provider: std::sync::RwLock::new(provider),
             sessions: Mutex::new(Vec::new()),
             agents,
             tasks: TaskManager::new(),
             teams: TeamManager::load(),
             mcp: Arc::new(Mutex::new(mcp)),
             mcp_visibility: Mutex::new(VisibilityManager::new()),
-            mcp_private_runtime: Mutex::new(PrivateRuntime::new(
-                workspace_root.join(".vikram").join("mcp-runtime"),
-            )),
             plugins: Mutex::new(plugins),
             skills,
+            evolution: Mutex::new(evolution),
+            workspace,
             approvals: Mutex::new(HashMap::new()),
             questions: Mutex::new(HashMap::new()),
             mode: Mutex::new(mode),
@@ -493,6 +546,28 @@ impl Runtime {
                 *session.messages.lock().expect("messages lock") = messages;
             }
             inner.sessions.lock().expect("sessions lock").push(session);
+        }
+
+        // Bootstrap a default user/profile/identity if none exist, so multi-user isolation has a
+        // starting account without assuming a single global user.
+        if inner
+            .store
+            .list_users()
+            .map(|u| u.is_empty())
+            .unwrap_or(true)
+        {
+            let now = now_ms();
+            if let Ok(user) = inner.store.create_user("default", now) {
+                if let Ok(profile) = inner.store.create_profile(&user.id, "default", now) {
+                    let _ = inner
+                        .store
+                        .set_active_identity(&vikram_store::ActiveIdentity {
+                            user: Some(user.id),
+                            profile: Some(profile.id),
+                            main_agent: None,
+                        });
+                }
+            }
         }
 
         if inner.session_list().is_empty() {
@@ -567,12 +642,220 @@ impl RuntimeHandle {
         self.inner.tool_context()
     }
 
-    pub fn tools(&self) -> &crate::tools::ToolRegistry {
-        self.inner.tools()
+    pub fn context(&self) -> Arc<crate::context::ContextLoader> {
+        Arc::clone(&self.inner.context)
     }
 
-    pub fn mcp_visibility(&self) -> &std::sync::Mutex<VisibilityManager> {
-        &self.inner.mcp_visibility
+    pub fn active_identity(&self) -> vikram_store::ActiveIdentity {
+        self.inner.store.get_active_identity().unwrap_or_default()
+    }
+
+    pub fn set_active_identity(&self, identity: &vikram_store::ActiveIdentity) -> Result<()> {
+        self.inner
+            .store
+            .set_active_identity(identity)
+            .map_err(|e| RuntimeError::Store(e.to_string()))
+    }
+
+    pub fn learning(&self) -> &crate::LearningManager {
+        &self.inner.learning
+    }
+
+    pub fn trigger_learning_review(&self, session: &SessionId, snapshot_text: &str) {
+        let inner = Arc::clone(&self.inner);
+        let session = session.clone();
+        let snapshot = snapshot_text.to_owned();
+        tokio::spawn(async move {
+            if inner.learning.policy_memory() == crate::LearningPolicy::Disabled
+                && inner.learning.policy_skill() == crate::LearningPolicy::Disabled
+            {
+                return;
+            }
+            let provider = match inner.provider.read().expect("provider lock").clone() {
+                Some(p) => p,
+                None => return,
+            };
+            let model = inner.model();
+            let prompt = format!(
+                "{}\n\nConversation:\n{}",
+                inner.learning.review_prompt(),
+                snapshot
+            );
+            let request = crate::provider::CompletionRequest {
+                model,
+                messages: vec![vikram_contracts::Message::user(prompt)],
+                tools: Vec::new(),
+                max_output_tokens: inner.config.max_output_tokens,
+            };
+            use futures_util::StreamExt;
+            let mut stream = provider.stream(request);
+            let mut collected = String::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(crate::provider::ProviderEvent::TextDelta(t)) => collected.push_str(&t),
+                    Ok(crate::provider::ProviderEvent::Finished { .. }) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            let trimmed = collected.trim();
+            if trimmed.is_empty() || trimmed == "Nothing to save." {
+                return;
+            }
+            let json_str = if trimmed.starts_with("```") {
+                trimmed
+                    .trim_start_matches("```json")
+                    .trim_start_matches("```")
+                    .trim_end_matches("```")
+                    .trim()
+            } else {
+                trimmed
+            };
+            let proposals: Vec<serde_json::Value> = match serde_json::from_str(json_str) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            for p in proposals {
+                let kind = p
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("memory")
+                    .to_owned();
+                let target = p
+                    .get("target")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("memory")
+                    .to_owned();
+                let action = p
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("add")
+                    .to_owned();
+                let key = p
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let content = p
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let reason = p
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                if content.trim().is_empty() {
+                    continue;
+                }
+                if kind == "memory" {
+                    let scope = if target == "user" {
+                        "user".to_owned()
+                    } else {
+                        "memory".to_owned()
+                    };
+                    let existing = inner.memory.list(&scope);
+                    let existing_contents: Vec<String> =
+                        existing.iter().map(|(_, v)| v.clone()).collect();
+                    if inner.learning.dedup_memory(&existing_contents, &content) {
+                        continue;
+                    }
+                    let policy = inner.learning.policy_memory();
+                    if policy == crate::LearningPolicy::Auto {
+                        let _ = inner.memory.save(&key, &content, &scope);
+                        inner.learning.audit(crate::learning::LearningAuditEntry {
+                            ts_ms: crate::types::now_ms(),
+                            session: session.clone(),
+                            kind: kind.clone(),
+                            action: action.clone(),
+                            target: target.clone(),
+                            outcome: "applied".to_owned(),
+                            detail: reason.clone(),
+                        });
+                    } else if policy == crate::LearningPolicy::ApprovalRequired
+                        || policy == crate::LearningPolicy::SuggestOnly
+                    {
+                        inner
+                            .learning
+                            .stage_proposal(crate::learning::LearningProposal {
+                                id: format!("lrn-{}", crate::types::now_ms()),
+                                session: session.clone(),
+                                kind: kind.clone(),
+                                target: target.clone(),
+                                action: action.clone(),
+                                key: key.clone(),
+                                content: content.clone(),
+                                reason: reason.clone(),
+                                status: "pending".to_owned(),
+                                created_ms: crate::types::now_ms(),
+                                before: None,
+                                after: Some(content.clone()),
+                            });
+                        inner.learning.audit(crate::learning::LearningAuditEntry {
+                            ts_ms: crate::types::now_ms(),
+                            session: session.clone(),
+                            kind: kind.clone(),
+                            action: action.clone(),
+                            target: target.clone(),
+                            outcome: "staged".to_owned(),
+                            detail: reason.clone(),
+                        });
+                    }
+                } else if kind == "skill" {
+                    let policy = inner.learning.policy_skill();
+                    if policy == crate::LearningPolicy::Auto {
+                        let mgr = vikram_skills::Manager::new();
+                        let name = if target.is_empty() {
+                            "learned-skill"
+                        } else {
+                            &target
+                        };
+                        let _ = mgr.create(name, &reason, &content);
+                        inner.learning.audit(crate::learning::LearningAuditEntry {
+                            ts_ms: crate::types::now_ms(),
+                            session: session.clone(),
+                            kind: kind.clone(),
+                            action: action.clone(),
+                            target: target.clone(),
+                            outcome: "applied".to_owned(),
+                            detail: reason.clone(),
+                        });
+                    } else {
+                        inner
+                            .learning
+                            .stage_proposal(crate::learning::LearningProposal {
+                                id: format!("lrn-{}", crate::types::now_ms()),
+                                session: session.clone(),
+                                kind: kind.clone(),
+                                target: target.clone(),
+                                action: action.clone(),
+                                key: key.clone(),
+                                content: content.clone(),
+                                reason: reason.clone(),
+                                status: "pending".to_owned(),
+                                created_ms: crate::types::now_ms(),
+                                before: None,
+                                after: Some(content.clone()),
+                            });
+                        inner.learning.audit(crate::learning::LearningAuditEntry {
+                            ts_ms: crate::types::now_ms(),
+                            session: session.clone(),
+                            kind: kind.clone(),
+                            action: action.clone(),
+                            target: target.clone(),
+                            outcome: "staged".to_owned(),
+                            detail: reason.clone(),
+                        });
+                    }
+                }
+            }
+            inner.learning.save();
+        });
+    }
+
+    pub fn tools(&self) -> &crate::tools::ToolRegistry {
+        self.inner.tools()
     }
 
     /// The configuration this process started with. Read-only: a live edit here would change what
@@ -622,8 +905,11 @@ impl RuntimeHandle {
         servers
     }
 
-    pub fn mcp_private_runtime(&self) -> &std::sync::Mutex<PrivateRuntime> {
-        &self.inner.mcp_private_runtime
+    pub fn workspace(&self) -> &WorkspaceManager {
+        &self.inner.workspace
+    }
+    pub fn evolution(&self) -> std::sync::MutexGuard<'_, vikram_evolution::EvolutionEngine> {
+        self.inner.evolution.lock().expect("evolution lock")
     }
     pub fn events(&self) -> broadcast::Receiver<RuntimeEvent> {
         self.inner.bus.subscribe()
@@ -810,13 +1096,32 @@ impl RuntimeHandle {
         );
         self.inner.publish_session(&session);
         self.inner.publish_metrics();
-        if self.inner.provider.is_none() {
-            self.inner.emit(RuntimeEvent::Notice {
-                level: NoticeLevel::Warn,
-                text: format!(
-                    "model set to `{model}`; no endpoint is configured yet, so a turn cannot start"
-                ),
-            });
+
+        // A provider that was never built at boot (no key yet, e.g.) can still come up now: the
+        // operator naming a model here is exactly the moment the endpoint is known.
+        let mut provider_slot = self.inner.provider.write().expect("provider lock");
+        if provider_slot.is_none() {
+            match crate::openai::OpenAiProvider::from_config(&config) {
+                Ok(Some(provider)) => {
+                    *provider_slot = Some(Arc::new(provider) as Arc<dyn Provider>);
+                    self.inner.emit(RuntimeEvent::Notice {
+                        level: NoticeLevel::Info,
+                        text: format!(
+                            "provider connected for `{model}`; turns can start now"
+                        ),
+                    });
+                }
+                _ => {
+                    drop(provider_slot);
+                    self.inner.emit(RuntimeEvent::Notice {
+                        level: NoticeLevel::Warn,
+                        text: format!(
+                            "model set to `{model}`; no endpoint is configured yet, so a turn cannot start"
+                        ),
+                    });
+                    return Ok(());
+                }
+            }
         }
         Ok(())
     }
@@ -1126,6 +1431,544 @@ impl RuntimeHandle {
         Ok(())
     }
 
+    // ---- hive group chat -------------------------------------------------
+
+    pub fn hive_create(
+        &self,
+        owner: vikram_contracts::UserId,
+        profile: Option<vikram_contracts::ProfileId>,
+        name: impl Into<String>,
+        objective: impl Into<String>,
+        policy: impl Into<String>,
+    ) -> Result<vikram_contracts::HiveId> {
+        let now = now_ms();
+        let row = self
+            .inner
+            .hive
+            .create(
+                owner,
+                profile,
+                &name.into(),
+                &objective.into(),
+                &policy.into(),
+                now,
+            )
+            .map_err(RuntimeError::InvalidState)?;
+        Ok(row.id)
+    }
+
+    pub fn hive_list(&self) -> Result<Vec<vikram_store::HiveRow>> {
+        self.inner.hive.list().map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn hive_list_by_user(
+        &self,
+        user: &vikram_contracts::UserId,
+    ) -> Result<Vec<vikram_store::HiveRow>> {
+        self.inner
+            .hive
+            .list_by_user(user)
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn hive_get(&self, id: &vikram_contracts::HiveId) -> Result<Option<vikram_store::HiveRow>> {
+        self.inner.hive.get(id).map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn hive_delete(&self, id: &vikram_contracts::HiveId) -> Result<()> {
+        self.inner
+            .hive
+            .delete(id)
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn hive_add_participant(
+        &self,
+        hive: &vikram_contracts::HiveId,
+        entity: &vikram_contracts::EntityId,
+        kind: vikram_store::EntityKind,
+        role: impl Into<String>,
+    ) -> Result<()> {
+        self.inner
+            .hive
+            .add_participant(hive, entity, kind, &role.into(), now_ms())
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn hive_remove_participant(
+        &self,
+        hive: &vikram_contracts::HiveId,
+        entity: &vikram_contracts::EntityId,
+    ) -> Result<()> {
+        self.inner
+            .hive
+            .remove_participant(hive, entity)
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn hive_participants(
+        &self,
+        hive: &vikram_contracts::HiveId,
+    ) -> Result<Vec<vikram_store::HiveParticipantRow>> {
+        self.inner
+            .hive
+            .participants(hive)
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn hive_append_message(
+        &self,
+        hive: &vikram_contracts::HiveId,
+        sender: &str,
+        sender_kind: &str,
+        content: &str,
+        task_ref: Option<&str>,
+    ) -> Result<vikram_store::HiveMessageRow> {
+        self.inner
+            .hive
+            .append_message(hive, sender, sender_kind, content, task_ref, now_ms())
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn hive_messages(
+        &self,
+        hive: &vikram_contracts::HiveId,
+    ) -> Result<Vec<vikram_store::HiveMessageRow>> {
+        self.inner
+            .hive
+            .messages(hive)
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn hive_set_session(
+        &self,
+        hive: &vikram_contracts::HiveId,
+        session: Option<&vikram_contracts::SessionId>,
+    ) -> Result<()> {
+        self.inner
+            .hive
+            .set_session(hive, session, now_ms())
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    // ---- unified ticket system ------------------------------------------
+
+    pub fn tickets(&self) -> &TicketManager {
+        &self.inner.tickets
+    }
+
+    pub fn ticket_create(
+        &self,
+        owner_key: &str,
+        owner_kind: &str,
+        kind: &str,
+        title: &str,
+        request: &str,
+    ) -> Result<vikram_contracts::TicketId> {
+        let now = now_ms();
+        let row = self
+            .inner
+            .tickets
+            .create(
+                owner_key, owner_kind, kind, title, request, "", None, None, None, None, now,
+            )
+            .map_err(RuntimeError::InvalidState)?;
+        Ok(row.id)
+    }
+
+    pub fn ticket_get(
+        &self,
+        id: &vikram_contracts::TicketId,
+    ) -> Result<Option<vikram_store::TicketRow>> {
+        self.inner
+            .tickets
+            .get(id)
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_list(&self) -> Result<Vec<vikram_store::TicketRow>> {
+        self.inner
+            .tickets
+            .list()
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_list_by_owner(&self, owner_key: &str) -> Result<Vec<vikram_store::TicketRow>> {
+        self.inner
+            .tickets
+            .list_by_owner(owner_key)
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_list_by_kind(&self, kind: &str) -> Result<Vec<vikram_store::TicketRow>> {
+        self.inner
+            .tickets
+            .list_by_kind(kind)
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_list_by_status(&self, status: &str) -> Result<Vec<vikram_store::TicketRow>> {
+        self.inner
+            .tickets
+            .list_by_status(status)
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_search(&self, query: &str) -> Result<Vec<vikram_store::TicketRow>> {
+        self.inner
+            .tickets
+            .search(query)
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_close(&self, id: &vikram_contracts::TicketId, actor: &str) -> Result<()> {
+        self.inner
+            .tickets
+            .close(id, actor, now_ms())
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_reopen(&self, id: &vikram_contracts::TicketId, actor: &str) -> Result<()> {
+        self.inner
+            .tickets
+            .reopen(id, actor, now_ms())
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_cancel(&self, id: &vikram_contracts::TicketId, actor: &str) -> Result<()> {
+        self.inner
+            .tickets
+            .cancel(id, actor, now_ms())
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_set_result(
+        &self,
+        id: &vikram_contracts::TicketId,
+        result: &str,
+        actor: &str,
+    ) -> Result<()> {
+        self.inner
+            .tickets
+            .set_result(id, result, actor, now_ms())
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_set_failure(
+        &self,
+        id: &vikram_contracts::TicketId,
+        reason: &str,
+        actor: &str,
+    ) -> Result<()> {
+        self.inner
+            .tickets
+            .set_failure(id, reason, actor, now_ms())
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_delete(&self, id: &vikram_contracts::TicketId) -> Result<()> {
+        self.inner
+            .tickets
+            .delete(id)
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_add_participant(&self, row: &vikram_store::TicketParticipantRow) -> Result<()> {
+        self.inner
+            .tickets
+            .add_participant(row)
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_participants(
+        &self,
+        id: &vikram_contracts::TicketId,
+    ) -> Result<Vec<vikram_store::TicketParticipantRow>> {
+        self.inner
+            .tickets
+            .participants(id)
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_post_message(
+        &self,
+        ticket: &vikram_contracts::TicketId,
+        author_key: &str,
+        author_kind: &str,
+        content: &str,
+        visibility: &str,
+    ) -> Result<vikram_store::TicketMessageRow> {
+        let now = now_ms();
+        self.inner
+            .tickets
+            .post_message(
+                ticket,
+                author_key,
+                author_kind,
+                content,
+                visibility,
+                None,
+                now,
+            )
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_messages(
+        &self,
+        ticket: &vikram_contracts::TicketId,
+        viewer_key: &str,
+    ) -> Result<Vec<vikram_store::TicketMessageRow>> {
+        self.inner
+            .tickets
+            .messages_for(ticket, viewer_key)
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_create_assignment(
+        &self,
+        ticket: &vikram_contracts::TicketId,
+        assignee_key: &str,
+        assignee_kind: &str,
+        entity_id: Option<vikram_contracts::EntityId>,
+        title: &str,
+        description: &str,
+    ) -> Result<vikram_store::AssignmentRow> {
+        let now = now_ms();
+        self.inner
+            .tickets
+            .create_assignment(
+                ticket,
+                assignee_key,
+                assignee_kind,
+                entity_id,
+                title,
+                description,
+                None,
+                None,
+                now,
+            )
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_assignments(
+        &self,
+        ticket: &vikram_contracts::TicketId,
+    ) -> Result<Vec<vikram_store::AssignmentRow>> {
+        self.inner
+            .tickets
+            .assignments(ticket)
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_complete_assignment(
+        &self,
+        id: &vikram_contracts::AssignmentId,
+        result: &str,
+        actor: &str,
+    ) -> Result<()> {
+        self.inner
+            .tickets
+            .complete_assignment(id, result, actor, now_ms())
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_fail_assignment(
+        &self,
+        id: &vikram_contracts::AssignmentId,
+        error: &str,
+        actor: &str,
+    ) -> Result<()> {
+        self.inner
+            .tickets
+            .fail_assignment(id, error, actor, now_ms())
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_update_assignment_status(
+        &self,
+        id: &vikram_contracts::AssignmentId,
+        status: &str,
+        actor: &str,
+    ) -> Result<()> {
+        self.inner
+            .tickets
+            .update_assignment_status(id, status, actor, now_ms())
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub fn ticket_events(
+        &self,
+        ticket: &vikram_contracts::TicketId,
+    ) -> Result<Vec<vikram_store::TicketEventRow>> {
+        self.inner
+            .tickets
+            .events(ticket)
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    // Hive-ticket integration: create a shared-collaboration ticket for a hive.
+    pub fn ticket_create_hive(
+        &self,
+        hive_id: &vikram_contracts::HiveId,
+        owner_key: &str,
+        title: &str,
+        request: &str,
+        strategy: &str,
+        member_keys: &[(String, String)],
+    ) -> Result<vikram_contracts::TicketId> {
+        let now = now_ms();
+        let row = self
+            .inner
+            .tickets
+            .create_hive_ticket(
+                hive_id,
+                owner_key,
+                title,
+                request,
+                strategy,
+                member_keys,
+                now,
+            )
+            .map_err(RuntimeError::InvalidState)?;
+        Ok(row.id)
+    }
+
+    // Bot-ticket integration: create an independent bot-owned ticket.
+    pub fn ticket_create_bot(
+        &self,
+        bot_key: &str,
+        title: &str,
+        request: &str,
+    ) -> Result<vikram_contracts::TicketId> {
+        let now = now_ms();
+        let row = self
+            .inner
+            .tickets
+            .create_bot_ticket(bot_key, title, request, now)
+            .map_err(RuntimeError::InvalidState)?;
+        Ok(row.id)
+    }
+
+    // Sub-agent assignment under a parent ticket.
+    pub fn ticket_create_subagent_assignment(
+        &self,
+        ticket: &vikram_contracts::TicketId,
+        assignee_key: &str,
+        assignee_kind: &str,
+        entity_id: Option<vikram_contracts::EntityId>,
+        title: &str,
+        description: &str,
+    ) -> Result<vikram_store::AssignmentRow> {
+        let now = now_ms();
+        self.inner
+            .tickets
+            .create_subagent_assignment(
+                ticket,
+                assignee_key,
+                assignee_kind,
+                entity_id,
+                title,
+                description,
+                now,
+            )
+            .map_err(RuntimeError::InvalidState)
+    }
+
+    pub async fn hive_run(
+        &self,
+        hive: &vikram_contracts::HiveId,
+        initial: &str,
+    ) -> Result<Vec<vikram_store::HiveMessageRow>> {
+        use futures_util::StreamExt;
+        let _ = self
+            .inner
+            .hive
+            .get(hive)
+            .map_err(RuntimeError::InvalidState)?
+            .ok_or_else(|| RuntimeError::InvalidState("hive not found".into()))?;
+
+        let now = now_ms();
+        self.inner
+            .hive
+            .append_message(hive, "vikram", "main_agent", initial, None, now)
+            .map_err(RuntimeError::InvalidState)?;
+
+        let participants = self
+            .inner
+            .hive
+            .participants(hive)
+            .map_err(RuntimeError::InvalidState)?;
+        let mut entities: Vec<vikram_store::EntityRow> = Vec::new();
+        for p in &participants {
+            if let Ok(Some(e)) = self.inner.store.get_entity(&p.entity) {
+                entities.push(e);
+            }
+        }
+
+        let provider = self
+            .inner
+            .provider
+            .read()
+            .expect("provider lock")
+            .clone()
+            .ok_or_else(|| RuntimeError::InvalidState("no provider configured".into()))?;
+        let model = self.inner.model();
+
+        for ent in &entities {
+            let ctx = self.inner.context.load_agent_or_bot(ent);
+            let system_text = ctx.render();
+            let msgs = self
+                .inner
+                .hive
+                .messages(hive)
+                .map_err(RuntimeError::InvalidState)?;
+            let mut request_messages: Vec<vikram_contracts::Message> = Vec::new();
+            if !system_text.trim().is_empty() {
+                request_messages.push(vikram_contracts::Message::system(system_text));
+            }
+            for m in &msgs {
+                let role = if m.sender == ent.name || m.sender == ent.slug {
+                    vikram_contracts::Role::Assistant
+                } else {
+                    vikram_contracts::Role::User
+                };
+                request_messages.push(vikram_contracts::Message::text(
+                    role,
+                    m.content.clone(),
+                    vikram_contracts::Trust::User,
+                ));
+            }
+            let request = crate::provider::CompletionRequest {
+                model: model.clone(),
+                messages: request_messages,
+                tools: Vec::new(),
+                max_output_tokens: self.inner.config.max_output_tokens,
+            };
+            let mut stream = provider.stream(request);
+            let mut collected = String::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(crate::provider::ProviderEvent::TextDelta(t)) => collected.push_str(&t),
+                    Ok(crate::provider::ProviderEvent::Finished { .. }) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            if !collected.trim().is_empty() {
+                let ts = now_ms();
+                self.inner
+                    .hive
+                    .append_message(hive, &ent.name, ent.kind.as_str(), &collected, None, ts)
+                    .map_err(RuntimeError::InvalidState)?;
+            }
+        }
+
+        self.inner
+            .hive
+            .messages(hive)
+            .map_err(RuntimeError::InvalidState)
+    }
+
     pub fn memory_save<K, V, S>(&self, key: K, value: V, scope: S) -> Result<()>
     where
         K: AsRef<str>,
@@ -1185,7 +2028,8 @@ impl RuntimeHandle {
     /// Enable a skill by name (removes it from the disabled list). Re-discovers afterwards.
     pub fn skill_enable(&self, name: &str) -> Result<()> {
         let mgr = vikram_skills::Manager::new();
-        mgr.enable(name).map_err(|e| RuntimeError::Store(e.to_string()))?;
+        mgr.enable(name)
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
         self.rescan_skills();
         self.inner.emit(RuntimeEvent::SkillsChanged {
             discovered: self.skill_count(),
@@ -1197,7 +2041,8 @@ impl RuntimeHandle {
     /// Disable a skill by name (adds it to the disabled list). Re-discovers afterwards.
     pub fn skill_disable(&self, name: &str) -> Result<()> {
         let mgr = vikram_skills::Manager::new();
-        mgr.disable(name).map_err(|e| RuntimeError::Store(e.to_string()))?;
+        mgr.disable(name)
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
         self.rescan_skills();
         self.inner.emit(RuntimeEvent::SkillsChanged {
             discovered: self.skill_count(),
@@ -1209,7 +2054,8 @@ impl RuntimeHandle {
     /// Delete a skill (moves it to trash). Re-discovers afterwards.
     pub fn skill_delete(&self, name: &str) -> Result<()> {
         let mgr = vikram_skills::Manager::new();
-        mgr.delete(name).map_err(|e| RuntimeError::Store(e.to_string()))?;
+        mgr.delete(name)
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
         self.rescan_skills();
         self.inner.emit(RuntimeEvent::SkillsChanged {
             discovered: self.skill_count(),
@@ -1221,7 +2067,8 @@ impl RuntimeHandle {
     /// Create a new skill with name + description + body. Re-discovers afterwards.
     pub fn skill_create(&self, name: &str, description: &str, body: &str) -> Result<()> {
         let mgr = vikram_skills::Manager::new();
-        mgr.create(name, description, body).map_err(|e| RuntimeError::Store(e.to_string()))?;
+        mgr.create(name, description, body)
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
         self.rescan_skills();
         self.inner.emit(RuntimeEvent::SkillsChanged {
             discovered: self.skill_count(),
@@ -1233,7 +2080,8 @@ impl RuntimeHandle {
     /// Import a skill from a directory path. Re-discovers afterwards.
     pub fn skill_import(&self, path: &str) -> Result<()> {
         let mgr = vikram_skills::Manager::new();
-        mgr.import(std::path::Path::new(path)).map_err(|e| RuntimeError::Store(e.to_string()))?;
+        mgr.import(std::path::Path::new(path))
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
         self.rescan_skills();
         self.inner.emit(RuntimeEvent::SkillsChanged {
             discovered: self.skill_count(),
@@ -1693,6 +2541,71 @@ mod tests {
 
         assert!(handle.set_model(&session, "   ".into()).is_err());
         assert_eq!(handle.inner.model(), "test-model");
+    }
+
+    #[tokio::test]
+    async fn hive_create_participants_messages_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+
+        let user = handle.inner.store.create_user("U", now_ms()).unwrap();
+        let hive_id = handle
+            .hive_create(
+                user.id.clone(),
+                None,
+                "Forge".to_string(),
+                "build".to_string(),
+                "cooperative".to_string(),
+            )
+            .unwrap();
+        let ent = vikram_store::EntityRow {
+            id: vikram_contracts::EntityId::generate(),
+            owner_user: None,
+            kind: vikram_store::EntityKind::Agent,
+            name: "Rudra".into(),
+            slug: "rudra".into(),
+            title: "Senior Developer".into(),
+            role: "coder".into(),
+            specialization: "rust,testing".into(),
+            description: String::new(),
+            icon: None,
+            model: None,
+            profile_id: None,
+            status: "active".into(),
+            created_ms: now_ms(),
+            updated_ms: now_ms(),
+        };
+        handle.inner.store.save_entity(&ent).unwrap();
+        handle
+            .hive_add_participant(&hive_id, &ent.id, vikram_store::EntityKind::Agent, "member")
+            .unwrap();
+        assert_eq!(handle.hive_participants(&hive_id).unwrap().len(), 1);
+        handle
+            .hive_append_message(&hive_id, "rudra", "agent", "hello", None)
+            .unwrap();
+        assert_eq!(handle.hive_messages(&hive_id).unwrap().len(), 1);
+        handle.hive_delete(&hive_id).unwrap();
+        assert!(handle.hive_get(&hive_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn context_loader_scaffolds_and_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let handle = Runtime::start(config_for(dir.path()))
+            .await
+            .unwrap()
+            .handle();
+        let base = crate::config::vikram_home();
+        let ctx = handle.context();
+        let entity_dir = base.join("agents").join("rudra");
+        ctx.scaffold_entity(&entity_dir, "Rudra", "agent", "Senior Developer");
+        assert!(entity_dir.join("SOUL.md").exists());
+        let bundle = ctx.load_agent("rudra", None, Some("task ctx"));
+        assert!(!bundle.sections.is_empty());
+        assert!(bundle.render().contains("SOUL"));
     }
 
     /// What the runtime published about a command. The `$ command` line, the outcome and any

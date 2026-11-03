@@ -15,8 +15,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use vikram_contracts::{Block, Message, Role, ToolCallId};
 
 use crate::app::{
-    Activity, ActivityKind, App, PendingQuestion, SessionView, ThoughtHit, ThoughtKey,
-    STREAMING_THOUGHT,
+    Activity, ActivityKind, App, PendingQuestion, STREAMING_THOUGHT, SessionView, ThoughtHit,
+    ThoughtKey,
 };
 use crate::theme::Theme;
 use crate::widgets::markdown;
@@ -346,7 +346,6 @@ fn conversation_lines_with_hits(
         }
     }
 
-
     if session.streaming.is_some() || session.streaming_thought.is_some() {
         // The turn list above already named the speaker when it had rows; naming it again here
         // would read as a second agent joining.
@@ -475,7 +474,9 @@ fn push_assistant(
         .iter()
         .enumerate()
         .filter_map(|(block_index, block)| match block {
-            Block::Text { text, .. } if !text.trim().is_empty() => Some((message_index, block_index)),
+            Block::Text { text, .. } if !text.trim().is_empty() => {
+                Some((message_index, block_index))
+            }
             _ => None,
         })
         .next_back();
@@ -550,7 +551,9 @@ fn push_blocks(
                 width,
                 theme,
             ),
-            Block::ToolResult { call, content, ok, .. } => {
+            Block::ToolResult {
+                call, content, ok, ..
+            } => {
                 // The row above already renders this result; a paired block adds nothing.
                 if !index.paired(call) {
                     push_tool_payload(lines, content, *ok, width, theme);
@@ -586,23 +589,21 @@ fn push_turn(
         return false;
     }
     // The turn's answer is its last words, found once so every earlier sentence knows it is not it.
-    let answer = turn
-        .iter()
-        .enumerate()
-        .filter(|(_, message)| message.role == Role::Assistant)
-        .flat_map(|(offset, message)| {
-            message
-                .blocks
-                .iter()
-                .enumerate()
-                .filter_map(move |(block_index, block)| match block {
-                    Block::Text { text, .. } if !text.trim().is_empty() => {
-                        Some((start + 1 + offset, block_index))
-                    }
-                    _ => None,
-                })
-        })
-        .next_back();
+    let answer =
+        turn.iter()
+            .enumerate()
+            .filter(|(_, message)| message.role == Role::Assistant)
+            .flat_map(|(offset, message)| {
+                message.blocks.iter().enumerate().filter_map(
+                    move |(block_index, block)| match block {
+                        Block::Text { text, .. } if !text.trim().is_empty() => {
+                            Some((start + 1 + offset, block_index))
+                        }
+                        _ => None,
+                    },
+                )
+            })
+            .next_back();
     let ctx = TurnCtx {
         session: ctx.session,
         waiting: ctx.waiting,
@@ -621,16 +622,14 @@ fn push_turn(
             .enumerate()
             .filter(|(_, message)| message.role == Role::Assistant)
             .flat_map(|(offset, message)| {
-                message
-                    .blocks
-                    .iter()
-                    .enumerate()
-                    .filter_map(move |(block_index, block)| match block {
+                message.blocks.iter().enumerate().filter_map(
+                    move |(block_index, block)| match block {
                         Block::Text { text, .. } if !text.trim().is_empty() => {
                             Some((text.as_str(), start + 1 + offset, block_index))
                         }
                         _ => None,
-                    })
+                    },
+                )
             })
             .next_back()
         {
@@ -657,14 +656,12 @@ fn push_turn(
                     else {
                         continue;
                     };
-                    let activity = index
-                        .position(call)
-                        .and_then(|position| {
-                            activities
-                                .iter()
-                                .find(|(at, _)| *at == position)
-                                .map(|(at, activity)| (*at, *activity))
-                        });
+                    let activity = index.position(call).and_then(|position| {
+                        activities
+                            .iter()
+                            .find(|(at, _)| *at == position)
+                            .map(|(at, activity)| (*at, *activity))
+                    });
                     if let Some((position, activity)) = activity {
                         push_activity(
                             lines,
@@ -760,7 +757,11 @@ fn push_turn_header(
     settled: bool,
 ) -> bool {
     let folded = session.thought_expanded((ACTIVITY_TURN, 0));
-    let chevron = if folded { ellipsis_pointing(theme, false) } else { ellipsis_pointing(theme, true) };
+    let chevron = if folded {
+        ellipsis_pointing(theme, false)
+    } else {
+        ellipsis_pointing(theme, true)
+    };
 
     // A finished turn is a receipt, not a speaker: `✓ Worked · 10s` says what happened and how
     // long it took, and the answer under it needs no second name. A running turn still has to say
@@ -771,7 +772,10 @@ fn push_turn_header(
         spans.push(Span::styled(clock.to_string(), theme.title()));
         label.push_str(clock);
     } else {
-        spans.push(Span::styled(format!("{} ", theme.filled_dot()), theme.title()));
+        spans.push(Span::styled(
+            format!("{} ", theme.filled_dot()),
+            theme.title(),
+        ));
         spans.push(Span::styled(AGENT, theme.title()));
         label = format!("{} {}", theme.filled_dot(), AGENT);
         if !clock.is_empty() {
@@ -857,7 +861,9 @@ fn push_system(
             Block::Text { text, .. } => {
                 lines.extend(markdown::markdown_lines_styled(text, width, theme, style))
             }
-            Block::Reasoning { text, .. } => push_reasoning(lines, text, false, false, key, marks, width, theme),
+            Block::Reasoning { text, .. } => {
+                push_reasoning(lines, text, false, false, key, marks, width, theme)
+            }
             Block::ToolCall { call } => push_tool_row(
                 lines,
                 call,
@@ -869,7 +875,9 @@ fn push_system(
                 width,
                 theme,
             ),
-            Block::ToolResult { call, content, ok, .. } => {
+            Block::ToolResult {
+                call, content, ok, ..
+            } => {
                 if !index.paired(call) {
                     push_tool_payload(lines, content, *ok, width, theme);
                 }
@@ -889,7 +897,9 @@ fn push_tool(
 ) {
     for block in &message.blocks {
         match block {
-            Block::ToolResult { call, content, ok, .. } => {
+            Block::ToolResult {
+                call, content, ok, ..
+            } => {
                 if index.paired(call) || index.activity.contains_key(call) {
                     continue;
                 }
@@ -1023,7 +1033,11 @@ fn push_activity_tool_row(
         spans.push(Span::styled(format!("  {detail}"), theme.muted()));
     }
     spans.push(Span::styled(
-        if expanded { " · click folds" } else { " · click" },
+        if expanded {
+            " · click folds"
+        } else {
+            " · click"
+        },
         Style::default().fg(theme.faint),
     ));
     lines.push(Line::from(spans));
@@ -1099,7 +1113,11 @@ fn tool_label(call: &vikram_contracts::ToolCall, theme: &Theme) -> ToolLabel {
         "ask_user" => ("Asked".to_owned(), arg(&["question"])),
         other => {
             let summary = argument_summary(&call.arguments, ARGUMENT_CAP, ellipsis(theme));
-            let detail = if summary.is_empty() { None } else { Some(summary) };
+            let detail = if summary.is_empty() {
+                None
+            } else {
+                Some(summary)
+            };
             (humanize(other), detail)
         }
     };
@@ -1188,15 +1206,15 @@ fn push_reasoning(
     if expanded {
         lines.push(Line::from(vec![
             Span::styled(heading_text, label),
-            Span::styled(format!("   {}", ellipsis_pointing(theme, true)), theme.muted()),
+            Span::styled(
+                format!("   {}", ellipsis_pointing(theme, true)),
+                theme.muted(),
+            ),
         ]));
         lines.extend(markdown::markdown_lines(text, width, theme));
         return;
     }
-    let mut row = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty());
+    let mut row = text.lines().map(str::trim).filter(|line| !line.is_empty());
     let preview = if live {
         row.next_back().unwrap_or_default()
     } else {
@@ -1598,6 +1616,8 @@ mod tests {
             updated_ms: 0,
             agent: None,
             queued: 0,
+            project_id: None,
+            status: "active".to_owned(),
         })
     }
 
@@ -1794,12 +1814,24 @@ mod tests {
 
         let collapsed_app = App::new(false);
         let mut s1 = sample_session();
-        s1.activity.push(Activity { kind: ActivityKind::Tool, text: long.into(), call: None, ok: Some(true), expanded: false });
+        s1.activity.push(Activity {
+            kind: ActivityKind::Tool,
+            text: long.into(),
+            call: None,
+            ok: Some(true),
+            expanded: false,
+        });
         let collapsed = conversation_lines(&collapsed_app, &s1, 40, &theme);
 
         let expanded_app = App::new(false);
         let mut s2 = sample_session();
-        s2.activity.push(Activity { kind: ActivityKind::Tool, text: long.into(), call: None, ok: Some(true), expanded: true });
+        s2.activity.push(Activity {
+            kind: ActivityKind::Tool,
+            text: long.into(),
+            call: None,
+            ok: Some(true),
+            expanded: true,
+        });
         let expanded = conversation_lines(&expanded_app, &s2, 40, &theme);
 
         assert!(
@@ -1965,7 +1997,9 @@ mod tests {
             "a folded block must not print its body: {all}"
         );
         assert_eq!(
-            all.lines().filter(|line| line.contains("thought line")).count(),
+            all.lines()
+                .filter(|line| line.contains("thought line"))
+                .count(),
             1,
             "folding is one line per block, not one per thought: {all}"
         );
@@ -1981,7 +2015,10 @@ mod tests {
         let theme = Theme::new(false);
         let all = transcript(&conversation_lines(&app, &session, 76, &theme)).join("\n");
 
-        assert!(all.contains("thought line 24"), "not the whole block: {all}");
+        assert!(
+            all.contains("thought line 24"),
+            "not the whole block: {all}"
+        );
         assert!(all.contains('▼'), "no way to close it: {all}");
     }
 
@@ -1990,8 +2027,7 @@ mod tests {
         let app = App::new(false);
         let mut session = sample_session();
         session.streaming_thought = Some(
-            "oldest line\nsecond thought line of the stream\nweighing the third option here"
-                .into(),
+            "oldest line\nsecond thought line of the stream\nweighing the third option here".into(),
         );
         let theme = Theme::new(false);
         let all = transcript(&conversation_lines(&app, &session, 76, &theme)).join("\n");
@@ -2017,9 +2053,12 @@ mod tests {
         for blank in ["", "   ", "\n\n"] {
             session.streaming_thought = Some(blank.into());
             let theme = Theme::new(false);
-            let all = transcript(&conversation_lines(&App::new(false), &session, 76, &theme))
-                .join("\n");
-            assert!(!all.contains("Thought"), "empty thinking drew a header: {all}");
+            let all =
+                transcript(&conversation_lines(&App::new(false), &session, 76, &theme)).join("\n");
+            assert!(
+                !all.contains("Thought"),
+                "empty thinking drew a header: {all}"
+            );
             assert!(all.contains("the answer"), "{all}");
         }
     }
@@ -2032,7 +2071,10 @@ mod tests {
         let theme = Theme::new(false);
         let all = transcript(&conversation_lines(&app, &session, 76, &theme)).join("\n");
 
-        assert!(!all.contains("1 lines"), "singular counted as plural: {all}");
+        assert!(
+            !all.contains("1 lines"),
+            "singular counted as plural: {all}"
+        );
         assert!(all.contains("thought line 1"), "{all}");
     }
 
@@ -2059,11 +2101,18 @@ mod tests {
         session
             .messages
             .push(Message::tool_result(call, "first hit", true));
-        session
-            .messages
-            .push(Message::text(Role::Assistant, "here is the answer", Trust::Model));
+        session.messages.push(Message::text(
+            Role::Assistant,
+            "here is the answer",
+            Trust::Model,
+        ));
 
-        let rows = transcript(&conversation_lines(&App::new(false), &session, 80, &Theme::new(false)));
+        let rows = transcript(&conversation_lines(
+            &App::new(false),
+            &session,
+            80,
+            &Theme::new(false),
+        ));
         let row = rows
             .iter()
             .position(|line| line.contains("Web search"))
@@ -2077,7 +2126,9 @@ mod tests {
             "the call belongs above the answer it produced: {rows:#?}"
         );
         assert_eq!(
-            rows.iter().filter(|line| line.contains("Web search")).count(),
+            rows.iter()
+                .filter(|line| line.contains("Web search"))
+                .count(),
             1,
             "one call is one row: {rows:#?}"
         );
@@ -2088,9 +2139,11 @@ mod tests {
     fn an_activity_call_and_its_result_draw_one_folded_row() {
         let mut session = sample_session();
         let id = ToolCall::new("web.search", serde_json::json!({ "query": "todays news" })).id;
-        session
-            .messages
-            .push(Message::tool_result(id.clone(), "1. first hit\n2. second hit", true));
+        session.messages.push(Message::tool_result(
+            id.clone(),
+            "1. first hit\n2. second hit",
+            true,
+        ));
         session.activity.push(Activity {
             kind: ActivityKind::Tool,
             text: "web.search  limit=10 query=todays news".to_owned(),
@@ -2154,7 +2207,10 @@ mod tests {
         let rows = transcript(&conversation_lines(&app, &session, 76, &theme));
         let calls: Vec<&String> = rows.iter().filter(|row| row.contains("Read")).collect();
         assert_eq!(calls.len(), 1, "one call is one row: {rows:?}");
-        assert!(calls[0].contains("Cargo.toml"), "label names the file: {rows:?}");
+        assert!(
+            calls[0].contains("Cargo.toml"),
+            "label names the file: {rows:?}"
+        );
         assert!(
             !rows.iter().any(|row| row.contains("line two")),
             "the payload starts folded: {rows:?}"
@@ -2176,7 +2232,9 @@ mod tests {
     fn speech_between_two_tool_rows_keeps_its_place_and_never_folds() {
         let app = App::new(false);
         let mut session = sample_session();
-        session.messages.push(Message::user("check the jwt middleware"));
+        session
+            .messages
+            .push(Message::user("check the jwt middleware"));
 
         let run = ToolCallId::generate();
         session.activity.push(Activity {
@@ -2232,7 +2290,9 @@ mod tests {
             "the speech belongs directly under its speaker line: {rows:#?}"
         );
         assert_eq!(
-            rows.iter().filter(|row| row.contains("security review")).count(),
+            rows.iter()
+                .filter(|row| row.contains("security review"))
+                .count(),
             1,
             "speech is printed once, not once per tool: {rows:#?}"
         );
@@ -2269,14 +2329,19 @@ mod tests {
 
         let theme = Theme::new(false);
         let rows = transcript(&conversation_lines(&app, &session, 80, &theme));
-        let labelled: Vec<&String> = rows.iter().filter(|row| row.contains("Web search")).collect();
+        let labelled: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.contains("Web search"))
+            .collect();
         assert_eq!(labelled.len(), 1, "one call is one row: {rows:#?}");
         assert!(
             labelled[0].starts_with(theme.check()),
             "a finished call ends on the check glyph, not the running arrow: {rows:#?}"
         );
         assert_eq!(
-            rows.iter().filter(|row| row.starts_with(theme.check())).count(),
+            rows.iter()
+                .filter(|row| row.starts_with(theme.check()))
+                .count(),
             1,
             "the call and its result is one done row, not two: {rows:#?}"
         );
@@ -2330,7 +2395,9 @@ mod tests {
         session.toggle_thought((1, 0));
         let thought_open = transcript(&conversation_lines(&app, &session, 80, &theme));
         assert!(
-            thought_open.iter().any(|row| row.contains("thought line 2")),
+            thought_open
+                .iter()
+                .any(|row| row.contains("thought line 2")),
             "the clicked thought opened: {thought_open:#?}"
         );
         assert!(
@@ -2362,8 +2429,7 @@ mod tests {
             turn: TurnId::generate(),
             text: "hello".to_owned(),
         });
-        session.turn_started_ms =
-            Some(vikram_runtime::types::now_ms().saturating_sub(3_000));
+        session.turn_started_ms = Some(vikram_runtime::types::now_ms().saturating_sub(3_000));
         let app = App::new(false);
         let theme = Theme::new(false);
         let all = transcript(&conversation_lines(&app, &session, 80, &theme)).join("\n");
@@ -2382,7 +2448,11 @@ mod tests {
         let mut session = sample_session();
         session.messages = vec![
             Message::user("say hi"),
-            Message::text(Role::Assistant, "hi there", vikram_contracts::Trust::External),
+            Message::text(
+                Role::Assistant,
+                "hi there",
+                vikram_contracts::Trust::External,
+            ),
         ];
         session.turn = TurnState::Idle;
         session.turn_started_ms = None;
@@ -2392,7 +2462,10 @@ mod tests {
         let app = App::new(false);
         let theme = Theme::new(false);
         let all = transcript(&conversation_lines(&app, &session, 80, &theme)).join("\n");
-        assert!(all.contains("Worked · 4s"), "the receipt keeps the time: {all}");
+        assert!(
+            all.contains("Worked · 4s"),
+            "the receipt keeps the time: {all}"
+        );
     }
 
     #[test]
@@ -2400,7 +2473,11 @@ mod tests {
         let mut session = sample_session();
         session.messages = vec![
             Message::user("say hi"),
-            Message::text(Role::Assistant, "hi there", vikram_contracts::Trust::External),
+            Message::text(
+                Role::Assistant,
+                "hi there",
+                vikram_contracts::Trust::External,
+            ),
         ];
         session.turn = TurnState::Idle;
         session.turn_elapsed_ms = 10_000;

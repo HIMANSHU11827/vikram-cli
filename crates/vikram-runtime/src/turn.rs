@@ -11,8 +11,8 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 use vikram_contracts::policy::Decision;
 use vikram_contracts::{
-    ActionKind, ApprovalId, Block, Message, PermissionMode, PermissionRequest, RecordKind, Role, ToolCall,
-    ToolCallId, Trust, TurnId,
+    ActionKind, ApprovalId, Block, Message, PermissionMode, PermissionRequest, RecordKind, Role,
+    ToolCall, ToolCallId, Trust, TurnId,
 };
 
 use crate::agents::ManagedAgent;
@@ -123,7 +123,7 @@ pub(crate) async fn run_turn(
     let max_steps = u64::from(inner.config.max_steps);
     let mut steps_used = 0u64;
 
-    let Some(provider) = inner.provider.clone() else {
+    let Some(provider) = inner.provider.read().expect("provider lock").clone() else {
         inner.emit(RuntimeEvent::Error {
             text: "no model configured: set `model` and the API key named by `api_key_env`".into(),
         });
@@ -154,15 +154,24 @@ pub(crate) async fn run_turn(
         // system message. Skill bodies are never loaded here; they are read on demand
         // through skill.load / skill.read.
         let reg = SkillRegistry::for_workspace(&inner.workspace_root);
-        let discovered = reg.skills().len();
-        inner.emit(RuntimeEvent::SkillsChanged {
-            discovered,
-            loaded: 0,
-        });
+        let skills = reg.skills();
+        let discovered = skills.len();
+        let loaded = skills.iter().filter(|s| s.loaded).count();
+        inner.emit(RuntimeEvent::SkillsChanged { discovered, loaded });
         let (catalog_text, _) = reg.catalog_listing();
         let mut request_messages = Vec::new();
         if !catalog_text.trim().is_empty() {
             request_messages.push(Message::text(Role::System, catalog_text, Trust::External));
+        }
+        // A delegated agent carries its own identity: the profile's name, role and description
+        // become the system identity for its session, so its behaviour follows its configuration.
+        if let Some(run) = &agent {
+            let profile = &run.agent.profile;
+            let identity = format!(
+                "You are {}. Role: {}. {}.",
+                profile.name, profile.role, profile.description
+            );
+            request_messages.push(Message::text(Role::System, identity, Trust::External));
         }
         // The operator sees the model's own words between the tool rows, so the model has to be
         // told that those words exist and what shape they take.
@@ -509,10 +518,10 @@ async fn run_tool(
                 ok: false,
                 summary: err.to_string(),
                 content: err.to_string(),
-            resource: String::new(),
-            arguments: arguments_text.clone(),
-            cwd: cwd.clone(),
-            duration_ms: elapsed(),
+                resource: String::new(),
+                arguments: arguments_text.clone(),
+                cwd: cwd.clone(),
+                duration_ms: elapsed(),
             });
             return (err.to_string(), false);
         }
@@ -522,7 +531,9 @@ async fn run_tool(
     // so the policy floor and scope checks see a canonical absolute path, and escapes are refused.
     if matches!(request.action, ActionKind::Read | ActionKind::Write) {
         let root = &inner.workspace_root;
-        if let Some(resolved) = crate::config::resolve_within(root, std::path::Path::new(&request.resource)) {
+        if let Some(resolved) =
+            crate::config::resolve_within(root, std::path::Path::new(&request.resource))
+        {
             request.resource = resolved.to_string_lossy().into_owned();
         }
     }
@@ -557,11 +568,11 @@ async fn run_tool(
                 name: call.name.clone(),
                 ok: false,
                 summary: format!("denied: {reason}"),
-            content: format!("permission denied: {reason}"),
-            resource: request.resource.clone(),
-            arguments: arguments_text.clone(),
-            cwd: cwd.clone(),
-            duration_ms: elapsed(),
+                content: format!("permission denied: {reason}"),
+                resource: request.resource.clone(),
+                arguments: arguments_text.clone(),
+                cwd: cwd.clone(),
+                duration_ms: elapsed(),
             });
             return (format!("permission denied: {reason}"), false);
         }
@@ -634,11 +645,11 @@ async fn run_tool(
                     name: call.name.clone(),
                     ok: false,
                     summary: "denied by operator".into(),
-            content: "permission denied by operator".into(),
-            resource: request.resource.clone(),
-            arguments: arguments_text.clone(),
-            cwd: cwd.clone(),
-            duration_ms: elapsed(),
+                    content: "permission denied by operator".into(),
+                    resource: request.resource.clone(),
+                    arguments: arguments_text.clone(),
+                    cwd: cwd.clone(),
+                    duration_ms: elapsed(),
                 });
                 return ("permission denied by operator".into(), false);
             }
@@ -680,7 +691,33 @@ async fn run_tool(
     let context = inner.tool_context();
     let arguments = call.arguments.clone();
     let handle = tool.clone();
-    let joined = tokio::task::spawn_blocking(move || handle.run(&arguments, &context)).await;
+    let mut blocking = tokio::task::spawn_blocking(move || handle.run(&arguments, &context));
+    let joined = loop {
+        tokio::select! {
+            joined = &mut blocking => break joined,
+            _ = async {
+                while !cancel.is_cancelled() {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            } => {
+                // The turn no longer waits on the tool, and the blocking task is dropped; a
+                // tool that honors its stop-hook stops, a stray one finishes unknown and its
+                // result is discarded.
+                blocking.abort();
+                inner.journal(
+                    &session.id,
+                    RecordKind::ToolResult,
+                    serde_json::json!({
+                        "call": call.id.as_str(),
+                        "name": call.name,
+                        "ok": false,
+                        "content": "cancelled while running",
+                    }),
+                );
+                return ("cancelled while running".to_owned(), false);
+            }
+        }
+    };
 
     let (mut content, mut ok) = match joined {
         Ok(Ok(output)) => (output.content, output.ok),
@@ -734,11 +771,11 @@ async fn run_tool(
         } else {
             format!("failed · {summary}")
         },
-            content: truncate(&content, 8_000),
-            resource: request.resource.clone(),
-            arguments: arguments_text.clone(),
-            cwd: cwd.clone(),
-            duration_ms: elapsed(),
+        content: truncate(&content, 8_000),
+        resource: request.resource.clone(),
+        arguments: arguments_text.clone(),
+        cwd: cwd.clone(),
+        duration_ms: elapsed(),
     });
 
     (content, ok)
@@ -843,25 +880,6 @@ fn truncate(text: &str, limit: usize) -> String {
         .map(|(i, c)| i + c.len_utf8())
         .unwrap_or(0);
     format!("{}…", &text[..cut])
-}
-
-/// Blocks that a provider-facing message may carry; exposed for tests of the loop's message shape.
-#[allow(dead_code)]
-fn assistant_with_calls(text: &str, calls: Vec<ToolCall>) -> Message {
-    let mut blocks = Vec::new();
-    if !text.is_empty() {
-        blocks.push(Block::Text {
-            text: text.to_owned(),
-            trust: Trust::Model,
-        });
-    }
-    for call in calls {
-        blocks.push(Block::ToolCall { call });
-    }
-    Message {
-        role: Role::Assistant,
-        blocks,
-    }
 }
 
 #[cfg(test)]
@@ -1055,6 +1073,7 @@ mod tests {
 
     /// Run one turn against a scripted provider. Returns the published order and the durable
     /// conversation the next request would carry.
+    #[allow(clippy::await_holding_lock)]
     async fn run_scripted(script: Vec<Vec<ProviderEvent>>) -> (Vec<Seen>, Vec<Message>) {
         let dir = tempfile::tempdir().expect("temp dir");
         let _home = isolated_home(dir.path());
@@ -1118,7 +1137,7 @@ mod tests {
 
         // Two turns of speech, one result, in order: the second sentence is not appended to the
         // first, and neither is repeated.
-        let roles: Vec<Role> = messages.iter().map(|m| m.role.clone()).collect();
+        let roles: Vec<Role> = messages.iter().map(|m| m.role).collect();
         assert_eq!(
             roles,
             vec![Role::User, Role::Assistant, Role::Tool, Role::Assistant]
@@ -1211,7 +1230,7 @@ mod tests {
         .await;
 
         assert_eq!(seen, vec![Seen::Speech("Nothing to do.".into())]);
-        let roles: Vec<Role> = messages.iter().map(|m| m.role.clone()).collect();
+        let roles: Vec<Role> = messages.iter().map(|m| m.role).collect();
         assert_eq!(roles, vec![Role::User, Role::Assistant]);
     }
 

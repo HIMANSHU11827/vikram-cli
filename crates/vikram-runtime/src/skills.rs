@@ -100,18 +100,6 @@ impl SkillRegistry {
         }
     }
 
-    pub fn merge(&mut self, other: Self) {
-        // Catalogs are immutable values; rebuild by re-discovering is not cheap.
-        // Keep existing entries and append any new ones from `other`.
-        // (Best-effort merge for backward compat; prefer for_workspace.)
-        for s in other.catalog.list() {
-            if self.catalog.resolve(s.name.as_str()).is_none() {
-                // Re-add by scanning that single root is not supported; skip.
-                let _ = s;
-            }
-        }
-    }
-
     pub fn list(&self) -> Vec<Skill> {
         self.catalog
             .list()
@@ -139,10 +127,6 @@ impl SkillRegistry {
 
     pub fn load(&self, name: &str) -> Option<Skill> {
         self.get(name)
-    }
-
-    pub fn scan_dir(dir: &Path) -> Self {
-        Self::scan(dir)
     }
 
     pub fn get_skill(&self, name: &str) -> Option<Skill> {

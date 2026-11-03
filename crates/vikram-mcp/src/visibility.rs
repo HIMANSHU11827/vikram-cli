@@ -57,21 +57,27 @@ impl VisibilityManager {
     }
 
     pub fn with_persist_path(path: std::path::PathBuf) -> Self {
-        Self {
+        let mut vm = Self {
             entries: std::collections::HashMap::new(),
-            persist_path: Some(path),
+            persist_path: Some(path.clone()),
+        };
+        if let Ok(raw) = std::fs::read_to_string(&path)
+            && let Ok(entries) =
+                serde_json::from_str::<std::collections::HashMap<String, ServerVisibility>>(&raw)
+        {
+            vm.entries = entries;
         }
+        vm
     }
 
     /// Load visibility state from disk.
     pub fn load(path: &std::path::Path) -> Self {
         let mut vm = Self::with_persist_path(path.to_path_buf());
-        if let Ok(raw) = std::fs::read_to_string(path) {
-            if let Ok(entries) =
+        if let Ok(raw) = std::fs::read_to_string(path)
+            && let Ok(entries) =
                 serde_json::from_str::<std::collections::HashMap<String, ServerVisibility>>(&raw)
-            {
-                vm.entries = entries;
-            }
+        {
+            vm.entries = entries;
         }
         vm
     }
@@ -115,7 +121,12 @@ impl VisibilityManager {
     pub fn set_exposed_tools(&mut self, name: &str, tools: Vec<String>) {
         if let Some(entry) = self.entries.get_mut(name) {
             entry.exposed_tools = tools;
+        } else {
+            let mut entry = ServerVisibility::new(name.to_string());
+            entry.exposed_tools = tools;
+            self.entries.insert(name.to_string(), entry);
         }
+        let _ = self.save();
     }
 
     pub fn is_public(&self, name: &str) -> bool {

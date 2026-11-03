@@ -58,6 +58,36 @@ pub struct SecurityConfig {
     pub disable_always_allow: bool,
     /// When present, only these postures exist. Anything outside the list is refused at activation.
     pub allowed_modes: Option<Vec<PermissionMode>>,
+    /// OS-level process isolation for shell/build/test tools. On by default.
+    #[serde(default)]
+    pub sandbox: SandboxSettings,
+}
+
+/// Sandbox configuration. `enabled` defaults to true; the platform decides which mechanism to
+/// use (bubblewrap on Linux, Seatbelt on macOS, Job objects on Windows where available).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allow_network: bool,
+    /// Extra read-only mounts granted to the sandbox (absolute paths).
+    #[serde(default)]
+    pub read_only_paths: Vec<PathBuf>,
+}
+
+impl Default for SandboxSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_network: false,
+            read_only_paths: Vec::new(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl SecurityConfig {
@@ -162,11 +192,9 @@ impl ModeAvailability {
 
     /// The rule and the layer that refuse this posture, so the interface can name where to look.
     pub fn refusal(&self, mode: PermissionMode) -> Option<(&'static str, &'static str)> {
-        self.layers.iter().find_map(|(layer, config)| {
-            config
-                .forbids(mode)
-                .map(|rule| (rule, *layer))
-        })
+        self.layers
+            .iter()
+            .find_map(|(layer, config)| config.forbids(mode).map(|rule| (rule, *layer)))
     }
 
     pub fn permits(&self, mode: PermissionMode) -> bool {
@@ -244,6 +272,7 @@ fn env_requirements() -> SecurityConfig {
         disable_auto_approve: forbidden("VIKRAM_DISABLE_AUTO_APPROVE"),
         disable_always_allow: forbidden("VIKRAM_DISABLE_ALWAYS_ALLOW"),
         allowed_modes: allowed,
+        sandbox: SandboxSettings::default(),
     }
 }
 
@@ -442,6 +471,13 @@ pub struct McpServerConfig {
 pub struct McpConfig {
     #[serde(default)]
     pub servers: Vec<McpServerConfig>,
+    /// `vikram mcp serve` exposes exactly these tools over STDIO. Empty means nothing is exposed.
+    #[serde(default)]
+    pub approved_tools: Vec<String>,
+    #[serde(default)]
+    pub auth_required: bool,
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 impl McpConfig {
@@ -479,16 +515,14 @@ pub fn resolve_within(root: &Path, candidate: &Path) -> Option<PathBuf> {
     }
 }
 
-#[cfg(test)]
 /// `VIKRAM_HOME` and the security switches are process-global, and `ModeAvailability` reads them
 /// while a runtime is being built, so every test that touches either takes turns on this one lock.
-pub(crate) static SECURITY_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub static SECURITY_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Clear every environment input, then hold the lock for the calling test. A test that sets one of
 /// these without clearing it itself leaks into whichever test runs next in the same process — the
 /// list is the backstop, not the test's own hygiene.
-#[cfg(test)]
-pub(crate) fn lock_security_env() -> std::sync::MutexGuard<'static, ()> {
+pub fn lock_security_env() -> std::sync::MutexGuard<'static, ()> {
     let guard = SECURITY_ENV.lock().unwrap_or_else(|err| err.into_inner());
     for name in [
         "VIKRAM_HOME",
@@ -704,7 +738,10 @@ mod tests {
             PermissionMode::Smart,
             PermissionMode::AcceptEdits,
         ] {
-            assert!(!availability.permits(mode), "{mode} approves without a human");
+            assert!(
+                !availability.permits(mode),
+                "{mode} approves without a human"
+            );
         }
         // Denying on the operator's behalf is not an auto-approval, so it survives.
         assert!(availability.permits(PermissionMode::Ask));
@@ -738,7 +775,10 @@ mod tests {
         });
         assert_eq!(nothing_but_yolo.fallback_mode(), PermissionMode::Yolo);
         // A layer that permits nothing at all still leaves the prompting posture.
-        assert_eq!(ModeAvailability::empty().fallback_mode(), PermissionMode::Ask);
+        assert_eq!(
+            ModeAvailability::empty().fallback_mode(),
+            PermissionMode::Ask
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub mod ids;
 pub mod journal;
 pub mod message;
 pub mod policy;
+pub mod ticket;
 pub mod trust;
 pub mod version;
 
@@ -17,8 +18,8 @@ pub use error::{Result, ToolOutcome, VikramError};
 pub use journal::{Appended, InMemoryJournal, JournalRecord, JournalSink, NewRecord, RecordKind};
 pub use message::{Block, Message, Role, ToolCall};
 pub use policy::{
-    ActionKind, Decision, PermissionMode, PermissionPolicy, PermissionRequest, Posture, RuleOutcome,
-    SideEffect, amendment_for,
+    ActionKind, Decision, PermissionMode, PermissionPolicy, PermissionRequest, Posture,
+    RuleOutcome, SideEffect, amendment_for,
 };
 pub use trust::Trust;
 pub use version::{
@@ -26,7 +27,12 @@ pub use version::{
     MODEL_PROVIDER, POLICY_EVALUATOR, TOOL_EXECUTOR, Versioned,
 };
 
-pub use ids::{AgentId, ApprovalId, EffectId, SessionId, TeamId, ToolCallId, TurnId};
+pub use ids::{
+    AgentId, ApprovalId, AssignmentId, EffectId, EntityId, HiveId, HiveMessageId, ProfileId,
+    ProjectId, SessionId, TeamId, TicketEventId, TicketId, TicketMessageId, ToolCallId, TurnId,
+    UserId, WorkspaceId,
+};
+pub use ticket::*;
 
 /// The contract version this crate speaks. A component declaring a newer major than the host
 /// offers is refused at activation rather than failing at run time.

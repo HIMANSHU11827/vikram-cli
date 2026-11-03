@@ -8,7 +8,7 @@ use std::io::{self, IsTerminal, Stdout};
 use std::time::Duration;
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEvent, MouseEventKind,
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -204,10 +204,7 @@ fn apply_terminal_event(app: &mut App, event: Event) {
                     }
                     // close buttons
                     for hit in app.tab_hits.clone() {
-                        if mouse.row == hit.row
-                            && x >= hit.close_x_start
-                            && x < hit.close_x_end
-                        {
+                        if mouse.row == hit.row && x >= hit.close_x_start && x < hit.close_x_end {
                             app.commands.push(UiCommand::CloseSession {
                                 session: hit.session,
                             });
@@ -347,18 +344,17 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
             Ok(rule) => app.push_notice(NoticeLevel::Info, format!("forgot {}", rule.describe())),
             Err(err) => report(app, err),
         },
-        UiCommand::AllowRule { session, rule } => {
-            match handle.allow(&session, rule.trim()) {
-                Ok(()) => app.push_notice(NoticeLevel::Info, format!("saved: {}", rule.trim())),
-                Err(err) => report(app, err),
-            }
-        }
-        UiCommand::DeleteSkill { name } => {
-            match handle.skill_delete(&name) {
-                Ok(()) => app.push_notice(NoticeLevel::Info, format!("deleted skill `{name}` (moved to trash)")),
-                Err(err) => report(app, err),
-            }
-        }
+        UiCommand::AllowRule { session, rule } => match handle.allow(&session, rule.trim()) {
+            Ok(()) => app.push_notice(NoticeLevel::Info, format!("saved: {}", rule.trim())),
+            Err(err) => report(app, err),
+        },
+        UiCommand::DeleteSkill { name } => match handle.skill_delete(&name) {
+            Ok(()) => app.push_notice(
+                NoticeLevel::Info,
+                format!("deleted skill `{name}` (moved to trash)"),
+            ),
+            Err(err) => report(app, err),
+        },
         UiCommand::CreateSkill { session: _, text } => {
             // parse "name: description"
             let (name, desc) = match text.split_once(':') {
@@ -375,12 +371,13 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
                 Err(err) => report(app, err),
             }
         }
-        UiCommand::ImportSkill { session: _, path } => {
-            match handle.skill_import(path.trim()) {
-                Ok(()) => app.push_notice(NoticeLevel::Info, format!("imported skill from `{}`", path.trim())),
-                Err(err) => report(app, err),
-            }
-        }
+        UiCommand::ImportSkill { session: _, path } => match handle.skill_import(path.trim()) {
+            Ok(()) => app.push_notice(
+                NoticeLevel::Info,
+                format!("imported skill from `{}`", path.trim()),
+            ),
+            Err(err) => report(app, err),
+        },
         UiCommand::Act {
             kind,
             verb,
@@ -395,7 +392,9 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
         }
         UiCommand::ForgetMemory { scope, key } => match handle.memory_delete(&key, &scope) {
             Ok(true) => app.push_notice(NoticeLevel::Info, format!("forgot {scope}/{key}")),
-            Ok(false) => app.push_notice(NoticeLevel::Warn, format!("{scope}/{key} was already gone")),
+            Ok(false) => {
+                app.push_notice(NoticeLevel::Warn, format!("{scope}/{key} was already gone"))
+            }
             Err(err) => report(app, err),
         },
         UiCommand::StopTask { id } => {
@@ -494,10 +493,9 @@ fn open_command(
                 let rest = args.trim();
                 if let Some(rule) = rest.strip_prefix("add ") {
                     match handle.allow(session, rule.trim()) {
-                        Ok(()) => app.push_notice(
-                            NoticeLevel::Info,
-                            format!("saved: {}", rule.trim()),
-                        ),
+                        Ok(()) => {
+                            app.push_notice(NoticeLevel::Info, format!("saved: {}", rule.trim()))
+                        }
                         Err(err) => report(app, err),
                     }
                 } else {
@@ -531,7 +529,10 @@ fn open_command(
         Outcome::Picker(kind) => open_panel(handle, app, kind),
         Outcome::Info => {
             // Info commands are now handled as pickers - this should not be reached
-            app.push_notice(NoticeLevel::Warn, format!("`/{}` should be a picker", command.name));
+            app.push_notice(
+                NoticeLevel::Warn,
+                format!("`/{}` should be a picker", command.name),
+            );
         }
         Outcome::Action => {
             // Legacy action commands - most are now pickers, but keep for safety
@@ -759,7 +760,10 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
             let skills = handle.skill_list();
             let mut items = vec![
                 PickerItem::new(
-                    format!("{} discovered · {} loaded this turn", snapshot.metrics.skills_discovered, snapshot.metrics.skills_loaded),
+                    format!(
+                        "{} discovered · {} loaded this turn",
+                        snapshot.metrics.skills_discovered, snapshot.metrics.skills_loaded
+                    ),
                     String::new(),
                     "summary".to_owned(),
                 ),
@@ -784,7 +788,6 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                         format!("{} · {} · {}", skill.description, skill.scope, status)
                     };
                     let item = PickerItem::new(skill.name.clone(), detail, skill.name.clone());
-                    let item = if skill.enabled { item } else { item };
                     items.push(item);
                 }
             }
@@ -807,7 +810,8 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                         "not set"
                     } else {
                         config.base_url.as_str()
-                    }.to_owned(),
+                    }
+                    .to_owned(),
                     "endpoint".to_owned(),
                 ),
                 PickerItem::new(
@@ -842,11 +846,7 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
         PickerKind::Permissions => {
             let rules = handle.allow_list();
             let mut items = vec![
-                PickerItem::new(
-                    "mode",
-                    handle.mode().as_str().to_owned(),
-                    "mode".to_owned(),
-                ),
+                PickerItem::new("mode", handle.mode().as_str().to_owned(), "mode".to_owned()),
                 PickerItem::new(
                     "policy",
                     "deny-first, with a floor no setting can widen".to_owned(),
@@ -893,7 +893,8 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                     "loaded".to_owned(),
                 ),
                 PickerItem::new(
-                    "! a plugin declares what it needs; the policy still decides every call".to_owned(),
+                    "! a plugin declares what it needs; the policy still decides every call"
+                        .to_owned(),
                     String::new(),
                     "hint".to_owned(),
                 ),
@@ -933,11 +934,7 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                     snapshot.status.label().to_owned(),
                     "runtime".to_owned(),
                 ),
-                PickerItem::new(
-                    "mode",
-                    handle.mode().as_str().to_owned(),
-                    "mode".to_owned(),
-                ),
+                PickerItem::new("mode", handle.mode().as_str().to_owned(), "mode".to_owned()),
                 PickerItem::new(
                     "model",
                     metrics
@@ -1151,46 +1148,62 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                 PickerItem::new("F6", "context usage", "f6".to_owned()),
                 PickerItem::new("F7", "model and throughput", "f7".to_owned()),
                 PickerItem::new("F8", "skills browser", "f8".to_owned()),
-                PickerItem::new("PgUp / PgDn", "scroll the transcript", "pgup_pgdn".to_owned()),
+                PickerItem::new(
+                    "PgUp / PgDn",
+                    "scroll the transcript",
+                    "pgup_pgdn".to_owned(),
+                ),
                 PickerItem::new("Esc", "cancel the running turn", "esc".to_owned()),
                 PickerItem::new("F1 / ?", "this help", "f1_help".to_owned()),
             ];
             app.open_picker(Picker::new(kind, "Key bindings", items));
         }
         PickerKind::Diff => {
-            let items = vec![
-                PickerItem::new("git diff", "show workspace changes", "git_diff".to_owned()),
-            ];
+            let items = vec![PickerItem::new(
+                "git diff",
+                "show workspace changes",
+                "git_diff".to_owned(),
+            )];
             app.open_picker(Picker::new(kind, "Run git diff", items));
         }
         PickerKind::Test => {
-            let items = vec![
-                PickerItem::new("cargo test", "run the test suite", "cargo_test".to_owned()),
-            ];
+            let items = vec![PickerItem::new(
+                "cargo test",
+                "run the test suite",
+                "cargo_test".to_owned(),
+            )];
             app.open_picker(Picker::new(kind, "Run tests", items));
         }
         PickerKind::Build => {
-            let items = vec![
-                PickerItem::new("cargo build", "build the workspace", "cargo_build".to_owned()),
-            ];
+            let items = vec![PickerItem::new(
+                "cargo build",
+                "build the workspace",
+                "cargo_build".to_owned(),
+            )];
             app.open_picker(Picker::new(kind, "Build workspace", items));
         }
         PickerKind::Clear => {
-            let items = vec![
-                PickerItem::new("Clear this conversation", "the transcript in this view goes away", "clear".to_owned()),
-            ];
+            let items = vec![PickerItem::new(
+                "Clear this conversation",
+                "the transcript in this view goes away",
+                "clear".to_owned(),
+            )];
             app.open_picker(Picker::new(kind, "Clear conversation", items));
         }
         PickerKind::NewSession => {
-            let items = vec![
-                PickerItem::new("Start a new session", "creates a fresh conversation", "new".to_owned()),
-            ];
+            let items = vec![PickerItem::new(
+                "Start a new session",
+                "creates a fresh conversation",
+                "new".to_owned(),
+            )];
             app.open_picker(Picker::new(kind, "New session", items));
         }
         PickerKind::Exit => {
-            let items = vec![
-                PickerItem::new("Quit VIKRAM", "exit the application", "exit".to_owned()),
-            ];
+            let items = vec![PickerItem::new(
+                "Quit VIKRAM",
+                "exit the application",
+                "exit".to_owned(),
+            )];
             app.open_picker(Picker::new(kind, "Quit", items));
         }
         PickerKind::RenameSession => {
@@ -1198,13 +1211,11 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                 .active_session()
                 .map(|view| view.title.clone())
                 .unwrap_or_else(|| "no session".to_owned());
-            let items = vec![
-                PickerItem::new(
-                    format!("Rename: {}", title),
-                    "type a new name for this conversation",
-                    "rename".to_owned(),
-                ),
-            ];
+            let items = vec![PickerItem::new(
+                format!("Rename: {}", title),
+                "type a new name for this conversation",
+                "rename".to_owned(),
+            )];
             app.open_picker(Picker::new(kind, "Rename session", items));
         }
         PickerKind::CloseSession => {
@@ -1219,13 +1230,11 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                 );
                 return;
             }
-            let items = vec![
-                PickerItem::new(
-                    format!("Close: {}", title),
-                    "the transcript stays in the store; only this view is closed",
-                    "close".to_owned(),
-                ),
-            ];
+            let items = vec![PickerItem::new(
+                format!("Close: {}", title),
+                "the transcript stays in the store; only this view is closed",
+                "close".to_owned(),
+            )];
             app.open_picker(Picker::new(kind, "Close session", items));
         }
         // Kinds with no source of their own: the table never opens them, and naming them as
@@ -1442,7 +1451,11 @@ fn apply_act(
                 if !skill.description.is_empty() {
                     lines.push(skill.description.clone());
                 }
-                lines.push(format!("scope: {} · enabled: {}", skill.scope, if skill.enabled { "yes" } else { "no" }));
+                lines.push(format!(
+                    "scope: {} · enabled: {}",
+                    skill.scope,
+                    if skill.enabled { "yes" } else { "no" }
+                ));
                 lines.push(format!("loaded: {}", skill.loaded));
                 if !skill.instructions.is_empty() {
                     lines.push(String::new());
@@ -1463,14 +1476,25 @@ fn apply_act(
         }
         (PickerKind::Skill, Verb::Toggle) => {
             // determine current enabled state
-            let enabled = handle.skill_list().iter().find(|s| s.name == value).map(|s| s.enabled).unwrap_or(true);
+            let enabled = handle
+                .skill_list()
+                .iter()
+                .find(|s| s.name == value)
+                .map(|s| s.enabled)
+                .unwrap_or(true);
             let res = if enabled {
                 handle.skill_disable(&value)
             } else {
                 handle.skill_enable(&value)
             };
             match res {
-                Ok(()) => app.push_notice(NoticeLevel::Info, format!("skill `{value}` {}", if enabled { "disabled" } else { "enabled" })),
+                Ok(()) => app.push_notice(
+                    NoticeLevel::Info,
+                    format!(
+                        "skill `{value}` {}",
+                        if enabled { "disabled" } else { "enabled" }
+                    ),
+                ),
                 Err(err) => report(app, err),
             }
         }
@@ -1489,14 +1513,23 @@ fn apply_act(
             );
         }
         (PickerKind::Skill, Verb::Remove) => {
-            let desc = handle.skill_get(&value).map(|s| s.description).unwrap_or_default();
+            let desc = handle
+                .skill_get(&value)
+                .map(|s| s.description)
+                .unwrap_or_default();
             app.open_confirm(
                 "Delete a skill",
                 vec![
                     value.clone(),
-                    if desc.is_empty() { "moves it to trash; recoverable".to_owned() } else { desc },
+                    if desc.is_empty() {
+                        "moves it to trash; recoverable".to_owned()
+                    } else {
+                        desc
+                    },
                 ],
-                UiCommand::DeleteSkill { name: value.clone() },
+                UiCommand::DeleteSkill {
+                    name: value.clone(),
+                },
             );
         }
         (PickerKind::Keys, _) => {
@@ -1710,12 +1743,6 @@ fn run_action(app: &mut App, session: &SessionId, name: &str) {
     }
 }
 
-/// Kept for tests that drive the loop with synthetic keys.
-#[allow(dead_code)]
-pub fn press(app: &mut App, key: KeyEvent) {
-    input::handle_key(app, key);
-}
-
 /// Hand text to the system clipboard. Wayland first, then X11, then the terminal's own OSC 52 —
 /// the last one works over SSH, where no display exists at all. A copy that fails everywhere says
 /// so in the transcript instead of pretending it happened.
@@ -1752,8 +1779,7 @@ fn copy_to_clipboard(text: &str) {
 
 /// Standard base64, because a clipboard escape takes it and the workspace has no encoder.
 fn base64(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b = [
@@ -1781,40 +1807,43 @@ fn base64(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::backend::TestBackend;
     use vikram_contracts::{Block, Message, Role, Trust};
-    use vikram_runtime::types::TurnState;
     use vikram_runtime::types::SessionSnapshot;
+    use vikram_runtime::types::TurnState;
     use vikram_tui::app::SessionView;
 
     fn app_with_one_thought() -> App {
         let mut app = App::new(false);
-        app.sessions.push(SessionView::from_snapshot(SessionSnapshot {
-            id: SessionId::generate(),
-            title: "Session 1".to_owned(),
-            cwd: "/work".into(),
-            model: None,
-            messages: vec![Message {
-                role: Role::Assistant,
-                blocks: vec![
-                    Block::Reasoning {
-                        text: "The user said hello.".to_owned(),
-                        trust: Trust::Model,
-                    },
-                    Block::Text {
-                        text: "Hello!".to_owned(),
-                        trust: Trust::Model,
-                    },
-                ],
-            }],
-            turn: TurnState::Idle,
-            tokens: Default::default(),
-            created_ms: 0,
-            updated_ms: 0,
-            agent: None,
-            queued: 0,
-        }));
+        app.sessions
+            .push(SessionView::from_snapshot(SessionSnapshot {
+                id: SessionId::generate(),
+                title: "Session 1".to_owned(),
+                cwd: "/work".into(),
+                model: None,
+                messages: vec![Message {
+                    role: Role::Assistant,
+                    blocks: vec![
+                        Block::Reasoning {
+                            text: "The user said hello.".to_owned(),
+                            trust: Trust::Model,
+                        },
+                        Block::Text {
+                            text: "Hello!".to_owned(),
+                            trust: Trust::Model,
+                        },
+                    ],
+                }],
+                turn: TurnState::Idle,
+                tokens: Default::default(),
+                created_ms: 0,
+                updated_ms: 0,
+                agent: None,
+                queued: 0,
+                project_id: None,
+                status: "active".to_owned(),
+            }));
         app
     }
 
