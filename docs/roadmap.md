@@ -84,7 +84,9 @@ where a feature genuinely cannot run (e.g. desktop automation on a headless serv
 
 ## 4. Feature roadmap (from audit)
 
-See `docs/audit/VIKRAM-AZ-AUDIT.md` §19 for the full prioritized list. Highlights:
+See `docs/audit/DEVELOPMENT_ROADMAP.md` for the full prioritized P0-P3 list (with
+complexity), and `docs/audit/VIKRAM-AZ-AUDIT.md` §19/§21 for the dependency graph.
+Highlights:
 
 **P0 (critical):** kernel trust propagation, MCP serve implementation, MCP stdio,
 silent-error fixes, OS sandbox, verification loop, durable mid-turn resume.

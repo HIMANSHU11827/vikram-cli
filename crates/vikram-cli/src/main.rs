@@ -62,10 +62,7 @@ enum Command {
         fresh: bool,
     },
     /// Steer a running session with a new instruction.
-    Steer {
-        id: String,
-        message: Vec<String>,
-    },
+    Steer { id: String, message: Vec<String> },
     /// Manage sessions.
     Sessions {
         #[command(subcommand)]
@@ -481,7 +478,9 @@ fn main() -> std::process::ExitCode {
 }
 
 async fn steer_cmd(config: Config, id: String, text: String) -> Result<(), String> {
-    let rt = vikram_runtime::Runtime::start(config).await.map_err(|e| e.to_string())?;
+    let rt = vikram_runtime::Runtime::start(config)
+        .await
+        .map_err(|e| e.to_string())?;
     let handle = rt.handle();
     let sid = vikram_contracts::SessionId::new(id);
     handle.steer(&sid, text).map_err(|e| e.to_string())?;
