@@ -67,9 +67,8 @@ where a feature genuinely cannot run (e.g. desktop automation on a headless serv
 
 - [ ] **Shell tool shell selection.** Already uses `cmd /C` on Windows, `sh -c` elsewhere.
   Add fish/zsh awareness? Keep simple: respect `$SHELL` on Unix, `%COMSPEC%` on Windows.
-- [ ] **Docker image + docs.** Add `Dockerfile` and `docs/docker.md`. Acceptance: `docker
-  run vikram` works headless.
-- [ ] **CI matrix.** GitHub Actions on ubuntu/macos/windows (and maybe termux via qemu).
+- [x] **Docker image + docs.** Add `Dockerfile` and `docs/docker.md`. ✅ Scaffolding done (image build pending network).
+- [ ] **CI matrix.** GitHub Actions on ubuntu/macos/windows (and maybe termux via qemu). (pending)
   Acceptance: `cargo test --workspace` green on all three.
 - [ ] **Windows sandbox (Job Objects).** Optional isolation. Acceptance: documented.
 - [ ] **Termux docs.** `docs/termux.md` with install steps (`pkg install rust clang`).

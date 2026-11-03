@@ -1875,7 +1875,6 @@ impl RuntimeHandle {
         initial: &str,
         parallel: bool,
     ) -> Result<Vec<vikram_store::HiveMessageRow>> {
-        use futures_util::StreamExt;
         let _ = self
             .inner
             .hive
