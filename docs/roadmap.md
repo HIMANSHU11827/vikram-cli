@@ -71,7 +71,7 @@ where a feature genuinely cannot run (e.g. desktop automation on a headless serv
 - [ ] **CI matrix.** GitHub Actions on ubuntu/macos/windows (and maybe termux via qemu). (pending)
   Acceptance: `cargo test --workspace` green on all three.
 - [ ] **Windows sandbox (Job Objects).** Optional isolation. Acceptance: documented.
-- [ ] **Termux docs.** `docs/termux.md` with install steps (`pkg install rust clang`).
+- [x] **Termux docs.** `docs/termux.md` with install steps (`pkg install rust clang`). ✅ Done.
 - [ ] **PowerShell/cmd examples** in docs for Windows users.
 
 ### P2 — polish

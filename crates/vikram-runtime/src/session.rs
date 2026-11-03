@@ -27,6 +27,8 @@ pub struct SessionRuntime {
     /// An operator-requested pause on this conversation's turns, honored between steps.
     pub paused: Mutex<bool>,
     pub queue: Mutex<VecDeque<String>>,
+    /// A pending steer instruction injected at a safe point during a running turn.
+    pub steer: Mutex<Option<String>>,
     pub agent: Mutex<Option<AgentId>>,
     pub created_ms: u64,
     pub updated_ms: AtomicU64,
@@ -53,6 +55,7 @@ impl SessionRuntime {
             cancel: Mutex::new(CancellationToken::new()),
             paused: Mutex::new(false),
             queue: Mutex::new(VecDeque::new()),
+            steer: Mutex::new(None),
             agent: Mutex::new(row.agent),
             created_ms: row.created_ms,
             updated_ms: AtomicU64::new(row.updated_ms),
@@ -162,6 +165,20 @@ impl SessionRuntime {
 
     pub fn queue_len(&self) -> usize {
         self.queue.lock().expect("queue lock").len()
+    }
+
+    /// Set a steer instruction to be incorporated at the next safe point.
+    pub fn steer(&self, text: String) {
+        *self.steer.lock().expect("steer lock") = Some(text);
+    }
+
+    /// Take the pending steer instruction, if any.
+    pub fn take_steer(&self) -> Option<String> {
+        self.steer.lock().expect("steer lock").take()
+    }
+
+    pub fn has_steer(&self) -> bool {
+        self.steer.lock().expect("steer lock").is_some()
     }
 
     pub fn set_agent(&self, agent: Option<AgentId>, now_ms: u64) {

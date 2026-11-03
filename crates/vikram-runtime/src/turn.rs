@@ -314,6 +314,25 @@ pub(crate) async fn run_turn(
             });
         }
 
+        // Steer: incorporate a user instruction injected mid-turn at this safe point.
+        if let Some(steer_text) = session.take_steer() {
+            let msg = Message::user(steer_text.clone());
+            session.push_message(msg.clone(), now_ms());
+            inner.journal(
+                &session.id,
+                RecordKind::Message,
+                serde_json::json!({"message": msg}),
+            );
+            inner.emit(RuntimeEvent::MessageCommitted {
+                session: session.id.clone(),
+                message: msg,
+            });
+            inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Info,
+                text: "steered".into(),
+            });
+        }
+
         if cancelled_mid_tools {
             if cancel.is_cancelled() {
                 outcome = TurnState::Cancelled;
@@ -435,12 +454,7 @@ fn finish(
                 task_id: bg.id.clone(),
             }
         });
-        spawn_turn(
-            Arc::clone(inner),
-            Arc::clone(session),
-            next,
-            queued_agent,
-        );
+        spawn_turn(Arc::clone(inner), Arc::clone(session), next, queued_agent);
     } else if session.queue_len() > 0 {
         inner.emit(RuntimeEvent::Notice {
             level: NoticeLevel::Warn,

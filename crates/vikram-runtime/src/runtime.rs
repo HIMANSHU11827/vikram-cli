@@ -1163,6 +1163,25 @@ impl RuntimeHandle {
         Ok(())
     }
 
+    /// Steer a running turn: inject an instruction at the next safe point (between tool calls).
+    /// If no turn is running, falls back to a normal submit.
+    pub fn steer(&self, session: &SessionId, text: String) -> Result<()> {
+        let Some(session) = self.inner.session(session) else {
+            return Err(RuntimeError::SessionNotFound(session.clone()));
+        };
+        if session.is_busy() {
+            session.steer(text);
+            self.inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Info,
+                text: "steered".into(),
+            });
+            self.inner.publish_session(&session);
+            Ok(())
+        } else {
+            self.submit(&session.id, text)
+        }
+    }
+
     pub fn cancel(&self, session: &SessionId) -> Result<()> {
         let Some(session) = self.inner.session(session) else {
             return Err(RuntimeError::SessionNotFound(session.clone()));

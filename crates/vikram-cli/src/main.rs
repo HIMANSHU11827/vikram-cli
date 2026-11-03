@@ -61,6 +61,11 @@ enum Command {
         #[arg(long)]
         fresh: bool,
     },
+    /// Steer a running session with a new instruction.
+    Steer {
+        id: String,
+        message: Vec<String>,
+    },
     /// Manage sessions.
     Sessions {
         #[command(subcommand)]
@@ -441,6 +446,10 @@ fn main() -> std::process::ExitCode {
             };
             run_async(chat::run(config, text, fresh))
         }
+        Command::Steer { id, message } => {
+            let text = message.join(" ");
+            run_async(steer_cmd(config, id, text))
+        }
         Command::Sessions { action } => sessions(action),
         Command::Project { action } => projects(action),
         Command::Workspace { action } => workspace_cmd(action),
@@ -469,6 +478,14 @@ fn main() -> std::process::ExitCode {
         Command::Learning { action } => learning(action),
         Command::Tickets { action } => tickets(action),
     }
+}
+
+async fn steer_cmd(config: Config, id: String, text: String) -> Result<(), String> {
+    let rt = vikram_runtime::Runtime::start(config).await.map_err(|e| e.to_string())?;
+    let handle = rt.handle();
+    let sid = vikram_contracts::SessionId::new(id);
+    handle.steer(&sid, text).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn runtime() -> tokio::runtime::Runtime {
