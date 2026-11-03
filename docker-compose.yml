@@ -1,0 +1,20 @@
+services:
+  vikram:
+    build: .
+    image: vikram:latest
+    container_name: vikram
+    # TUI needs a tty; for headless use: docker compose run --rm vikram chat "..."
+    stdin_open: true
+    tty: true
+    environment:
+      - VIKRAM_HOME=/data/vikram
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # Optional: override model/endpoint
+      # - VIKRAM_MODEL=${VIKRAM_MODEL}
+    volumes:
+      - vikram-data:/data/vikram
+      - ./:/workspace
+    working_dir: /workspace
+
+volumes:
+  vikram-data:

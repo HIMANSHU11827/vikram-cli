@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vikram-config
+  namespace: vikram
+data:
+  # Minimal config; secrets (API key) go in the Secret below.
+  config.json: |
+    {
+      "model": "gpt-4o-mini",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "context_window": 128000,
+      "max_steps": 24,
+      "max_output_tokens": 4096,
+      "ascii_fallback": true,
+      "thinking": false,
+      "mode": "ask",
+      "security": { "disable_yolo": true, "disable_auto_approve": false, "disable_always_allow": false }
+    }

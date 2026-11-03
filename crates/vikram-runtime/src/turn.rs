@@ -419,14 +419,27 @@ fn finish(
         && !session.cancel_handle().is_cancelled()
         && let Some(next) = session.dequeue()
     {
+        // A queued follow-up keeps the same agent (if any) but gets its own
+        // background task id so progress and completion are tracked rather than
+        // being silently dropped (the previous `String::new()` lost the task).
+        let queued_agent = agent.as_ref().map(|run| {
+            run.agent.set_state(AgentState::Thinking);
+            run.agent.set_task(Some(next.clone()));
+            inner.publish_agent(&run.agent);
+            let bg = inner.tasks.start(
+                format!("agent: {}", run.agent.profile.name),
+                session.id.clone(),
+            );
+            AgentRun {
+                agent: Arc::clone(&run.agent),
+                task_id: bg.id.clone(),
+            }
+        });
         spawn_turn(
             Arc::clone(inner),
             Arc::clone(session),
             next,
-            agent.as_ref().map(|run| AgentRun {
-                agent: Arc::clone(&run.agent),
-                task_id: String::new(),
-            }),
+            queued_agent,
         );
     } else if session.queue_len() > 0 {
         inner.emit(RuntimeEvent::Notice {

@@ -279,6 +279,8 @@ Override via flags: `--model`, `--base-url`, `--workspace`, `--mode`, `--ascii`.
 | [`docs/session-workspace.md`](docs/session-workspace.md) | Sessions, workspaces, projects, artifacts, checkpoints |
 | [`docs/evolution.md`](docs/evolution.md) | Self-evolution engine |
 | [`docs/roadmap.md`](docs/roadmap.md) | Roadmap (cross-platform + features, contributor guide) |
+| [`docs/docker.md`](docs/docker.md) | Docker usage |
+| [`docs/kubernetes.md`](docs/kubernetes.md) | Kubernetes usage |
 | [`docs/audit/VIKRAM-AZ-AUDIT.md`](docs/audit/VIKRAM-AZ-AUDIT.md) | Full A–Z audit |
 | [`docs/skills/`](docs/skills/) | Skills system reference |
 | [`docs/development/`](docs/development/) | Testing strategy, implementation notes |

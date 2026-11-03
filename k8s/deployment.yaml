@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vikram
+  namespace: vikram
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: vikram }
+  template:
+    metadata:
+      labels: { app: vikram }
+    spec:
+      containers:
+        - name: vikram
+          image: vikram:latest
+          imagePullPolicy: IfNotPresent
+          # Interactive TUI; for a non-interactive pod use: ["vikram", "chat", "hello"]
+          command: ["vikram"]
+          stdin: true
+          tty: true
+          env:
+            - name: VIKRAM_HOME
+              value: /data/vikram
+            - name: OPENAI_API_KEY
+              valueFrom: { secretKeyRef: { name: vikram-secrets, key: OPENAI_API_KEY } }
+          volumeMounts:
+            - name: data
+              mountPath: /data/vikram
+            - name: config
+              mountPath: /data/vikram/config.json
+              subPath: config.json
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: vikram-data }
+        - name: config
+          configMap: { name: vikram-config }

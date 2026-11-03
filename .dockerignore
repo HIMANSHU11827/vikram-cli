@@ -1,0 +1,12 @@
+target/
+.git/
+docs/
+*.md
+.env
+*.log
+codex/
+gitui/
+openhands2/
+inspect_ai/
+harbor/
+.freebuff/
