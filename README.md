@@ -264,6 +264,18 @@ Override via flags: `--model`, `--base-url`, `--workspace`, `--mode`, `--ascii`.
 | [`HARNESS.md`](HARNESS.md) | Architecture overview |
 | [`docs/concepts.md`](docs/concepts.md) | Core concepts (users, profiles, agents, bots, Hive, teams, tickets, sessions, permissions, memory) |
 | [`docs/tickets.md`](docs/tickets.md) | Unified Ticket System (Hive, bots, sub-agents) |
+| [`docs/agents.md`](docs/agents.md) | Agents, bots, Hive, teams, assignments |
+| [`docs/permissions.md`](docs/permissions.md) | Permission model, postures, floor, allow-list |
+| [`docs/kernel.md`](docs/kernel.md) | Kernel execution architecture |
+| [`docs/store.md`](docs/store.md) | Durable SQLite state and tables |
+| [`docs/runtime.md`](docs/runtime.md) | Runtime host integration |
+| [`docs/memory.md`](docs/memory.md) | Memory and self-improvement |
+| [`docs/context.md`](docs/context.md) | Context loader |
+| [`docs/tools.md`](docs/tools.md) | Tool surface and execution |
+| [`docs/plugins.md`](docs/plugins.md) | Plugin system |
+| [`docs/tui.md`](docs/tui.md) | Terminal interface |
+| [`docs/cli.md`](docs/cli.md) | CLI operator commands |
+| [`docs/security.md`](docs/security.md) | Security model and gaps |
 | [`docs/session-workspace.md`](docs/session-workspace.md) | Sessions, workspaces, projects, artifacts, checkpoints |
 | [`docs/evolution.md`](docs/evolution.md) | Self-evolution engine |
 | [`docs/audit/VIKRAM-AZ-AUDIT.md`](docs/audit/VIKRAM-AZ-AUDIT.md) | Full A–Z audit |
