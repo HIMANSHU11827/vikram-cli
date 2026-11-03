@@ -262,6 +262,7 @@ Override via flags: `--model`, `--base-url`, `--workspace`, `--mode`, `--ascii`.
 | Doc | Description |
 |---|---|
 | [`HARNESS.md`](HARNESS.md) | Architecture overview |
+| [`docs/concepts.md`](docs/concepts.md) | Core concepts (users, profiles, agents, bots, Hive, teams, tickets, sessions, permissions, memory) |
 | [`docs/tickets.md`](docs/tickets.md) | Unified Ticket System (Hive, bots, sub-agents) |
 | [`docs/session-workspace.md`](docs/session-workspace.md) | Sessions, workspaces, projects, artifacts, checkpoints |
 | [`docs/evolution.md`](docs/evolution.md) | Self-evolution engine |
