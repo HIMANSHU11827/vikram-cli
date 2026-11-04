@@ -457,8 +457,13 @@ enum JobsAction {
     },
     /// One run in full: what it printed and what it returned.
     Inspect { id: String },
-    /// Ask the daemon to stop a run.
-    Cancel { id: String },
+    /// Ask the daemon to stop a run, or one member of a team run.
+    Cancel {
+        id: String,
+        /// Stop only this member; the rest of the team keeps working.
+        #[arg(long)]
+        agent: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2046,7 +2051,10 @@ fn jobs(action: JobsAction) -> std::process::ExitCode {
     match action {
         JobsAction::List { limit } => report(cli::jobs_list(limit)),
         JobsAction::Inspect { id } => report(cli::jobs_inspect(&id)),
-        JobsAction::Cancel { id } => report(cli::jobs_cancel(&id)),
+        JobsAction::Cancel { id, agent } => match agent {
+            Some(agent) => report(cli::jobs_cancel_member(&id, &agent)),
+            None => report(cli::jobs_cancel(&id)),
+        },
     }
 }
 

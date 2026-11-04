@@ -9,10 +9,11 @@
 use std::path::Path;
 use std::time::Duration;
 
+use std::sync::Arc;
 use vikram_contracts::{AgentId, Block, Message, PermissionMode, Role, SessionId};
 use vikram_runtime::config::Config;
 use vikram_runtime::types::{RuntimeEvent, RuntimeStatus, TurnState};
-use vikram_runtime::{Runtime, RuntimeHandle};
+use vikram_runtime::{AgentControl, Runtime, RuntimeHandle};
 
 /// How much of a run's own words are kept. A job that prints a gigabyte must not fill the database.
 const OUTPUT_CAP: usize = 64 * 1024;
@@ -268,8 +269,12 @@ impl DelegateRequest {
     }
 }
 
+/// Asked, between events, whether one member of a running team should be stopped. The daemon
+/// answers from the scheduler database, so the request survives the process boundary that
+/// separates `vikram jobs cancel` from the runtime doing the work.
+pub type StopProbe = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// A job that runs as a team: one delegated turn per member, all at once.
-#[derive(Debug, Clone)]
 pub struct TeamRequest {
     pub team: String,
     pub prompt: String,
@@ -277,6 +282,7 @@ pub struct TeamRequest {
     pub model: Option<String>,
     pub unattended: bool,
     pub order: TeamOrder,
+    pub stop: Option<StopProbe>,
 }
 
 /// Whether a team's members work at the same time or one after another.
@@ -323,7 +329,14 @@ impl TeamRequest {
             model: None,
             unattended: true,
             order: TeamOrder::Parallel,
+            stop: None,
         }
+    }
+
+    /// Ask this probe, while the team runs, which members the operator has stopped.
+    pub fn stopping_when(mut self, probe: Option<StopProbe>) -> Self {
+        self.stop = probe;
+        self
     }
 
     pub fn in_order(mut self, order: TeamOrder) -> Self {
@@ -372,6 +385,7 @@ pub async fn run_delegate(
             request.model,
             request.unattended,
             TeamOrder::Parallel,
+            None,
         )
         .await;
         fanout
@@ -410,6 +424,7 @@ pub async fn run_team(config: Config, request: TeamRequest, timeout: Duration) -
             request.model,
             request.unattended,
             request.order,
+            request.stop,
         )
         .await;
         team_report(fanout)
@@ -466,6 +481,7 @@ async fn delegated(
     model: Option<String>,
     unattended: bool,
     order: TeamOrder,
+    stop: Option<StopProbe>,
 ) -> Fanout {
     let mut fanout = Fanout {
         parent: None,
@@ -540,14 +556,19 @@ async fn delegated(
         TeamOrder::Parallel => {
             let started = spawn_into(&handle, &agents, &prompt, &parent, &mut fanout.results);
             let children = children_of(&handle, &started, &mut fanout.results);
-            let (finished, failure) = wait_for(&mut events, &handle, &children, &mut denied).await;
+            let (finished, failure, stopped) =
+                wait_for(&mut events, &handle, &children, &mut denied, stop.as_ref()).await;
             pause_learning(&handle).await;
             for (sid, agent) in children {
                 let state = finished
                     .iter()
                     .find(|(session, _)| *session == sid)
                     .map(|(_, state)| state.clone());
-                let outcome = outcome_of(&handle, sid, state, &failure, denied);
+                let outcome = if stopped.contains(&agent) {
+                    RunOutcome::failed(format!("{} was stopped by the operator", agent.as_str()))
+                } else {
+                    outcome_of(&handle, sid, state, &failure, denied)
+                };
                 fanout.results.push((agent, outcome));
             }
         }
@@ -556,6 +577,18 @@ async fn delegated(
             // finished, so a team sharing a rate limit or a single test database cannot collide.
             // Each member still gets its own session; sequential means ordered, not shared.
             for agent in &agents {
+                // A member stopped before its turn began never starts, so the queue behind it moves
+                // on instead of waiting for work nobody wants any more.
+                if stop.as_ref().is_some_and(|probe| probe(agent.as_str())) {
+                    fanout.results.push((
+                        agent.clone(),
+                        RunOutcome::failed(format!(
+                            "{} was stopped by the operator",
+                            agent.as_str()
+                        )),
+                    ));
+                    continue;
+                }
                 let started = spawn_into(
                     &handle,
                     std::slice::from_ref(agent),
@@ -567,14 +600,21 @@ async fn delegated(
                 if children.is_empty() {
                     continue;
                 }
-                let (finished, failure) =
-                    wait_for(&mut events, &handle, &children, &mut denied).await;
+                let (finished, failure, stopped) =
+                    wait_for(&mut events, &handle, &children, &mut denied, stop.as_ref()).await;
                 for (sid, child) in children {
                     let state = finished
                         .iter()
                         .find(|(session, _)| *session == sid)
                         .map(|(_, state)| state.clone());
-                    let outcome = outcome_of(&handle, sid, state, &failure, denied);
+                    let outcome = if stopped.contains(&child) {
+                        RunOutcome::failed(format!(
+                            "{} was stopped by the operator",
+                            child.as_str()
+                        ))
+                    } else {
+                        outcome_of(&handle, sid, state, &failure, denied)
+                    };
                     fanout.results.push((child, outcome));
                 }
             }
@@ -644,11 +684,32 @@ async fn wait_for(
     handle: &RuntimeHandle,
     children: &[(SessionId, AgentId)],
     denied: &mut usize,
-) -> (Vec<(SessionId, TurnState)>, Option<String>) {
+    stop: Option<&StopProbe>,
+) -> (Vec<(SessionId, TurnState)>, Option<String>, Vec<AgentId>) {
     let mut finished: Vec<(SessionId, TurnState)> = Vec::new();
     let mut failure: Option<String> = None;
+    let mut stopped: Vec<AgentId> = Vec::new();
     while finished.len() < children.len() {
-        match events.recv().await {
+        // Wait for an event, but not forever: a stop request arrives through the database, not
+        // through the event stream, so the loop has to surface every so often to look.
+        let next = match tokio::time::timeout(Duration::from_millis(400), events.recv()).await {
+            Ok(event) => event,
+            Err(_) => {
+                if let Some(probe) = stop {
+                    for (_, agent) in children {
+                        if stopped.contains(agent) || !probe(agent.as_str()) {
+                            continue;
+                        }
+                        // The runtime owns the turn; asking it to stop is the only way to end one
+                        // member without ending the team.
+                        let _ = handle.control_agent(agent, AgentControl::Stop);
+                        stopped.push(agent.clone());
+                    }
+                }
+                continue;
+            }
+        };
+        match next {
             Ok(RuntimeEvent::ApprovalRequested(prompt)) => {
                 if children.iter().any(|(child, _)| *child == prompt.session) {
                     *denied += 1;
@@ -676,7 +737,7 @@ async fn wait_for(
             }
         }
     }
-    (finished, failure)
+    (finished, failure, stopped)
 }
 
 /// Let the runtime finish whatever it learned from the turn before the process is dropped.

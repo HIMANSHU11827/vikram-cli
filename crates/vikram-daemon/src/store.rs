@@ -316,6 +316,7 @@ impl ScheduleStore {
             "order_mode",
             "TEXT NOT NULL DEFAULT 'parallel'",
         )?;
+        self.add_column("daemon_runs", "delivery_note", "TEXT NOT NULL DEFAULT ''")?;
         Ok(())
     }
 
@@ -744,6 +745,12 @@ const JOB_COLUMNS: &str = "id, name, description, schedule, timezone, mode, payl
 /// stable order, or `history` would show a different list every time it was asked.
 const RUN_ORDER: &str = "started_ms DESC, slot_ms DESC, attempt DESC";
 
+/// The state key that asks one member of one running team to stop. It lives in the database
+/// because the CLI that asks and the daemon that honours it are different processes.
+pub fn member_stop_key(run: &str, agent: &str) -> String {
+    format!("member.{run}.{agent}")
+}
+
 const RUN_COLUMNS: &str =
     "id, job_id, slot_ms, attempt, started_ms, finished_ms, status, session, output, error,
     delivery, delivery_note";
@@ -992,5 +999,72 @@ mod tests {
             Some(1_700_000_000_000)
         );
         assert!(!store.state_bool("heartbeat.enabled", true).unwrap());
+    }
+    #[test]
+    fn one_member_of_one_run_gets_its_own_stop_flag() {
+        let store = store();
+        assert_eq!(
+            member_stop_key("run_1", "mira"),
+            "member.run_1.mira".to_string()
+        );
+        let key = member_stop_key("run_1", "mira");
+        assert!(!store.state_bool(&key, false).unwrap());
+        store.set_state(&key, "1").unwrap();
+        assert!(store.state_bool(&key, false).unwrap());
+        // The other member of the same run is untouched by her stop.
+        assert!(
+            !store
+                .state_bool(&member_stop_key("run_1", "arun"), false)
+                .unwrap()
+        );
+    }
+    #[test]
+    fn a_column_added_later_is_given_to_a_home_written_before_it() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("vikram.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("old database");
+            // The schema as it was before `order_mode` and `delivery_note` existed.
+            conn.execute_batch(
+                "CREATE TABLE daemon_jobs (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '', schedule TEXT NOT NULL,
+                    timezone TEXT NOT NULL DEFAULT 'local', mode TEXT NOT NULL DEFAULT 'agent',
+                    payload TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT 'local',
+                    agent TEXT NOT NULL DEFAULT '', bot TEXT NOT NULL DEFAULT '',
+                    timeout_ms INTEGER, retries INTEGER NOT NULL DEFAULT 0,
+                    priority INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+                    created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL,
+                    last_run_ms INTEGER, next_run_ms INTEGER,
+                    last_status TEXT NOT NULL DEFAULT 'never'
+                 );
+                 CREATE TABLE daemon_runs (
+                    id TEXT PRIMARY KEY, job_id TEXT NOT NULL, slot_ms INTEGER NOT NULL,
+                    attempt INTEGER NOT NULL DEFAULT 1, started_ms INTEGER NOT NULL,
+                    finished_ms INTEGER, status TEXT NOT NULL, session TEXT,
+                    output TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
+                    delivery TEXT NOT NULL DEFAULT 'none'
+                 );",
+            )
+            .expect("old schema");
+        }
+        // Opening it again is what an upgraded daemon does, and it has to leave a table it can
+        // read: a missing column fails every `jobs inspect` with an error no operator can fix.
+        let store = ScheduleStore::open(&path).expect("upgraded store");
+        let conn = store.lock();
+        for (table, column) in [
+            ("daemon_jobs", "order_mode"),
+            ("daemon_runs", "delivery_note"),
+        ] {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .expect("pragma");
+            let known: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("columns")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("names");
+            assert!(known.iter().any(|name| name == column), "{table}.{column}");
+        }
     }
 }

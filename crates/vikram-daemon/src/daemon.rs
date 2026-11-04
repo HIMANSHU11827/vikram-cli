@@ -368,7 +368,8 @@ impl Daemon {
     fn dispatch(&mut self, claimed: Claimed, now: Millis, report: &mut TickReport) {
         let Claimed { job, run, .. } = claimed;
         let timeout = job.timeout_ms.unwrap_or(DEFAULT_JOB_TIMEOUT_MS).max(1_000);
-        let work = work_for(&job, timeout);
+        let stop = Some(member_probe(self.store.clone(), &run.id));
+        let work = work_for(&job, timeout, stop);
         let id = run.id.clone();
         match self.pool.dispatch(id, class_of(job.mode), work) {
             Ok(()) => {
@@ -567,7 +568,18 @@ impl Daemon {
     }
 }
 
-fn work_for(job: &Job, timeout: Millis) -> Work {
+/// Answer, for one running team, whether the operator has stopped a member. The request travels
+/// through the scheduler database because the CLI and the daemon are different processes.
+fn member_probe(store: ScheduleStore, run: &str) -> runner::StopProbe {
+    let run = run.to_string();
+    std::sync::Arc::new(move |agent: &str| {
+        store
+            .state_bool(&format!("member.{run}.{agent}"), false)
+            .unwrap_or(false)
+    })
+}
+
+fn work_for(job: &Job, timeout: Millis, stop: Option<runner::StopProbe>) -> Work {
     let job = job.clone();
     Box::pin(async move {
         let limit = Duration::from_millis(timeout as u64);
@@ -625,7 +637,10 @@ fn work_for(job: &Job, timeout: Millis) -> Work {
                 };
                 let request = runner::TeamRequest::new(job.agent.clone(), job.payload.clone())
                     .title(runner::title_from(&job.payload))
-                    .in_order(runner::TeamOrder::parse(&job.order).unwrap_or_default());
+                    .in_order(runner::TeamOrder::parse(&job.order).unwrap_or_default())
+                    // A member stopped from the CLI is asked about between events, so the rest of
+                    // the team keeps working instead of being cancelled with it.
+                    .stopping_when(stop);
                 let request = match job.target.strip_prefix("model:") {
                     Some(model) => request.model(model.to_string()),
                     None => request,
@@ -932,7 +947,7 @@ mod tests {
                 time::now_ms(),
             )
             .unwrap();
-        let outcome = work_for(&job, 1_000).await;
+        let outcome = work_for(&job, 1_000, None).await;
         assert!(!outcome.ok);
         assert!(
             outcome.error.unwrap_or_default().contains("--bot"),
@@ -952,7 +967,7 @@ mod tests {
                 time::now_ms(),
             )
             .unwrap();
-        let outcome = work_for(&job, 1_000).await;
+        let outcome = work_for(&job, 1_000, None).await;
         assert!(!outcome.ok);
         assert!(outcome.error.unwrap_or_default().contains("--agent"));
     }

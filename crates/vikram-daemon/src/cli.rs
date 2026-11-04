@@ -804,6 +804,34 @@ pub fn jobs_cancel(needle: &str) -> Result<String, String> {
     Ok(format!("asked {} to stop", run.id))
 }
 
+/// Ask the daemon to stop one member of a running team, leaving the rest of it working.
+///
+/// A team run has one turn per member; cancelling the whole run throws away the members that are
+/// doing fine. This names one of them and lets the others finish.
+pub fn jobs_cancel_member(needle: &str, agent: &str) -> Result<String, String> {
+    let store = store()?;
+    let said = stop_member_in(&store, needle, agent)?;
+    audit(
+        &home(),
+        &format!("jobs cancel {needle} member {}", agent.trim()),
+    );
+    Ok(said)
+}
+
+/// The part of stopping one member that does not touch the audit log or the home directory, so a
+/// test can drive it against a store in a temporary directory.
+fn stop_member_in(store: &ScheduleStore, needle: &str, agent: &str) -> Result<String, String> {
+    let agent = agent.trim();
+    if agent.is_empty() {
+        return Err("say which member to stop: --agent <name>".to_string());
+    }
+    let run = resolve_running(store, needle)?;
+    store
+        .set_state(&crate::store::member_stop_key(&run.id, agent), "1")
+        .map_err(|err| err.to_string())?;
+    Ok(format!("asked {agent} to stop in {}", run.id))
+}
+
 /// Mark a run cancelled once the daemon has honoured the request.
 pub fn finish_cancelled(store: &ScheduleStore, run_id: &str, output: &str) -> Result<(), String> {
     store
@@ -1077,5 +1105,51 @@ mod tests {
         assert_eq!(job.mode, JobMode::Script);
         assert_eq!(job.retries, 2);
         assert_eq!(job.timezone, "+02:00");
+    }
+    #[test]
+    fn stopping_one_member_flags_that_member_and_nobody_else() {
+        let (_dir, store) = fixture();
+        let manager = JobManager::new(store.clone());
+        let job = manager
+            .create(NewJob::new("crunch", "every 5m").payload("check"), now_ms())
+            .unwrap();
+        let run = store
+            .begin_run(&job, job.next_run_ms.unwrap(), None)
+            .unwrap();
+
+        let said = stop_member_in(&store, "crunch", " mira ").unwrap();
+        assert!(said.contains("mira"), "{said}");
+        assert!(
+            store
+                .state_bool(&crate::store::member_stop_key(&run.id, "mira"), false)
+                .unwrap()
+        );
+        // Nobody asked arun to stop, so he must not read as stopped.
+        assert!(
+            !store
+                .state_bool(&crate::store::member_stop_key(&run.id, "arun"), false)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_member_has_to_be_named_and_its_run_has_to_be_running() {
+        let (_dir, store) = fixture();
+        let manager = JobManager::new(store.clone());
+        let job = manager
+            .create(NewJob::new("crunch", "every 5m").payload("check"), now_ms())
+            .unwrap();
+
+        let err = stop_member_in(&store, "crunch", "   ").unwrap_err();
+        assert!(err.contains("say which member"), "{err}");
+
+        let run = store
+            .begin_run(&job, job.next_run_ms.unwrap(), None)
+            .unwrap();
+        store
+            .finish_run(&run.id, RunStatus::Ok, "done", "", Delivery::None)
+            .unwrap();
+        let err = stop_member_in(&store, "crunch", "mira").unwrap_err();
+        assert!(err.contains("nothing running"), "{err}");
     }
 }
