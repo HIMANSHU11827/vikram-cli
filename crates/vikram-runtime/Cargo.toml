@@ -10,6 +10,9 @@ rust-version.workspace = true
 vikram-contracts.workspace = true
 vikram-policy.workspace = true
 vikram-store.workspace = true
+vikram-sandbox.workspace = true
+vikram-codeindex.workspace = true
+vikram-terminals.workspace = true
 vikram-skills = { path = "../vikram-skills" }
 vikram-mcp = { path = "../vikram-mcp" }
 vikram-evolution = { path = "../vikram-evolution" }

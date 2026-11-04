@@ -1,0 +1,16 @@
+[package]
+name = "vikram-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+landlock = { version = "0.4", optional = true }
+
+[features]
+default = ["landlock"]
+landlock = ["dep:landlock"]

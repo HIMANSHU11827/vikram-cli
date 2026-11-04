@@ -11,6 +11,10 @@ members = [
     "crates/vikram-mcp",
     "crates/vikram-evolution",
     "crates/vikram-daemon",
+    "crates/vikram-sandbox",
+    "crates/vikram-codeindex",
+    "crates/vikram-acp",
+    "crates/vikram-terminals",
 ]
 
 [workspace.package]
@@ -29,7 +33,10 @@ vikram-tui = { path = "crates/vikram-tui" }
 vikram-skills = { path = "crates/vikram-skills" }
 vikram-mcp = { path = "crates/vikram-mcp" }
 vikram-daemon = { path = "crates/vikram-daemon" }
-
+vikram-sandbox = { path = "crates/vikram-sandbox" }
+vikram-codeindex = { path = "crates/vikram-codeindex" }
+vikram-acp = { path = "crates/vikram-acp" }
+vikram-terminals = { path = "crates/vikram-terminals" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
@@ -44,6 +51,7 @@ tokio = { version = "1.54", features = [
     "signal",
 ] }
 futures-util = "0.3"
+async-trait = "0.1"
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
     "json",

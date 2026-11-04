@@ -49,6 +49,7 @@ impl ToolContext {
     pub fn new(workspace_root: PathBuf, settings: &crate::config::SandboxSettings) -> Self {
         let sandbox = if settings.enabled {
             crate::sandbox::Sandbox::detect(
+                crate::sandbox::SandboxMode::Full,
                 settings.allow_network,
                 settings.read_only_paths.clone(),
             )
@@ -191,6 +192,8 @@ impl ToolRegistry {
         registry.register(Box::new(MemorySearch));
         registry.register(Box::new(MemoryList));
         registry.register(Box::new(MemoryDelete));
+        registry.register(Box::new(MemoryNote));
+        registry.register(Box::new(SessionSearch));
         registry.register(Box::new(WebSearch));
         registry.register(Box::new(TeamCreate));
         registry.register(Box::new(TeamList));
@@ -232,6 +235,7 @@ impl ToolRegistry {
         registry.register(Box::new(LspReferences));
         registry.register(Box::new(LspSymbols));
         registry.register(Box::new(LspDiagnostics));
+        registry.register(Box::new(CodeIndexTool));
         registry.register(Box::new(PluginExecute));
         registry.register(Box::new(PluginList));
         registry.register(Box::new(PluginInstall));

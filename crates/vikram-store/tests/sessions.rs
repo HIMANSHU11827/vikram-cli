@@ -419,3 +419,45 @@ fn recent_sessions_are_listed_by_activity_not_by_creation() {
         "the session used most recently is the one listed first"
     );
 }
+
+#[test]
+fn session_fts_filtered_and_browse() {
+    let store = Store::open_in_memory().unwrap();
+    let now = now();
+    let agent = AgentId::new("rudra");
+    let s1 = store
+        .create_session("Deploy notes", Path::new("/work"), None, now)
+        .unwrap();
+    store.set_session_agent(&s1.id, Some(&agent), now).unwrap();
+    let p = store
+        .create_project("website", Path::new("/tmp/website"), now)
+        .unwrap();
+    store.set_session_project(&s1.id, Some(&p.id), now).unwrap();
+    store
+        .index_session_text(&s1.id, "rotate the kafka broker certs")
+        .unwrap();
+
+    let s2 = store
+        .create_session("Other", Path::new("/work"), None, now + 10)
+        .unwrap();
+    store
+        .index_session_text(&s2.id, "kafka again")
+        .unwrap();
+
+    let hits = store
+        .search_session_text_filtered("kafka", Some(&agent), Some(&p.id), 0, 10)
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, s1.id);
+
+    let hits = store
+        .search_session_text_filtered("kafka", None, None, now + 5, 10)
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, s2.id);
+
+    let browsed = store.browse_sessions().unwrap();
+    assert_eq!(browsed.len(), 2);
+    let total: u64 = browsed.iter().map(|(_, c)| *c).sum();
+    assert_eq!(total, 2);
+}

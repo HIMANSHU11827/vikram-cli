@@ -2536,4 +2536,46 @@ mod tests {
         assert_eq!(experiences, 0, "a disabled policy means off, not quiet");
         assert!(handle.inner.learning.pending_proposals().is_empty());
     }
+
+    #[tokio::test]
+    async fn memory_nudge_due_uses_session_message_count() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let config = Config {
+            model: "test-model".into(),
+            workspace_root: Some(dir.path().to_path_buf()),
+            memory_nudge_interval: 2,
+            ..Config::default()
+        };
+        let runtime = Runtime::start_with_provider(config, Arc::new(ScriptedProvider::new(vec![])))
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        let session_id = handle.snapshot().sessions[0].id.clone();
+        let session = handle.inner.session(&session_id).expect("session");
+        assert!(!handle.inner.memory_nudge_due(&session));
+        session.push_message(vikram_contracts::Message::user("one"), 1);
+        assert!(!handle.inner.memory_nudge_due(&session));
+        session.push_message(vikram_contracts::Message::user("two"), 2);
+        assert!(handle.inner.memory_nudge_due(&session));
+
+        // A zero interval never nudges.
+        let dir2 = tempfile::tempdir().expect("temp dir");
+        let _home2 = isolated_home(dir2.path());
+        let config2 = Config {
+            model: "test-model".into(),
+            workspace_root: Some(dir2.path().to_path_buf()),
+            memory_nudge_interval: 0,
+            ..Config::default()
+        };
+        let runtime2 = Runtime::start_with_provider(config2, Arc::new(ScriptedProvider::new(vec![])))
+            .await
+            .expect("runtime starts");
+        let handle2 = runtime2.handle();
+        let sid2 = handle2.snapshot().sessions[0].id.clone();
+        let session2 = handle2.inner.session(&sid2).expect("session");
+        session2.push_message(vikram_contracts::Message::user("one"), 1);
+        assert!(!handle2.inner.memory_nudge_due(&session2));
+    }
+
 }

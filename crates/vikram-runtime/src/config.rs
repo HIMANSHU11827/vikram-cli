@@ -38,6 +38,10 @@ pub struct Config {
     /// tokens. `0` — the default — never asks a model to review; the free experience pipeline runs
     /// regardless.
     pub learning_review_every: u64,
+    /// Every Nth message in a session nudges the runtime to review the conversation for durable
+    /// memory. `0` disables the nudge. Defaults to 10.
+    #[serde(default = "default_memory_nudge_interval")]
+    pub memory_nudge_interval: u64,
     /// A cheaper model used only to name sessions. Empty means the main model is used. Title
     /// generation is a few words of output, so spending the reasoning model on it is waste the
     /// operator pays for on every new conversation.
@@ -99,6 +103,10 @@ impl Default for SandboxSettings {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_memory_nudge_interval() -> u64 {
+    10
 }
 
 impl SecurityConfig {
@@ -351,6 +359,7 @@ impl Default for Config {
             max_steps: 24,
             max_output_tokens: None,
             learning_review_every: 0,
+            memory_nudge_interval: 10,
             title_model: String::new(),
             ascii_fallback: false,
             thinking: false,
@@ -751,6 +760,11 @@ mod tests {
             cfg.api_key_with_source().map(|(_, source)| source),
             Some("environment")
         );
+    }
+
+    #[test]
+    fn the_memory_nudge_interval_defaults_to_ten() {
+        assert_eq!(Config::default().memory_nudge_interval, 10);
     }
 
     #[test]

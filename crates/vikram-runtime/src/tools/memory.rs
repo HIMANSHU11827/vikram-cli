@@ -220,3 +220,52 @@ impl Tool for MemoryDelete {
         })
     }
 }
+
+pub(crate) struct MemoryNote;
+
+impl Tool for MemoryNote {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "memory.note".into(),
+            description: "Append a free-form note to MEMORY.md or USER.md (Hermes-style).".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "enum": ["memory", "user"]},
+                    "note": {"type": "string"}
+                },
+                "required": ["note"]
+            }),
+        }
+    }
+
+    fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
+        let note = arg_str(args, "note")?;
+        Ok(PermissionRequest::new(
+            ActionKind::Write,
+            "memory.note",
+            note,
+            SideEffect::LocalMutation,
+            Trust::Model,
+        ))
+    }
+
+    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+        let note = arg_str(args, "note")?;
+        let target = args
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or("memory");
+        let home = crate::config::vikram_home();
+        let mut f = if target == "user" {
+            crate::memory_files::user_file(&home)
+        } else {
+            crate::memory_files::memory_file(&home)
+        };
+        f.add(&note).map_err(|e| VikramError::Storage(e))?;
+        Ok(ToolOutput {
+            content: format!("noted in {target}"),
+            ok: true,
+        })
+    }
+}

@@ -609,6 +609,108 @@ impl Store {
         Ok(rows)
     }
 
+    /// Index free-form text (e.g. a message or tool result) for a session into the FTS5 table.
+    pub fn index_session_text(&self, session: &SessionId, content: &str) -> Result<()> {
+        let conn = self.lock();
+        // Best-effort: ignore if FTS5 unavailable.
+        let _ = conn.execute(
+            "INSERT INTO session_fts(session, content) VALUES (?1, ?2)",
+            params![session.to_string(), content],
+        );
+        Ok(())
+    }
+
+    /// FTS5-backed session message search. Returns matching session ids ordered by rank.
+    pub fn search_session_text(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(SessionId, String)>> {
+        let conn = self.lock();
+        let mut out = Vec::new();
+        let sql = "SELECT session, snippet(session_fts, 1, '[', ']', '…', 12) \
+                   FROM session_fts WHERE session_fts MATCH ?1 ORDER BY rank LIMIT ?2";
+        if let Ok(mut stmt) = conn.prepare(sql) {
+            if let Ok(rows) = stmt.query_map(params![query, limit as i64], |r| {
+                Ok((
+                    SessionId::new(r.get::<_, String>(0)?),
+                    r.get::<_, String>(1)?,
+                ))
+            }) {
+                for r in rows.flatten() {
+                    out.push(r);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// FTS5-backed session message search with optional agent/project/time filters, joining
+    /// `session_fts` to `sessions`. `since_ms == 0` disables the time filter.
+    pub fn search_session_text_filtered(
+        &self,
+        query: &str,
+        agent_filter: Option<&AgentId>,
+        project_filter: Option<&ProjectId>,
+        since_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<(SessionId, String)>> {
+        let conn = self.lock();
+        let mut out = Vec::new();
+        let sql = "SELECT session_fts.session, snippet(session_fts, 1, '[', ']', '…', 12) \
+                   FROM session_fts JOIN sessions s ON s.id = session_fts.session \
+                   WHERE session_fts MATCH ?1 \
+                     AND (?2 IS NULL OR s.agent_id = ?2) \
+                     AND (?3 IS NULL OR s.project_id = ?3) \
+                     AND (?4 = 0 OR s.updated_ms >= ?4) \
+                   ORDER BY rank LIMIT ?5";
+        let agent = agent_filter.map(|a| a.as_str().to_owned());
+        let project = project_filter.map(|p| p.as_str().to_owned());
+        if let Ok(mut stmt) = conn.prepare(sql) {
+            if let Ok(rows) = stmt.query_map(
+                params![query, agent, project, since_ms as i64, limit as i64],
+                |r| {
+                    Ok((
+                        SessionId::new(r.get::<_, String>(0)?),
+                        r.get::<_, String>(1)?,
+                    ))
+                },
+            ) {
+                for r in rows.flatten() {
+                    out.push(r);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Recent sessions (active, by updated_ms) with a count of their indexed FTS rows.
+    pub fn browse_sessions(&self) -> Result<Vec<(SessionRow, u64)>> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {SESSION_COLS} FROM sessions WHERE status = 'active' ORDER BY updated_ms DESC"
+        );
+        let sessions: Vec<SessionRow> = {
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map([], map_session_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let mut out = Vec::with_capacity(sessions.len());
+        for s in sessions {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM session_fts WHERE session = ?1",
+                    params![s.id.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            out.push((s, count as u64));
+        }
+        Ok(out)
+    }
+
     pub fn set_session_status(&self, id: &SessionId, status: &str, now_ms: u64) -> Result<()> {
         self.lock().execute(
             "UPDATE sessions SET status = ?2, updated_ms = ?3 WHERE id = ?1",
@@ -2934,6 +3036,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         classify_legacy_titles(conn)?;
         mark_title_migration_done(conn)?;
     }
+
+    // FTS5 session message search (Hermes-shaped). Best-effort: if FTS5 is unavailable the table
+    // simply isn't created and callers fall back to LIKE.
+    let _ = conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS session_fts USING fts5(session UNINDEXED, content, tokenize='porter');",
+    );
 
     Ok(())
 }

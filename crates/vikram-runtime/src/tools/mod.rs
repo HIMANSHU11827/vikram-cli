@@ -12,6 +12,7 @@
 pub use crate::tools::core::*;
 
 pub use crate::tools::browser::*;
+pub(crate) use crate::tools::codeindex::*;
 pub(crate) use crate::tools::fs::*;
 pub use crate::tools::interact::*;
 pub(crate) use crate::tools::lsp::*;
@@ -20,6 +21,7 @@ pub(crate) use crate::tools::memory::*;
 pub(crate) use crate::tools::plugins::*;
 pub(crate) use crate::tools::process::*;
 pub(crate) use crate::tools::search::*;
+pub(crate) use crate::tools::session_search::*;
 pub(crate) use crate::tools::shell::*;
 pub use crate::tools::skills::*;
 pub(crate) use crate::tools::teams::*;
@@ -27,6 +29,7 @@ pub(crate) use crate::tools::verify::*;
 pub(crate) use crate::tools::web::*;
 
 pub(crate) mod browser;
+pub(crate) mod codeindex;
 pub(crate) mod core;
 pub(crate) mod fs;
 pub(crate) mod interact;
@@ -36,6 +39,7 @@ pub(crate) mod memory;
 pub(crate) mod plugins;
 pub(crate) mod process;
 pub(crate) mod search;
+pub(crate) mod session_search;
 pub(crate) mod shell;
 pub(crate) mod skills;
 pub(crate) mod teams;

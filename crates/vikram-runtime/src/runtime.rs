@@ -106,6 +106,33 @@ impl Drop for LearningGuard {
     }
 }
 
+/// A source of the message count a memory nudge is keyed on. Keeps `memory_nudge_due` usable
+/// with a session handle, an `Arc` to one, or a session id that has to be looked up.
+pub(crate) trait MemoryNudgeSession {
+    fn message_count(&self, inner: &RuntimeInner) -> usize;
+}
+
+impl MemoryNudgeSession for crate::session::SessionRuntime {
+    fn message_count(&self, _inner: &RuntimeInner) -> usize {
+        self.messages().len()
+    }
+}
+
+impl MemoryNudgeSession for std::sync::Arc<crate::session::SessionRuntime> {
+    fn message_count(&self, _inner: &RuntimeInner) -> usize {
+        self.messages().len()
+    }
+}
+
+impl MemoryNudgeSession for vikram_contracts::SessionId {
+    fn message_count(&self, inner: &RuntimeInner) -> usize {
+        inner
+            .session(self)
+            .map(|s| s.messages().len())
+            .unwrap_or(0)
+    }
+}
+
 impl RuntimeInner {
     pub fn emit(&self, event: RuntimeEvent) {
         self.bus.publish(event);
@@ -136,6 +163,17 @@ impl RuntimeInner {
         let _ = self
             .store
             .touch_session(&session.id, session.updated_ms.load(Ordering::Relaxed));
+    }
+
+    /// Whether this session has crossed a memory-nudge boundary: its message count is a positive
+    /// multiple of the configured `memory_nudge_interval`. A zero interval never nudges.
+    pub fn memory_nudge_due<S: MemoryNudgeSession>(&self, session: &S) -> bool {
+        let interval = self.config.memory_nudge_interval;
+        if interval == 0 {
+            return false;
+        }
+        let count = session.message_count(self) as u64;
+        count > 0 && count % interval == 0
     }
 
     /// The evaluator for this runtime: the operator's saved rules first, then the built-in
@@ -367,9 +405,26 @@ impl RuntimeInner {
         let Ok(entries) = self.memory.recall_terms(&terms, &scopes, 8) else {
             return None;
         };
-        if entries.is_empty() {
+        // Also pull free-form notes from MEMORY.md / USER.md (Hermes-style), matching terms.
+        let mut file_entries: Vec<(String, String, String)> = Vec::new();
+        let home = crate::config::vikram_home();
+        let mf = crate::memory_files::memory_file(&home);
+        let uf = crate::memory_files::user_file(&home);
+        for (scope, e) in [("memory", mf), ("user", uf)] {
+            for entry in e.load() {
+                let lower = entry.to_lowercase();
+                if terms.iter().any(|t| lower.contains(&t.to_lowercase())) {
+                    file_entries.push((scope.to_owned(), scope.to_owned(), entry));
+                }
+            }
+        }
+        let mut all_entries = entries;
+        all_entries.extend(file_entries);
+        if all_entries.is_empty() {
             return None;
         }
+        // use all_entries below
+        let entries = all_entries;
         let estimator = session.estimator();
         let budget_tokens = self.config.context.memory_budget_tokens;
         let mut block = String::from(

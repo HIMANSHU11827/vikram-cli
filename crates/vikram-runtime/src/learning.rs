@@ -481,12 +481,14 @@ pub(crate) fn on_turn_end(
     if growth.had_tools() || !growth.errors.is_empty() || outcome == TurnState::Failed {
         record_and_reflect(inner, session, request, outcome, growth);
     }
+    let nudge_due = inner.memory_nudge_due(session);
     if review_is_due(
         turns,
         growth.had_tools(),
         inner.config.learning_review_every,
         policies_enabled,
-    ) {
+    ) || (policies_enabled && nudge_due)
+    {
         let snapshot = transcript_snapshot(&session.messages(), REVIEW_SNAPSHOT_BUDGET);
         inner.spawn_learning_review(session.id.clone(), snapshot);
     }
