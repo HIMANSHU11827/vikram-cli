@@ -1466,6 +1466,35 @@ impl RuntimeHandle {
     }
 
     /// Queue if a turn is running; otherwise start one immediately.
+    /// Put a message into a session that already exists, the way a delegation result arrives: the
+    /// transcript, the journal and the event stream all get it, and no model turn starts.
+    ///
+    /// This is how work that finished outside a conversation — a scheduled job's report, a bot's
+    /// answer — lands back in one without pretending the operator typed it. It refuses a session
+    /// this runtime does not hold, because a message written into a copy nobody is reading is not
+    /// a delivery.
+    pub fn post_message(&self, session: &SessionId, text: String) -> Result<()> {
+        let Some(target) = self.inner.session(session) else {
+            return Err(RuntimeError::SessionNotFound(session.clone()));
+        };
+        let message = vikram_contracts::Message::text(
+            vikram_contracts::Role::System,
+            text,
+            vikram_contracts::Trust::Host,
+        );
+        target.push_message(message.clone(), crate::types::now_ms());
+        self.inner.journal(
+            session,
+            RecordKind::Message,
+            serde_json::json!({"message": message}),
+        );
+        self.inner.emit(RuntimeEvent::MessageCommitted {
+            session: session.clone(),
+            message,
+        });
+        Ok(())
+    }
+
     pub fn submit(&self, session: &SessionId, text: String) -> Result<()> {
         let Some(session) = self.inner.session(session) else {
             return Err(RuntimeError::SessionNotFound(session.clone()));

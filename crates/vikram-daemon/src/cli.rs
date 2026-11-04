@@ -15,6 +15,7 @@ use crate::daemon::{Daemon, Lock, LockError, owner};
 use crate::heartbeat::{Beat, BeatKind, Heartbeat, Policy};
 use crate::jobs::{JobManager, NewJob};
 use crate::notify;
+use crate::runner::TeamOrder;
 use crate::service;
 use crate::store::{Delivery, JobMode, Run, RunStatus, ScheduleStore};
 use crate::time::{Zone, format_ms, humanize_ms, now_ms, parse_duration};
@@ -394,6 +395,8 @@ pub struct Draft {
     pub retries: Option<u32>,
     pub timeout: Option<String>,
     pub priority: Option<i64>,
+    /// How a team job runs its members: `parallel` or `sequential`.
+    pub order: Option<String>,
     pub enabled: Option<bool>,
 }
 
@@ -413,7 +416,7 @@ impl Draft {
         if let Some(zone) = &self.timezone {
             if Zone::parse(zone).is_none() {
                 return Err(format!(
-                    "unknown timezone {zone:?}: use local, UTC or an offset like +02:00"
+                    "unknown timezone {zone:?}: use local, UTC, an offset like +02:00, or a zone this machine knows like Europe/Berlin"
                 ));
             }
             job = job.timezone(zone.clone());
@@ -434,6 +437,13 @@ impl Draft {
             let millis =
                 parse_duration(timeout).ok_or_else(|| format!("unknown duration {timeout:?}"))?;
             job = job.timeout_ms(millis);
+        }
+        if let Some(order) = &self.order {
+            // A word the runner cannot read would quietly fall back to parallel, which is the
+            // opposite of what somebody asking for sequential wants.
+            TeamOrder::parse(order)
+                .ok_or_else(|| format!("unknown order {order:?}: use parallel or sequential"))?;
+            job = job.order(order.clone());
         }
         if let Some(priority) = self.priority {
             job = job.priority(priority);
@@ -574,6 +584,11 @@ pub fn cron_edit(needle: &str, draft: &Draft) -> Result<String, String> {
     if let Some(timeout) = &draft.timeout {
         job.timeout_ms =
             Some(parse_duration(timeout).ok_or_else(|| format!("unknown duration {timeout:?}"))?);
+    }
+    if let Some(order) = &draft.order {
+        TeamOrder::parse(order)
+            .ok_or_else(|| format!("unknown order {order:?}: use parallel or sequential"))?;
+        job.order = order.clone();
     }
     if let Some(priority) = draft.priority {
         job.priority = priority;
@@ -730,6 +745,9 @@ pub fn jobs_inspect(needle: &str) -> Result<String, String> {
         text.push_str(&format!("finished: {}\n", format_ms(Zone::Local, finished)));
     }
     text.push_str(&format!("delivery: {}\n", run.delivery.as_str()));
+    if !run.delivery_note.is_empty() {
+        text.push_str(&format!("          {}\n", run.delivery_note));
+    }
     if let Some(session) = &run.session {
         text.push_str(&format!("session: {session}\n"));
     }
@@ -912,12 +930,27 @@ mod tests {
     #[test]
     fn a_timezone_that_is_not_understood_is_refused() {
         let err = Draft {
-            timezone: Some("Europe/Berlin".into()),
+            timezone: Some("Mars/Olympus".into()),
             ..Draft::default()
         }
         .apply(NewJob::new("x", "every 5m"))
         .unwrap_err();
-        assert!(err.contains("Europe/Berlin"), "{err}");
+        assert!(err.contains("Mars/Olympus"), "{err}");
+    }
+
+    #[test]
+    fn a_named_zone_the_system_knows_is_accepted_as_typed() {
+        if Zone::parse("Europe/Berlin").is_none() {
+            // No tzdata here, so there is nothing to accept; the refusal path is tested above.
+            return;
+        }
+        let job = Draft {
+            timezone: Some("Europe/Berlin".into()),
+            ..Draft::default()
+        }
+        .apply(NewJob::new("x", "every 5m"))
+        .expect("a zone the system knows is a valid timezone");
+        assert_eq!(job.timezone, "Europe/Berlin");
     }
 
     #[test]
@@ -962,6 +995,30 @@ mod tests {
         .unwrap();
         assert_eq!(job.mode, JobMode::Delegate);
         assert_eq!(job.bot, "arun");
+    }
+
+    #[test]
+    fn an_order_nobody_can_read_is_refused_while_it_is_being_typed() {
+        let refused = Draft {
+            mode: Some(JobMode::Workflow),
+            agent: Some("core".into()),
+            order: Some("sideways".into()),
+            ..Draft::default()
+        }
+        .apply(NewJob::new("x", "every 5m"));
+        let err = refused.unwrap_err();
+        assert!(err.contains("unknown order"), "{err}");
+        assert!(err.contains("sequential"), "{err}");
+
+        let accepted = Draft {
+            mode: Some(JobMode::Workflow),
+            agent: Some("core".into()),
+            order: Some("sequential".into()),
+            ..Draft::default()
+        }
+        .apply(NewJob::new("x", "every 5m"))
+        .unwrap();
+        assert_eq!(accepted.order, "sequential");
     }
 
     #[test]

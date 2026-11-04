@@ -25,9 +25,12 @@ When both day-of-month and day-of-week are restricted, either may match —
 the same rule as cron.
 
 There is no seconds field; `0 9 * * * *` is refused as an unknown shape. Time
-zones are `local`, `UTC`, or a fixed offset (`+05:30`). Named zones such as
-`America/New_York` are refused rather than faked: without a timezone database a
-fixed offset would move a 09:00 job twice a year.
+zones are `local`, `UTC`, a fixed offset (`+05:30`), or any zone name this
+machine knows (`America/New_York`, `Europe/Berlin`, `Asia/Kolkata`). Names are
+read straight out of the system tz database (`$TZDIR` or `/usr/share/zoneinfo`),
+so a 09:00 job stays at 09:00 through both daylight-saving changes — it lands at
+13:00 UTC in a New York summer and 14:00 UTC in a New York winter. A name with no
+file behind it is refused when you type it, rather than silently treated as UTC.
 
 ## Job fields
 
@@ -35,7 +38,8 @@ fixed offset would move a 09:00 job twice a year.
 |---|---|
 | `--job-mode` | `agent`, `script`, `workflow`, `delegate` (default agent) |
 | `--target` | `local`, `session:<id>`, `webhook:<url>`, `model:<id>`, `none` |
-| `--timezone` | `local`, `UTC`, `+HH:MM` |
+| `--timezone` | `local`, `UTC`, `+HH:MM`, or an IANA name the machine knows |
+| `--order` | for a team job: `parallel` (default) or `sequential` |
 | `--retries` | attempts after a failure (backoff 30s, 60s, 5m, 15m, 60m) |
 | `--timeout` | `90s`, `10m` … (default ten minutes) |
 | `--priority` | higher runs first among due jobs |
@@ -51,7 +55,7 @@ fixed offset would move a 09:00 job twice a year.
 - **agent** – a fresh isolated session, same runtime and turn loop as `vikram chat`. In `ask` mode the run switches itself to `unattended` and records every approval it had to refuse; it never approves on your behalf.
 - **script** – `sh -c "<payload>"`, no model, no tokens. Non-zero exit is a failure with the command's own output attached.
 - **delegate** – the job runs on one bot's own identity: `--bot arun` spawns a child session owned by that agent through the runtime's own delegation path, and the bot's answer is what the run records. Without `--bot` the job is refused when it is created, not on its first slot.
-- **workflow** – the job runs a team: `--agent <team>` fans the prompt out to every member of that team in its own session, then reports one line per member (`arun: port 80 is up` / `mira: failed — timed out`). The run fails when any member failed, and names them. Teams are capped at 8 members for an unattended run. Without `--agent` the job is refused when it is created.
+- **workflow** – the job runs a team: `--agent <team>` fans the prompt out to every member of that team in its own session, then reports one line per member (`arun: port 80 is up` / `mira: failed — timed out`). The run fails when any member failed, and names them. Teams are capped at 8 members for an unattended run. Without `--agent` the job is refused when it is created. `--order sequential` runs one member at a time, each one starting only after the previous turn finished — for a team that shares a rate limit, one test database or a deploy lock; the run output is still one line per member. Cancelling the run stops whichever members are still working.
 
 Bots and teams come from the runtime's own `agents` and `teams` stores (`vikram agents`, `vikram config`), not from a second registry inside the daemon.
 

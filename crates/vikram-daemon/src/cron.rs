@@ -178,7 +178,7 @@ impl Schedule {
                 let slots = elapsed / period + 1;
                 Some(from + slots * period)
             }
-            Schedule::Cron { fields, zone } => fields.next_after(*zone, after),
+            Schedule::Cron { fields, zone } => fields.next_after(zone.clone(), after),
         }
     }
 
@@ -211,7 +211,7 @@ impl Schedule {
     /// The zone the schedule is read in. A period has no wall clock, so it reports `local`.
     pub fn zone(&self) -> Zone {
         match self {
-            Schedule::Cron { zone, .. } => *zone,
+            Schedule::Cron { zone, .. } => zone.clone(),
             _ => Zone::Local,
         }
     }
@@ -336,7 +336,7 @@ impl CronExpr {
         // Start at the next whole minute: a cron expression has no seconds, so the current minute
         // can never match again.
         let mut candidate = align_minute(after);
-        let mut civil = time::civil_in(zone, candidate);
+        let mut civil = time::civil_in(zone.clone(), candidate);
         // Five years covers every gap a valid expression can have (a leap day is the widest).
         let deadline = after + 5 * 366 * 86_400_000;
         while candidate < deadline {
@@ -351,13 +351,13 @@ impl CronExpr {
             } else {
                 // The civil reading matches; the instant it names has to read back the same way,
                 // otherwise the reading fell in a daylight saving gap and this minute does not exist.
-                let instant = time::instant_of(zone, civil);
-                if time::civil_in(zone, instant) == civil {
+                let instant = time::instant_of(zone.clone(), civil);
+                if time::civil_in(zone.clone(), instant) == civil {
                     return Some(instant);
                 }
                 advance_minute(&mut civil);
             }
-            candidate = time::instant_of(zone, civil);
+            candidate = time::instant_of(zone.clone(), civil);
         }
         None
     }
@@ -744,6 +744,25 @@ mod tests {
             .next_after(Zone::Fixed(4 * 60), start)
             .expect("a daily expression always has a next run");
         assert_eq!(next, at(2026, 11, 3, 5, 0));
+    }
+
+    #[test]
+    fn a_named_zone_holds_the_wall_clock_through_a_daylight_saving_change() {
+        // The reason a name is worth supporting: 09:00 in New York is 13:00 UTC in summer and
+        // 14:00 UTC in winter, and the operator asked for 09:00 both times.
+        let Some(zone) = Zone::parse("America/New_York") else {
+            // No tzdata on this machine; the refusal path is covered by the time tests.
+            return;
+        };
+        let expression = cron("0 9 * * *");
+        let summer = expression
+            .next_after(zone.clone(), at(2026, 6, 1, 0, 0))
+            .expect("a daily expression always has a next run");
+        assert_eq!(time::format_ms(Zone::Utc, summer), "2026-06-01 13:00");
+        let winter = expression
+            .next_after(zone, at(2026, 1, 15, 0, 0))
+            .expect("a daily expression always has a next run");
+        assert_eq!(time::format_ms(Zone::Utc, winter), "2026-01-15 14:00");
     }
 
     #[test]

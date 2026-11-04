@@ -149,6 +149,8 @@ pub struct Job {
     pub timeout_ms: Option<Millis>,
     pub retries: u32,
     pub priority: i64,
+    /// How a team job runs its members: `parallel` or `sequential`.
+    pub order: String,
     pub enabled: bool,
     pub created_ms: Millis,
     pub updated_ms: Millis,
@@ -179,6 +181,7 @@ impl Job {
             timeout_ms: None,
             retries: 0,
             priority: 0,
+            order: "parallel".into(),
             enabled: true,
             created_ms: now,
             updated_ms: now,
@@ -205,6 +208,8 @@ pub struct Run {
     pub output: String,
     pub error: String,
     pub delivery: Delivery,
+    /// Why the delivery went the way it did, when that is worth keeping; empty otherwise.
+    pub delivery_note: String,
 }
 
 /// The scheduler's database. Owns its own connection so the daemon can hold it for its whole life
@@ -265,6 +270,7 @@ impl ScheduleStore {
                 timeout_ms INTEGER,
                 retries INTEGER NOT NULL DEFAULT 0,
                 priority INTEGER NOT NULL DEFAULT 0,
+                order_mode TEXT NOT NULL DEFAULT 'parallel',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_ms INTEGER NOT NULL,
                 updated_ms INTEGER NOT NULL,
@@ -286,7 +292,8 @@ impl ScheduleStore {
                 session TEXT,
                 output TEXT NOT NULL DEFAULT '',
                 error TEXT NOT NULL DEFAULT '',
-                delivery TEXT NOT NULL DEFAULT 'none'
+                delivery TEXT NOT NULL DEFAULT 'none',
+                delivery_note TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS daemon_runs_by_job
                 ON daemon_runs(job_id, started_ms DESC);
@@ -301,6 +308,31 @@ impl ScheduleStore {
             );
             "#,
         )?;
+        // Columns added after a home was first written. `CREATE TABLE IF NOT EXISTS` leaves an
+        // older table alone, so a daemon upgraded in place would otherwise fail every read with
+        // "no such column" — the one failure an operator cannot fix without deleting their jobs.
+        self.add_column(
+            "daemon_jobs",
+            "order_mode",
+            "TEXT NOT NULL DEFAULT 'parallel'",
+        )?;
+        Ok(())
+    }
+
+    /// Add a column if this table does not already have it.
+    fn add_column(&self, table: &str, column: &str, declaration: &str) -> Result<(), StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let known: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if known.iter().any(|name| name == column) {
+            return Ok(());
+        }
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {declaration}"),
+            [],
+        )?;
         Ok(())
     }
 
@@ -310,10 +342,10 @@ impl ScheduleStore {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO daemon_jobs (id, name, description, schedule, timezone, mode, payload,
-                 target, agent, bot, timeout_ms, retries, priority, enabled, created_ms,
-                 updated_ms, last_run_ms, next_run_ms, last_status)
+                 target, agent, bot, timeout_ms, retries, priority, order_mode, enabled,
+                 created_ms, updated_ms, last_run_ms, next_run_ms, last_status)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                 ?17, ?18, ?19)",
+                 ?17, ?18, ?19, ?20)",
             params![
                 job.id,
                 job.name,
@@ -328,6 +360,7 @@ impl ScheduleStore {
                 job.timeout_ms,
                 job.retries,
                 job.priority,
+                job.order,
                 i64::from(job.enabled),
                 job.created_ms,
                 job.updated_ms,
@@ -345,8 +378,8 @@ impl ScheduleStore {
         let changed = conn.execute(
             "UPDATE daemon_jobs SET name = ?2, description = ?3, schedule = ?4, timezone = ?5,
                  mode = ?6, payload = ?7, target = ?8, agent = ?9, bot = ?10, timeout_ms = ?11,
-                 retries = ?12, priority = ?13, enabled = ?14, updated_ms = ?15,
-                 last_run_ms = ?16, next_run_ms = ?17, last_status = ?18
+                 retries = ?12, priority = ?13, order_mode = ?14, enabled = ?15, updated_ms = ?16,
+                 last_run_ms = ?17, next_run_ms = ?18, last_status = ?19
              WHERE id = ?1",
             params![
                 job.id,
@@ -362,6 +395,7 @@ impl ScheduleStore {
                 job.timeout_ms,
                 job.retries,
                 job.priority,
+                job.order,
                 i64::from(job.enabled),
                 job.updated_ms,
                 job.last_run_ms,
@@ -509,6 +543,7 @@ impl ScheduleStore {
             } else {
                 Delivery::Pending
             },
+            delivery_note: String::new(),
         };
         conn.execute(
             "INSERT INTO daemon_runs (id, job_id, slot_ms, attempt, started_ms, status, session,
@@ -557,10 +592,21 @@ impl ScheduleStore {
     /// Record where a finished run's result went, without touching its status: delivery happens
     /// after the run is settled, and a delivery that failed must not rewrite what the job did.
     pub fn set_delivery(&self, id: &str, delivery: Delivery) -> Result<bool, StoreError> {
+        self.set_delivery_note(id, delivery, "")
+    }
+
+    /// Record where a delivery ended up, and why. The note is what turns `delivery: failed` into
+    /// something an operator can act on, so it is kept with the run instead of being printed once.
+    pub fn set_delivery_note(
+        &self,
+        id: &str,
+        delivery: Delivery,
+        note: &str,
+    ) -> Result<bool, StoreError> {
         let conn = self.lock();
         let changed = conn.execute(
-            "UPDATE daemon_runs SET delivery = ?2 WHERE id = ?1",
-            params![id, delivery.as_str()],
+            "UPDATE daemon_runs SET delivery = ?2, delivery_note = ?3 WHERE id = ?1",
+            params![id, delivery.as_str(), note],
         )?;
         Ok(changed == 1)
     }
@@ -691,7 +737,7 @@ impl ScheduleStore {
 
 const JOB_COLUMNS: &str = "id, name, description, schedule, timezone, mode, payload, target, agent,
     bot, timeout_ms, retries, priority, enabled, created_ms, updated_ms, last_run_ms, next_run_ms,
-    last_status";
+    last_status, order_mode";
 
 /// Newest first, with the slot and the attempt as tiebreakers. Runs started in the same
 /// millisecond — which is normal in a test and possible in a burst — must still come back in a
@@ -700,7 +746,7 @@ const RUN_ORDER: &str = "started_ms DESC, slot_ms DESC, attempt DESC";
 
 const RUN_COLUMNS: &str =
     "id, job_id, slot_ms, attempt, started_ms, finished_ms, status, session, output, error,
-    delivery";
+    delivery, delivery_note";
 
 fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
     let mode: String = row.get(5)?;
@@ -726,12 +772,16 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         last_run_ms: row.get(16)?,
         next_run_ms: row.get(17)?,
         last_status: row.get(18)?,
+        // Kept exactly as written; the runner reads it with a fallback, so a word from a newer
+        // build cannot stop the job from running.
+        order: row.get(19)?,
     })
 }
 
 fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     let status: String = row.get(6)?;
     let delivery: String = row.get(10)?;
+    let delivery_note: String = row.get(11)?;
     Ok(Run {
         id: row.get(0)?,
         job_id: row.get(1)?,
@@ -744,6 +794,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         output: row.get(8)?,
         error: row.get(9)?,
         delivery: Delivery::parse(&delivery),
+        delivery_note,
     })
 }
 
@@ -788,6 +839,24 @@ mod tests {
         assert_eq!(reread.payload, "look at the server");
         assert_eq!(reread.next_run_ms, Some(1_000));
         assert_eq!(reread.created_ms, read.created_ms, "creation time is fixed");
+    }
+
+    #[test]
+    fn the_order_a_team_runs_in_is_kept_with_the_job() {
+        let store = store();
+        let mut team = job("deploy", "every 1h");
+        team.order = "sequential".into();
+        store.insert_job(&team).unwrap();
+        assert_eq!(
+            store.get_job("job_deploy").unwrap().unwrap().order,
+            "sequential"
+        );
+
+        // A row written before the column existed still reads as the default.
+        let mut plain = job("plain", "every 1h");
+        plain.order = String::new();
+        store.insert_job(&plain).unwrap();
+        assert_eq!(store.get_job("job_plain").unwrap().unwrap().order, "");
     }
 
     #[test]

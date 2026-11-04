@@ -11,6 +11,7 @@ pub mod daemon;
 pub mod heartbeat;
 pub mod jobs;
 pub mod notify;
+pub mod postbox;
 pub mod runner;
 pub mod service;
 pub mod store;

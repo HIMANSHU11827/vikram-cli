@@ -10,9 +10,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use vikram_contracts::{AgentId, Block, Message, PermissionMode, Role, SessionId};
-use vikram_runtime::Runtime;
 use vikram_runtime::config::Config;
 use vikram_runtime::types::{RuntimeEvent, RuntimeStatus, TurnState};
+use vikram_runtime::{Runtime, RuntimeHandle};
 
 /// How much of a run's own words are kept. A job that prints a gigabyte must not fill the database.
 const OUTPUT_CAP: usize = 64 * 1024;
@@ -276,6 +276,42 @@ pub struct TeamRequest {
     pub title: Option<String>,
     pub model: Option<String>,
     pub unattended: bool,
+    pub order: TeamOrder,
+}
+
+/// Whether a team's members work at the same time or one after another.
+///
+/// Parallel is the default because the members do not depend on each other; sequential exists for a
+/// team whose members share something outside vikram — a rate limit, a single test database, a
+/// deploy lock — where two turns at once would interfere.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TeamOrder {
+    #[default]
+    Parallel,
+    Sequential,
+}
+
+impl TeamOrder {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TeamOrder::Parallel => "parallel",
+            TeamOrder::Sequential => "sequential",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "parallel" | "together" | "at-once" | "all" => Some(TeamOrder::Parallel),
+            "sequential" | "serial" | "one" | "in-order" => Some(TeamOrder::Sequential),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for TeamOrder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl TeamRequest {
@@ -286,7 +322,13 @@ impl TeamRequest {
             title: None,
             model: None,
             unattended: true,
+            order: TeamOrder::Parallel,
         }
+    }
+
+    pub fn in_order(mut self, order: TeamOrder) -> Self {
+        self.order = order;
+        self
     }
 
     pub fn title(mut self, title: impl Into<String>) -> Self {
@@ -329,6 +371,7 @@ pub async fn run_delegate(
             title,
             request.model,
             request.unattended,
+            TeamOrder::Parallel,
         )
         .await;
         fanout
@@ -366,6 +409,7 @@ pub async fn run_team(config: Config, request: TeamRequest, timeout: Duration) -
             title,
             request.model,
             request.unattended,
+            request.order,
         )
         .await;
         team_report(fanout)
@@ -421,6 +465,7 @@ async fn delegated(
     title: String,
     model: Option<String>,
     unattended: bool,
+    order: TeamOrder,
 ) -> Fanout {
     let mut fanout = Fanout {
         parent: None,
@@ -490,17 +535,85 @@ async fn delegated(
     }
 
     let mut events = handle.events();
-    let mut started: Vec<AgentId> = Vec::new();
-    for agent in &agents {
-        match handle.spawn_agent(agent.clone(), prompt.clone(), parent.clone()) {
+    let mut denied = 0_usize;
+    match order {
+        TeamOrder::Parallel => {
+            let started = spawn_into(&handle, &agents, &prompt, &parent, &mut fanout.results);
+            let children = children_of(&handle, &started, &mut fanout.results);
+            let (finished, failure) = wait_for(&mut events, &handle, &children, &mut denied).await;
+            pause_learning(&handle).await;
+            for (sid, agent) in children {
+                let state = finished
+                    .iter()
+                    .find(|(session, _)| *session == sid)
+                    .map(|(_, state)| state.clone());
+                let outcome = outcome_of(&handle, sid, state, &failure, denied);
+                fanout.results.push((agent, outcome));
+            }
+        }
+        TeamOrder::Sequential => {
+            // One member at a time: the next turn does not start until the previous one has
+            // finished, so a team sharing a rate limit or a single test database cannot collide.
+            // Each member still gets its own session; sequential means ordered, not shared.
+            for agent in &agents {
+                let started = spawn_into(
+                    &handle,
+                    std::slice::from_ref(agent),
+                    &prompt,
+                    &parent,
+                    &mut fanout.results,
+                );
+                let children = children_of(&handle, &started, &mut fanout.results);
+                if children.is_empty() {
+                    continue;
+                }
+                let (finished, failure) =
+                    wait_for(&mut events, &handle, &children, &mut denied).await;
+                for (sid, child) in children {
+                    let state = finished
+                        .iter()
+                        .find(|(session, _)| *session == sid)
+                        .map(|(_, state)| state.clone());
+                    let outcome = outcome_of(&handle, sid, state, &failure, denied);
+                    fanout.results.push((child, outcome));
+                }
+            }
+            pause_learning(&handle).await;
+        }
+    }
+
+    fanout
+}
+
+/// Start every named agent on the same request, recording the ones that would not start.
+fn spawn_into(
+    handle: &RuntimeHandle,
+    agents: &[AgentId],
+    prompt: &str,
+    parent: &SessionId,
+    results: &mut Vec<(AgentId, RunOutcome)>,
+) -> Vec<AgentId> {
+    let mut started = Vec::new();
+    for agent in agents {
+        match handle.spawn_agent(agent.clone(), prompt.to_string(), parent.clone()) {
             Ok(()) => started.push(agent.clone()),
-            Err(err) => fanout.results.push((
+            Err(err) => results.push((
                 agent.clone(),
                 RunOutcome::failed(format!("could not start {agent}: {err}")),
             )),
         }
     }
+    started
+}
 
+/// The child sessions the runtime opened for the agents that started. A runtime that accepted the
+/// delegation but opened no session leaves the agent without an answer, so it is recorded here
+/// rather than silently dropped from the report.
+fn children_of(
+    handle: &RuntimeHandle,
+    started: &[AgentId],
+    results: &mut Vec<(AgentId, RunOutcome)>,
+) -> Vec<(SessionId, AgentId)> {
     let mut children: Vec<(SessionId, AgentId)> = Vec::new();
     for snapshot in handle.agent_snapshots() {
         if let (Some(session), true) = (
@@ -516,20 +629,29 @@ async fn delegated(
         .cloned()
         .collect();
     for agent in missing {
-        fanout.results.push((
+        results.push((
             agent.clone(),
             RunOutcome::failed(format!("the runtime opened no session for {agent}")),
         ));
     }
+    children
+}
 
+/// Wait until every child session has finished its turn. A turn the runtime refuses approval for
+/// could otherwise wait forever, so a refusal is answered immediately and counted.
+async fn wait_for(
+    events: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+    handle: &RuntimeHandle,
+    children: &[(SessionId, AgentId)],
+    denied: &mut usize,
+) -> (Vec<(SessionId, TurnState)>, Option<String>) {
     let mut finished: Vec<(SessionId, TurnState)> = Vec::new();
     let mut failure: Option<String> = None;
-    let mut denied = 0_usize;
     while finished.len() < children.len() {
         match events.recv().await {
             Ok(RuntimeEvent::ApprovalRequested(prompt)) => {
                 if children.iter().any(|(child, _)| *child == prompt.session) {
-                    denied += 1;
+                    *denied += 1;
                     let _ = handle.answer_approval(&prompt.approval, false, false);
                 }
             }
@@ -554,47 +676,53 @@ async fn delegated(
             }
         }
     }
+    (finished, failure)
+}
 
+/// Let the runtime finish whatever it learned from the turn before the process is dropped.
+async fn pause_learning(handle: &RuntimeHandle) {
     if handle.learning_busy() {
         let _ = handle.wait_for_learning(Duration::from_secs(20)).await;
     }
+}
 
-    for (sid, agent) in children {
-        let state = finished
-            .iter()
-            .find(|(session, _)| *session == sid)
-            .map(|(_, state)| state.clone());
-        let answer = handle
-            .snapshot()
-            .sessions
-            .iter()
-            .find(|session| session.id == sid)
-            .and_then(|session| answer_text(&session.messages));
-        let mut outcome = match state {
-            Some(TurnState::Idle) | Some(TurnState::Cancelled) => match answer {
-                Some(text) if !text.trim().is_empty() => {
-                    RunOutcome::finished(text, Some(sid.to_string()))
-                }
-                _ => RunOutcome::failed("the agent finished without saying anything"),
-            },
-            Some(other) => RunOutcome::failed(format!("the turn ended {other:?}")),
-            None => RunOutcome::failed(
-                failure
-                    .clone()
-                    .unwrap_or_else(|| "the turn never finished".to_string()),
-            ),
-        };
-        if denied > 0 && !outcome.ok {
-            outcome.error = Some(format!(
-                "{} ({} request(s) refused)",
-                outcome.error.unwrap_or_default(),
-                denied
-            ));
-        }
-        fanout.results.push((agent, outcome));
+/// What one member's turn amounts to, read back from the snapshot because the handle exposes no
+/// session accessor: the answer is the last thing that member said.
+fn outcome_of(
+    handle: &RuntimeHandle,
+    sid: SessionId,
+    state: Option<TurnState>,
+    failure: &Option<String>,
+    denied: usize,
+) -> RunOutcome {
+    let answer = handle
+        .snapshot()
+        .sessions
+        .iter()
+        .find(|session| session.id == sid)
+        .and_then(|session| answer_text(&session.messages));
+    let mut outcome = match state {
+        Some(TurnState::Idle) | Some(TurnState::Cancelled) => match answer {
+            Some(text) if !text.trim().is_empty() => {
+                RunOutcome::finished(text, Some(sid.to_string()))
+            }
+            _ => RunOutcome::failed("the agent finished without saying anything"),
+        },
+        Some(other) => RunOutcome::failed(format!("the turn ended {other:?}")),
+        None => RunOutcome::failed(
+            failure
+                .clone()
+                .unwrap_or_else(|| "the turn never finished".to_string()),
+        ),
+    };
+    if denied > 0 && !outcome.ok {
+        outcome.error = Some(format!(
+            "{} ({} request(s) refused)",
+            outcome.error.unwrap_or_default(),
+            denied
+        ));
     }
-
-    fanout
+    outcome
 }
 
 /// Join a fan-out into one report a notification can carry.
@@ -867,6 +995,17 @@ mod tests {
                 .contains("stops at"),
             "a schedule must not start eleven model turns because somebody typed a big team"
         );
+    }
+
+    #[test]
+    fn an_order_is_read_the_way_an_operator_would_write_it() {
+        assert_eq!(TeamOrder::parse("parallel"), Some(TeamOrder::Parallel));
+        assert_eq!(TeamOrder::parse("SEQUENTIAL"), Some(TeamOrder::Sequential));
+        assert_eq!(TeamOrder::parse("one"), Some(TeamOrder::Sequential));
+        assert_eq!(TeamOrder::parse(""), None);
+        assert_eq!(TeamOrder::parse("sideways"), None);
+        assert_eq!(TeamOrder::Sequential.to_string(), "sequential");
+        assert_eq!(TeamOrder::default(), TeamOrder::Parallel);
     }
 
     #[test]

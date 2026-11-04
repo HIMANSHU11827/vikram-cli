@@ -370,6 +370,9 @@ struct JobArgs {
     /// Higher runs first when several are due together.
     #[arg(long)]
     priority: Option<i64>,
+    /// How a team job runs its members: parallel (default) or sequential.
+    #[arg(long)]
+    order: Option<String>,
     /// Create it switched off.
     #[arg(long)]
     disabled: bool,
@@ -412,6 +415,9 @@ struct JobChanges {
     /// Priority among jobs due together.
     #[arg(long)]
     priority: Option<i64>,
+    /// How a team job runs its members: parallel or sequential.
+    #[arg(long)]
+    order: Option<String>,
     /// Switch it on.
     #[arg(long)]
     enable: bool,
@@ -434,6 +440,7 @@ impl JobArgs {
             retries: self.retries,
             timeout: self.timeout.clone(),
             priority: self.priority,
+            order: self.order.clone(),
             enable: false,
             disable: self.disabled,
         }
@@ -2085,6 +2092,7 @@ fn draft_of(
         retries: changes.retries,
         timeout: changes.timeout.clone(),
         priority: changes.priority,
+        order: changes.order.clone(),
         enabled,
     }
 }

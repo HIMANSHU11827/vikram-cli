@@ -8,12 +8,16 @@
 //! Every conversion below takes a number, never text, so none of them can panic on operator input;
 //! the parsing entry points return `Option` and reject what they cannot read.
 //!
-//! What is deliberately NOT here: named IANA zones (`America/New_York`). Resolving those needs a
-//! timezone database, and pretending a fixed offset is New York would move a 09:00 job by an hour
-//! twice a year. Use [`Zone::Local`] for the machine's own zone, `UTC`, or an explicit offset.
+//! Named zones (`America/New_York`) are read straight out of the system tz database, the compiled
+//! `TZif` files under `/usr/share/zoneinfo` (or `$TZDIR`). That file format carries the transitions
+//! themselves, so a 09:00 job stays at 09:00 across both daylight-saving changes instead of being
+//! pinned to whichever offset was in force when it was created. A name with no file on this machine
+//! is refused rather than approximated.
 
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::Once;
+use std::path::Path;
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A point in time, in milliseconds since the Unix epoch.
@@ -86,7 +90,7 @@ impl fmt::Display for Civil {
 }
 
 /// A UTC offset, either named or numeric.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Zone {
     /// The machine's own zone, read from the C library and therefore from `TZ`.
     Local,
@@ -94,11 +98,15 @@ pub enum Zone {
     Utc,
     /// A fixed offset in minutes east of UTC; `Fixed(330)` is `+05:30`.
     Fixed(i32),
+    /// A named zone from the system tz database; `Named("America/New_York")` keeps its own history
+    /// of daylight-saving changes.
+    Named(String),
 }
 
 impl Zone {
-    /// Read a zone from operator text: `utc`/`z`/`gmt`, `local`/`system`, an empty string, or a
-    /// numeric offset as `+05:30`, `-08:00`, `+0000`, `+05`.
+    /// Read a zone from operator text: `utc`/`z`/`gmt`, `local`/`system`, an empty string, a
+    /// numeric offset as `+05:30`, `-08:00`, `+0000`, `+05`, or a name the system tz database
+    /// holds (`America/New_York`, `Europe/Berlin`, `Asia/Kolkata`).
     pub fn parse(text: &str) -> Option<Self> {
         let text = text.trim();
         if text.is_empty()
@@ -117,7 +125,8 @@ impl Zone {
         let sign = match bytes.first()? {
             b'+' => 1,
             b'-' => -1,
-            _ => return None,
+            // Not an offset, so it has to be a name the machine actually knows.
+            _ => return zone_file(text).map(|_| Zone::Named(text.to_string())),
         };
         let rest = &text[1..];
         let (hours, minutes) = match rest.split_once(':') {
@@ -139,11 +148,14 @@ impl Zone {
     }
 
     /// The offset in seconds east of UTC that this zone was at a given instant.
-    fn offset_seconds(self, at_ms: Millis) -> i64 {
+    fn offset_seconds(&self, at_ms: Millis) -> i64 {
         match self {
             Zone::Utc => 0,
-            Zone::Fixed(minutes) => i64::from(minutes) * 60,
+            Zone::Fixed(minutes) => i64::from(*minutes) * 60,
             Zone::Local => local_offset_seconds(at_ms.div_euclid(MS_PER_SEC)),
+            Zone::Named(name) => zone_file(name)
+                .map(|file| i64::from(file.offset_at(at_ms.div_euclid(MS_PER_SEC))))
+                .unwrap_or(0),
         }
     }
 }
@@ -153,6 +165,7 @@ impl fmt::Display for Zone {
         match self {
             Zone::Utc => f.write_str("UTC"),
             Zone::Local => f.write_str("local"),
+            Zone::Named(name) => f.write_str(name),
             Zone::Fixed(minutes) => {
                 let sign = if *minutes < 0 { '-' } else { '+' };
                 let minutes = minutes.abs();
@@ -160,6 +173,139 @@ impl fmt::Display for Zone {
             }
         }
     }
+}
+
+/// One compiled zone: the offsets the tz database says were in force, oldest first.
+struct ZoneFile {
+    /// Instants (epoch seconds) at which the offset changed.
+    transitions: Vec<i64>,
+    /// Offset in seconds east of UTC after the transition at the same index.
+    offsets: Vec<i32>,
+    /// The offset before the first transition.
+    first: i32,
+}
+
+impl ZoneFile {
+    fn offset_at(&self, secs: i64) -> i32 {
+        match self.transitions.partition_point(|&at| at <= secs) {
+            0 => self.first,
+            used => self.offsets[used - 1],
+        }
+    }
+}
+
+/// Read a zone out of the system tz database, once per name per process.
+fn zone_file(name: &str) -> Option<Arc<ZoneFile>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<ZoneFile>>>>> = OnceLock::new();
+    if !is_zone_name(name) {
+        return None;
+    }
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(hit) = cache.lock().expect("zone cache").get(name) {
+        return hit.clone();
+    }
+    let root = std::env::var("TZDIR").unwrap_or_else(|_| "/usr/share/zoneinfo".to_string());
+    let loaded = std::fs::read(Path::new(&root).join(name))
+        .ok()
+        .and_then(|bytes| parse_zone_file(&bytes))
+        .map(Arc::new);
+    cache
+        .lock()
+        .expect("zone cache")
+        .insert(name.to_string(), loaded.clone());
+    loaded
+}
+
+/// A zone name may only reach inside the database, never above it.
+fn is_zone_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains("..")
+        && !name.starts_with('/')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'+'))
+}
+
+/// Bytes that follow the 44-byte header of a `TZif` block.
+fn block_end(counts: [usize; 6], width: usize) -> usize {
+    let [isut, isstd, leap, time, kind, chars] = counts;
+    time * width + time + kind * 6 + chars + leap * (width + 4) + isstd + isut
+}
+
+fn counts(bytes: &[u8], header: usize) -> Option<[usize; 6]> {
+    let raw = bytes.get(header + 20..header + 44)?;
+    if bytes.get(header..header + 4)? != b"TZif" {
+        return None;
+    }
+    let mut out = [0usize; 6];
+    for (slot, chunk) in out.iter_mut().zip(raw.chunks_exact(4)) {
+        *slot = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as usize;
+    }
+    Some(out)
+}
+
+/// Parse a `TZif` file: the transitions and the offset each one switches to.
+fn parse_zone_file(bytes: &[u8]) -> Option<ZoneFile> {
+    let mut header = 0;
+    let mut width = 4;
+    if bytes.get(4)? != &0 {
+        // A version-2 file repeats itself: a 32-bit block for readers that predate it, then the
+        // real one with 64-bit times. Only the second is worth reading.
+        let next = 44 + block_end(counts(bytes, 0)?, 4);
+        if bytes.get(next..next + 4)? == b"TZif" {
+            header = next;
+            width = 8;
+        }
+    }
+    let shape = counts(bytes, header)?;
+    let body = header + 44;
+    if bytes.len() < body + block_end(shape, width) {
+        return None;
+    }
+    let [_, _, _, time_count, kind_count, _] = shape;
+    let transitions_raw = bytes.get(body..body + time_count * width)?;
+    let indices = bytes.get(body + time_count * width..body + time_count * width + time_count)?;
+    let kinds_raw = bytes.get(
+        body + time_count * width + time_count
+            ..body + time_count * width + time_count + kind_count * 6,
+    )?;
+
+    let mut transitions = Vec::with_capacity(time_count);
+    for chunk in transitions_raw.chunks_exact(width) {
+        transitions.push(if width == 8 {
+            i64::from_be_bytes(chunk.try_into().ok()?)
+        } else {
+            i64::from(i32::from_be_bytes(chunk.try_into().ok()?))
+        });
+    }
+    let mut kinds = Vec::with_capacity(kind_count);
+    for chunk in kinds_raw.chunks_exact(6) {
+        kinds.push((
+            i32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+            chunk[4] != 0,
+        ));
+    }
+    // Before the first transition the tz database's own rule applies: the first zone that is not
+    // daylight time, or the first zone if they all are.
+    let first = kinds
+        .iter()
+        .find(|(_, daylight)| !daylight)
+        .or_else(|| kinds.first())
+        .map(|(offset, _)| *offset)?;
+    let mut offsets = Vec::with_capacity(time_count);
+    for index in indices {
+        offsets.push(
+            kinds
+                .get(usize::from(*index))
+                .map(|(offset, _)| *offset)
+                .unwrap_or(first),
+        );
+    }
+    Some(ZoneFile {
+        transitions,
+        offsets,
+        first,
+    })
 }
 
 /// Load the C library's idea of the local zone once, so a `TZ` change made after start is not
@@ -283,20 +429,16 @@ pub fn instant_of(zone: Zone, civil: Civil) -> Millis {
         + i64::from(civil.minute) * 60
         + i64::from(civil.second);
     let local_ms = local * MS_PER_SEC;
-    match zone {
-        Zone::Utc => local_ms,
-        Zone::Fixed(minutes) => local_ms - i64::from(minutes) * MS_PER_MIN,
-        Zone::Local => {
-            // The offset that applies depends on the instant, which is what we are solving for, so
-            // resolve it twice: once with the offset of the reading taken as UTC, once with the
-            // offset at the result. A reading inside a spring-forward gap lands after the gap.
-            ensure_tz();
-            let first = zone.offset_seconds(local_ms);
-            let guess = local_ms - first * MS_PER_SEC;
-            let second = zone.offset_seconds(guess);
-            local_ms - second * MS_PER_SEC
-        }
+    if matches!(zone, Zone::Utc) {
+        return local_ms;
     }
+    // The offset that applies depends on the instant, which is what we are solving for, so resolve
+    // it twice: once with the offset of the reading taken as UTC, once with the offset at the
+    // result. A reading inside a spring-forward gap lands after the gap.
+    let first = zone.offset_seconds(local_ms);
+    let guess = local_ms - first * MS_PER_SEC;
+    let second = zone.offset_seconds(guess);
+    local_ms - second * MS_PER_SEC
 }
 
 /// `YYYY-MM-DD HH:MM` in `zone`.
@@ -482,10 +624,29 @@ mod tests {
         assert_eq!(Zone::parse("+05:30"), Some(Zone::Fixed(330)));
         assert_eq!(Zone::parse("-0800"), Some(Zone::Fixed(-480)));
         assert_eq!(Zone::parse("+05"), Some(Zone::Fixed(300)));
-        assert_eq!(Zone::parse("Europe/Berlin"), None);
         assert_eq!(Zone::parse("+25:00"), None);
         assert_eq!(Zone::Fixed(330).to_string(), "+05:30");
         assert_eq!(Zone::Utc.to_string(), "UTC");
+    }
+
+    #[test]
+    fn a_zone_that_is_only_a_name_is_read_out_of_the_tz_database() {
+        // A name the machine does not know is refused rather than turned into an offset, and a name
+        // may never climb out of the database directory.
+        assert_eq!(Zone::parse("Nowhere/Nothing"), None);
+        assert_eq!(Zone::parse("../../etc/passwd"), None);
+        assert_eq!(Zone::parse("/etc/passwd"), None);
+        let Some(berlin) = Zone::parse("Europe/Berlin") else {
+            // A machine without tzdata cannot answer this; skipping is honest, guessing is not.
+            return;
+        };
+        assert_eq!(berlin.to_string(), "Europe/Berlin");
+        // Berlin is +01:00 in January and +02:00 in July, which is the whole point of the name.
+        let winter = instant_of(berlin.clone(), Civil::new(2026, 1, 15, 12, 0, 0));
+        let summer = instant_of(berlin.clone(), Civil::new(2026, 7, 15, 12, 0, 0));
+        assert_eq!(format_ms(Zone::Utc, winter), "2026-01-15 11:00");
+        assert_eq!(format_ms(Zone::Utc, summer), "2026-07-15 10:00");
+        assert_eq!(civil_in(berlin, summer), Civil::new(2026, 7, 15, 12, 0, 0));
     }
 
     #[test]

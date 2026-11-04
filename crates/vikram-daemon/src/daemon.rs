@@ -29,6 +29,7 @@ use tokio::sync::Notify;
 use crate::heartbeat::{Beat, BeatKind, Heartbeat, Policy};
 use crate::jobs::{Claimed, JobManager};
 use crate::notify::{self, Destination, Notice};
+use crate::postbox::Postbox;
 use crate::runner::{self, AgentRequest, RunOutcome};
 use crate::store::{Delivery, Job, JobMode, Run, RunStatus, ScheduleStore, StoreError};
 use crate::time::{self, Millis};
@@ -227,6 +228,7 @@ pub struct Daemon {
     catch_up_ms: Millis,
     running: Vec<Running>,
     results: tokio::sync::mpsc::UnboundedReceiver<Finished>,
+    postbox: Postbox,
 }
 
 impl Daemon {
@@ -235,6 +237,7 @@ impl Daemon {
         let pool = WorkerPool::new(Limits::default());
         let results = pool.take_results().expect("a fresh pool owns its results");
         Self {
+            postbox: Postbox::new(store.clone()),
             store,
             jobs,
             pool,
@@ -468,7 +471,27 @@ impl Daemon {
         };
         match Destination::parse(&job.target) {
             Ok(destination) => {
-                let delivered = notify::deliver(&destination, &notice, &self.home, None).await;
+                let delivered = match &destination {
+                    // A conversation is written to directly. The daemon keeps a runtime for exactly
+                    // this, and what it writes lands in the same database the terminal reads, so the
+                    // report is there the next time that conversation is opened.
+                    Destination::Session(wanted) => {
+                        match self.postbox.post(wanted, &notice.line()).await {
+                            Ok((session, note)) => notify::Report {
+                                delivered: true,
+                                detail: match note {
+                                    Some(note) => format!("session {session}: {note}"),
+                                    None => format!("session {session}"),
+                                },
+                            },
+                            Err(err) => notify::Report {
+                                delivered: false,
+                                detail: err,
+                            },
+                        }
+                    }
+                    _ => notify::deliver(&destination, &notice, &self.home, None).await,
+                };
                 // `none` is a job that was never meant to report anywhere: recording that as
                 // delivered would claim a delivery that by definition never happened.
                 let state = match destination {
@@ -476,7 +499,11 @@ impl Daemon {
                     _ if delivered.delivered => Delivery::Delivered,
                     _ => Delivery::Failed,
                 };
-                let _ = self.store.set_delivery(&run.id, state);
+                // The note is part of the record: `delivery: failed` on its own tells an operator
+                // nothing about what to fix.
+                let _ = self
+                    .store
+                    .set_delivery_note(&run.id, state, &delivered.detail);
                 report.delivered.push((job.id, delivered.delivered));
             }
             Err(err) => report.refused.push(format!("{}: {err}", job.id)),
@@ -524,6 +551,12 @@ impl Daemon {
     /// Run until `stop` is notified. Each pass is bounded, because a tick that hangs looks exactly
     /// like a daemon that is dead, which is the failure the heartbeat exists to notice.
     pub async fn run(mut self, stop: Arc<Notify>) -> Result<(), StoreError> {
+        // Open the delivery runtime once, before the first tick, so a report for a conversation does
+        // not pay for a cold start every morning. A machine with no model configured refuses here
+        // and still runs every script job; the refusal is reported per delivery.
+        if let Err(err) = self.postbox.open().await {
+            eprintln!("[vikram] conversation delivery unavailable: {err}");
+        }
         loop {
             let _ = self.tick(time::now_ms()).await;
             tokio::select! {
@@ -543,9 +576,9 @@ fn work_for(job: &Job, timeout: Millis) -> Work {
                 let cwd = (!job.agent.trim().is_empty()).then(|| PathBuf::from(&job.agent));
                 runner::run_script(&job.payload, cwd.as_deref(), limit).await
             }
-            // An agent job starts its own runtime. The daemon holds no model connection of its own:
-            // a scheduler that kept one warm would be a second pair of credentials and a second set
-            // of permissions to keep in step.
+            // An agent job starts its own runtime and drops it when the turn ends. The daemon keeps a
+            // runtime only to write reports into a conversation, never to run work, so a schedule
+            // never inherits a model turn it did not ask for.
             JobMode::Agent => {
                 let config = match vikram_runtime::config::Config::load() {
                     Ok(config) => config,
@@ -591,7 +624,8 @@ fn work_for(job: &Job, timeout: Millis) -> Work {
                     Err(err) => return RunOutcome::failed(format!("config: {err}")),
                 };
                 let request = runner::TeamRequest::new(job.agent.clone(), job.payload.clone())
-                    .title(runner::title_from(&job.payload));
+                    .title(runner::title_from(&job.payload))
+                    .in_order(runner::TeamOrder::parse(&job.order).unwrap_or_default());
                 let request = match job.target.strip_prefix("model:") {
                     Some(model) => request.model(model.to_string()),
                     None => request,

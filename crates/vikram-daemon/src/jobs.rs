@@ -31,6 +31,8 @@ pub struct NewJob {
     pub timeout_ms: Option<Millis>,
     pub retries: u32,
     pub priority: i64,
+    /// How a team job runs its members: `parallel` or `sequential`.
+    pub order: String,
     pub enabled: bool,
 }
 
@@ -42,6 +44,7 @@ impl NewJob {
             timezone: "local".into(),
             mode: JobMode::Agent,
             target: "local".into(),
+            order: "parallel".into(),
             enabled: true,
             ..Self::default()
         }
@@ -99,6 +102,11 @@ impl NewJob {
 
     pub fn enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
+        self
+    }
+
+    pub fn order(mut self, order: impl Into<String>) -> Self {
+        self.order = order.into();
         self
     }
 }
@@ -182,6 +190,11 @@ impl JobManager {
         job.timeout_ms = draft.timeout_ms;
         job.retries = draft.retries;
         job.priority = draft.priority;
+        job.order = if draft.order.trim().is_empty() {
+            "parallel".into()
+        } else {
+            draft.order
+        };
         job.enabled = draft.enabled;
         job.created_ms = now;
         job.updated_ms = now;
