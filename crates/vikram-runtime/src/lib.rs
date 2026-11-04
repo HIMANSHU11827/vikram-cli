@@ -9,9 +9,11 @@
 pub mod agents;
 pub mod browser;
 pub mod bus;
+pub mod compaction;
 pub mod computer;
 pub mod config;
 pub mod context;
+pub mod context_engine;
 pub mod error;
 pub mod hive_chat;
 pub mod learning;
@@ -28,8 +30,10 @@ pub mod sandbox;
 pub mod search;
 pub mod session;
 pub mod skills;
+pub mod spill;
 pub mod teams;
 pub mod tickets;
+pub mod titling;
 pub mod tools;
 pub mod turn;
 pub mod types;
@@ -38,10 +42,16 @@ pub mod workspace;
 
 pub use agents::{AgentManager, ManagedAgent, TaskManager};
 pub use bus::EventBus;
+pub use compaction::{
+    COMPACTION_FOLDED_KEY, COMPACTION_SUMMARY_KEY, COMPACTION_THROUGH_KEY, CompactionPolicy,
+    CompactionReport, compact, delegation_answer, delegation_brief, digest_tool_output,
+    is_compaction_summary, project_from_journal, should_compact,
+};
 pub use config::{
     Config, McpConfig, McpServerConfig, SearchBackend, SearchConfig, database_path, vikram_home,
 };
 pub use context::{ContextBundle, ContextLoader};
+pub use context_engine::*;
 pub use error::{Result, RuntimeError};
 pub use hive_chat::HiveManager;
 pub use learning::{LearningAuditEntry, LearningManager, LearningPolicy, LearningProposal};

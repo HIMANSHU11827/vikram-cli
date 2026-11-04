@@ -103,6 +103,8 @@ pub enum PickerKind {
     RenameSession,
     /// Close current session
     CloseSession,
+    /// Scheduled jobs and the daemon that runs them
+    Background,
 }
 
 impl PickerKind {
@@ -168,6 +170,7 @@ impl PickerKind {
             | Self::Exit
             | Self::RenameSession
             | Self::CloseSession => &[(Verb::Choose, '\n', "open")],
+            Self::Background => &[(Verb::Toggle, '\n', "pause/resume")],
         }
     }
 
@@ -221,6 +224,7 @@ impl PickerKind {
             Self::Exit => "exit",
             Self::RenameSession => "rename",
             Self::CloseSession => "close",
+            Self::Background => "background",
         }
     }
 }

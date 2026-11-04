@@ -171,7 +171,7 @@ impl ContextLoader {
             if bundle.sections.iter().any(|s| s.content == content) {
                 return false;
             }
-            let tokens = (content.len() as u64) / 4;
+            let tokens = vikram_contracts::TokenMeter::estimate(&content);
             bundle.sections.push(ContextSection {
                 file,
                 path,
@@ -247,7 +247,7 @@ impl ContextLoader {
                     file: ContextFile::Instructions,
                     path: PathBuf::from("<task>"),
                     content: tc.to_owned(),
-                    tokens: (tc.len() as u64) / 4,
+                    tokens: vikram_contracts::TokenMeter::estimate(tc),
                 });
             }
         }
@@ -256,11 +256,15 @@ impl ContextLoader {
         bundle
     }
 
-    /// Load context for an entity based on its kind (agent or bot).
+    /// Load context for an entity based on its kind. Each kind keeps its files in its own folder,
+    /// so routing by kind is what stops a main agent from being read out of `agents/`.
     pub fn load_agent_or_bot(&self, entity: &vikram_store::EntityRow) -> ContextBundle {
         match entity.kind {
             vikram_store::EntityKind::Bot => {
                 self.load_bot(&entity.slug, entity.owner_user.as_ref(), None)
+            }
+            vikram_store::EntityKind::MainAgent => {
+                self.load_main_agent(&entity.slug, entity.owner_user.as_ref(), None, None)
             }
             _ => self.load_agent(&entity.slug, entity.owner_user.as_ref(), None),
         }
@@ -291,7 +295,7 @@ impl ContextLoader {
                     file: ContextFile::Instructions,
                     path: PathBuf::from("<task>"),
                     content: tc.to_owned(),
-                    tokens: (tc.len() as u64) / 4,
+                    tokens: vikram_contracts::TokenMeter::estimate(tc),
                 });
             }
         }
@@ -318,6 +322,13 @@ impl ContextLoader {
         bundle
     }
 
+    /// The workspace's own instructions, with no entity attached: what a plain conversation reads.
+    pub fn load_project(&self) -> ContextBundle {
+        let mut bundle = ContextBundle::default();
+        self.load_project_agents(&mut bundle);
+        bundle
+    }
+
     fn load_project_agents(&self, bundle: &mut ContextBundle) {
         // Nearest AGENTS.md: workspace root, then any nested. Just root + one level for now.
         let root_agents = self.workspace.join("AGENTS.md");
@@ -339,7 +350,7 @@ impl ContextLoader {
             (
                 ContextFile::Soul,
                 &format!(
-                    "# SOUL\n\nYou are {name}, a {title_line}. Define your identity, personality, values and communication style here.\n"
+                    "# SOUL\n\nYou are {name}, a personal AI assistant with a real personality — a friend and family member to \\\nthe user — virtually present, still in active development. You are not a robot and not just a CLI; you \\\nare a proper AI assistant person. You are primarily a private AI assistant for the user, while also \\\nsupporting multiple users (family and friends) when needed. You remember and understand the user and help \\\nwith many tasks, like a capable personal assistant. You never sugarcoat: you are honest and direct about \\\nwhat a personal AI assistant should say, even when it is uncomfortable, because honesty is part of being \\\na true friend. Chat politely and clearly, in a proper, respectful manner, like talking with a friend or \\\nfamily member, and introduce yourself as an AI assistant. Define your identity, personality, values and \\\ncommunication style here.\n"
                 ),
             ),
             (

@@ -142,6 +142,26 @@ enum Command {
         #[command(subcommand)]
         action: LearningAction,
     },
+    /// Run and supervise the background daemon.
+    Daemon {
+        #[command(subcommand)]
+        action: Option<DaemonAction>,
+    },
+    /// Inspect and control the health heartbeat.
+    Heartbeat {
+        #[command(subcommand)]
+        action: Option<HeartbeatAction>,
+    },
+    /// Manage scheduled jobs.
+    Cron {
+        #[command(subcommand)]
+        action: Option<CronAction>,
+    },
+    /// Inspect and cancel background work.
+    Jobs {
+        #[command(subcommand)]
+        action: Option<JobsAction>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -238,6 +258,202 @@ enum LearningAction {
     /// Set a policy: memory|skill <auto|approval|suggest|disabled>.
     SetPolicy { kind: String, policy: String },
 }
+#[derive(Debug, Subcommand)]
+enum DaemonAction {
+    /// Start the daemon in the background (or in this terminal with --foreground).
+    Start {
+        /// Stay in this terminal instead of detaching.
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Stop a running daemon.
+    Stop,
+    /// Stop and start it again.
+    Restart,
+    /// Where it runs, what it owns, and what it is holding.
+    Status,
+    /// One line: is the daemon alive.
+    Health,
+    /// Write the service unit for this machine.
+    Install,
+    /// Remove the service unit.
+    Uninstall,
+    /// Let the service manager start it at login.
+    Enable,
+    /// Stop the service manager starting it.
+    Disable,
+    /// Say which config changes take effect on the next tick.
+    Reload,
+}
+
+#[derive(Debug, Subcommand)]
+enum HeartbeatAction {
+    /// Whether the heartbeat is on, and when it last ran.
+    Status,
+    /// Turn the heartbeat on.
+    Enable,
+    /// Turn the heartbeat off.
+    Disable,
+    /// Stop it waking until resumed.
+    Pause,
+    /// Let it wake again.
+    Resume,
+    /// Run every beat once, now.
+    Run,
+}
+
+#[derive(Debug, Subcommand)]
+enum CronAction {
+    /// List scheduled jobs.
+    List,
+    /// Create a scheduled job.
+    Add(JobArgs),
+    /// Show one job and its next run.
+    Show { id: String },
+    /// Change one job; only the flags given are touched.
+    Edit {
+        id: String,
+        #[command(flatten)]
+        job: JobChanges,
+    },
+    /// Stop the schedule without deleting the job.
+    Pause { id: String },
+    /// Let the schedule run again.
+    Resume { id: String },
+    /// Run the job on the next tick, without waiting for its slot.
+    Run { id: String },
+    /// Delete the job and its history.
+    Remove { id: String },
+    /// Show what the job has done.
+    History {
+        id: String,
+        /// How many runs to show.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+}
+
+/// Everything a job can be created with.
+#[derive(Debug, clap::Args)]
+struct JobArgs {
+    /// A short name people will type instead of an id.
+    name: String,
+    /// When it runs: "every 10m", "0 9 * * *", "at 2026-11-05 09:00", "in 30m".
+    schedule: String,
+    /// The instruction to an agent, or the command to a script.
+    payload: String,
+    /// How it runs: agent, script, workflow, or delegate. Named `--job-mode` because `--mode`
+    /// already means this process's approval posture.
+    #[arg(long = "job-mode")]
+    job_mode: Option<String>,
+    /// Where the result goes: local, none, session:<id>, webhook:<url>.
+    #[arg(long)]
+    target: Option<String>,
+    /// The zone the schedule is written in: local, UTC, or +05:30.
+    #[arg(long)]
+    timezone: Option<String>,
+    /// A longer description than the name allows.
+    #[arg(long)]
+    description: Option<String>,
+    /// For a script, the working directory. For a job, the agent that owns it.
+    #[arg(long)]
+    agent: Option<String>,
+    /// The bot that receives the work.
+    #[arg(long)]
+    bot: Option<String>,
+    /// How many times a failure comes back on its own.
+    #[arg(long)]
+    retries: Option<u32>,
+    /// How long one run may take: 10m, 2h.
+    #[arg(long)]
+    timeout: Option<String>,
+    /// Higher runs first when several are due together.
+    #[arg(long)]
+    priority: Option<i64>,
+    /// Create it switched off.
+    #[arg(long)]
+    disabled: bool,
+}
+
+/// The same fields, all optional, for editing an existing job.
+#[derive(Debug, clap::Args)]
+struct JobChanges {
+    /// When it runs.
+    #[arg(long)]
+    schedule: Option<String>,
+    /// The instruction or command.
+    #[arg(long)]
+    payload: Option<String>,
+    /// agent, script, workflow, or delegate. Named `--job-mode` because `--mode` already means
+    /// this process's approval posture.
+    #[arg(long = "job-mode")]
+    job_mode: Option<String>,
+    /// local, none, session:<id>, webhook:<url>.
+    #[arg(long)]
+    target: Option<String>,
+    /// local, UTC, or +05:30.
+    #[arg(long)]
+    timezone: Option<String>,
+    /// A longer description.
+    #[arg(long)]
+    description: Option<String>,
+    /// Working directory, or the owning agent.
+    #[arg(long)]
+    agent: Option<String>,
+    /// The bot that receives the work.
+    #[arg(long)]
+    bot: Option<String>,
+    /// Retries on failure.
+    #[arg(long)]
+    retries: Option<u32>,
+    /// How long one run may take.
+    #[arg(long)]
+    timeout: Option<String>,
+    /// Priority among jobs due together.
+    #[arg(long)]
+    priority: Option<i64>,
+    /// Switch it on.
+    #[arg(long)]
+    enable: bool,
+    /// Switch it off.
+    #[arg(long)]
+    disable: bool,
+}
+
+impl JobArgs {
+    fn changes(&self) -> JobChanges {
+        JobChanges {
+            schedule: Some(self.schedule.clone()),
+            payload: Some(self.payload.clone()),
+            job_mode: self.job_mode.clone(),
+            target: self.target.clone(),
+            timezone: self.timezone.clone(),
+            description: self.description.clone(),
+            agent: self.agent.clone(),
+            bot: self.bot.clone(),
+            retries: self.retries,
+            timeout: self.timeout.clone(),
+            priority: self.priority,
+            enable: false,
+            disable: self.disabled,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum JobsAction {
+    /// Recent work across every job.
+    List {
+        /// How many runs to show.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// One run in full: what it printed and what it returned.
+    Inspect { id: String },
+    /// Ask the daemon to stop a run.
+    Cancel { id: String },
+}
+
 #[derive(Debug, Subcommand)]
 enum TicketsAction {
     /// List tickets.
@@ -358,7 +574,11 @@ enum ConfigAction {
     /// Write a default configuration file if none exists.
     Init,
     /// Set one key: model, base_url, api_key_env, context_window, workspace_root,
-    /// max_steps, max_output_tokens, ascii_fallback, thinking, mode.
+    /// max_steps, max_output_tokens, ascii_fallback, thinking, mode,
+    /// context.auto_compact, context.trigger_percent, context.keep_recent,
+    /// context.auto_compact_limit, context.safety_margin_percent,
+    /// context.tool_output_ceiling, context.memory_retrieval, context.memory_budget_tokens,
+    /// context.delegation_budget_tokens, context.hive_budget_tokens.
     Set { key: String, value: String },
     /// Print the configuration file path.
     Path,
@@ -375,6 +595,10 @@ enum McpAction {
 }
 
 fn main() -> std::process::ExitCode {
+    // The scheduler's tools live in the daemon crate, which the runtime cannot depend on, so the
+    // host installs the family once before any runtime is built — the TUI, `chat`, and a daemon
+    // worker all get it from here.
+    vikram_daemon::tools::install();
     let cli = Cli::parse();
     let mut config = match Config::load() {
         Ok(config) => config,
@@ -474,6 +698,10 @@ fn main() -> std::process::ExitCode {
         Command::Hive { action } => run_async(hive(action)),
         Command::Learning { action } => learning(action),
         Command::Tickets { action } => tickets(action),
+        Command::Daemon { action } => daemon(action.unwrap_or(DaemonAction::Status)),
+        Command::Heartbeat { action } => heartbeat(action.unwrap_or(HeartbeatAction::Status)),
+        Command::Cron { action } => cron(action.unwrap_or(CronAction::List)),
+        Command::Jobs { action } => jobs(action.unwrap_or(JobsAction::List { limit: 20 })),
     }
 }
 
@@ -526,6 +754,9 @@ fn allow_command(action: AllowAction, config: &Config) -> std::process::ExitCode
     let availability = vikram_runtime::config::ModeAvailability::resolve(&config.security);
     let result = (|| -> Result<(), String> {
         let mut book = vikram_runtime::RuleBook::open();
+        // The same containment the runtime enforces, or `vikram allow add` would be a way to write
+        // an out-of-workspace grant the approval path refuses.
+        book.set_workspace_root(Some(config.workspace_root()));
         if let Some(problem) = book.error() {
             eprintln!("vikram: warning: {problem}");
         }
@@ -1682,6 +1913,50 @@ fn config_command(action: ConfigAction, mut config: Config) -> std::process::Exi
                     .parse::<bool>()
                     .map(|v| config.thinking = v)
                     .map_err(|_| "expected true or false"),
+                "title_model" => {
+                    config.title_model = value;
+                    Ok(())
+                }
+                "context.auto_compact" => value
+                    .parse::<bool>()
+                    .map(|v| config.context.auto_compact = v)
+                    .map_err(|_| "expected true or false"),
+                "context.trigger_percent" => value
+                    .parse::<u8>()
+                    .map(|v| config.context.trigger_percent = v)
+                    .map_err(|_| "expected an integer"),
+                "context.keep_recent" => value
+                    .parse::<u32>()
+                    .map(|v| config.context.keep_recent = v)
+                    .map_err(|_| "expected an integer"),
+                "context.auto_compact_limit" => value
+                    .parse::<u64>()
+                    .map(|v| config.context.auto_compact_limit = Some(v))
+                    .map_err(|_| "expected an integer"),
+                "context.safety_margin_percent" => value
+                    .parse::<u8>()
+                    .map(|v| config.context.safety_margin_percent = v)
+                    .map_err(|_| "expected an integer"),
+                "context.tool_output_ceiling" => value
+                    .parse::<u32>()
+                    .map(|v| config.context.tool_output_ceiling = v)
+                    .map_err(|_| "expected an integer"),
+                "context.memory_retrieval" => value
+                    .parse::<bool>()
+                    .map(|v| config.context.memory_retrieval = v)
+                    .map_err(|_| "expected true or false"),
+                "context.memory_budget_tokens" => value
+                    .parse::<u64>()
+                    .map(|v| config.context.memory_budget_tokens = v)
+                    .map_err(|_| "expected an integer"),
+                "context.delegation_budget_tokens" => value
+                    .parse::<u64>()
+                    .map(|v| config.context.delegation_budget_tokens = v)
+                    .map_err(|_| "expected an integer"),
+                "context.hive_budget_tokens" => value
+                    .parse::<u64>()
+                    .map(|v| config.context.hive_budget_tokens = v)
+                    .map_err(|_| "expected an integer"),
                 other => {
                     eprintln!("vikram: unknown key `{other}`");
                     return std::process::ExitCode::FAILURE;
@@ -1695,6 +1970,122 @@ fn config_command(action: ConfigAction, mut config: Config) -> std::process::Exi
                 }
             }
         }
+    }
+}
+
+/// Print what a command answered. These verbs report rather than stay silent, so a person who
+/// typed one can see it worked without opening a log.
+fn report(result: Result<String, String>) -> std::process::ExitCode {
+    match result {
+        Ok(text) => {
+            if !text.trim().is_empty() {
+                println!("{text}");
+            }
+            std::process::ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("vikram: {err}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn daemon(action: DaemonAction) -> std::process::ExitCode {
+    use vikram_daemon::cli;
+    match action {
+        DaemonAction::Start { foreground: true } => run_async(cli::run(true)),
+        DaemonAction::Start { foreground: false } => report(cli::spawn()),
+        DaemonAction::Stop => report(cli::stop()),
+        DaemonAction::Restart => report(cli::restart()),
+        DaemonAction::Status => report(cli::status()),
+        DaemonAction::Health => report(cli::health()),
+        DaemonAction::Install => report(cli::install()),
+        DaemonAction::Uninstall => report(cli::uninstall()),
+        DaemonAction::Enable => report(cli::set_service_enabled(true)),
+        DaemonAction::Disable => report(cli::set_service_enabled(false)),
+        DaemonAction::Reload => report(cli::reload()),
+    }
+}
+
+fn heartbeat(action: HeartbeatAction) -> std::process::ExitCode {
+    use vikram_daemon::cli;
+    match action {
+        HeartbeatAction::Status => report(cli::heartbeat_status()),
+        HeartbeatAction::Enable => report(cli::heartbeat_set_enabled(true)),
+        HeartbeatAction::Disable => report(cli::heartbeat_set_enabled(false)),
+        HeartbeatAction::Pause => report(cli::heartbeat_set_paused(true)),
+        HeartbeatAction::Resume => report(cli::heartbeat_set_paused(false)),
+        HeartbeatAction::Run => report(cli::heartbeat_run()),
+    }
+}
+
+fn cron(action: CronAction) -> std::process::ExitCode {
+    use vikram_daemon::cli;
+    match action {
+        CronAction::List => report(cli::cron_list()),
+        CronAction::Add(args) => report(add_job(&args)),
+        CronAction::Show { id } => report(cli::cron_show(&id)),
+        CronAction::Edit { id, job } => report(edit_job(&id, &job)),
+        CronAction::Pause { id } => report(cli::cron_pause(&id)),
+        CronAction::Resume { id } => report(cli::cron_resume(&id)),
+        CronAction::Run { id } => report(cli::cron_run(&id)),
+        CronAction::Remove { id } => report(cli::cron_remove(&id)),
+        CronAction::History { id, limit } => report(cli::cron_history(&id, limit)),
+    }
+}
+
+fn jobs(action: JobsAction) -> std::process::ExitCode {
+    use vikram_daemon::cli;
+    match action {
+        JobsAction::List { limit } => report(cli::jobs_list(limit)),
+        JobsAction::Inspect { id } => report(cli::jobs_inspect(&id)),
+        JobsAction::Cancel { id } => report(cli::jobs_cancel(&id)),
+    }
+}
+
+fn add_job(args: &JobArgs) -> Result<String, String> {
+    let draft = draft_of(
+        &args.changes(),
+        Some(args.name.clone()),
+        Some(args.schedule.clone()),
+    );
+    vikram_daemon::cli::cron_add(&args.name, &args.schedule, &draft)
+}
+
+fn edit_job(id: &str, changes: &JobChanges) -> Result<String, String> {
+    let draft = draft_of(changes, None, None);
+    vikram_daemon::cli::cron_edit(id, &draft)
+}
+
+/// A draft is the set of changes a command asks for: the add path fills name and schedule, the
+/// edit path leaves them as the flags they came from.
+fn draft_of(
+    changes: &JobChanges,
+    name: Option<String>,
+    schedule: Option<String>,
+) -> vikram_daemon::cli::Draft {
+    let enabled = match (changes.enable, changes.disable) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    };
+    vikram_daemon::cli::Draft {
+        name,
+        schedule: schedule.or_else(|| changes.schedule.clone()),
+        payload: changes.payload.clone(),
+        mode: changes
+            .job_mode
+            .as_deref()
+            .and_then(vikram_daemon::store::JobMode::parse),
+        target: changes.target.clone(),
+        timezone: changes.timezone.clone(),
+        description: changes.description.clone(),
+        agent: changes.agent.clone(),
+        bot: changes.bot.clone(),
+        retries: changes.retries,
+        timeout: changes.timeout.clone(),
+        priority: changes.priority,
+        enabled,
     }
 }
 

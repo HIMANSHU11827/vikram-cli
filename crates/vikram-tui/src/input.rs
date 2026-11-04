@@ -586,10 +586,21 @@ fn handle_suggestion_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         KeyCode::Enter => {
-            // Enter always sends/runs the message. Suggestions are completed with Tab, so a
-            // half-typed `!cmd`, `@file`, or `/cmd` is never silently replaced by a suggestion.
-            app.suggestions = None;
-            false
+            // Enter takes what is highlighted and runs it, so a command never has to be spelled
+            // out: `/cl` + Enter runs `/close`. A bare prefix (`/`, `@`, `!`) still opens its
+            // panel, and a half-typed `@path` is only filled in, because the mention is part of
+            // a sentence the operator is still writing.
+            let token = app.active_session().and_then(|session| {
+                let text = session.editor.text();
+                let (_, col) = session.editor.cursor();
+                current_token(&text, col)
+            });
+            let Some(token) = token.filter(|token| !token.query.is_empty()) else {
+                app.suggestions = None;
+                return false;
+            };
+            accept_suggestion(app);
+            token.kind == PrefixKind::At
         }
         KeyCode::Esc => {
             app.suggestions = None;
@@ -1497,6 +1508,8 @@ mod tests {
                 queued: 0,
                 project_id: None,
                 status: "active".to_owned(),
+                title_source: "generic".to_owned(),
+                title_status: "pending".to_owned(),
             }));
         app
     }
@@ -1655,6 +1668,65 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Tab));
         assert!(app.suggestions.is_none());
         assert_eq!(app.active_session().unwrap().editor.text(), "/help ");
+    }
+
+    #[test]
+    fn enter_runs_the_highlighted_command_instead_of_making_you_type_it() {
+        let mut app = app_with_session();
+        for ch in "/cl".chars() {
+            handle_key(&mut app, key(KeyCode::Char(ch)));
+        }
+        let popup = app.suggestions.as_ref().expect("popup open");
+        assert_eq!(popup.items[0].text, "/close");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.suggestions.is_none());
+        assert_eq!(app.active_session().unwrap().editor.text(), "");
+        assert!(
+            matches!(
+                app.take_commands().as_slice(),
+                [UiCommand::SlashCommand { command, .. }] if command == "close"
+            ),
+            "a half-typed command has to run the completion, not fail as unknown"
+        );
+    }
+
+    #[test]
+    fn typing_a_whole_command_and_pressing_enter_runs_it_once() {
+        let mut app = app_with_session();
+        for ch in "/model".chars() {
+            handle_key(&mut app, key(KeyCode::Char(ch)));
+        }
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(
+            matches!(
+                app.take_commands().as_slice(),
+                [UiCommand::SlashCommand { command, .. }] if command == "model"
+            ),
+            "a spelled-out command runs on one Enter, and only once"
+        );
+        assert_eq!(
+            app.active_session().unwrap().editor.text(),
+            "",
+            "the line is spent once it has been run"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_reference_fills_the_mention_and_keeps_the_draft() {
+        let mut app = app_with_session();
+        for ch in "tell me about @mai".chars() {
+            handle_key(&mut app, key(KeyCode::Char(ch)));
+        }
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.suggestions.is_none());
+        assert_eq!(
+            app.active_session().unwrap().editor.text(),
+            "tell me about @main"
+        );
+        assert!(
+            app.take_commands().is_empty(),
+            "@ fills the path, it does not send"
+        );
     }
 
     #[test]

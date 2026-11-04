@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, oneshot};
 use vikram_contracts::journal::JournalSink;
@@ -14,7 +14,6 @@ use vikram_contracts::{
     ActionKind, AgentId, ApprovalId, Decision, Message, PermissionMode, PermissionRequest, Posture,
     RecordKind, SessionId,
 };
-use vikram_kernel::TokenMeter;
 use vikram_policy::{MandatoryFloor, Policy, ResourcePattern, Rule};
 use vikram_store::Store;
 
@@ -30,6 +29,7 @@ use crate::session::SessionRuntime;
 use crate::skills::{Skill, SkillRegistry};
 use crate::teams::{Team, TeamManager};
 use crate::tickets::TicketManager;
+use crate::titling;
 use crate::tools::{McpTool, ToolContext, ToolRegistry};
 use crate::types::{
     AgentSnapshot, AgentState, ApprovalPrompt, BackgroundTask, Metrics, NoticeLevel, RuntimeEvent,
@@ -92,6 +92,18 @@ pub(crate) struct RuntimeInner {
     pub started_ms: u64,
     pub last_turn_ms: Mutex<Option<u64>>,
     pub last_tokens_per_sec: Mutex<Option<f64>>,
+    /// Learning reviews this runtime has started and not finished. A one-shot process that exits
+    /// without waiting for these drops a review it already paid for.
+    pub review_tasks: Arc<AtomicU64>,
+}
+
+/// Keeps that count honest even if the review task panics.
+struct LearningGuard(Arc<AtomicU64>);
+
+impl Drop for LearningGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl RuntimeInner {
@@ -230,23 +242,17 @@ impl RuntimeInner {
 
     pub fn metrics(&self) -> Metrics {
         let sessions = self.session_list();
-        let context_used = sessions
-            .iter()
-            .map(|s| {
-                s.messages()
-                    .iter()
-                    .map(|m| TokenMeter::estimate(&m.text_body()))
-                    .sum::<u64>()
-            })
-            .max()
-            .unwrap_or(0);
-        let context_window = self
-            .provider
-            .read()
-            .expect("provider lock")
+        // One session is the one the operator is looking at; the meter reports the largest live
+        // transcript rather than an average of everything that exists.
+        let status = self.context_status();
+        let context_used = status.as_ref().map(|s| s.used).unwrap_or(0);
+        let context_window = status.as_ref().map(|s| s.window);
+        let context_measured = status.as_ref().is_some_and(|s| s.measured);
+        let limit_assumed = status
             .as_ref()
-            .and_then(|p| p.context_window())
-            .or(self.config.context_window);
+            .is_some_and(|s| s.limits_source == crate::context_engine::LimitsSource::Assumed);
+        let compactions: u64 = sessions.iter().map(|s| s.folds()).sum();
+        let context_window = context_window.or(self.config.context_window);
         let turn_elapsed_ms = sessions
             .iter()
             .filter_map(|s| s.turn_elapsed_ms(now_ms()))
@@ -271,6 +277,10 @@ impl RuntimeInner {
                 .map(|p| p.name().to_owned()),
             context_used,
             context_window,
+            context_measured,
+            context_limit_assumed: limit_assumed,
+            context_compactions: compactions,
+            context_usable: status.as_ref().map(|s| s.usable).unwrap_or(0),
             turn_elapsed_ms,
             elapsed_ms: now_ms().saturating_sub(self.started_ms),
             tokens_per_sec: *self.last_tokens_per_sec.lock().expect("tps metric"),
@@ -296,8 +306,388 @@ impl RuntimeInner {
         self.emit(RuntimeEvent::Metrics(self.metrics()));
     }
 
+    /// The fixed cost of a request: tool schemas plus the system messages built for this turn.
+    /// Measured with the same estimator as the transcript, or the two numbers cannot be added.
+    fn request_overhead(
+        &self,
+        estimator: &crate::context_engine::TokenEstimator,
+        prefix: &[Message],
+    ) -> u64 {
+        self.tool_schema_tokens(estimator) + estimator.estimate_messages(prefix)
+    }
+
+    /// What the tool declarations cost in every request, on their own. Surfaced separately because
+    /// it is the one part of the overhead an operator can actually shrink, by disabling a server.
+    pub fn tool_schema_tokens(&self, estimator: &crate::context_engine::TokenEstimator) -> u64 {
+        let schemas = serde_json::to_string(&self.tools.specs()).unwrap_or_default();
+        estimator.estimate_text(&schemas)
+    }
+
+    /// Whether a provider failure is the recoverable "you sent me too much" kind.
+    pub(crate) fn context_limit_error(&self, text: &str) -> bool {
+        let lower = text.to_lowercase();
+        [
+            "context_length_exceeded",
+            "context length",
+            "maximum context",
+            "context window",
+            "too many tokens",
+            "prompt is too long",
+            "input is too long",
+            "reduce the length",
+            "exceeds the model",
+            "exceeds available",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    }
+
+    /// Relevant long-term memory for this turn, inside the configured budget, or nothing at all.
+    ///
+    /// Terms come from the most recent instruction rather than the whole transcript, because the
+    /// thing worth remembering is what the agent is being asked about now.
+    pub fn retrieved_memory(&self, session: &Arc<SessionRuntime>) -> Option<String> {
+        if !self.config.context.memory_retrieval {
+            return None;
+        }
+        let transcript = session.messages();
+        let query = transcript
+            .iter()
+            .rev()
+            .find(|m| m.role == vikram_contracts::Role::User)
+            .map(|m| m.text_body())
+            .unwrap_or_default();
+        if query.trim().is_empty() {
+            return None;
+        }
+        let terms = Self::retrieval_terms(&query);
+        // A conversation may draw on shared `global` notes and its own; nothing else in the shared
+        // table. Entity/user-scoped recall waits until the host, not the model, assigns those scopes.
+        let scopes = vec!["global".to_owned(), session.id.as_str().to_owned()];
+        let Ok(entries) = self.memory.recall_terms(&terms, &scopes, 8) else {
+            return None;
+        };
+        if entries.is_empty() {
+            return None;
+        }
+        let estimator = session.estimator();
+        let budget_tokens = self.config.context.memory_budget_tokens;
+        let mut block = String::from(
+            "Relevant memory (durable notes from earlier sessions; may be stale, verify before relying on it):\n",
+        );
+        let mut spent = estimator.estimate_text(&block);
+        let mut used = 0usize;
+        for (scope, key, value) in entries {
+            let line = format!("- [{scope}] {key}: {value}\n");
+            let cost = estimator.estimate_text(&line);
+            if spent + cost > budget_tokens {
+                break;
+            }
+            spent += cost;
+            used += 1;
+            block.push_str(&line);
+        }
+        if used == 0 {
+            return None;
+        }
+        Some(block)
+    }
+
+    /// The instructions this conversation runs under: the active entity's own files when there is
+    /// one, and always the workspace's `AGENTS.md`. Bounded by `context.project_budget_tokens`, so
+    /// a large set of Markdown files cannot quietly eat the window a transcript needs.
+    pub fn project_context(&self) -> Option<String> {
+        let identity = self.store.get_active_identity().unwrap_or_default();
+        let bundle = match identity
+            .main_agent
+            .as_ref()
+            .and_then(|id| self.store.get_entity(id).ok().flatten())
+        {
+            Some(entity) => self.context.load_agent_or_bot(&entity),
+            None => self.context.load_project(),
+        };
+        let text = bundle.render();
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    /// Content words worth matching on, longest first, capped so one broad instruction cannot
+    /// pull in the entire memory table.
+    fn retrieval_terms(query: &str) -> Vec<String> {
+        const STOP: &[&str] = &[
+            "the", "and", "with", "that", "this", "from", "have", "has", "are", "was", "were",
+            "will", "would", "could", "should", "about", "into", "your", "you", "for", "not",
+            "but", "can", "did", "does", "just", "please", "make", "them", "they", "their",
+            "there", "then", "than", "here", "what", "when", "where", "which", "while", "all",
+            "any", "some", "more", "most", "other", "each", "per", "use", "using", "used",
+        ];
+        let mut terms: Vec<String> = query
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+            .filter(|word| word.len() >= 4 && !STOP.contains(word))
+            .map(str::to_owned)
+            .collect();
+        terms.sort_by(|a, b| b.len().cmp(&a.len()));
+        terms.dedup();
+        terms.truncate(8);
+        terms
+    }
+
+    /// This session's budget, resolved from the model it is actually talking to.
+    pub fn context_budget(
+        &self,
+        session: &SessionRuntime,
+        prefix: &[Message],
+    ) -> crate::context_engine::ContextBudget {
+        let estimator = session.estimator();
+        let advertised = self
+            .provider
+            .read()
+            .expect("provider lock")
+            .as_ref()
+            .and_then(|p| p.context_window());
+        let limits = crate::context_engine::ModelLimits::resolve_with_margin(
+            &self.model(),
+            self.config.context_window,
+            advertised,
+            self.config.context.safety_margin_percent,
+        );
+        let budget = crate::context_engine::ContextBudget::new(
+            limits,
+            self.request_overhead(&estimator, prefix),
+            self.config.max_output_tokens.map(u64::from),
+        );
+        match session.anchor() {
+            Some(anchor) => budget.with_anchor(anchor),
+            None => budget,
+        }
+    }
+
+    /// Enforce the budget before a request is built, and return the transcript that may be sent.
+    ///
+    /// Two moves, in this order: fold the older conversation into a summary, then digest oversized
+    /// tool results in the tail if folding alone left us over. Both are journaled and both are
+    /// announced, because a context that quietly changed shape is a context nobody can reason about.
+    pub fn prepare_context(
+        &self,
+        session: &Arc<SessionRuntime>,
+        prefix: &[Message],
+    ) -> (Vec<Message>, crate::context_engine::ContextBudget) {
+        use crate::compaction::{CompactionPolicy, prune_transcript, should_compact};
+
+        let estimator = session.estimator();
+        let budget = self.context_budget(session, prefix);
+        let policy = CompactionPolicy::from_config(&self.config.context);
+        let mut transcript = session.messages();
+        let usable = budget.usable_input();
+
+        if self.config.context.auto_compact
+            && should_compact(&estimator, &transcript, &budget, &policy)
+            && let Some((folded, _)) =
+                self.fold_once(&session.id, &transcript, &estimator, &budget, &policy)
+        {
+            transcript = folded;
+        }
+
+        if transcript.len() > policy.keep_recent
+            && let Some((pruned, replaced)) =
+                prune_transcript(&estimator, &budget, &transcript, policy.tool_output_ceiling)
+        {
+            let saved = estimator
+                .estimate_messages(&transcript)
+                .saturating_sub(estimator.estimate_messages(&pruned));
+            session.replace_messages(pruned.clone(), now_ms());
+            self.emit(RuntimeEvent::ContextPruned {
+                session: session.id.clone(),
+                replaced,
+                saved_tokens: saved,
+            });
+            transcript = pruned;
+        }
+
+        if !self.config.context.auto_compact && usable > 0 {
+            let used = crate::compaction::active_context_tokens(&estimator, &transcript, &budget);
+            if used > usable {
+                // Compaction is off, so the only honest move left is to say so rather than send a
+                // request the provider will reject.
+                self.emit(RuntimeEvent::Error {
+                    text: format!(
+                        "context is {used} tokens over a {usable}-token budget and auto-compaction is disabled"
+                    ),
+                });
+            }
+        }
+
+        (transcript, budget)
+    }
+
+    /// `/compact`: fold now, whether or not the meter has reached the trigger.
+    pub fn compact_now(&self, session: &SessionId) -> Option<crate::compaction::CompactionReport> {
+        let live = self.session(session)?;
+        let estimator = live.estimator();
+        let budget = self.context_budget(&live, &[]);
+        let policy = crate::compaction::CompactionPolicy::from_config(&self.config.context);
+        let transcript = live.messages();
+        self.fold_once(session, &transcript, &estimator, &budget, &policy)
+            .map(|(_, report)| report)
+    }
+
+    /// Fold the transcript once, journal the marker, publish the result, and hand back what to send.
+    ///
+    /// `None` means nothing was folded: the span was too short, the relief too small, a cut would
+    /// have split a tool call from its result, or this exact fold has already happened. The same
+    /// routine serves the automatic trigger and `/compact`, so a manual fold is journalled,
+    /// announced and guarded exactly like an automatic one.
+    fn fold_once(
+        &self,
+        session: &SessionId,
+        transcript: &[Message],
+        estimator: &crate::context_engine::TokenEstimator,
+        budget: &crate::context_engine::ContextBudget,
+        policy: &crate::compaction::CompactionPolicy,
+    ) -> Option<(Vec<Message>, crate::compaction::CompactionReport)> {
+        let through_seq = self
+            .store
+            .journal()
+            .last_seq(session)
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        let length_before = transcript.len();
+        let (folded, report) =
+            crate::compaction::compact(estimator, transcript, budget, policy, through_seq)?;
+        let live = self.session(session)?;
+        if !live.note_compaction(length_before) {
+            return None;
+        }
+        let summary = folded[0].clone();
+        self.journal_compaction(session, &summary, &report);
+        live.replace_messages(folded.clone(), now_ms());
+        self.emit(RuntimeEvent::ContextCompacted {
+            session: session.clone(),
+            folded: report.folded,
+            kept: report.kept,
+            before_tokens: report.before_tokens,
+            after_tokens: report.after_tokens,
+            through_seq: report.through_seq,
+        });
+        Some((folded, report))
+    }
+
+    /// Append the compaction marker. The summary is stored with the number of messages it folded,
+    /// which is the forget range a replay needs to rebuild this exact transcript.
+    fn journal_compaction(
+        &self,
+        session: &SessionId,
+        summary: &Message,
+        report: &crate::compaction::CompactionReport,
+    ) {
+        let payload = serde_json::json!({
+            crate::compaction::COMPACTION_SUMMARY_KEY: summary,
+            crate::compaction::COMPACTION_THROUGH_KEY: report.through_seq,
+            crate::compaction::COMPACTION_FOLDED_KEY: report.folded,
+            "before_tokens": report.before_tokens,
+            "after_tokens": report.after_tokens,
+        });
+        self.journal(session, RecordKind::Compaction, payload);
+    }
+
+    /// The live context figure for the interface: the busiest session, with the provenance of both
+    /// the number and the limit attached.
+    pub fn context_status(&self) -> Option<crate::context_engine::ContextStatus> {
+        let session = self
+            .session_list()
+            .into_iter()
+            .max_by_key(|s| s.messages().len())?;
+        let budget = self.context_budget(&session, &[]);
+        let estimator = session.estimator();
+        let transcript = session.messages();
+        let used = crate::compaction::active_context_tokens(&estimator, &transcript, &budget);
+        let measured = session.anchor().is_some();
+        Some(crate::context_engine::ContextStatus::new(
+            &budget, used, measured,
+        ))
+    }
+
     pub fn tool_context(&self) -> ToolContext {
         ToolContext::new(self.workspace_root.clone(), &self.config.security.sandbox)
+    }
+
+    /// A context that can reach this session's spool, so `output.read` resolves the handles the
+    /// digests in this transcript advertise and nothing else.
+    pub fn tool_context_for(&self, session: &SessionId) -> ToolContext {
+        let mut context = self.tool_context();
+        context.spill = crate::spill::Spill::for_session(self.workspace.home(), session);
+        context.session = Some(session.clone());
+        context
+    }
+
+    /// Deliver a delegated agent's bounded answer to the session that asked for it.
+    ///
+    /// The child's transcript stays its own; what the parent receives is the final statement, fitted
+    /// to `context.delegation_budget_tokens` and journaled so it survives a restart of either session.
+    pub fn deliver_delegation(&self, parent: &SessionId, child: &SessionRuntime) {
+        let Some(parent_session) = self.session(parent) else {
+            return;
+        };
+        let budget = self.config.context.delegation_budget_tokens;
+        let Some(answer) =
+            crate::compaction::delegation_answer(&child.estimator(), &child.messages(), budget)
+        else {
+            return;
+        };
+        let text = format!(
+            "[VIKRAM delegation result] {} said:\n{answer}",
+            child.title()
+        );
+        let message = vikram_contracts::Message::text(
+            vikram_contracts::Role::System,
+            text,
+            vikram_contracts::Trust::Host,
+        );
+        parent_session.push_message(message.clone(), now_ms());
+        self.journal(
+            parent,
+            RecordKind::Message,
+            serde_json::json!({"message": message}),
+        );
+        self.emit(RuntimeEvent::MessageCommitted {
+            session: parent.clone(),
+            message,
+        });
+        self.emit(RuntimeEvent::Notice {
+            level: NoticeLevel::Info,
+            text: format!("{} answered", child.title()),
+        });
+        self.publish_metrics();
+    }
+
+    /// Digest a result the transcript cannot carry, keeping the full text addressable.
+    ///
+    /// The ceiling is `context.tool_output_ceiling`, so the operator's budget knob decides when a
+    /// result is too big; the spooled text is what `output.read` serves back.
+    pub fn spool_output(&self, session: &SessionId, call: &str, content: String) -> String {
+        use crate::compaction::digest_tool_output;
+        let ceiling = self.config.context.tool_output_ceiling as usize;
+        let chars = content.chars().count();
+        if chars <= ceiling {
+            return content;
+        }
+        let digested = digest_tool_output(&content, ceiling);
+        match crate::spill::Spill::for_session(self.workspace.home(), session).write(call, &content)
+        {
+            Some(handle) => format!(
+                "{digested}{}",
+                crate::spill::pointer(&handle, chars - ceiling)
+            ),
+            None => format!(
+                "{digested}\n\n[{} characters elided; no spool was available for this session]",
+                chars - ceiling
+            ),
+        }
     }
 
     pub fn tools(&self) -> &crate::tools::ToolRegistry {
@@ -306,12 +696,16 @@ impl RuntimeInner {
 
     pub fn create_session(&self, title: Option<String>) -> Result<Arc<SessionRuntime>> {
         let now = now_ms();
-        let title = title.unwrap_or_else(|| {
-            let count = self.session_list().len() + 1;
-            format!("Session {count}")
-        });
+        // A session starts life named only when the caller actually named it. Otherwise it carries
+        // the placeholder and stays `pending`, which is what lets the first real message earn it a
+        // title. The old code derived a name from the session's position in the list, so identity
+        // and label were tangled: deleting a session renumbered the ones behind it.
+        let supplied = title.filter(|t| !t.trim().is_empty() && !titling::is_placeholder(t));
+        let title = supplied
+            .clone()
+            .unwrap_or_else(|| titling::NEW_SESSION.to_owned());
         let model = self.model();
-        let row = self
+        let mut row = self
             .store
             .create_session(
                 &title,
@@ -320,6 +714,13 @@ impl RuntimeInner {
                 now,
             )
             .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        if supplied.is_none() {
+            self.store
+                .mark_session_title_pending(&row.id, vikram_store::TITLE_GENERIC)
+                .map_err(|e| RuntimeError::Store(e.to_string()))?;
+            row.title_source = vikram_store::TITLE_GENERIC.to_owned();
+            row.title_status = vikram_store::TITLE_PENDING.to_owned();
+        }
         // Stamp the ownership now so user/profile deletion cascades reach this session too.
         let identity = self.store.get_active_identity().unwrap_or_default();
         if let Some(user) = identity.user {
@@ -407,6 +808,230 @@ pub struct Runtime {
     handle: RuntimeHandle,
 }
 
+impl RuntimeInner {
+    /// The paid half of the growth pipeline: ask the model what in this conversation is worth
+    /// keeping, then hand every answer to the same gate a heuristic proposal goes through. A
+    /// model's output is content, never a decision — it cannot widen a permission, and a disabled
+    /// policy drops it here exactly as it drops one the runtime derived by itself.
+    pub(crate) fn spawn_learning_review(
+        self: &Arc<Self>,
+        session: SessionId,
+        snapshot_text: String,
+    ) {
+        let inner = Arc::clone(self);
+        inner.review_tasks.fetch_add(1, Ordering::SeqCst);
+        let guard = LearningGuard(Arc::clone(&inner.review_tasks));
+        tokio::spawn(async move {
+            let _guard = guard;
+            if inner.learning.policy_memory() == crate::LearningPolicy::Disabled
+                && inner.learning.policy_skill() == crate::LearningPolicy::Disabled
+            {
+                return;
+            }
+            let provider = match inner.provider.read().expect("provider lock").clone() {
+                Some(p) => p,
+                None => return,
+            };
+            let request = crate::provider::CompletionRequest {
+                model: inner.model(),
+                messages: vec![vikram_contracts::Message::user(format!(
+                    "{}\n\nConversation:\n{}",
+                    inner.learning.review_prompt(),
+                    snapshot_text
+                ))],
+                tools: Vec::new(),
+                max_output_tokens: inner.config.max_output_tokens,
+            };
+            use futures_util::StreamExt;
+            let mut stream = provider.stream(request);
+            let mut collected = String::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(crate::provider::ProviderEvent::TextDelta(t)) => collected.push_str(&t),
+                    Ok(crate::provider::ProviderEvent::Finished { .. }) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            let trimmed = collected.trim();
+            if trimmed.is_empty() || trimmed == "Nothing to save." {
+                return;
+            }
+            let json_str = trimmed
+                .trim_start_matches("```json")
+                .trim_start_matches("```")
+                .trim_end_matches("```")
+                .trim();
+            let Ok(proposals) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) else {
+                return;
+            };
+            for proposal in proposals {
+                let field = |name: &str, fallback: &str| -> String {
+                    proposal
+                        .get(name)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(fallback)
+                        .to_owned()
+                };
+                let content = field("content", "");
+                if content.trim().is_empty() {
+                    continue;
+                }
+                let after = content.clone();
+                crate::learning::apply_or_stage(
+                    &inner,
+                    crate::LearningProposal {
+                        id: crate::learning::new_proposal_id(),
+                        session: session.clone(),
+                        kind: field("kind", "memory"),
+                        target: field("target", "memory"),
+                        action: field("action", "add"),
+                        key: field("key", ""),
+                        content,
+                        reason: field("reason", ""),
+                        status: "pending".to_owned(),
+                        created_ms: crate::types::now_ms(),
+                        before: None,
+                        after: Some(after),
+                    },
+                );
+            }
+        });
+    }
+}
+
+impl RuntimeInner {
+    /// Name a session after what it is actually about, once, without the operator waiting on it.
+    ///
+    /// Three things gate it, and each exists because a naive version went wrong somewhere else:
+    /// provenance (a title a human typed is theirs, not ours to replace), the pending flag (one
+    /// attempt per session, so a ten-message conversation is not ten model calls), and the claim
+    /// (two messages arriving at once still produce one title). When there is nothing worth naming
+    /// yet — a session opened with "hi" — the claim is handed back so a later message can name it.
+    pub(crate) fn maybe_title_session(self: &Arc<Self>, session: &Arc<SessionRuntime>) {
+        if !session.accepts_derived_title() {
+            return;
+        }
+        if session.title_status() != vikram_store::TITLE_PENDING {
+            return;
+        }
+        if !session.claim_titling() {
+            return;
+        }
+        let Some(seed) = titling::seed(&session.messages()) else {
+            session.release_titling();
+            return;
+        };
+        self.spawn_titling(Arc::clone(session), seed);
+    }
+
+    /// Run the naming request in the background. Reuses the learning review's task counter: a
+    /// one-shot process that exits before this lands has paid for a title and thrown it away, and
+    /// headless runs already wait on that counter before shutting down.
+    pub(crate) fn spawn_titling(self: &Arc<Self>, session: Arc<SessionRuntime>, seed: String) {
+        let inner = Arc::clone(self);
+        inner.review_tasks.fetch_add(1, Ordering::SeqCst);
+        let guard = LearningGuard(Arc::clone(&inner.review_tasks));
+        tokio::spawn(async move {
+            let _guard = guard;
+            // Bound here, not in the `match`: a read guard held as the match scrutinee lives through
+            // the await below, and that makes the future non-`Send`.
+            let provider = inner.provider.read().expect("provider lock").clone();
+            let derived = match provider {
+                Some(provider) => {
+                    let request = crate::provider::CompletionRequest {
+                        model: inner.title_model(),
+                        messages: vec![vikram_contracts::Message::user(titling::prompt(&seed))],
+                        tools: Vec::new(),
+                        // A title is a few words. The cap is what keeps this a cheap call.
+                        max_output_tokens: Some(24),
+                    };
+                    let raw = inner.collect_title(&provider, request).await;
+                    // Whatever the model said is checked, and if it was unusable the session is
+                    // named from its own words rather than left anonymous.
+                    titling::sanitize(&raw).or_else(|| titling::sanitize(&titling::fallback(&seed)))
+                }
+                // No model configured is not a failure to report, it is the ordinary offline case:
+                // name the session from its own words instead.
+                None => titling::sanitize(&titling::fallback(&seed)),
+            };
+            match derived {
+                Some(title) => inner.apply_derived_title(&session, &title),
+                None => {
+                    session.set_title_status(vikram_store::TITLE_FAILED);
+                    let _ = inner
+                        .store
+                        .set_session_title_status(&session.id, vikram_store::TITLE_FAILED);
+                    inner.publish_session(&session);
+                }
+            }
+        });
+    }
+
+    /// Drain a naming stream to text. Returns whatever came out, usable or not; [`titling::sanitize`]
+    /// is the one that decides.
+    async fn collect_title(
+        &self,
+        provider: &Arc<dyn Provider>,
+        request: crate::provider::CompletionRequest,
+    ) -> String {
+        use futures_util::StreamExt;
+        // A slow or hung endpoint must not hold a process open: naming is worth a second, not a turn.
+        let drain = async {
+            let mut stream = provider.stream(request);
+            let mut collected = String::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(crate::provider::ProviderEvent::TextDelta(t)) => collected.push_str(&t),
+                    Ok(crate::provider::ProviderEvent::Finished { .. }) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            collected
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(2), drain).await {
+            Ok(raw) => raw,
+            Err(_) => String::new(),
+        }
+    }
+
+    /// Store the derived name — but only if the session still has no name of its own. The store
+    /// re-checks provenance in its `WHERE`, so a rename that landed while the model was answering
+    /// wins: this returns quietly and the operator's title survives.
+    pub(crate) fn apply_derived_title(
+        self: &Arc<Self>,
+        session: &Arc<SessionRuntime>,
+        title: &str,
+    ) {
+        if !session.accepts_derived_title() {
+            return;
+        }
+        let now = now_ms();
+        match self.store.set_session_auto_title(&session.id, title, now) {
+            Ok(true) => {
+                session.set_title(title, now);
+                session.set_title_source(vikram_store::TITLE_AUTO);
+                session.set_title_status(vikram_store::TITLE_READY);
+                self.publish_session(session);
+            }
+            Ok(false) => {
+                session.set_title_source(vikram_store::TITLE_MANUAL);
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// The cheap model used for naming, if one is configured. Naming a session is not worth the
+    /// price of the reasoning model the operator is chatting with.
+    fn title_model(&self) -> String {
+        if !self.config.title_model.trim().is_empty() {
+            return self.config.title_model.trim().to_owned();
+        }
+        self.model()
+    }
+}
+
 impl Runtime {
     pub async fn start(config: Config) -> Result<Self> {
         Self::boot(config, None).await
@@ -434,11 +1059,16 @@ impl Runtime {
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let workspace_root = std::fs::canonicalize(&workspace_root).unwrap_or(workspace_root);
+        let mut rules = RuleBook::open();
+        rules.set_workspace_root(Some(workspace_root.clone()));
 
-        let context = Arc::new(crate::context::ContextLoader::new(
-            crate::config::vikram_home(),
-            workspace_root.clone(),
-        ));
+        let context = Arc::new(
+            crate::context::ContextLoader::new(
+                crate::config::vikram_home(),
+                workspace_root.clone(),
+            )
+            .with_budget(config.context.project_budget_tokens),
+        );
 
         let hive = crate::HiveManager::new(std::sync::Arc::new(store.clone()));
         let tickets = crate::TicketManager::new(std::sync::Arc::new(store.clone()));
@@ -460,7 +1090,7 @@ impl Runtime {
                 .map(|p| Arc::new(p) as Arc<dyn Provider>),
         };
 
-        let mcp = McpRegistry::load(McpConfig::load());
+        let mcp = McpRegistry::load(McpConfig::load().into_specs());
         let plugins = PluginRegistry::from_default_dir();
         let skills = std::sync::Mutex::new(SkillRegistry::for_workspace(&workspace_root));
         let evolution_skills_root = crate::config::vikram_home().join("skills");
@@ -515,11 +1145,12 @@ impl Runtime {
             mode: Mutex::new(mode),
             model: Mutex::new(model_name),
             availability,
-            rules: Mutex::new(RuleBook::open()),
+            rules: Mutex::new(rules),
             workspace_root,
             started_ms: now_ms(),
             last_turn_ms: Mutex::new(None),
             last_tokens_per_sec: Mutex::new(None),
+            review_tasks: Arc::new(AtomicU64::new(0)),
         });
 
         // Rehydrate durable sessions. Journal replay restores the conversation without re-applying
@@ -530,16 +1161,16 @@ impl Runtime {
             .map_err(|e| RuntimeError::Store(e.to_string()))?;
         for row in rows {
             let session = Arc::new(SessionRuntime::from_row(row));
+            if let Ok(Some((parent, depth))) = inner.store.session_lineage(&session.id) {
+                session.set_parent(Some(parent));
+                session.set_depth(depth);
+            }
             if let Ok(records) = inner.store.replay_messages(&session.id) {
-                let mut messages = Vec::new();
-                for record in records {
-                    if record.kind == RecordKind::Message
-                        && let Some(message) = record.payload.get("message")
-                        && let Ok(message) = serde_json::from_value::<Message>(message.clone())
-                    {
-                        messages.push(message);
-                    }
-                }
+                let messages = crate::compaction::project_from_journal(
+                    records
+                        .into_iter()
+                        .map(|record| (record.seq, record.kind, record.payload)),
+                );
                 *session.messages.lock().expect("messages lock") = messages;
             }
             inner.sessions.lock().expect("sessions lock").push(session);
@@ -658,197 +1289,27 @@ impl RuntimeHandle {
         &self.inner.learning
     }
 
+    /// Whether the runtime is still working out what a finished turn taught it.
+    pub fn learning_busy(&self) -> bool {
+        self.inner.review_tasks.load(Ordering::SeqCst) > 0
+    }
+
+    /// Wait for in-flight learning to land, up to the deadline; `true` means it settled. The result
+    /// is staged either way — this only decides whether the caller sees it before exiting.
+    pub async fn wait_for_learning(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.learning_busy() {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        true
+    }
+
     pub fn trigger_learning_review(&self, session: &SessionId, snapshot_text: &str) {
-        let inner = Arc::clone(&self.inner);
-        let session = session.clone();
-        let snapshot = snapshot_text.to_owned();
-        tokio::spawn(async move {
-            if inner.learning.policy_memory() == crate::LearningPolicy::Disabled
-                && inner.learning.policy_skill() == crate::LearningPolicy::Disabled
-            {
-                return;
-            }
-            let provider = match inner.provider.read().expect("provider lock").clone() {
-                Some(p) => p,
-                None => return,
-            };
-            let model = inner.model();
-            let prompt = format!(
-                "{}\n\nConversation:\n{}",
-                inner.learning.review_prompt(),
-                snapshot
-            );
-            let request = crate::provider::CompletionRequest {
-                model,
-                messages: vec![vikram_contracts::Message::user(prompt)],
-                tools: Vec::new(),
-                max_output_tokens: inner.config.max_output_tokens,
-            };
-            use futures_util::StreamExt;
-            let mut stream = provider.stream(request);
-            let mut collected = String::new();
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(crate::provider::ProviderEvent::TextDelta(t)) => collected.push_str(&t),
-                    Ok(crate::provider::ProviderEvent::Finished { .. }) => break,
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-            }
-            let trimmed = collected.trim();
-            if trimmed.is_empty() || trimmed == "Nothing to save." {
-                return;
-            }
-            let json_str = if trimmed.starts_with("```") {
-                trimmed
-                    .trim_start_matches("```json")
-                    .trim_start_matches("```")
-                    .trim_end_matches("```")
-                    .trim()
-            } else {
-                trimmed
-            };
-            let proposals: Vec<serde_json::Value> = match serde_json::from_str(json_str) {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            for p in proposals {
-                let kind = p
-                    .get("kind")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("memory")
-                    .to_owned();
-                let target = p
-                    .get("target")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("memory")
-                    .to_owned();
-                let action = p
-                    .get("action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("add")
-                    .to_owned();
-                let key = p
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_owned();
-                let content = p
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_owned();
-                let reason = p
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_owned();
-                if content.trim().is_empty() {
-                    continue;
-                }
-                if kind == "memory" {
-                    let scope = if target == "user" {
-                        "user".to_owned()
-                    } else {
-                        "memory".to_owned()
-                    };
-                    let existing = inner.memory.list(&scope);
-                    let existing_contents: Vec<String> =
-                        existing.iter().map(|(_, v)| v.clone()).collect();
-                    if inner.learning.dedup_memory(&existing_contents, &content) {
-                        continue;
-                    }
-                    let policy = inner.learning.policy_memory();
-                    if policy == crate::LearningPolicy::Auto {
-                        let _ = inner.memory.save(&key, &content, &scope);
-                        inner.learning.audit(crate::learning::LearningAuditEntry {
-                            ts_ms: crate::types::now_ms(),
-                            session: session.clone(),
-                            kind: kind.clone(),
-                            action: action.clone(),
-                            target: target.clone(),
-                            outcome: "applied".to_owned(),
-                            detail: reason.clone(),
-                        });
-                    } else if policy == crate::LearningPolicy::ApprovalRequired
-                        || policy == crate::LearningPolicy::SuggestOnly
-                    {
-                        inner
-                            .learning
-                            .stage_proposal(crate::learning::LearningProposal {
-                                id: format!("lrn-{}", crate::types::now_ms()),
-                                session: session.clone(),
-                                kind: kind.clone(),
-                                target: target.clone(),
-                                action: action.clone(),
-                                key: key.clone(),
-                                content: content.clone(),
-                                reason: reason.clone(),
-                                status: "pending".to_owned(),
-                                created_ms: crate::types::now_ms(),
-                                before: None,
-                                after: Some(content.clone()),
-                            });
-                        inner.learning.audit(crate::learning::LearningAuditEntry {
-                            ts_ms: crate::types::now_ms(),
-                            session: session.clone(),
-                            kind: kind.clone(),
-                            action: action.clone(),
-                            target: target.clone(),
-                            outcome: "staged".to_owned(),
-                            detail: reason.clone(),
-                        });
-                    }
-                } else if kind == "skill" {
-                    let policy = inner.learning.policy_skill();
-                    if policy == crate::LearningPolicy::Auto {
-                        let mgr = vikram_skills::Manager::new();
-                        let name = if target.is_empty() {
-                            "learned-skill"
-                        } else {
-                            &target
-                        };
-                        let _ = mgr.create(name, &reason, &content);
-                        inner.learning.audit(crate::learning::LearningAuditEntry {
-                            ts_ms: crate::types::now_ms(),
-                            session: session.clone(),
-                            kind: kind.clone(),
-                            action: action.clone(),
-                            target: target.clone(),
-                            outcome: "applied".to_owned(),
-                            detail: reason.clone(),
-                        });
-                    } else {
-                        inner
-                            .learning
-                            .stage_proposal(crate::learning::LearningProposal {
-                                id: format!("lrn-{}", crate::types::now_ms()),
-                                session: session.clone(),
-                                kind: kind.clone(),
-                                target: target.clone(),
-                                action: action.clone(),
-                                key: key.clone(),
-                                content: content.clone(),
-                                reason: reason.clone(),
-                                status: "pending".to_owned(),
-                                created_ms: crate::types::now_ms(),
-                                before: None,
-                                after: Some(content.clone()),
-                            });
-                        inner.learning.audit(crate::learning::LearningAuditEntry {
-                            ts_ms: crate::types::now_ms(),
-                            session: session.clone(),
-                            kind: kind.clone(),
-                            action: action.clone(),
-                            target: target.clone(),
-                            outcome: "staged".to_owned(),
-                            detail: reason.clone(),
-                        });
-                    }
-                }
-            }
-            inner.learning.save();
-        });
+        self.inner
+            .spawn_learning_review(session.clone(), snapshot_text.to_owned());
     }
 
     pub fn tools(&self) -> &crate::tools::ToolRegistry {
@@ -1194,22 +1655,77 @@ impl RuntimeHandle {
         Ok(())
     }
 
+    /// Fold this conversation now. `/compact`.
+    pub fn compact_now(&self, session: &SessionId) -> Result<crate::compaction::CompactionReport> {
+        if self.inner.session(session).is_none() {
+            return Err(RuntimeError::SessionNotFound(session.clone()));
+        }
+        self.inner
+            .compact_now(session)
+            .ok_or_else(|| RuntimeError::InvalidState("nothing to fold: the span is shorter than the minimum this policy allows, or an earlier fold already covered it".into()))
+            .inspect(|_| self.inner.publish_metrics())
+    }
+
     pub fn create_session(&self, title: Option<String>) -> Result<SessionId> {
         let session = self.inner.create_session(title)?;
         self.inner.publish_metrics();
         Ok(session.id.clone())
     }
 
+    /// Name a session by hand. This is the operator's own title and it is permanent: provenance
+    /// moves to `manual`, and automatic naming is barred from this session from here on — including
+    /// after a restart, because the flag is stored with the row. An empty title is refused rather
+    /// than silently reverting to a placeholder.
     pub fn rename_session(&self, session: &SessionId, title: String) -> Result<()> {
         let Some(session) = self.inner.session(session) else {
             return Err(RuntimeError::SessionNotFound(session.clone()));
         };
+        let title = titling::clip(title.trim(), titling::MAX_TITLE_CHARS);
+        if title.chars().filter(|c| !c.is_whitespace()).count() < 2 {
+            return Err(RuntimeError::InvalidState(
+                "a session title needs at least two characters".into(),
+            ));
+        }
         session.set_title(&title, now_ms());
+        session.set_title_source(vikram_store::TITLE_MANUAL);
+        session.set_title_status(vikram_store::TITLE_READY);
         self.inner
             .store
             .rename_session(&session.id, &title, now_ms())
             .map_err(|e| RuntimeError::Store(e.to_string()))?;
         self.inner.publish_session(&session);
+        Ok(())
+    }
+
+    /// Throw away the current name and derive a fresh one from the conversation. `/retitle`.
+    ///
+    /// `force` is what makes this usable on a session the operator renamed earlier: it clears the
+    /// `manual` bar, because asking for a regenerated title *is* the consent to let naming write
+    /// again. Without it this only works on sessions that never got a name.
+    pub fn retitle_session(&self, session: &SessionId, force: bool) -> Result<()> {
+        let Some(session) = self.inner.session(session) else {
+            return Err(RuntimeError::SessionNotFound(session.clone()));
+        };
+        if !force && !session.accepts_derived_title() {
+            return Err(RuntimeError::InvalidState(
+                "this title was set by hand; renaming is how you change it".into(),
+            ));
+        }
+        let Some(seed) = titling::seed(&session.messages()) else {
+            return Err(RuntimeError::InvalidState(
+                "nothing to name this session after yet".into(),
+            ));
+        };
+        session.set_title_source(vikram_store::TITLE_GENERIC);
+        session.set_title_status(vikram_store::TITLE_PENDING);
+        session.release_titling();
+        self.inner
+            .store
+            .mark_session_title_pending(&session.id, vikram_store::TITLE_GENERIC)
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        self.inner.publish_session(&session);
+        session.claim_titling();
+        self.inner.spawn_titling(session, seed);
         Ok(())
     }
 
@@ -1237,21 +1753,60 @@ impl RuntimeHandle {
         let Some(agent) = self.inner.agents.get(&profile) else {
             return Err(RuntimeError::AgentNotFound(profile.to_string()));
         };
-        let Some(_parent) = self.inner.session(&session) else {
+        let Some(parent) = self.inner.session(&session) else {
             return Err(RuntimeError::SessionNotFound(session));
         };
-        let title = format!("{} · {}", agent.profile.name, truncate(&task, 28));
+        // The floor already refuses a Delegate *action* past the limit; this refuses the spawn
+        // itself, so a deep chain cannot be built by a path that skipped the gate.
+        let depth = parent.depth() + 1;
+        let limit = self.inner.policy().max_delegation_depth();
+        if depth > limit {
+            return Err(RuntimeError::InvalidState(format!(
+                "delegation depth {depth} exceeds the limit of {limit}"
+            )));
+        }
+        // A delegated session is named for the agent that owns it and the work it was given, so the
+        // tab reads "Arun — Security Review". The identity stays in the label because two bots
+        // working on the same task must never look like one session.
+        let subject = titling::sanitize(&titling::fallback(&task))
+            .unwrap_or_else(|| titling::clip(&task, 28));
+        let title = format!("{} — {}", agent.profile.name, subject);
         let agent_session = self.inner.create_session(Some(title))?;
         agent_session.set_agent(Some(profile.clone()), now_ms());
+        agent_session.set_parent(Some(parent.id.clone()));
+        agent_session.set_depth(depth);
         let _ = self
             .inner
             .store
             .set_session_agent(&agent_session.id, Some(&profile), now_ms());
+        self.inner
+            .store
+            .set_session_lineage(&agent_session.id, Some(&parent.id), depth)?;
+        // What crosses the boundary is a brief, not the parent's transcript: the live instruction
+        // plus the decisions, files and open errors, inside the delegation budget.
+        let brief = crate::compaction::delegation_brief(
+            &agent_session.estimator(),
+            &parent.messages(),
+            self.inner.config.context.delegation_budget_tokens,
+        );
+        if let Some(brief) = brief {
+            let message = vikram_contracts::Message::text(
+                vikram_contracts::Role::System,
+                brief,
+                vikram_contracts::Trust::Host,
+            );
+            agent_session.push_message(message.clone(), now_ms());
+            self.inner.journal(
+                &agent_session.id,
+                RecordKind::Message,
+                serde_json::json!({"message": message}),
+            );
+        }
         agent.set_task(Some(task.clone()));
         agent.set_state(AgentState::Thinking);
         agent.set_session(Some(agent_session.id.clone()));
         *agent.paused.lock().expect("pause") = false;
-        *agent.cancel.lock().expect("cancel") = vikram_kernel::CancellationToken::new();
+        *agent.cancel.lock().expect("cancel") = vikram_contracts::CancellationToken::new();
         let bg = self.inner.tasks.start(
             format!("agent: {}", agent.profile.name),
             agent_session.id.clone(),
@@ -1946,11 +2501,27 @@ impl RuntimeHandle {
         ) -> String {
             let ctx = inner.context.load_agent_or_bot(ent);
             let system_text = ctx.render();
+            // A hive turn is shared context, and authorising a share is not the same as emptying
+            // the log into the prompt: the participant answers from the most recent exchange that
+            // fits its budget, and nothing it was not party to.
+            let budget_tokens = inner.config.context.hive_budget_tokens;
+            let estimator = crate::context_engine::TokenEstimator::default();
+            let mut spent = estimator.estimate_text(&system_text);
+            let mut kept: Vec<&vikram_store::HiveMessageRow> = Vec::new();
+            for m in msgs.iter().rev() {
+                let cost = estimator.estimate_text(&m.content) + 4;
+                if !kept.is_empty() && spent + cost > budget_tokens {
+                    break;
+                }
+                spent += cost;
+                kept.push(m);
+            }
+            kept.reverse();
             let mut request_messages: Vec<vikram_contracts::Message> = Vec::new();
             if !system_text.trim().is_empty() {
                 request_messages.push(vikram_contracts::Message::system(system_text));
             }
-            for m in msgs {
+            for m in kept {
                 let role = if m.sender == ent.name || m.sender == ent.slug {
                     vikram_contracts::Role::Assistant
                 } else {
@@ -2045,7 +2616,7 @@ impl RuntimeHandle {
             .map_err(|e| RuntimeError::Store(e.to_string()))
     }
 
-    pub fn memory_search<Q, S>(&self, query: Q, scope: S) -> Vec<(String, String)>
+    pub fn memory_search<Q, S>(&self, query: Q, scope: S) -> Result<Vec<(String, String)>>
     where
         Q: AsRef<str>,
         S: AsRef<str>,
@@ -2053,7 +2624,7 @@ impl RuntimeHandle {
         self.inner.memory.search(query, scope)
     }
 
-    pub fn memory_list<S>(&self, scope: S) -> Vec<(String, String)>
+    pub fn memory_list<S>(&self, scope: S) -> Result<Vec<(String, String)>>
     where
         S: AsRef<str>,
     {
@@ -2062,7 +2633,7 @@ impl RuntimeHandle {
 
     /// Every remembered key, as `(scope, key, value)`. The panel lists them all because a scope the
     /// operator cannot see is a scope they cannot ask about.
-    pub fn memory_list_all(&self) -> Vec<(String, String, String)> {
+    pub fn memory_list_all(&self) -> Result<Vec<(String, String, String)>> {
         self.inner.memory.list_all()
     }
 
@@ -2170,14 +2741,6 @@ impl RuntimeHandle {
         }
         self.inner.emit(RuntimeEvent::Shutdown);
     }
-}
-
-fn truncate(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_owned();
-    }
-    let cut: String = text.chars().take(limit.saturating_sub(1)).collect();
-    format!("{cut}…")
 }
 
 #[cfg(test)]
@@ -2376,10 +2939,11 @@ mod tests {
             .set_mode(&session, PermissionMode::AllowList)
             .unwrap();
 
+        let read_target = format!("{}/hosts", dir.path().display());
         let read = PermissionRequest::new(
             ActionKind::Read,
             "fs.read",
-            "/etc/hosts",
+            &read_target,
             SideEffect::None,
             Trust::Model,
         );
@@ -2396,6 +2960,51 @@ mod tests {
         assert!(
             inner.judge(&read).is_allowed(),
             "keeping the approval ends the prompt"
+        );
+    }
+
+    /// The invariant the retired kernel enforced at issue time (`ApprovalBroker::issue` refused a
+    /// policy-side auto-approval): a decision nobody was asked about cannot become a saved
+    /// permission, and an approval id nobody was given cannot be answered at all.
+    #[tokio::test]
+    async fn a_decision_the_runtime_made_alone_saves_no_permission() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let session = handle.create_session(Some("unasked".into())).unwrap();
+        handle
+            .set_mode(&session, PermissionMode::Yolo)
+            .expect("yolo is available here");
+
+        let command = PermissionRequest::new(
+            ActionKind::Execute,
+            "shell.run",
+            "cargo test",
+            SideEffect::LocalMutation,
+            Trust::Model,
+        );
+        assert!(
+            handle.inner.judge(&command).is_allowed(),
+            "the posture resolves it without asking"
+        );
+        assert!(
+            handle.snapshot().approvals.is_empty(),
+            "and nothing becomes pending: an auto-approval is not an approval"
+        );
+
+        let forged = vikram_contracts::ApprovalId::generate();
+        let err = handle
+            .answer_approval(&forged, true, true)
+            .expect_err("an id that was never issued cannot be answered");
+        assert!(
+            err.to_string().contains("no longer pending"),
+            "the refusal says why: {err}"
+        );
+        assert!(
+            handle.allow_list().is_empty(),
+            "the allow-list is unchanged: {:?}",
+            handle.allow_list()
         );
     }
 
@@ -2899,5 +3508,451 @@ mod tests {
             "the saved rule lets the next one through"
         );
         assert_eq!(rec.approvals.len(), 1, "and it does not ask again");
+    }
+
+    /// A provider that answers every request with the same text. Naming races the turn for the
+    /// provider, so a script popping one batch per call would only prove whichever request won.
+    /// A constant answer proves the naming path whatever the order, and `asked()` shows what was
+    /// actually put in front of the model.
+    struct NamingProvider {
+        answer: String,
+        requests: Mutex<Vec<Vec<Message>>>,
+    }
+
+    impl NamingProvider {
+        fn new(answer: &str) -> Arc<Self> {
+            Arc::new(Self {
+                answer: answer.to_owned(),
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn asked(&self) -> Vec<Vec<Message>> {
+            self.requests.lock().expect("requests lock").clone()
+        }
+
+        /// Whether naming itself was ever asked — the turn's own request is not a naming call.
+        fn named(&self) -> bool {
+            self.naming_calls() > 0
+        }
+
+        /// How many times the model was asked to name a session.
+        fn naming_calls(&self) -> usize {
+            self.asked()
+                .iter()
+                .filter(|msgs| {
+                    msgs.iter()
+                        .any(|m| m.text_body().contains("Write a short title"))
+                })
+                .count()
+        }
+    }
+
+    impl Provider for NamingProvider {
+        fn name(&self) -> &str {
+            "naming"
+        }
+
+        fn model(&self) -> &str {
+            "test-model"
+        }
+
+        fn context_window(&self) -> Option<u64> {
+            Some(8192)
+        }
+
+        fn stream(
+            &self,
+            request: crate::provider::CompletionRequest,
+        ) -> crate::provider::ProviderStream {
+            self.requests
+                .lock()
+                .expect("requests lock")
+                .push(request.messages);
+            let events = vec![
+                crate::provider::ProviderEvent::TextDelta(self.answer.clone()),
+                crate::provider::ProviderEvent::Finished {
+                    input_tokens: None,
+                    output_tokens: Some(1),
+                },
+            ];
+            Box::pin(futures_util::stream::iter(
+                events
+                    .into_iter()
+                    .map(Ok::<_, vikram_contracts::VikramError>),
+            ))
+        }
+    }
+
+    fn title_of(handle: &RuntimeHandle, id: &SessionId) -> (String, String, String) {
+        let view = handle
+            .snapshot()
+            .sessions
+            .iter()
+            .find(|s| s.id == *id)
+            .expect("session is in the snapshot")
+            .clone();
+        (view.title, view.title_source, view.title_status)
+    }
+
+    /// Wait until a submitted turn has genuinely run: the model answered, the turn closed, and no
+    /// background naming task is still outstanding. Waiting on the task counter alone is not enough —
+    /// it reads zero before the turn has even been scheduled, so a test could assert against a state
+    /// the runtime had not reached yet and pass for the wrong reason.
+    async fn settle(handle: &RuntimeHandle, id: &SessionId, answers: usize) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let view = handle
+                .snapshot()
+                .sessions
+                .iter()
+                .find(|s| s.id == *id)
+                .cloned()
+                .expect("session is in the snapshot");
+            let answered = view
+                .messages
+                .iter()
+                .filter(|m| matches!(m.role, vikram_contracts::Role::Assistant))
+                .count();
+            let closed = matches!(
+                view.turn,
+                crate::types::TurnState::Idle
+                    | crate::types::TurnState::Failed
+                    | crate::types::TurnState::Cancelled
+            );
+            // A turn that could not reach a model at all leaves no reply behind, so its own end
+            // state has to count as finished.
+            let turned = answered >= answers
+                || matches!(
+                    view.turn,
+                    crate::types::TurnState::Failed | crate::types::TurnState::Cancelled
+                );
+            if turned && closed && !handle.learning_busy() {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the turn never settled for {id}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn named_runtime(dir: &std::path::Path, answer: &str) -> (Runtime, Arc<NamingProvider>) {
+        let provider = NamingProvider::new(answer);
+        let runtime = Runtime::start_with_provider(
+            config_for(dir),
+            Arc::clone(&provider) as Arc<dyn Provider>,
+        )
+        .await
+        .expect("runtime boots with the naming provider");
+        (runtime, provider)
+    }
+
+    #[tokio::test]
+    async fn a_new_session_is_anonymous_and_awaits_its_first_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let (runtime, _provider) = named_runtime(dir.path(), "Rust JWT Authentication").await;
+        let handle = runtime.handle();
+        let id = handle.create_session(None).unwrap();
+        let (title, source, status) = title_of(&handle, &id);
+        assert_eq!(
+            title,
+            titling::NEW_SESSION,
+            "a brand new session is a placeholder"
+        );
+        assert_eq!(source, vikram_store::TITLE_GENERIC);
+        assert_eq!(status, vikram_store::TITLE_PENDING);
+    }
+
+    #[tokio::test]
+    async fn the_first_real_message_earns_a_title_and_it_is_written_to_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let (runtime, provider) = named_runtime(dir.path(), "Rust JWT Authentication").await;
+        let handle = runtime.handle();
+        let id = handle.create_session(None).unwrap();
+        handle
+            .submit(&id, "build jwt authentication in rust".into())
+            .unwrap();
+        settle(&handle, &id, 1).await;
+        let (title, source, status) = title_of(&handle, &id);
+        assert_eq!(title, "Rust JWT Authentication");
+        assert_eq!(source, vikram_store::TITLE_AUTO);
+        assert_eq!(status, vikram_store::TITLE_READY);
+        assert!(provider.named(), "the model was asked to name the session");
+
+        // Durable: the same name is what a fresh reader of the database finds.
+        let store = vikram_store::Store::open(&database_path()).unwrap();
+        let row = store.get_session(&id).unwrap().expect("session row");
+        assert_eq!(row.title, "Rust JWT Authentication");
+        assert_eq!(row.title_source, vikram_store::TITLE_AUTO);
+    }
+
+    #[tokio::test]
+    async fn a_greeting_names_nothing_and_leaves_the_session_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let (runtime, provider) = named_runtime(dir.path(), "Login Page Bug Fix").await;
+        let handle = runtime.handle();
+        let id = handle.create_session(None).unwrap();
+        handle.submit(&id, "hi".into()).unwrap();
+        settle(&handle, &id, 1).await;
+        let (title, _, status) = title_of(&handle, &id);
+        assert_eq!(title, titling::NEW_SESSION, "\"hi\" is not a topic");
+        assert_eq!(status, vikram_store::TITLE_PENDING);
+        assert!(
+            !provider.named(),
+            "no model request spent naming a greeting"
+        );
+
+        // The attempt was handed back, so the next message still names it.
+        handle
+            .submit(&id, "fix the login page after deploy".into())
+            .unwrap();
+        settle(&handle, &id, 2).await;
+        assert_eq!(title_of(&handle, &id).0, "Login Page Bug Fix");
+    }
+
+    #[tokio::test]
+    async fn continuing_the_conversation_does_not_rename_it_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let (runtime, provider) = named_runtime(dir.path(), "Rust JWT Authentication").await;
+        let handle = runtime.handle();
+        let id = handle.create_session(None).unwrap();
+        handle
+            .submit(&id, "build jwt authentication in rust".into())
+            .unwrap();
+        settle(&handle, &id, 1).await;
+        assert_eq!(title_of(&handle, &id).0, "Rust JWT Authentication");
+
+        let naming_calls = provider.naming_calls();
+        for (turn, message) in ["now add refresh tokens", "and write tests for it"]
+            .iter()
+            .enumerate()
+        {
+            handle.submit(&id, (*message).into()).unwrap();
+            settle(&handle, &id, turn + 2).await;
+        }
+        assert_eq!(
+            title_of(&handle, &id).0,
+            "Rust JWT Authentication",
+            "the title is derived once, not on every message"
+        );
+        assert_eq!(
+            provider.naming_calls(),
+            naming_calls,
+            "the two extra turns asked for answers, never for another title"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_title_the_operator_chose_is_never_replaced_by_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let (runtime, provider) = named_runtime(dir.path(), "Rust JWT Authentication").await;
+        let handle = runtime.handle();
+        let id = handle.create_session(None).unwrap();
+        handle
+            .rename_session(&id, "Auth sprint — week 3".into())
+            .unwrap();
+        assert_eq!(title_of(&handle, &id).1, vikram_store::TITLE_MANUAL);
+
+        handle
+            .submit(&id, "build jwt authentication in rust".into())
+            .unwrap();
+        settle(&handle, &id, 1).await;
+
+        let (title, source, _) = title_of(&handle, &id);
+        assert_eq!(
+            title, "Auth sprint — week 3",
+            "a human's title outranks the model's"
+        );
+        assert_eq!(source, vikram_store::TITLE_MANUAL);
+        assert!(!provider.named(), "and it is not even asked for");
+
+        // The bar is stored, not just remembered: a fresh store read still says manual.
+        let store = vikram_store::Store::open(&database_path()).unwrap();
+        assert_eq!(
+            store.get_session(&id).unwrap().unwrap().title_source,
+            vikram_store::TITLE_MANUAL
+        );
+    }
+
+    #[tokio::test]
+    async fn renaming_to_nothing_is_refused_instead_of_reverting_to_a_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let (runtime, _) = named_runtime(dir.path(), "Rust JWT Authentication").await;
+        let handle = runtime.handle();
+        let id = handle.create_session(None).unwrap();
+        assert!(
+            handle.rename_session(&id, "   ".into()).is_err(),
+            "an empty rename cannot silently un-name a session"
+        );
+        assert_eq!(title_of(&handle, &id).0, titling::NEW_SESSION);
+    }
+
+    #[tokio::test]
+    async fn retitle_asks_for_a_fresh_name_and_refuses_a_untitled_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let (runtime, provider) = named_runtime(dir.path(), "Hermes Self-Evolution").await;
+        let handle = runtime.handle();
+        let id = handle.create_session(None).unwrap();
+
+        // Nothing to name it after yet.
+        assert!(
+            handle.retitle_session(&id, true).is_err(),
+            "an empty conversation cannot be retitled"
+        );
+
+        handle
+            .submit(&id, "research hermes self evolution".into())
+            .unwrap();
+        settle(&handle, &id, 1).await;
+        assert_eq!(title_of(&handle, &id).0, "Hermes Self-Evolution");
+
+        // A hand-written title is protected until the operator explicitly hands it back.
+        handle.rename_session(&id, "My research".into()).unwrap();
+        assert!(
+            handle.retitle_session(&id, false).is_err(),
+            "regenerating over a manual title needs the explicit opt-in"
+        );
+        handle.retitle_session(&id, true).unwrap();
+        settle(&handle, &id, 1).await;
+        assert_eq!(
+            title_of(&handle, &id).0,
+            "Hermes Self-Evolution",
+            "with consent, naming runs again"
+        );
+        assert!(provider.named());
+    }
+
+    #[tokio::test]
+    async fn with_no_model_the_session_is_still_named_from_its_own_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        // No provider configured at all: this is the offline path, and it must not leave
+        // "Session 7" behind.
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let id = handle.create_session(None).unwrap();
+        handle
+            .submit(&id, "build a minecraft hosting website with prices".into())
+            .unwrap();
+        settle(&handle, &id, 1).await;
+        let (title, source, _) = title_of(&handle, &id);
+        assert!(!titling::is_placeholder(&title), "got {title:?}");
+        assert!(
+            title.to_lowercase().contains("minecraft"),
+            "the fallback still says what the session is about: {title:?}"
+        );
+        assert_eq!(source, vikram_store::TITLE_AUTO);
+    }
+
+    #[tokio::test]
+    async fn a_model_that_ignores_the_instructions_is_not_stored_as_a_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        // The model answered with exactly the kind of nothing the prompt forbids.
+        let (runtime, _) = named_runtime(dir.path(), "General Chat").await;
+        let handle = runtime.handle();
+        let id = handle.create_session(None).unwrap();
+        handle
+            .submit(&id, "compare AI coding agents".into())
+            .unwrap();
+        settle(&handle, &id, 1).await;
+        let (title, _, status) = title_of(&handle, &id);
+        assert_ne!(title, "General Chat", "a forbidden title is refused");
+        assert!(!titling::is_placeholder(&title));
+        assert_eq!(status, vikram_store::TITLE_READY, "the fallback named it");
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_never_renumbers_or_renames_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let (runtime, _) = named_runtime(dir.path(), "Rust JWT Authentication").await;
+        let handle = runtime.handle();
+        let first = handle.create_session(Some("Alpha work".into())).unwrap();
+        let second = handle.create_session(Some("Beta work".into())).unwrap();
+        let third = handle.create_session(Some("Gamma work".into())).unwrap();
+
+        handle.close_session(&second).unwrap();
+
+        let titles: Vec<(String, String)> = handle
+            .snapshot()
+            .sessions
+            .iter()
+            .map(|s| (s.title.clone(), s.id.to_string()))
+            .collect();
+        assert!(
+            !titles.iter().any(|(_, id)| *id == second.to_string()),
+            "the closed session left the list"
+        );
+        // The runtime opens a session of its own at boot, so the survivors are looked up by the
+        // identity they were given rather than counted.
+        for (id, title) in [(&first, "Alpha work"), (&third, "Gamma work")] {
+            assert_eq!(
+                titles
+                    .iter()
+                    .find(|(_, listed)| *listed == id.to_string())
+                    .map(|(title, _)| title.clone()),
+                Some(title.to_owned()),
+                "closing a different session never moves this one's name or id"
+            );
+        }
+
+        // A session made after the deletion does not inherit the freed slot's name.
+        let fourth = handle.create_session(None).unwrap();
+        assert_eq!(title_of(&handle, &fourth).0, titling::NEW_SESSION);
+        assert_ne!(fourth, second, "an identity is never handed out twice");
+    }
+
+    #[tokio::test]
+    async fn titles_and_provenance_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let (runtime, _) = named_runtime(dir.path(), "Minecraft Hosting Website").await;
+        let handle = runtime.handle();
+        let auto = handle.create_session(None).unwrap();
+        handle
+            .submit(
+                &auto,
+                "i need a site for my minecraft server hosting".into(),
+            )
+            .unwrap();
+        settle(&handle, &auto, 1).await;
+        let manual = handle.create_session(None).unwrap();
+        handle
+            .rename_session(&manual, "Quarterly review".into())
+            .unwrap();
+        drop(runtime);
+
+        // Reopen the same home exactly the way a fresh `vikram` process does.
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let sessions = handle.snapshot().sessions;
+        let reopened_auto = sessions
+            .iter()
+            .find(|s| s.id == auto)
+            .expect("auto session restored");
+        let reopened_manual = sessions
+            .iter()
+            .find(|s| s.id == manual)
+            .expect("manual session restored");
+        assert_eq!(reopened_auto.title, "Minecraft Hosting Website");
+        assert_eq!(reopened_auto.title_source, vikram_store::TITLE_AUTO);
+        assert_eq!(reopened_manual.title, "Quarterly review");
+        assert_eq!(reopened_manual.title_source, vikram_store::TITLE_MANUAL);
+
+        // And the restored manual title is still protected from naming.
+        handle
+            .submit(&manual, "more messages about something else".into())
+            .unwrap();
+        settle(&handle, &manual, 1).await;
+        assert_eq!(title_of(&handle, &manual).0, "Quarterly review");
     }
 }

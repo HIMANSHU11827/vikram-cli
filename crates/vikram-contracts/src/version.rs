@@ -54,10 +54,8 @@ pub trait Versioned {
     fn contract(&self) -> ContractDecl;
 }
 
-pub const KERNEL_LIFECYCLE: &str = "vikram.kernel.lifecycle";
 pub const JOURNAL_SINK: &str = "vikram.store.journal";
 pub const POLICY_EVALUATOR: &str = "vikram.policy.evaluator";
-pub const EFFECT_HANDLER: &str = "vikram.runtime.effects";
 pub const MEMORY_STORE: &str = "vikram.memory.store";
 pub const MODEL_PROVIDER: &str = "vikram.model.provider";
 pub const TOOL_EXECUTOR: &str = "vikram.tool.executor";

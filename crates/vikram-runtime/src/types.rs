@@ -6,10 +6,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
+use vikram_contracts::TokenMeter;
 use vikram_contracts::{
     AgentId, ApprovalId, Message, PermissionMode, ProjectId, SessionId, TeamId, ToolCallId, TurnId,
 };
-use vikram_kernel::TokenMeter;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeStatus {
@@ -43,6 +43,18 @@ pub struct Metrics {
     pub provider: Option<String>,
     pub context_used: u64,
     pub context_window: Option<u64>,
+    /// True when `context_used` rests on provider-reported usage rather than the estimator.
+    #[serde(default)]
+    pub context_measured: bool,
+    /// True when no source advertised a window and a conservative floor is being assumed.
+    #[serde(default)]
+    pub context_limit_assumed: bool,
+    /// How many times transcripts have been folded across live sessions.
+    #[serde(default)]
+    pub context_compactions: u64,
+    /// Tokens the budget still allows, after output reserve, overhead and safety margin.
+    #[serde(default)]
+    pub context_usable: u64,
     pub turn_elapsed_ms: Option<u64>,
     pub elapsed_ms: u64,
     pub tokens_per_sec: Option<f64>,
@@ -71,6 +83,39 @@ impl Metrics {
             _ => None,
         }
     }
+}
+
+/// One labelled slice of a request, priced by the same counter that prices the transcript.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextPart {
+    pub label: String,
+    pub tokens: u64,
+}
+
+impl ContextPart {
+    pub fn new(label: impl Into<String>, tokens: u64) -> Self {
+        Self {
+            label: label.into(),
+            tokens,
+        }
+    }
+}
+
+/// Everything the interface needs to say what a context is made of and where the number came from.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextMeter {
+    pub window: u64,
+    pub usable: u64,
+    pub used: u64,
+    /// True when `used` rests on a provider-reported figure for the older part of the transcript.
+    pub measured: bool,
+    /// True when nothing advertised a window and a conservative floor is being assumed.
+    pub limits_assumed: bool,
+    /// Tokens held back for the reply.
+    pub output_reserve: u64,
+    /// The fixed cost of the system parts and tool schemas.
+    pub overhead: u64,
+    pub parts: Vec<ContextPart>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +231,12 @@ pub struct SessionSnapshot {
     pub queued: usize,
     pub project_id: Option<ProjectId>,
     pub status: String,
+    /// `generic`, `auto` or `manual` — how this session got its name, so an interface can tell the
+    /// operator which titles are still the placeholder and whether renaming would stick.
+    pub title_source: String,
+    /// `pending`, `ready` or `failed` for automatic naming. `pending` is what a `generic` title
+    /// carries before the first meaningful message has been named.
+    pub title_status: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -378,6 +429,29 @@ pub enum RuntimeEvent {
     SkillsChanged {
         discovered: usize,
         loaded: usize,
+    },
+    /// The transcript was folded. Reported every time, because a silent compaction is the one an
+    /// operator cannot trust the answer after.
+    ContextCompacted {
+        session: SessionId,
+        folded: usize,
+        kept: usize,
+        before_tokens: u64,
+        after_tokens: u64,
+        /// Journal sequence the folded span reaches, which is where the originals still live.
+        through_seq: u64,
+    },
+    /// A tool result was digested in place rather than folded into a summary.
+    ContextPruned {
+        session: SessionId,
+        replaced: usize,
+        saved_tokens: u64,
+    },
+    /// What actually went into the request that is about to be sent, priced part by part. Published
+    /// once per provider call: the inspector is only honest if it shows the thing being sent.
+    ContextMetered {
+        session: SessionId,
+        meter: ContextMeter,
     },
     /// What the configured endpoint says it serves, read from its own `/models` listing. An endpoint
     /// that will not answer arrives as `error` rather than as an empty list that looks like a reply.

@@ -22,6 +22,9 @@ const FILE: &str = "rules.json";
 pub struct RuleBook {
     path: PathBuf,
     rules: Vec<Rule>,
+    /// The workspace an `allow` may reach. Without it a saved grant is unchecked, so it stays
+    /// `None` only for read-only views of the file.
+    workspace_root: Option<PathBuf>,
     /// Set when the file could not be read or written; the reason the operator needs to see.
     error: Option<String>,
 }
@@ -52,7 +55,12 @@ impl RuleBook {
                 Some(format!("cannot read {}: {err}", path.display())),
             ),
         };
-        Self { path, rules, error }
+        Self {
+            path,
+            rules,
+            workspace_root: None,
+            error,
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -72,6 +80,12 @@ impl RuleBook {
         self.rules.clone()
     }
 
+    /// Point the book at the workspace an `allow` is confined to. Called wherever a rule is about
+    /// to be written; a read-only view does not need it.
+    pub fn set_workspace_root(&mut self, root: Option<PathBuf>) {
+        self.workspace_root = root;
+    }
+
     /// Save one approved amendment. Returns `Ok(false)` when the same rule was already listed.
     pub fn add_amendment(&mut self, text: &str) -> Result<bool> {
         let rule = parse_amendment(text).ok_or_else(|| {
@@ -83,6 +97,15 @@ impl RuleBook {
     }
 
     pub fn add(&mut self, rule: Rule) -> Result<bool> {
+        if let Some(root) = &self.workspace_root {
+            if vikram_policy::allow_reaches_outside(&rule, root) {
+                let resource = rule.resource.to_wire();
+                return Err(RuntimeError::InvalidState(format!(
+                    "`{resource}` is outside the workspace ({})",
+                    root.display()
+                )));
+            }
+        }
         if self.rules.contains(&rule) {
             return Ok(false);
         }
@@ -243,6 +266,30 @@ mod tests {
         assert!(
             !book.path().exists(),
             "a refused save must not touch the file"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_allow_that_reaches_outside_the_workspace_is_not_saved() {
+        let (mut book, dir) = temp_book("containment");
+        book.set_workspace_root(Some(PathBuf::from("/work/proj")));
+        assert!(
+            book.add_amendment("allow write fs.write resource=/work/proj/src/**")
+                .expect("a path inside the workspace is the ordinary case")
+        );
+        for text in [
+            "allow write fs.write resource=/home/other/.ssh/**",
+            "allow write fs.write resource=/work/proj/../elsewhere/**",
+            "allow write fs.write resource=/etc/**",
+        ] {
+            assert!(book.add_amendment(text).is_err(), "{text} must not be kept");
+        }
+        assert_eq!(book.rules().len(), 1, "only the contained entry survived");
+        // A refusal is not a widening, so it stays allowed even for a path outside the workspace.
+        assert!(
+            book.add_amendment("deny write fs.write resource=/home/other/.ssh/**")
+                .expect("a deny is not a grant")
         );
         let _ = std::fs::remove_dir_all(dir);
     }

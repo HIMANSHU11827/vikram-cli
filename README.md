@@ -2,6 +2,9 @@
 
 > A multi-user, multi-entity AI harness in Rust. One binary. Deny-first permissions.
 > Durable SQLite state. Hive teams, bots, sub-agents and a unified Ticket System.
+> Vikram is a personal AI assistant with a real personality — a friend and family member to the user —
+> virtually present, still in active development. Not a robot and not just a CLI; a proper AI assistant
+> person, primarily private to the user while supporting multiple users. Chats politely and clearly.
 
 [![Rust](https://img.shields.io/badge/rust-1.86%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![Edition](https://img.shields.io/badge/edition-2024-blue)]()
@@ -30,10 +33,16 @@
 
 ## What is VIKRAM
 
-VIKRAM is a terminal AI runtime. A single binary (`vikram`) drives an interactive TUI,
-headless chat, and a full set of operator commands. It is **multi-user and multi-entity**:
-humans, a main orchestrator (Vikram), delegated sub-agents, dedicated bots and Hive
-collaborative teams all share one runtime, one permission model and one durable store.
+VIKRAM is a terminal AI runtime and a personal AI assistant with a real personality — a friend and
+family member to the user — virtually present, still in active development. Not a robot and not just
+a CLI; a proper AI assistant person, primarily private to the user while supporting multiple users
+(family and friends). A single binary (`vikram`) drives an interactive TUI, headless chat, and a
+full set of operator commands, usable from the CLI. It is **multi-user and multi-entity**: humans,
+a main orchestrator (Vikram), delegated sub-agents, dedicated bots and Hive collaborative teams all
+share one runtime, one permission model and one durable store. Vikram remembers and understands the
+user, helps with many tasks, and never sugarcoats — honest and direct, like a true friend. It
+chats politely and clearly, like talking with a friend or family member, introduces itself as an
+AI assistant, and keeps a respectful tone in every conversation.
 
 - **Journal-first** execution: append-only event log, idempotent effects, crash-safe.
 - **Deny-first** permissions with a non-widenable mandatory floor.
@@ -116,7 +125,6 @@ User (TUI / CLI / Chat)
 ```
 vikram-contracts  (IDs, messages, policy, journal, trust, versioning, tickets)
    ▲
-   ├── vikram-kernel   (operations, effects, grants, cancellation, token meter)
    ├── vikram-policy   (deny-first, floor, rules, posture)
    └── vikram-store    (SQLite durable state)
          ▲
@@ -189,7 +197,6 @@ Ticket. Discord is an optional external surface; the canonical Ticket stays in V
 | Crate | Role |
 |---|---|
 | `vikram-contracts` | Stable typed contracts (IDs, messages, policy, journal, trust, versioning, tickets) |
-| `vikram-kernel` | Single execution architecture: ordered operations, effects, journal, grants, cancellation |
 | `vikram-policy` | Deny-first permission evaluation with non-widenable mandatory floor |
 | `vikram-store` | Durable SQLite state (sessions, agents, teams, hives, tickets, journal, users, profiles, entities, projects, artifacts, file changes) |
 | `vikram-runtime` | Host: sessions, agents, tasks, teams, hives, tickets, providers, tools, MCP, plugins, skills, memory, context, learning, workspace, sandbox |

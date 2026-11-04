@@ -9,7 +9,6 @@ rust-version.workspace = true
 [dependencies]
 serde_json.workspace = true
 vikram-contracts.workspace = true
-vikram-kernel.workspace = true
 vikram-runtime.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true

@@ -115,6 +115,18 @@ pub async fn run(config: Config, message: String, fresh: bool) -> Result<(), Str
         }
     }
 
+    // The turn is over, but the learning it started may still be running: it spent the tokens the
+    // operator configured, so give it a bounded moment to land rather than dropping it on exit.
+    if handle.learning_busy() {
+        eprintln!("[vikram] finishing what this turn taught…");
+        if !handle
+            .wait_for_learning(std::time::Duration::from_secs(20))
+            .await
+        {
+            eprintln!("[vikram] learning review did not settle in time");
+        }
+    }
+
     if failed {
         Err("turn did not complete".into())
     } else {

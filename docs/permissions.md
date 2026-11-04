@@ -55,12 +55,11 @@ with content; untrusted content cannot grant authority.
 
 - `crates/vikram-contracts/src/policy.rs` — vocabulary.
 - `crates/vikram-policy/src/lib.rs` — evaluator + floor + amendment parsing.
-- `crates/vikram-kernel/src/machine.rs` — kernel dispatch applies posture.
+- `crates/vikram-runtime/src/turn.rs` — turn dispatch applies posture.
 - `crates/vikram-runtime/src/rules.rs` — RuleBook persistence.
 - `crates/vikram-runtime/src/runtime.rs` — `judge()`, `set_mode()`, `allow()`.
 
 ## Tests
 
 - `vikram-policy`: 18 unit tests (deny-first, floor, posture resolution, amendments).
-- `vikram-kernel`: 28 unit tests (dispatch, idempotency, cancellation, posture).
 - `vikram-runtime`: posture/allow-list tests.

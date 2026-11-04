@@ -17,6 +17,7 @@ vikram-skills.workspace = true
 vikram-tui.workspace = true
 vikram-store.workspace = true
 vikram-mcp.workspace = true
+vikram-daemon.workspace = true
 clap.workspace = true
 tokio.workspace = true
 futures-util.workspace = true

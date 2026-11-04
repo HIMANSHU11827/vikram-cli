@@ -1,0 +1,22 @@
+[package]
+name = "vikram-daemon"
+description = "Background runtime for vikram: daemon lifecycle, cron scheduling, heartbeat and workers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vikram-contracts.workspace = true
+vikram-runtime.workspace = true
+vikram-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true

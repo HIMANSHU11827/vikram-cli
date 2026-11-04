@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use vikram_contracts::CancellationToken;
 use vikram_contracts::{AgentId, SessionId};
-use vikram_kernel::CancellationToken;
 use vikram_store::AgentRow;
 
 use crate::types::{

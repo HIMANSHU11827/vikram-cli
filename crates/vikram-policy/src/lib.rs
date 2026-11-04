@@ -9,6 +9,7 @@
 //!    then the runtime's built-in defaults for whatever none of them matched. An allow-list entry
 //!    has to be able to end a prompt, which it could not do as one rule among defaults that ask.
 
+use std::path::Path;
 use vikram_contracts::POLICY_EVALUATOR;
 use vikram_contracts::policy::{
     ActionKind, Decision, PermissionPolicy, PermissionRequest, RuleOutcome,
@@ -332,7 +333,7 @@ fn resource_path(req: &PermissionRequest) -> Option<std::path::PathBuf> {
             (!trimmed.is_empty()).then(|| std::path::PathBuf::from(trimmed))
         }
         ActionKind::Execute => {
-            let head = req.resource.trim().split_whitespace().next()?;
+            let head = req.resource.split_whitespace().next()?;
             let path = std::path::PathBuf::from(head);
             path.is_absolute().then_some(path)
         }
@@ -396,6 +397,11 @@ impl Policy {
 
     pub fn defaults(&self) -> &[Rule] {
         &self.defaults
+    }
+
+    /// How deep delegation may nest. Callers that spawn a session check this before the gate does.
+    pub fn max_delegation_depth(&self) -> u32 {
+        self.floor.max_delegation_depth
     }
 
     pub fn evaluate(&self, req: &PermissionRequest) -> Decision {
@@ -495,8 +501,37 @@ impl Policy {
     }
 }
 
-/// Parse the amendment string the runtime proposed back into a rule. Deliberately strict: anything
-/// that is not exactly the shape we emit is refused rather than guessed at, because this text is the
+/// Whether a rule the human is about to keep would grant reach past `root`.
+///
+/// Checked when the rule is *persisted*, not only when it is used: the mandatory floor already
+/// vetoes an out-of-workspace write at decision time, so an entry pointing outside the workspace is
+/// dead weight until the root changes — and the day it changes, a file nobody re-read becomes the
+/// permission. Only `allow` is a grant, and only file actions name a path; a command prefix and a
+/// network target are checked by their own rules, not as paths.
+pub fn allow_reaches_outside(rule: &Rule, root: &Path) -> bool {
+    if rule.outcome != RuleOutcome::Allow {
+        return false;
+    }
+    if !rule
+        .actions
+        .iter()
+        .any(|a| matches!(a, ActionKind::Read | ActionKind::Write))
+    {
+        return false;
+    }
+    let value = match &rule.resource {
+        ResourcePattern::Any => return true,
+        ResourcePattern::Exact(s) | ResourcePattern::Subtree(s) | ResourcePattern::Prefix(s) => s,
+    };
+    let path = std::path::Path::new(value);
+    if path.is_absolute() {
+        return !(path.starts_with(root) && !escapes_root(path, &root.to_string_lossy()));
+    }
+    // A relative entry is resolved against the root when it is used, so only a climb can escape.
+    escapes_root(&root.join(value), &root.to_string_lossy())
+}
+
+/// Parse the amendment string the runtime proposed back into a rule. Deliberately strict: anything/// that is not exactly the shape we emit is refused rather than guessed at, because this text is the
 /// only thing standing between "allow `cargo test`" and "allow everything".
 pub fn parse_amendment(text: &str) -> Option<Rule> {
     // The resource is last and may contain spaces, so it is taken as the remainder, not a word.
@@ -1057,5 +1092,97 @@ mod tests {
             rules,
             "a rule must survive its own file: {json}"
         );
+    }
+
+    #[test]
+    fn extra_write_roots_are_the_only_way_outside_the_workspace_becomes_writable() {
+        let floor = MandatoryFloor {
+            workspace_root: Some("/work/proj".into()),
+            extra_write_roots: vec!["/home/u/.vikram/sessions".into()],
+            ..Default::default()
+        };
+        let policy = Policy::new(
+            vec![Rule::allow(ActionKind::Write, ResourcePattern::Any)],
+            floor,
+        );
+        assert!(
+            policy
+                .evaluate(&fs_write("/home/u/.vikram/sessions/note.md", Trust::Model))
+                .is_allowed(),
+            "a host-declared root is writable"
+        );
+        assert!(
+            matches!(
+                policy.evaluate(&fs_write("/home/u/.vikram/sessions-evil/x", Trust::Model)),
+                Decision::Deny { .. }
+            ),
+            "a lookalike prefix of an extra root is not inside it"
+        );
+        assert!(matches!(
+            policy.evaluate(&fs_write("/home/u/.vikram/config.json", Trust::Model)),
+            Decision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn a_traversal_that_climbs_out_of_the_root_is_refused() {
+        let floor = MandatoryFloor {
+            workspace_root: Some("/work/proj".into()),
+            ..Default::default()
+        };
+        let policy = Policy::new(
+            vec![Rule::allow(ActionKind::Write, ResourcePattern::Any)],
+            floor,
+        );
+        assert!(
+            matches!(
+                policy.evaluate(&fs_write("/work/proj/../outside.txt", Trust::Model)),
+                Decision::Deny { .. }
+            ),
+            "/work/proj/../outside.txt joins the root but climbs back out"
+        );
+        assert!(matches!(
+            policy.evaluate(&fs_write("../outside.txt", Trust::Model)),
+            Decision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn a_relative_write_is_normalised_against_the_root_before_ruling() {
+        let floor = MandatoryFloor {
+            workspace_root: Some("/work/proj".into()),
+            ..Default::default()
+        };
+        let policy = Policy::new(
+            vec![Rule::allow(ActionKind::Write, ResourcePattern::Any)],
+            floor,
+        );
+        assert!(
+            policy
+                .evaluate(&fs_write("src/main.rs", Trust::Model))
+                .is_allowed(),
+            "relative paths belong inside the workspace"
+        );
+    }
+
+    #[test]
+    fn tool_and_web_sourced_content_is_untrusted_by_the_floor() {
+        let policy = Policy::new(
+            vec![Rule::allow(ActionKind::Admin, ResourcePattern::Any)],
+            MandatoryFloor::default(),
+        );
+        let req = PermissionRequest::new(
+            ActionKind::Admin,
+            "policy.set",
+            "*",
+            SideEffect::ExternalChange,
+            Trust::External,
+        );
+        match policy.evaluate(&req) {
+            Decision::Deny { reason } => {
+                assert!(reason.contains("tool or web-sourced content"), "{reason}")
+            }
+            other => panic!("external content must never widen policy, got {other:?}"),
+        }
     }
 }

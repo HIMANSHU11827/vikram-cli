@@ -368,13 +368,25 @@ pub fn status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if let Some(ratio) = app.metrics.context_ratio() {
         let pct = (f64::from(ratio) * 100.0).round() as u64;
         let bar = context_bar(ratio, 10, theme);
+        // A tilde says the figure is the estimator's, not the provider's; an asterisk says the
+        // window itself was assumed because nothing advertised it. Both are explained in F6.
+        let approx = if app.metrics.context_measured {
+            ""
+        } else {
+            "~"
+        };
+        let assumed = if app.metrics.context_limit_assumed {
+            "*"
+        } else {
+            ""
+        };
         left.push(Span::raw(sep.to_owned()));
         left.push(Span::styled(
             "ctx ",
             theme.status_style(StatusSegment::Label),
         ));
         left.push(Span::styled(
-            format!("[{bar}] {pct}%"),
+            format!("[{bar}] {approx}{pct}%{assumed}"),
             theme.status_style(StatusSegment::Value),
         ));
     }
@@ -877,22 +889,97 @@ fn inspector_lines(app: &App, kind: &InspectorKind, theme: &Theme) -> Vec<Line<'
                 }
             }
         }
-        InspectorKind::Context => match app.metrics.context_ratio() {
-            Some(ratio) => {
-                let window = app.metrics.context_window.unwrap_or(0);
-                lines.push(kv("used", human(app.metrics.context_used), theme));
-                lines.push(kv("window", human(window), theme));
-                lines.push(Line::from(""));
+        InspectorKind::Context => {
+            // The meter is the request that was actually sent, so it beats the summary figures:
+            // one says what the model was given, the other says what the runtime last totals.
+            let detail = app
+                .context_detail
+                .as_ref()
+                .filter(|(id, _)| app.active_session().is_some_and(|s| s.id == *id))
+                .cloned()
+                .map(|(_, meter)| meter);
+            let (window, usable, used, measured, assumed) = match &detail {
+                Some(meter) => (
+                    meter.window,
+                    meter.usable,
+                    meter.used,
+                    meter.measured,
+                    meter.limits_assumed,
+                ),
+                None => (
+                    app.metrics.context_window.unwrap_or(0),
+                    app.metrics.context_usable,
+                    app.metrics.context_used,
+                    app.metrics.context_measured,
+                    app.metrics.context_limit_assumed,
+                ),
+            };
+            if window == 0 {
                 lines.push(Line::styled(
-                    format!("  {}", ratio_bar(ratio, 40, theme)),
-                    Style::default().fg(ratio_colour(ratio, theme)),
+                    "  no live session has a context window yet",
+                    theme.secondary(),
                 ));
+            } else {
+                lines.push(kv("used", human(used), theme));
+                lines.push(kv("window", human(window), theme));
+                lines.push(kv(
+                    "usable",
+                    format!("{} (after reply reserve, schemas, margin)", human(usable)),
+                    theme,
+                ));
+                lines.push(kv("left", human(usable.saturating_sub(used)), theme));
+                lines.push(kv(
+                    "counting",
+                    if measured {
+                        "measured, newest tail estimated".to_owned()
+                    } else {
+                        "estimated and self-calibrated".to_owned()
+                    },
+                    theme,
+                ));
+                lines.push(kv(
+                    "limit from",
+                    if assumed {
+                        "assumed floor: nothing advertised one"
+                    } else {
+                        "config, provider, or model registry"
+                    }
+                    .to_owned(),
+                    theme,
+                ));
+                lines.push(kv(
+                    "folds",
+                    format!(
+                        "{} (older turns summarised; originals stay in the journal)",
+                        app.metrics.context_compactions
+                    ),
+                    theme,
+                ));
+                if let Some(meter) = &detail {
+                    let fill = used_ratio(used, usable);
+                    lines.push(Line::from(""));
+                    lines.push(Line::styled(
+                        format!("  {}", ratio_bar(fill, 40, theme)),
+                        Style::default().fg(ratio_colour(fill, theme)),
+                    ));
+                    lines.push(Line::styled("  in the last request", theme.muted()));
+                    for part in &meter.parts {
+                        lines.push(kv(part.label.as_str(), human(part.tokens), theme));
+                    }
+                } else {
+                    lines.push(Line::from(""));
+                    lines.push(Line::styled(
+                        format!("  {}", ratio_bar(used_ratio(used, window), 40, theme)),
+                        Style::default().fg(ratio_colour(used_ratio(used, window), theme)),
+                    ));
+                    lines.push(Line::styled(
+                        "  ! no request has gone out yet: these are totals, not one prompt"
+                            .to_owned(),
+                        theme.muted(),
+                    ));
+                }
             }
-            None => lines.push(Line::styled(
-                "  the provider has not reported a window",
-                theme.secondary(),
-            )),
-        },
+        }
         InspectorKind::Model => {
             lines.push(kv(
                 "model",
@@ -1045,6 +1132,15 @@ fn ratio_colour(ratio: f32, theme: &Theme) -> ratatui::style::Color {
     }
 }
 
+/// How full a budget is, as a fraction. A zero denominator reads as empty, not as infinite.
+fn used_ratio(used: u64, of: u64) -> f32 {
+    if of == 0 {
+        0.0
+    } else {
+        (used as f32 / of as f32).clamp(0.0, 1.0)
+    }
+}
+
 fn ratio_bar(ratio: f32, width: usize, theme: &Theme) -> String {
     let filled = ((ratio.clamp(0.0, 1.0) * width as f32).round() as usize).min(width);
     let (full, empty) = if theme.ascii {
@@ -1166,8 +1262,8 @@ mod tests {
     use ratatui::backend::TestBackend;
     use vikram_contracts::{AgentId, ApprovalId, Message, SessionId};
     use vikram_runtime::types::{
-        AgentProfile, AgentSnapshot, AgentState, ApprovalPrompt, BackgroundTask, Metrics,
-        NoticeLevel, RuntimeStatus, SessionSnapshot, TurnState,
+        AgentProfile, AgentSnapshot, AgentState, ApprovalPrompt, BackgroundTask, ContextMeter,
+        ContextPart, Metrics, NoticeLevel, RuntimeStatus, SessionSnapshot, TurnState,
     };
 
     fn draw(width: u16, height: u16, render: impl FnOnce(&mut Frame)) -> String {
@@ -1192,6 +1288,8 @@ mod tests {
             queued: 0,
             project_id: None,
             status: "active".to_owned(),
+            title_source: "generic".to_owned(),
+            title_status: "pending".to_owned(),
         }
     }
 
@@ -1481,7 +1579,73 @@ mod tests {
         let rendered = draw(80, 24, |frame| {
             overlay(frame, frame.area(), &mut app, &Theme::new(false))
         });
-        assert!(rendered.contains("has not reported"), "got {rendered}");
+        assert!(rendered.contains("no live session"), "got {rendered}");
+        assert!(!rendered.contains(" 0% of"), "got {rendered}");
+    }
+
+    #[test]
+    fn context_inspector_prices_the_last_request_part_by_part() {
+        let mut app = app_with_default_bots();
+        let id = app.sessions[0].id.clone();
+        app.context_detail = Some((
+            id,
+            ContextMeter {
+                window: 128_000,
+                usable: 100_000,
+                used: 42_000,
+                measured: true,
+                limits_assumed: false,
+                output_reserve: 16_384,
+                overhead: 12_000,
+                parts: vec![
+                    ContextPart::new("project instructions", 1_800),
+                    ContextPart::new("tool schemas", 9_200),
+                    ContextPart::new("conversation", 31_000),
+                ],
+            },
+        ));
+        app.overlay = Some(Overlay::Inspector(InspectorKind::Context));
+        let rendered = draw(80, 30, |frame| {
+            overlay(frame, frame.area(), &mut app, &Theme::new(false))
+        });
+        for needle in [
+            "project instructions",
+            "tool schemas",
+            "conversation",
+            "measured",
+            "in the last request",
+        ] {
+            assert!(rendered.contains(needle), "missing {needle}: {rendered}");
+        }
+    }
+
+    #[test]
+    fn status_bar_marks_estimated_counts_and_assumed_limits() {
+        let mut app = app_with_default_bots();
+        app.metrics = Metrics {
+            context_used: 50_000,
+            context_window: Some(100_000),
+            context_measured: false,
+            context_limit_assumed: true,
+            ..Metrics::default()
+        };
+        let estimated = draw(130, 1, |frame| {
+            status_bar(frame, frame.area(), &app, &Theme::new(false))
+        });
+        assert!(estimated.contains("~50%*"), "got {estimated}");
+        app.metrics.context_measured = true;
+        app.metrics.context_limit_assumed = false;
+        let measured = draw(130, 1, |frame| {
+            status_bar(frame, frame.area(), &app, &Theme::new(false))
+        });
+        assert!(
+            measured.contains("[") && measured.contains("50%"),
+            "got {measured}"
+        );
+        assert!(
+            !measured.contains("~50%"),
+            "a measured figure carries no approximation mark: {measured}"
+        );
     }
 
     #[test]
@@ -1617,6 +1781,8 @@ mod picker_panel_tests {
                 queued: 0,
                 project_id: None,
                 status: "active".to_owned(),
+                title_source: "generic".to_owned(),
+                title_status: "pending".to_owned(),
             }));
         app
     }

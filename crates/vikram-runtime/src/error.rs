@@ -38,6 +38,9 @@ pub enum RuntimeError {
 
     #[error("invalid runtime state: {0}")]
     InvalidState(String),
+
+    #[error("MCP server failure: {0}")]
+    Mcp(String),
 }
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;

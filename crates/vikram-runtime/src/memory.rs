@@ -89,7 +89,7 @@ impl MemoryStore {
         Ok(())
     }
 
-    pub fn get<K, S>(&self, key: K, scope: S) -> Option<String>
+    pub fn get<K, S>(&self, key: K, scope: S) -> Result<Option<String>>
     where
         K: AsRef<str>,
         S: AsRef<str>,
@@ -103,11 +103,10 @@ impl MemoryStore {
             |row| row.get(0),
         )
         .optional()
-        .ok()
-        .flatten()
+        .map_err(|e| RuntimeError::Store(e.to_string()))
     }
 
-    pub fn search<Q, S>(&self, query: Q, scope: S) -> Vec<(String, String)>
+    pub fn search<Q, S>(&self, query: Q, scope: S) -> Result<Vec<(String, String)>>
     where
         Q: AsRef<str>,
         S: AsRef<str>,
@@ -115,38 +114,101 @@ impl MemoryStore {
         let query = query.as_ref();
         let scope = scope.as_ref();
         let conn = self.lock();
-        let mut stmt =
-            match conn.prepare("SELECT key, value FROM memory WHERE scope = ?1 ORDER BY key ASC") {
-                Ok(s) => s,
-                Err(_) => return Vec::new(),
-            };
-        let rows = stmt
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM memory WHERE scope = ?1 ORDER BY key ASC")
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        let mut rows = stmt
             .query_map(params![scope], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
-            .ok();
-        let collected: Vec<(String, String)> = match rows {
-            Some(mapped) => mapped.filter_map(|r| r.ok()).collect(),
-            None => Vec::new(),
-        };
-        collected
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        let collected = read_pairs(&mut rows)?;
+        Ok(collected
             .into_iter()
             .filter(|(k, v)| k.contains(query) || v.contains(query))
-            .collect()
+            .collect())
+    }
+
+    /// Ranked recall for the context builder, restricted to the scopes the caller is allowed to see.
+    ///
+    /// The stored `search` answers a whole-phrase question; this answers "what does this turn
+    /// overlap with". Terms are matched with parameterized `LIKE` clauses, then each candidate is
+    /// scored on how many terms it hits and how recently it was touched, so a stale note that
+    /// matches one word cannot outrank a current note that matches five.
+    ///
+    /// `scopes` is a deny-first guard. Every conversation writes into one shared table keyed only by
+    /// a free-form `scope` string, so an unscoped sweep would surface another session's or entity's
+    /// notes into this one's context. Recall is confined to the scopes named here, and to nothing
+    /// when none are given.
+    pub fn recall_terms(
+        &self,
+        terms: &[String],
+        scopes: &[String],
+        limit: usize,
+    ) -> Result<Vec<(String, String, String)>> {
+        if terms.is_empty() || limit == 0 || scopes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let scope_placeholders = scopes.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let clauses = terms
+            .iter()
+            .map(|_| "(key LIKE ? OR value LIKE ?)")
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!(
+            "SELECT scope, key, value, updated_ms FROM memory WHERE scope IN ({scope_placeholders}) \
+             AND ({clauses}) ORDER BY updated_ms DESC LIMIT 200"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        let mut bindings: Vec<String> = scopes.to_vec();
+        for term in terms {
+            bindings.push(format!("%{term}%"));
+            bindings.push(format!("%{term}%"));
+        }
+        let params: Vec<&dyn rusqlite::ToSql> =
+            bindings.iter().map(|b| b as &dyn rusqlite::ToSql).collect();
+        let mut rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                ))
+            })
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        let mut scored: Vec<(u64, (String, String, String))> = Vec::new();
+        for row in read_quadruples(&mut rows)? {
+            let (scope, key, value, updated_ms) = row;
+            let haystack = format!("{key} {}", value.to_lowercase());
+            let hits = terms
+                .iter()
+                .filter(|term| haystack.contains(&term.to_lowercase()))
+                .count() as u64;
+            // Recency breaks ties inside a rough day band, never dominates a real match.
+            let score = hits * 1_000 + updated_ms / (24 * 3_600_000);
+            scored.push((score, (scope, key, value)));
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, entry)| entry)
+            .collect())
     }
 
     /// Every key in every scope, ordered by scope then key. The interface shows what the model has
     /// remembered; a scope-filtered list would make the panel depend on a word the operator has to
     /// guess first.
-    pub fn list_all(&self) -> Vec<(String, String, String)> {
+    pub fn list_all(&self) -> Result<Vec<(String, String, String)>> {
         let conn = self.lock();
-        let mut stmt = match conn
+        let mut stmt = conn
             .prepare("SELECT scope, key, value FROM memory ORDER BY scope ASC, key ASC")
-        {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let rows = stmt
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        let mut rows = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -154,33 +216,31 @@ impl MemoryStore {
                     row.get::<_, String>(2)?,
                 ))
             })
-            .ok();
-        match rows {
-            Some(mapped) => mapped.filter_map(|r| r.ok()).collect(),
-            None => Vec::new(),
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        let mut collected = Vec::new();
+        while let Some(row) = rows.next() {
+            let row = row.map_err(|e| RuntimeError::Store(e.to_string()))?;
+            collected.push(row);
         }
+        Ok(collected)
     }
 
-    pub fn list<S>(&self, scope: S) -> Vec<(String, String)>
+    pub fn list<S>(&self, scope: S) -> Result<Vec<(String, String)>>
     where
         S: AsRef<str>,
     {
         let scope = scope.as_ref();
         let conn = self.lock();
-        let mut stmt =
-            match conn.prepare("SELECT key, value FROM memory WHERE scope = ?1 ORDER BY key ASC") {
-                Ok(s) => s,
-                Err(_) => return Vec::new(),
-            };
-        let rows = stmt
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM memory WHERE scope = ?1 ORDER BY key ASC")
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        let mut rows = stmt
             .query_map(params![scope], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
-            .ok();
-        match rows {
-            Some(mapped) => mapped.filter_map(|r| r.ok()).collect(),
-            None => Vec::new(),
-        }
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        let collected = read_pairs(&mut rows)?;
+        Ok(collected)
     }
 
     pub fn delete<K, S>(&self, key: K, scope: S) -> Result<bool>
@@ -200,7 +260,7 @@ impl MemoryStore {
         Ok(n > 0)
     }
 
-    pub fn count<S>(&self, scope: S) -> usize
+    pub fn count<S>(&self, scope: S) -> Result<usize>
     where
         S: AsRef<str>,
     {
@@ -212,18 +272,34 @@ impl MemoryStore {
             |row| row.get::<_, i64>(0),
         )
         .map(|n| n as usize)
-        .unwrap_or(0)
+        .map_err(|e| RuntimeError::Store(e.to_string()))
     }
 
     /// Total number of entries across all scopes.
-    pub fn total_count(&self) -> usize {
+    pub fn total_count(&self) -> Result<usize> {
         let conn = self.lock();
         conn.query_row("SELECT COUNT(*) FROM memory", [], |row| {
             row.get::<_, i64>(0)
         })
         .map(|n| n as usize)
-        .unwrap_or(0)
+        .map_err(|e| RuntimeError::Store(e.to_string()))
     }
+}
+
+fn read_pairs<I>(rows: I) -> Result<Vec<(String, String)>>
+where
+    I: Iterator<Item = std::result::Result<(String, String), rusqlite::Error>>,
+{
+    rows.map(|row| row.map_err(|e| RuntimeError::Store(e.to_string())))
+        .collect()
+}
+
+fn read_quadruples<I>(rows: I) -> Result<Vec<(String, String, String, u64)>>
+where
+    I: Iterator<Item = std::result::Result<(String, String, String, u64), rusqlite::Error>>,
+{
+    rows.map(|row| row.map_err(|e| RuntimeError::Store(e.to_string())))
+        .collect()
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -252,7 +328,7 @@ mod tests {
         let store = MemoryStore::open_in_memory().unwrap();
         store.save("greeting", "hello", "global").unwrap();
         store.save("convention", "tabs", "project").unwrap();
-        let all = store.list_all();
+        let all = store.list_all().unwrap();
         assert_eq!(
             all,
             vec![
@@ -275,8 +351,11 @@ mod tests {
     fn save_and_get_round_trip() {
         let store = MemoryStore::open_in_memory().unwrap();
         store.save("greeting", "hello", "global").unwrap();
-        assert_eq!(store.get("greeting", "global"), Some("hello".to_string()));
-        assert_eq!(store.get("greeting", "other"), None);
+        assert_eq!(
+            store.get("greeting", "global").unwrap(),
+            Some("hello".to_string())
+        );
+        assert_eq!(store.get("greeting", "other").unwrap(), None);
     }
 
     #[test]
@@ -284,8 +363,8 @@ mod tests {
         let store = MemoryStore::open_in_memory().unwrap();
         store.save("k", "v1", "global").unwrap();
         store.save("k", "v2", "global").unwrap();
-        assert_eq!(store.get("k", "global"), Some("v2".to_string()));
-        assert_eq!(store.count("global"), 1);
+        assert_eq!(store.get("k", "global").unwrap(), Some("v2".to_string()));
+        assert_eq!(store.count("global").unwrap(), 1);
     }
 
     #[test]
@@ -293,10 +372,10 @@ mod tests {
         let store = MemoryStore::open_in_memory().unwrap();
         store.save("alpha", "first value", "global").unwrap();
         store.save("beta", "second", "global").unwrap();
-        let hits = store.search("value", "global");
+        let hits = store.search("value", "global").unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, "alpha");
-        let hits = store.search("beta", "global");
+        let hits = store.search("beta", "global").unwrap();
         assert_eq!(hits.len(), 1);
     }
 
@@ -305,7 +384,7 @@ mod tests {
         let store = MemoryStore::open_in_memory().unwrap();
         store.save("a", "1", "global").unwrap();
         store.save("b", "2", "global").unwrap();
-        let all = store.list("global");
+        let all = store.list("global").unwrap();
         assert_eq!(all.len(), 2);
     }
 
@@ -315,7 +394,7 @@ mod tests {
         store.save("k", "v", "global").unwrap();
         assert!(store.delete("k", "global").unwrap());
         assert!(!store.delete("k", "global").unwrap());
-        assert_eq!(store.get("k", "global"), None);
+        assert_eq!(store.get("k", "global").unwrap(), None);
     }
 
     #[test]
@@ -323,10 +402,100 @@ mod tests {
         let store = MemoryStore::open_in_memory().unwrap();
         store.save("k", "global-val", "global").unwrap();
         store.save("k", "session-val", "session-1").unwrap();
-        assert_eq!(store.get("k", "global"), Some("global-val".to_string()));
-        assert_eq!(store.get("k", "session-1"), Some("session-val".to_string()));
-        assert_eq!(store.count("global"), 1);
-        assert_eq!(store.count("session-1"), 1);
-        assert_eq!(store.list("global").len(), 1);
+        assert_eq!(
+            store.get("k", "global").unwrap(),
+            Some("global-val".to_string())
+        );
+        assert_eq!(
+            store.get("k", "session-1").unwrap(),
+            Some("session-val".to_string())
+        );
+        assert_eq!(store.count("global").unwrap(), 1);
+        assert_eq!(store.count("session-1").unwrap(), 1);
+        assert_eq!(store.list("global").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recall_terms_confines_results_to_the_granted_scopes() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store
+            .save("note", "deploy the payment gateway", "global")
+            .unwrap();
+        store
+            .save("note", "the gateway secret lives in vault", "session-1")
+            .unwrap();
+        store
+            .save("note", "a different user's gateway plan", "session-2")
+            .unwrap();
+        let terms = vec!["gateway".to_string()];
+
+        let mine = store
+            .recall_terms(&terms, &["global".into(), "session-1".into()], 8)
+            .unwrap();
+        let scopes: Vec<&str> = mine.iter().map(|(scope, _, _)| scope.as_str()).collect();
+        assert!(
+            scopes.contains(&"global"),
+            "global notes are shared: {mine:?}"
+        );
+        assert!(
+            scopes.contains(&"session-1"),
+            "the session's own notes recall: {mine:?}"
+        );
+        assert!(
+            !scopes.contains(&"session-2"),
+            "a foreign session's note must never surface here: {mine:?}"
+        );
+
+        assert!(
+            store.recall_terms(&terms, &[], 8).unwrap().is_empty(),
+            "no granted scope means no recall at all, deny-first"
+        );
+    }
+
+    #[test]
+    fn a_read_failure_is_reported_instead_of_looking_like_an_empty_memory() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store.save("k", "v", "global").unwrap();
+        {
+            let conn = store.lock();
+            conn.execute("DROP TABLE memory", []).unwrap();
+        }
+        assert!(
+            store.get("k", "global").is_err(),
+            "missing table is not 'no value'"
+        );
+        assert!(
+            store.list("global").is_err(),
+            "missing table is not 'no entries'"
+        );
+        assert!(
+            store.search("k", "global").is_err(),
+            "missing table is not 'no matches'"
+        );
+        assert!(
+            store.list_all().is_err(),
+            "missing table is not 'nothing remembered'"
+        );
+        assert!(
+            store.count("global").is_err(),
+            "missing table is not a count of 0"
+        );
+        assert!(
+            store.total_count().is_err(),
+            "missing table is not a total of 0"
+        );
+    }
+
+    #[test]
+    fn a_write_failure_is_reported() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        {
+            let conn = store.lock();
+            conn.execute("DROP TABLE memory", []).unwrap();
+        }
+        assert!(
+            store.save("k", "v", "global").is_err(),
+            "a failed save must not look like a saved memory"
+        );
     }
 }

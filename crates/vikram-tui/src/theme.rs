@@ -136,10 +136,6 @@ impl Theme {
         if self.ascii { "@" } else { "☤" }
     }
 
-    pub fn thought_glyph(&self) -> &'static str {
-        if self.ascii { "~" } else { "💭" }
-    }
-
     pub fn tasks_glyph(&self) -> &'static str {
         if self.ascii { "B" } else { "⏵" }
     }

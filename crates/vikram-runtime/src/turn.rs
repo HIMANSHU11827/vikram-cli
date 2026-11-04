@@ -16,12 +16,14 @@ use vikram_contracts::{
 };
 
 use crate::agents::ManagedAgent;
+use crate::learning::TurnGrowth;
 use crate::provider::{CompletionRequest, ProviderEvent};
 use crate::runtime::{PendingApproval, RuntimeInner};
 use crate::session::SessionRuntime;
 use crate::skills::SkillRegistry;
 use crate::types::{
-    AgentState, ApprovalPrompt, NoticeLevel, RuntimeEvent, TaskState, TurnState, now_ms,
+    AgentState, ApprovalPrompt, ContextMeter, ContextPart, NoticeLevel, RuntimeEvent, TaskState,
+    TurnState, now_ms,
 };
 
 /// An agent turn carries the task record it must close when it finishes.
@@ -61,12 +63,20 @@ impl Origin {
 /// between the tool rows as the agent's voice, so they are part of the interface and not decoration:
 /// one or two sentences, present tense, naming the file, command or question in hand.
 const PREAMBLE: &str = "\
-You are VIKRAM, working in a terminal. Alongside your tool calls, write one or two short sentences \
-of progress in the present tense: what you are about to do and why, naming the file, command or \
-question involved. Write one before you start a piece of work, and again whenever what you are \
-doing changes, for example when one thing finished and another begins. These lines are shown to \
-the operator as your voice between the tool rows, so each must stand alone. Do not narrate every \
-step, do not repeat a line you already wrote, and never describe your private reasoning.";
+You are VIKRAM, a personal AI assistant with a real personality — a friend and family member to \
+the user — virtually present, still in active development. You are not a robot and not just a CLI; \
+you are a proper AI assistant person. You are primarily a private AI assistant for the user, while \
+also supporting multiple users (family and friends) when needed. You remember and understand the \
+user and help with many tasks, like a capable personal assistant. You never sugarcoat: you are \
+honest and direct about what a personal AI assistant should say, even when it is uncomfortable, \
+because honesty is part of being a true friend. Chat politely and clearly, in a proper, respectful \
+manner, like talking with a friend or family member, and introduce yourself as an AI assistant \
+when it helps. Alongside your tool calls, write one or two short sentences of progress in the \
+present tense: what you are about to do and why, naming the file, command or question involved. \
+Write one before you start a piece of work, and again whenever what you are doing changes, for \
+example when one thing finished and another begins. These lines are shown to the operator as your \
+voice between the tool rows, so each must stand alone. Do not narrate every step, do not repeat a \
+line you already wrote, and never describe your private reasoning.";
 
 pub(crate) fn spawn_turn(
     inner: Arc<RuntimeInner>,
@@ -91,6 +101,7 @@ pub(crate) async fn run_turn(
 
     // The user's message is durable before any model work begins.
     let user_message = Message::user(text.clone());
+    let request_text = text.clone();
     session.push_message(user_message.clone(), now_ms());
     inner.journal(
         &session.id,
@@ -103,8 +114,13 @@ pub(crate) async fn run_turn(
         text,
     });
     inner.touch(&session);
+    // The conversation now has something to be named after. Naming runs in the background and is
+    // gated to one attempt per session, so this costs nothing on the turn the operator is waiting for.
+    inner.maybe_title_session(&session);
 
     session.begin_turn(now_ms());
+    // What this turn actually did, collected as it happens and handed to the growth pipeline.
+    let mut growth = TurnGrowth::default();
     inner.emit(RuntimeEvent::StreamStarted {
         session: session.id.clone(),
         turn: turn.clone(),
@@ -120,6 +136,8 @@ pub(crate) async fn run_turn(
     let mut output_tokens = 0u64;
     let mut reported_output: Option<u64> = None;
     let mut reported_input: Option<u64> = None;
+    let mut last_estimated_input = 0u64;
+    let mut over_limit_retries = 0u32;
     let max_steps = u64::from(inner.config.max_steps);
     let mut steps_used = 0u64;
 
@@ -132,9 +150,13 @@ pub(crate) async fn run_turn(
             &session,
             &agent,
             turn,
-            TurnState::Failed,
-            started,
-            output_tokens,
+            TurnReport {
+                outcome: TurnState::Failed,
+                started,
+                output_tokens,
+                request: &request_text,
+                growth: &TurnGrowth::default(),
+            },
         );
         return;
     };
@@ -159,9 +181,19 @@ pub(crate) async fn run_turn(
         let loaded = skills.iter().filter(|s| s.loaded).count();
         inner.emit(RuntimeEvent::SkillsChanged { discovered, loaded });
         let (catalog_text, _) = reg.catalog_listing();
-        let mut request_messages = Vec::new();
+        // Every part of the request is labelled in the order it is assembled, so the inspector
+        // prices what is actually being sent rather than guessing at the shape afterwards.
+        let mut prefix: Vec<Message> = Vec::new();
+        let mut labels: Vec<&'static str> = Vec::new();
         if !catalog_text.trim().is_empty() {
-            request_messages.push(Message::text(Role::System, catalog_text, Trust::External));
+            labels.push("skill catalogue");
+            prefix.push(Message::text(Role::System, catalog_text, Trust::External));
+        }
+        // Project and entity instructions are context, not decoration: they arrive on every turn so
+        // the model does not have to re-read the same AGENTS.md to remember the rules it works under.
+        if let Some(project_text) = inner.project_context() {
+            labels.push("project instructions");
+            prefix.push(Message::text(Role::System, project_text, Trust::External));
         }
         // A delegated agent carries its own identity: the profile's name, role and description
         // become the system identity for its session, so its behaviour follows its configuration.
@@ -171,13 +203,74 @@ pub(crate) async fn run_turn(
                 "You are {}. Role: {}. {}.",
                 profile.name, profile.role, profile.description
             );
-            request_messages.push(Message::text(Role::System, identity, Trust::External));
+            labels.push("agent identity");
+            prefix.push(Message::text(Role::System, identity, Trust::External));
         }
         // The operator sees the model's own words between the tool rows, so the model has to be
         // told that those words exist and what shape they take.
-        request_messages.push(Message::text(Role::System, PREAMBLE, Trust::External));
-        request_messages.extend(session.messages());
+        labels.push("turn voice");
+        prefix.push(Message::text(Role::System, PREAMBLE, Trust::External));
+        // Memory and project context are assembled against the budget that is left after the
+        // transcript, not on top of it.
+        if let Some(memory_text) = inner.retrieved_memory(&session) {
+            labels.insert(0, "retrieved memory");
+            prefix.insert(0, Message::text(Role::System, memory_text, Trust::External));
+        }
+        let (transcript, budget) = inner.prepare_context(&session, &prefix);
+        let estimator = session.estimator();
+        let mut parts: Vec<ContextPart> = labels
+            .iter()
+            .zip(&prefix)
+            .map(|(label, message)| ContextPart::new(*label, estimator.estimate_message(message)))
+            .collect();
+        parts.push(ContextPart::new(
+            "tool schemas",
+            inner.tool_schema_tokens(&estimator),
+        ));
+        let mut summary_tokens = 0u64;
+        let mut tool_result_tokens = 0u64;
+        let mut conversation_tokens = 0u64;
+        for (index, message) in transcript.iter().enumerate() {
+            let cost = estimator.estimate_message(message);
+            if index == 0 && crate::compaction::is_compaction_summary(message) {
+                summary_tokens += cost;
+            } else if message.role == Role::Tool {
+                tool_result_tokens += cost;
+            } else {
+                conversation_tokens += cost;
+            }
+        }
+        for (label, tokens) in [
+            ("compaction summary", summary_tokens),
+            ("conversation", conversation_tokens),
+            ("tool results", tool_result_tokens),
+        ] {
+            if tokens > 0 {
+                parts.push(ContextPart::new(label, tokens));
+            }
+        }
+        let used = crate::compaction::active_context_tokens(&estimator, &transcript, &budget);
+        inner.emit(RuntimeEvent::ContextMetered {
+            session: session.id.clone(),
+            meter: ContextMeter {
+                window: budget.limits.context_window,
+                usable: budget.usable_input(),
+                used,
+                measured: budget.anchor.is_some(),
+                limits_assumed: budget.limits.source
+                    == crate::context_engine::LimitsSource::Assumed,
+                output_reserve: budget.output_reserve,
+                overhead: budget.overhead,
+                parts,
+            },
+        });
+        let mut request_messages = prefix;
+        request_messages.extend(transcript);
 
+        // Recorded against the provider's own figure when it reports one, which is how the
+        // estimator learns this model's real cost per character.
+        let estimated_input = estimator.estimate_messages(&request_messages);
+        last_estimated_input = estimated_input;
         let request = CompletionRequest {
             model: inner.model(),
             messages: request_messages,
@@ -186,6 +279,7 @@ pub(crate) async fn run_turn(
         };
 
         let mut stream = provider.stream(request);
+        let mut dropped_for_limit = false;
         let mut text_buffer = String::new();
         let mut reasoning_buffer = String::new();
         let mut calls: Vec<ToolCall> = Vec::new();
@@ -198,7 +292,7 @@ pub(crate) async fn run_turn(
             match item {
                 Ok(ProviderEvent::TextDelta(delta)) => {
                     if !delta.is_empty() {
-                        output_tokens += vikram_kernel::TokenMeter::estimate(&delta);
+                        output_tokens += vikram_contracts::TokenMeter::estimate(&delta);
                         text_buffer.push_str(&delta);
                         inner.emit(RuntimeEvent::StreamDelta {
                             session: session.id.clone(),
@@ -233,8 +327,26 @@ pub(crate) async fn run_turn(
                     break;
                 }
                 Err(err) => {
+                    let text = err.to_string();
+                    // A provider that rejects the request for size is recoverable once, by dropping
+                    // the oldest turn the transcript can afford to lose. Retrying the identical
+                    // request would fail identically, and looping on it burns the step budget.
+                    if inner.context_limit_error(&text) && over_limit_retries < 2 {
+                        over_limit_retries += 1;
+                        let dropped = session.drop_oldest_for_limit(now_ms());
+                        if dropped > 0 {
+                            inner.emit(RuntimeEvent::Notice {
+                                level: NoticeLevel::Warn,
+                                text: format!(
+                                    "model rejected the request as too large: dropped {dropped} oldest messages (still durable in the journal) and retried"
+                                ),
+                            });
+                            dropped_for_limit = true;
+                            break;
+                        }
+                    }
                     inner.emit(RuntimeEvent::Error {
-                        text: format!("provider: {err}"),
+                        text: format!("provider: {text}"),
                     });
                     stream_failed = true;
                     break;
@@ -242,6 +354,10 @@ pub(crate) async fn run_turn(
             }
         }
 
+        if dropped_for_limit {
+            // Nothing was produced; rebuild the request from the shortened transcript.
+            continue;
+        }
         if cancel.is_cancelled() {
             if !text_buffer.is_empty() {
                 commit_assistant_text(&inner, &session, &text_buffer, &reasoning_buffer);
@@ -277,9 +393,10 @@ pub(crate) async fn run_turn(
         let mut results: Vec<(ToolCallId, String, bool)> = Vec::new();
         let mut cancelled_mid_tools = false;
 
-        for call in calls {
+        for (index, call) in calls.iter().enumerate() {
             if cancel.is_cancelled() {
                 cancelled_mid_tools = true;
+                results.extend(answer_unrun(&calls[index..], Abandoned::Cancelled));
                 break;
             }
             if steps_used >= max_steps {
@@ -288,14 +405,20 @@ pub(crate) async fn run_turn(
                 });
                 outcome = TurnState::Failed;
                 cancelled_mid_tools = true;
+                results.extend(answer_unrun(&calls[index..], Abandoned::OutOfSteps));
                 break;
             }
             steps_used += 1;
             let (content, ok) =
                 run_tool(&inner, &session, &call, &cancel, &agent, Origin::Model).await;
+            growth.record_call(&call.name);
+            if !ok {
+                growth.record_failure(&call.name, &content);
+            }
             results.push((call.id.clone(), content, ok));
             if cancel.is_cancelled() {
                 cancelled_mid_tools = true;
+                results.extend(answer_unrun(&calls[index + 1..], Abandoned::Cancelled));
                 break;
             }
         }
@@ -342,15 +465,60 @@ pub(crate) async fn run_turn(
     }
 
     session.record_usage(reported_input, reported_output.or(Some(output_tokens)));
+    if let (Some(input), Some(output)) = (reported_input, reported_output) {
+        // Compare what we predicted for this exact prompt with what the provider charged for it.
+        session.observe_reported_usage(last_estimated_input, input, output);
+    }
+    // Account for the turn durably. A provider-reported pair is written as `measured`; anything
+    // else is the estimator's figure and is labelled so, never passed off as a billed count.
+    let prompt_tokens = reported_input.unwrap_or(last_estimated_input);
+    let completion_tokens = reported_output.unwrap_or(output_tokens);
+    if prompt_tokens + completion_tokens > 0 {
+        let _ = inner.store.record_usage(&vikram_store::UsageRow {
+            id: 0,
+            session: session.id.clone(),
+            ts_ms: now_ms(),
+            model: inner.model(),
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            measured: reported_input.is_some() && reported_output.is_some(),
+        });
+    }
     finish(
         &inner,
         &session,
         &agent,
         turn,
-        outcome,
-        started,
-        output_tokens,
+        TurnReport {
+            outcome,
+            started,
+            output_tokens,
+            request: &request_text,
+            growth: &growth,
+        },
     );
+}
+
+/// Why a batch of tool calls stopped before all of them ran.
+enum Abandoned {
+    Cancelled,
+    OutOfSteps,
+}
+
+/// Answer the calls a batch never reached. The model asked for them, so the transcript the next turn
+/// reads has to say what happened to each one: silence is what makes a resumed conversation
+/// unreadable, and the honest line differs depending on whether a person stopped the turn or the
+/// step budget did.
+fn answer_unrun(calls: &[ToolCall], why: Abandoned) -> Vec<(ToolCallId, String, bool)> {
+    let text = match why {
+        Abandoned::Cancelled => "cancelled before completion",
+        Abandoned::OutOfSteps => "not run: the step budget was exhausted first",
+    };
+    calls
+        .iter()
+        .map(|call| (call.id.clone(), text.to_owned(), false))
+        .collect()
 }
 
 fn commit_assistant_text(
@@ -391,15 +559,30 @@ fn commit_assistant_text(
     });
 }
 
+/// What a finished turn is worth telling the rest of the runtime: how it ended, what it cost, what
+/// the operator asked for, and what the turn actually did.
+struct TurnReport<'a> {
+    outcome: TurnState,
+    started: Instant,
+    output_tokens: u64,
+    request: &'a str,
+    growth: &'a TurnGrowth,
+}
+
 fn finish(
     inner: &Arc<RuntimeInner>,
     session: &Arc<SessionRuntime>,
     agent: &Option<AgentRun>,
     turn: TurnId,
-    outcome: TurnState,
-    started: Instant,
-    output_tokens: u64,
+    report: TurnReport<'_>,
 ) {
+    let TurnReport {
+        outcome,
+        started,
+        output_tokens,
+        request,
+        growth,
+    } = report;
     let elapsed = started.elapsed();
     let elapsed_ms = elapsed.as_millis() as u64;
     let tps = if output_tokens > 0 && !elapsed.is_zero() {
@@ -411,6 +594,9 @@ fn finish(
     *inner.last_tokens_per_sec.lock().expect("tps metric") = tps;
 
     session.finish_turn(outcome, now_ms());
+    // Growth runs before the turn is announced finished, so an interface that reads what was
+    // learned on this event never sees a turn that has not yet been learned from.
+    crate::learning::on_turn_end(inner, session, request, outcome, growth);
     inner.emit(RuntimeEvent::TurnFinished {
         session: session.id.clone(),
         turn,
@@ -428,6 +614,11 @@ fn finish(
         inner.publish_agent(&run.agent);
         if let Some(task) = inner.tasks.finish(&run.task_id, task_state) {
             inner.task_snapshot(&task);
+        }
+        // A delegated session answers the session that asked; the answer is bounded, and the child's
+        // transcript is not handed over with it.
+        if let Some(parent) = session.parent() {
+            inner.deliver_delegation(&parent, session);
         }
     }
 
@@ -463,7 +654,7 @@ fn finish(
     }
 }
 
-async fn wait_unpaused(agent: &Option<AgentRun>, cancel: &vikram_kernel::CancellationToken) {
+async fn wait_unpaused(agent: &Option<AgentRun>, cancel: &vikram_contracts::CancellationToken) {
     let Some(run) = agent else {
         return;
     };
@@ -492,7 +683,7 @@ async fn run_tool(
     inner: &Arc<RuntimeInner>,
     session: &Arc<SessionRuntime>,
     call: &ToolCall,
-    cancel: &vikram_kernel::CancellationToken,
+    cancel: &vikram_contracts::CancellationToken,
     agent: &Option<AgentRun>,
     origin: Origin,
 ) -> (String, bool) {
@@ -565,7 +756,9 @@ async fn run_tool(
         }
     }
 
-    let raw = inner.policy().evaluate(&request);
+    // A delegated session is one step further from the operator, and `max_delegation_depth` is only
+    // real if the gate can see that: a child may not keep spawning children.
+    let raw = inner.policy().evaluate_at_depth(&request, session.depth());
     let decision = inner.judge(&request);
     let auto = PermissionMode::auto_resolved(&raw, &decision);
     inner.journal(
@@ -694,7 +887,7 @@ async fn run_tool(
     inner.journal(
         &session.id,
         RecordKind::ToolCall,
-        serde_json::json!({"name": call.name, "arguments": call.arguments}),
+        serde_json::json!({"call": call.id.as_str(), "name": call.name, "arguments": call.arguments}),
     );
 
     let summary = summarize_arguments(&call.arguments);
@@ -715,34 +908,34 @@ async fn run_tool(
         inner.publish_agent(&run.agent);
     }
 
-    let context = inner.tool_context();
+    let mut context = inner.tool_context_for(&session.id);
+    // Tools whose subject is the running system (delegation) need the live runtime, not a file.
+    context.runtime = Some(Arc::clone(inner));
     let arguments = call.arguments.clone();
     let handle = tool.clone();
     let mut blocking = tokio::task::spawn_blocking(move || handle.run(&arguments, &context));
-    let joined = loop {
-        tokio::select! {
-            joined = &mut blocking => break joined,
-            _ = async {
-                while !cancel.is_cancelled() {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-            } => {
-                // The turn no longer waits on the tool, and the blocking task is dropped; a
-                // tool that honors its stop-hook stops, a stray one finishes unknown and its
-                // result is discarded.
-                blocking.abort();
-                inner.journal(
-                    &session.id,
-                    RecordKind::ToolResult,
-                    serde_json::json!({
-                        "call": call.id.as_str(),
-                        "name": call.name,
-                        "ok": false,
-                        "content": "cancelled while running",
-                    }),
-                );
-                return ("cancelled while running".to_owned(), false);
+    let joined = tokio::select! {
+        joined = &mut blocking => joined,
+        _ = async {
+            while !cancel.is_cancelled() {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
+        } => {
+            // The turn no longer waits on the tool, and the blocking task is dropped; a
+            // tool that honors its stop-hook stops, a stray one finishes unknown and its
+            // result is discarded.
+            blocking.abort();
+            inner.journal(
+                &session.id,
+                RecordKind::ToolResult,
+                serde_json::json!({
+                    "call": call.id.as_str(),
+                    "name": call.name,
+                    "ok": false,
+                    "content": "cancelled while running",
+                }),
+            );
+            return ("cancelled while running".to_owned(), false);
         }
     };
 
@@ -778,6 +971,10 @@ async fn run_tool(
         }
     }
 
+    // What is journaled and sent next is what the model will be held to: the digest. The full text
+    // stays on disk under the session's spool, named by the handle appended to it.
+    let content = inner.spool_output(&session.id, call.id.as_str(), content);
+
     inner.journal(
         &session.id,
         RecordKind::ToolResult,
@@ -810,7 +1007,7 @@ async fn run_tool(
 
 async fn wait_for_approval(
     receiver: oneshot::Receiver<bool>,
-    cancel: &vikram_kernel::CancellationToken,
+    cancel: &vikram_contracts::CancellationToken,
 ) -> bool {
     tokio::select! {
         result = receiver => result.unwrap_or(false),
@@ -826,7 +1023,7 @@ async fn wait_for_approval(
 /// cancelled. It never invents an answer, so a cancelled question fails the tool call.
 async fn wait_for_answer(
     receiver: oneshot::Receiver<String>,
-    cancel: &vikram_kernel::CancellationToken,
+    cancel: &vikram_contracts::CancellationToken,
 ) -> Option<String> {
     tokio::select! {
         result = receiver => result.ok(),
@@ -913,7 +1110,7 @@ fn truncate(text: &str, limit: usize) -> String {
 mod tests {
     use super::parse_question;
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, ContextConfig};
     use crate::provider::{Provider, ProviderStream, ToolSpec};
     use crate::runtime::Runtime;
     use crate::tools::{Tool, ToolContext, ToolOutput};
@@ -921,7 +1118,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Mutex;
     use tokio::sync::broadcast;
-    use vikram_contracts::{ActionKind, PermissionRequest, SideEffect, VikramError};
+    use vikram_contracts::{ActionKind, PermissionRequest, SessionId, SideEffect, VikramError};
 
     #[test]
     fn an_ask_user_reply_yields_the_request_id_the_question_and_the_choices() {
@@ -963,15 +1160,24 @@ mod tests {
 
     /// A provider that replays one canned stream per request. Running out of script yields an empty
     /// stream, which ends the turn the same way a model that says nothing more would.
+    ///
+    /// It also keeps what each request contained, because the only context worth asserting about is
+    /// the one that was actually sent.
     struct ScriptedProvider {
         script: Mutex<VecDeque<Vec<ProviderEvent>>>,
+        requests: Mutex<Vec<Vec<Message>>>,
     }
 
     impl ScriptedProvider {
         fn new(batches: Vec<Vec<ProviderEvent>>) -> Self {
             Self {
                 script: Mutex::new(batches.into()),
+                requests: Mutex::new(Vec::new()),
             }
+        }
+
+        fn taken(&self) -> Vec<Vec<Message>> {
+            self.requests.lock().expect("requests lock").clone()
         }
     }
 
@@ -988,7 +1194,11 @@ mod tests {
             Some(8192)
         }
 
-        fn stream(&self, _request: CompletionRequest) -> ProviderStream {
+        fn stream(&self, request: CompletionRequest) -> ProviderStream {
+            self.requests
+                .lock()
+                .expect("requests lock")
+                .push(request.messages);
             let batch = self
                 .script
                 .lock()
@@ -1052,6 +1262,20 @@ mod tests {
         }
     }
 
+    /// The first session, named by the operator rather than left for the runtime to name.
+    ///
+    /// A session with no human-chosen title spends one model request on naming itself as soon as the
+    /// first real message arrives. These tests script the exact number of requests a turn makes, so
+    /// that request would be taken out of the script and land on the wrong turn — a naming call is
+    /// not part of what a turn is being tested to do.
+    fn named_session(handle: &crate::runtime::RuntimeHandle) -> vikram_contracts::SessionId {
+        let id = handle.snapshot().sessions[0].id.clone();
+        handle
+            .rename_session(&id, "Probe session".into())
+            .expect("name the session");
+        id
+    }
+
     /// Drain one turn's events into the sequence the interface would draw, stopping at the end of
     /// the turn. Five seconds bounds a hung loop instead of letting the test hang with it.
     async fn record(events: &mut broadcast::Receiver<RuntimeEvent>) -> Vec<Seen> {
@@ -1113,7 +1337,7 @@ mod tests {
         let handle = runtime.handle();
         handle.inner.tools.register(Box::new(ProbeTool));
         let mut events = handle.events();
-        let session = handle.snapshot().sessions[0].id.clone();
+        let session = named_session(&handle);
         handle
             .submit(&session, "audit the code".into())
             .expect("the turn is accepted");
@@ -1124,6 +1348,95 @@ mod tests {
             .expect("the session survives the turn")
             .messages();
         (seen, messages)
+    }
+
+    #[tokio::test]
+    async fn a_turn_writes_a_durable_usage_ledger_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::new(ScriptedProvider::new(vec![vec![
+                ProviderEvent::TextDelta("done".into()),
+                ProviderEvent::Finished {
+                    input_tokens: Some(10),
+                    output_tokens: Some(8),
+                },
+            ]])),
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "hello".into())
+            .expect("the turn is accepted");
+        let _ = record(&mut events).await;
+
+        let rows = handle
+            .inner
+            .store
+            .list_usage(&session)
+            .expect("the ledger is readable");
+        assert_eq!(rows.len(), 1, "one turn, one accounting row");
+        let row = &rows[0];
+        assert!(row.measured, "the provider reported these figures");
+        assert_eq!(row.prompt_tokens, 10);
+        assert_eq!(row.completion_tokens, 8);
+        assert_eq!(row.total_tokens, 18);
+        assert_eq!(row.model, "test-model");
+
+        let totals = handle.inner.store.usage_totals(&session).unwrap();
+        assert_eq!(totals.requests, 1);
+        assert_eq!(totals.measured_requests, 1);
+        assert_eq!(totals.total_tokens, 18);
+    }
+
+    #[tokio::test]
+    async fn an_unreported_turn_is_still_accounted_but_not_marked_measured() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::new(ScriptedProvider::new(vec![vec![
+                ProviderEvent::TextDelta("a reasonably long answer to estimate".into()),
+                ProviderEvent::Finished {
+                    input_tokens: None,
+                    output_tokens: None,
+                },
+            ]])),
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "hello".into())
+            .expect("the turn is accepted");
+        let _ = record(&mut events).await;
+
+        let rows = handle.inner.store.list_usage(&session).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !rows[0].measured,
+            "no provider figure, so this is an estimate"
+        );
+        assert!(
+            rows[0].total_tokens > 0,
+            "the estimator still produces a non-zero, honestly-labelled count"
+        );
+        assert_eq!(
+            handle
+                .inner
+                .store
+                .usage_totals(&session)
+                .unwrap()
+                .measured_requests,
+            0,
+            "an estimated turn must not inflate the measured count"
+        );
     }
 
     #[tokio::test]
@@ -1283,5 +1596,944 @@ mod tests {
             !seen.iter().any(|item| matches!(item, Seen::Speech(_))),
             "a silent tool call must not gain a progress sentence: {seen:?}"
         );
+    }
+
+    /// One exchange the way a live transcript holds it: an instruction, an assistant turn carrying a
+    /// call, then the result that answers that call. A fold that split these is an API error, not a
+    /// saving.
+    fn exchange(prompt: &str, reply: &str) -> Vec<Message> {
+        let call = ToolCall::new("probe", serde_json::json!({ "note": prompt }));
+        let id = call.id.clone();
+        vec![
+            Message::user(prompt.to_owned()),
+            Message {
+                role: Role::Assistant,
+                blocks: vec![
+                    Block::Text {
+                        text: format!("looking into {prompt}"),
+                        trust: Trust::Model,
+                    },
+                    Block::ToolCall { call },
+                ],
+            },
+            Message::tool_result(id, reply.to_owned(), true),
+        ]
+    }
+
+    /// Drain a whole turn, keeping the context events rather than the speech rows.
+    async fn drain(
+        events: &mut broadcast::Receiver<RuntimeEvent>,
+    ) -> (
+        Option<(usize, usize, u64, u64)>,
+        Option<crate::types::ContextMeter>,
+        Vec<(usize, u64)>,
+    ) {
+        let mut compacted = None;
+        let mut meter = None;
+        let mut pruned = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the turn never finished");
+            }
+            let Ok(Ok(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), events.recv()).await
+            else {
+                continue;
+            };
+            match event {
+                RuntimeEvent::ContextCompacted {
+                    folded,
+                    kept,
+                    before_tokens,
+                    after_tokens,
+                    ..
+                } => compacted = Some((folded, kept, before_tokens, after_tokens)),
+                RuntimeEvent::ContextMetered { meter: m, .. } => meter = Some(m),
+                RuntimeEvent::ContextPruned {
+                    replaced,
+                    saved_tokens,
+                    ..
+                } => pruned.push((replaced, saved_tokens)),
+                RuntimeEvent::TurnFinished { .. } => return (compacted, meter, pruned),
+                _ => {}
+            }
+        }
+    }
+
+    /// The whole context path, through the loop that actually runs: a transcript that no longer fits
+    /// is folded before the request leaves, the fold is journalled, the request the provider receives
+    /// carries the summary and keeps every tool call paired with its result, and the interface is
+    /// told what the request was made of.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_over_budget_transcript_folds_before_the_request_leaves() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![ProviderEvent::Finished {
+            input_tokens: Some(1_200),
+            output_tokens: Some(20),
+        }]]));
+        let config = Config {
+            model: "test-model".into(),
+            workspace_root: Some(dir.path().to_path_buf()),
+            context_window: Some(12_000),
+            max_output_tokens: Some(200),
+            context: ContextConfig {
+                trigger_percent: 10,
+                keep_recent: 6,
+                ..ContextConfig::default()
+            },
+            ..Config::default()
+        };
+        let runtime = Runtime::start_with_provider(config, provider.clone())
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        let session_id = named_session(&handle);
+        let session = handle
+            .inner
+            .session(&session_id)
+            .expect("the session exists");
+        for index in 0..12 {
+            for message in exchange(
+                &format!(
+                    "inspect item {index} and report what it reads, writes and returns in this workspace"
+                ),
+                &format!("item {index} reads a file and returns its first line"),
+            ) {
+                session.push_message(message, now_ms());
+            }
+        }
+        let seeded = session.messages().len();
+        assert_eq!(seeded, 36);
+
+        let mut events = handle.events();
+        handle
+            .submit(&session_id, "summarise everything found".into())
+            .expect("the turn is accepted");
+        let (compacted, meter, _) = drain(&mut events).await;
+
+        let (folded, kept, before_tokens, after_tokens) =
+            compacted.expect("an over-budget transcript folds before the request goes out");
+        assert!(folded >= 6, "the fold must clear a real span, got {folded}");
+        assert_eq!(kept, 6, "the tail is kept verbatim");
+        assert!(
+            after_tokens < before_tokens,
+            "a fold that saves nothing is not a fold: {before_tokens} -> {after_tokens}"
+        );
+
+        let requests = provider.taken();
+        assert_eq!(requests.len(), 1, "one request went out");
+        let sent = &requests[0];
+        assert!(
+            sent.iter()
+                .any(|m| crate::compaction::is_compaction_summary(m)),
+            "the summary travels with the request"
+        );
+        assert!(
+            crate::compaction::pairing_is_consistent(sent),
+            "a fold must not split a tool call from its result"
+        );
+        assert!(
+            sent.last().is_some_and(|m| m.role == Role::User),
+            "the live instruction is the newest thing in the request"
+        );
+
+        let stored = session.messages().len();
+        assert!(
+            stored < seeded,
+            "the folded transcript replaces the long one: {seeded} -> {stored}"
+        );
+        // The instruction is durable before the fold runs, so it is already inside the kept tail:
+        // summary + tail, nothing dropped on the way in.
+        assert_eq!(stored, kept + 1, "summary + kept tail");
+        assert!(
+            session
+                .messages()
+                .last()
+                .is_some_and(|m| m.role == Role::User),
+            "the live instruction survived the fold in stored order"
+        );
+
+        let records = handle
+            .inner
+            .store
+            .replay_messages(&session_id)
+            .expect("the journal reads back");
+        assert!(
+            records.iter().any(|r| r.kind == RecordKind::Compaction),
+            "the fold is durable, not just in memory"
+        );
+
+        let meter = meter.expect("the request is priced part by part");
+        assert!(meter.window > 0 && meter.usable > 0);
+        assert!(
+            !meter.measured,
+            "nothing reported a figure before this request"
+        );
+        assert!(
+            meter.parts.iter().any(|p| p.label == "conversation"),
+            "the inspector names the parts: {:?}",
+            meter.parts
+        );
+
+        // The provider's own figure becomes the anchor, so the next estimate trusts it.
+        let state = session.context.lock().expect("context lock");
+        assert!(state.anchor.is_some(), "reported usage anchored the meter");
+        assert!(
+            state.estimator.ratio() < 2.5,
+            "calibration stayed inside its clamp"
+        );
+    }
+
+    /// A result too large for the transcript is digested, not discarded: both ends stay in context,
+    /// and the middle is readable back from the session's spool through the named handle.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_oversized_tool_result_is_spooled_and_read_back() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![ProviderEvent::Finished {
+            input_tokens: None,
+            output_tokens: None,
+        }]]));
+        let config = Config {
+            model: "test-model".into(),
+            workspace_root: Some(dir.path().to_path_buf()),
+            context: ContextConfig {
+                tool_output_ceiling: 400,
+                ..ContextConfig::default()
+            },
+            ..Config::default()
+        };
+        let runtime = Runtime::start_with_provider(config, provider)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        let session_id = named_session(&handle);
+
+        let body = format!(
+            "HEAD\n{}MIDDLE-MARKER {}\nTAIL",
+            "a".repeat(2_000),
+            "b".repeat(2_000)
+        );
+        let digested = handle
+            .inner
+            .spool_output(&session_id, "call-7", body.clone());
+        assert!(digested.chars().count() < body.chars().count());
+        assert!(
+            digested.starts_with("HEAD"),
+            "the front of the result survives"
+        );
+        assert!(
+            digested.contains("TAIL"),
+            "the back survives too: {digested}"
+        );
+        assert!(
+            digested.contains("output.read(id=\"call-7\""),
+            "the digest names how to get the rest: {digested}"
+        );
+
+        let tool = handle
+            .inner
+            .tools
+            .get("output.read")
+            .expect("output.read is registered");
+        let context = handle.inner.tool_context_for(&session_id);
+        let read = tool
+            .run(
+                &serde_json::json!({ "id": "call-7", "offset": 2_005, "limit": 40 }),
+                &context,
+            )
+            .expect("the tool runs");
+        assert!(read.ok, "{}", read.content);
+        assert!(read.content.contains("MIDDLE-MARKER"), "{}", read.content);
+        assert!(
+            read.content
+                .contains(&format!("of {}", body.chars().count())),
+            "the read says how much is there: {}",
+            read.content
+        );
+
+        // A handle from another session's spool is not addressable here at all.
+        let other =
+            crate::spill::Spill::for_session(dir.path(), &vikram_contracts::SessionId::generate());
+        assert!(other.read("call-7", 0, 40).is_err());
+    }
+
+    /// The file tools checkpoint what they overwrite, so an agent edit is never the only copy: the
+    /// pre-edit bytes are spooled per-session and `restore_file` can bring them back.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_session_file_write_is_checkpointed_and_restorable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::new(ScriptedProvider::new(vec![])),
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        let session_id = named_session(&handle);
+        let mut context = handle.inner.tool_context_for(&session_id);
+        context.runtime = Some(Arc::clone(&handle.inner));
+
+        let write = handle
+            .inner
+            .tools
+            .get("fs.write")
+            .expect("fs.write is registered");
+        write
+            .run(
+                &serde_json::json!({ "path": "notes/a.txt", "content": "one" }),
+                &context,
+            )
+            .expect("the create write runs");
+        let file = dir.path().join("notes/a.txt");
+        write
+            .run(
+                &serde_json::json!({ "path": "notes/a.txt", "content": "two" }),
+                &context,
+            )
+            .expect("the overwrite runs");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "two");
+
+        let changes = handle.inner.workspace.file_changes(&session_id).unwrap();
+        assert_eq!(changes.len(), 2, "both writes are recorded");
+        let create = changes
+            .iter()
+            .find(|c| c.operation == "create")
+            .expect("the first write is a create");
+        assert!(
+            create.checkpoint_path.is_none(),
+            "a create has no earlier content to recover"
+        );
+        let modify = changes
+            .iter()
+            .find(|c| c.operation == "modify")
+            .expect("the overwrite is a modify");
+        assert!(
+            modify.checkpoint_path.is_some(),
+            "an overwrite keeps the bytes it replaced"
+        );
+
+        handle
+            .inner
+            .workspace
+            .restore_file(&session_id, &file)
+            .expect("the checkpoint restores");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "one",
+            "recovery returns the pre-overwrite content, not the discarded edit"
+        );
+    }
+
+    /// Delegation transfers a bounded brief down and a bounded answer back. The child never sees
+    /// the parent's transcript, and a chain that would exceed the depth limit is refused.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_delegated_agent_starts_from_a_brief_and_answers_its_parent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("Reviewed it: the gate is wired before the request.".into()),
+            ProviderEvent::Finished {
+                input_tokens: None,
+                output_tokens: Some(9),
+            },
+        ]]));
+        let config = Config {
+            model: "test-model".into(),
+            workspace_root: Some(dir.path().to_path_buf()),
+            context: ContextConfig {
+                delegation_budget_tokens: 200,
+                ..ContextConfig::default()
+            },
+            ..Config::default()
+        };
+        let runtime = Runtime::start_with_provider(config, provider)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        let parent_id = handle.snapshot().sessions[0].id.clone();
+        let parent = handle
+            .inner
+            .session(&parent_id)
+            .expect("the parent session");
+        for message in exchange(
+            "audit the payment module and report the gates it misses",
+            "we will check turn.rs before the gate lands",
+        ) {
+            parent.push_message(message, now_ms());
+        }
+
+        let profile = vikram_contracts::AgentId::new("delegatee");
+        handle.inner.agents.add(Arc::new(ManagedAgent::from_profile(
+            crate::types::AgentProfile {
+                id: profile.clone(),
+                name: "Rudra".into(),
+                role: "reviewer".into(),
+                description: "reads code".into(),
+                icon: None,
+                created_ms: now_ms(),
+            },
+        )));
+        handle
+            .spawn_agent(profile, "summarise the findings".into(), parent_id.clone())
+            .expect("the agent starts");
+
+        let child_id = handle
+            .snapshot()
+            .sessions
+            .iter()
+            .find(|s| s.id != parent_id)
+            .expect("a child session")
+            .id
+            .clone();
+        let child = handle.inner.session(&child_id).expect("the child session");
+
+        // The child begins from a brief, not from the parent's transcript.
+        let opening = child.messages();
+        let brief = opening
+            .first()
+            .expect("the brief is the first thing the child holds")
+            .text_body();
+        assert!(
+            brief.starts_with("[VIKRAM delegation brief]"),
+            "got {brief}"
+        );
+        assert!(
+            brief.contains("audit the payment module and report the gates it misses"),
+            "the live instruction crosses verbatim: {brief}"
+        );
+        assert!(
+            child.estimator().estimate_text(&brief) <= 200,
+            "the brief respects its budget"
+        );
+        assert_eq!(
+            child.parent().as_ref(),
+            Some(&parent_id),
+            "lineage in memory"
+        );
+        assert_eq!(child.depth(), 1, "one step from the operator's session");
+        assert_eq!(
+            handle
+                .inner
+                .store
+                .session_lineage(&child_id)
+                .expect("the store reads"),
+            Some((parent_id.clone(), 1)),
+            "lineage is durable"
+        );
+
+        // The answer comes back to the parent when the child's turn is done.
+        let mut arrived = None;
+        for _ in 0..200 {
+            let messages = parent.messages();
+            if let Some(found) = messages
+                .iter()
+                .rev()
+                .map(|m| m.text_body())
+                .find(|text| text.starts_with("[VIKRAM delegation result]"))
+            {
+                arrived = Some(found);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let answer = arrived.expect("the delegated answer reaches the parent");
+        assert!(
+            answer.contains("the gate is wired before the request"),
+            "the child's statement arrives: {answer}"
+        );
+        assert!(
+            !answer.contains("audit the payment module"),
+            "the parent's own transcript is not echoed back: {answer}"
+        );
+
+        // A chain deeper than the floor is refused, not silently allowed to nest.
+        child.set_depth(handle.inner.policy().max_delegation_depth());
+        let refused = handle.spawn_agent(
+            vikram_contracts::AgentId::new("delegatee"),
+            "deeper".into(),
+            child_id.clone(),
+        );
+        match refused {
+            Err(crate::error::RuntimeError::InvalidState(reason)) => {
+                assert!(reason.contains("delegation depth"), "{reason}")
+            }
+            other => panic!("expected a depth refusal, got {other:?}"),
+        }
+    }
+    /// A tool that declares a plain read and only says it ran, under whatever name the test needs
+    /// — the growth pipeline counts distinct tools, so one turn needs more than `probe`.
+    struct NamedProbeTool(&'static str);
+
+    impl Tool for NamedProbeTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.0.into(),
+                description: "records that it ran".into(),
+                schema: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+
+        fn permission(&self, _args: &serde_json::Value) -> Result<PermissionRequest, VikramError> {
+            Ok(PermissionRequest::new(
+                ActionKind::Read,
+                "probe.run",
+                self.0,
+                SideEffect::None,
+                Trust::Model,
+            ))
+        }
+
+        fn run(
+            &self,
+            _args: &serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolOutput, VikramError> {
+            Ok(ToolOutput {
+                content: format!("{}: done", self.0),
+                ok: true,
+            })
+        }
+    }
+
+    fn finished() -> ProviderEvent {
+        ProviderEvent::Finished {
+            input_tokens: None,
+            output_tokens: None,
+        }
+    }
+
+    /// A tool that stops the turn it is running in. The operator hitting cancel between two calls of
+    /// one batch is the only way the loop can walk away from a call the model actually made.
+    struct CancellingTool {
+        handle: crate::runtime::RuntimeHandle,
+        session: SessionId,
+    }
+
+    impl Tool for CancellingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "stop-turn".into(),
+                description: "cancels the session it runs in".into(),
+                schema: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+
+        fn permission(&self, _args: &serde_json::Value) -> Result<PermissionRequest, VikramError> {
+            Ok(PermissionRequest::new(
+                ActionKind::Read,
+                "probe.run",
+                "stop-turn",
+                SideEffect::None,
+                Trust::Model,
+            ))
+        }
+
+        fn run(
+            &self,
+            _args: &serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolOutput, VikramError> {
+            let _ = self.handle.cancel(&self.session);
+            Ok(ToolOutput {
+                content: "cancelled the turn".into(),
+                ok: true,
+            })
+        }
+    }
+
+    /// Wait for the turn to end without reading its rows: a cancelled call answers with a failure,
+    /// and `record` asserts that every probe succeeded.
+    async fn run_to_end(events: &mut broadcast::Receiver<RuntimeEvent>) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the turn never finished");
+            }
+            if let Ok(Ok(RuntimeEvent::TurnFinished { .. })) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), events.recv()).await
+            {
+                return;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_batch_still_answers_the_call_that_never_ran() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let stop = ToolCall::new("stop-turn", serde_json::json!({}));
+        let unrun = ToolCall::new("probe-read", serde_json::json!({}));
+        let unrun_id = unrun.id.clone();
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            ProviderEvent::ToolCall(stop),
+            ProviderEvent::ToolCall(unrun),
+            finished(),
+        ]]));
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), provider)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        let session = named_session(&handle);
+        handle.inner.tools.register(Box::new(CancellingTool {
+            handle: handle.clone(),
+            session: session.clone(),
+        }));
+        let mut events = handle.events();
+        handle
+            .submit(&session, "stop this batch".into())
+            .expect("the turn is accepted");
+        run_to_end(&mut events).await;
+
+        let messages = handle
+            .inner
+            .session(&session)
+            .expect("the session survives the turn")
+            .messages();
+        let answered: Vec<String> = messages
+            .iter()
+            .flat_map(|m| m.blocks.iter())
+            .filter_map(|block| match block {
+                Block::ToolResult { call, content, .. } => Some(format!("{call}: {content}")),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            answered
+                .iter()
+                .any(|row| row.starts_with(&format!("{unrun_id}:"))),
+            "a call the model made must not vanish from the transcript: {answered:?}"
+        );
+        assert!(
+            answered
+                .iter()
+                .any(|row| row.starts_with(&format!("{unrun_id}:")) && row.contains("cancel")),
+            "and it says so honestly: {answered:?}"
+        );
+    }
+
+    /// A crash between recording a call and recording its result is the case replay has to repair,
+    /// and it can only do that if the call row says which call it was.
+    #[tokio::test]
+    async fn the_journal_names_the_call_it_started() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let call = ToolCall::new("probe", serde_json::json!({}));
+        let call_id = call.id.clone();
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::new(ScriptedProvider::new(vec![vec![
+                ProviderEvent::ToolCall(call),
+                finished(),
+            ]])),
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        handle.inner.tools.register(Box::new(ProbeTool));
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "audit the code".into())
+            .expect("the turn is accepted");
+        run_to_end(&mut events).await;
+
+        let records = handle
+            .inner
+            .store
+            .replay_messages(&session)
+            .expect("the journal reads back");
+        let journaled: Vec<String> = records
+            .iter()
+            .filter(|r| r.kind == RecordKind::ToolCall)
+            .map(|r| {
+                r.payload
+                    .get("call")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            journaled,
+            vec![call_id.as_str().to_owned()],
+            "the call row carries the id the result row answers"
+        );
+    }
+
+    /// Run one scripted turn over two tools and hand back what the runtime kept.
+    #[allow(clippy::await_holding_lock)]
+    async fn grow_through_tools(
+        scripts: Vec<Vec<ProviderEvent>>,
+        tool_names: &[&'static str],
+    ) -> (Arc<ScriptedProvider>, crate::runtime::RuntimeHandle) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let provider = Arc::new(ScriptedProvider::new(scripts));
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        for name in tool_names {
+            handle.inner.tools.register(Box::new(NamedProbeTool(name)));
+        }
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "audit the workspace".into())
+            .expect("the turn is accepted");
+        let _ = record(&mut events).await;
+        (provider, handle)
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_used_tools_teaches_the_runtime_without_anyone_being_asked() {
+        let first = ToolCall::new("probe-read", serde_json::json!({}));
+        let second = ToolCall::new("probe-write", serde_json::json!({}));
+        let (provider, handle) = grow_through_tools(
+            vec![
+                vec![ProviderEvent::ToolCall(first), finished()],
+                vec![ProviderEvent::ToolCall(second), finished()],
+                vec![
+                    ProviderEvent::TextDelta("the workspace is clean".into()),
+                    finished(),
+                ],
+            ],
+            &["probe-read", "probe-write"],
+        )
+        .await;
+
+        let experiences = handle
+            .inner
+            .evolution
+            .lock()
+            .expect("evolution lock")
+            .experience
+            .count()
+            .expect("the store reads");
+        assert_eq!(experiences, 1, "the turn became one experience");
+
+        let pending = handle.inner.learning.pending_proposals();
+        assert_eq!(
+            pending.len(),
+            1,
+            "a two-tool success becomes exactly one staged proposal: {pending:?}"
+        );
+        assert_eq!(pending[0].kind, "skill");
+        assert_eq!(
+            pending[0].status, "pending",
+            "the operator decides, not the model"
+        );
+
+        let audit = handle.inner.learning.audit_log();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].outcome, "staged");
+
+        assert_eq!(
+            provider.taken().len(),
+            3,
+            "the default config spends no tokens on a background review"
+        );
+    }
+
+    /// A one-shot process that exits when the turn is announced finished would otherwise drop the
+    /// review it started, so the runtime counts reviews in flight and can be waited on.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_review_in_flight_is_counted_until_it_lands() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta(
+                r#"[{"kind":"memory","target":"memory","action":"add","key":"probe","content":"the probe tools always succeed","reason":"observed"}]"#.into(),
+            ),
+            finished(),
+        ]]));
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        let session = named_session(&handle);
+
+        handle.trigger_learning_review(&session, "user: run the probe\ntools: probe");
+        assert!(
+            handle.learning_busy(),
+            "a review is counted the moment it is started, not when it is polled"
+        );
+        assert!(
+            handle
+                .wait_for_learning(std::time::Duration::from_secs(5))
+                .await,
+            "and the runtime says when it is done learning"
+        );
+        assert!(!handle.learning_busy());
+        let staged = handle.inner.learning.pending_proposals();
+        assert!(
+            staged
+                .iter()
+                .any(|p| p.kind == "memory" && p.content == "the probe tools always succeed"),
+            "the review's answer reached the approval surface: {staged:?}"
+        );
+    }
+
+    /// The paid half, end to end: a turn that earns a review asks the model, and the model's
+    /// answer goes through the same policy gate as one the runtime derived itself.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_earning_turn_asks_the_model_and_the_answer_lands_on_the_same_gate() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let call = ToolCall::new("probe-read", serde_json::json!({}));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![ProviderEvent::ToolCall(call), finished()],
+            vec![
+                ProviderEvent::TextDelta("the workspace is clean".into()),
+                finished(),
+            ],
+            vec![
+                ProviderEvent::TextDelta(
+                    r#"[{"kind":"memory","target":"user","action":"add","key":"pref","content":"prefers pnpm","reason":"stated twice"}]"#.into(),
+                ),
+                finished(),
+            ],
+        ]));
+        let model: Arc<dyn Provider> = Arc::clone(&provider) as Arc<dyn Provider>;
+        let config = Config {
+            model: "test-model".into(),
+            workspace_root: Some(dir.path().to_path_buf()),
+            learning_review_every: 1,
+            ..Config::default()
+        };
+        let runtime = Runtime::start_with_provider(config, model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        handle
+            .inner
+            .tools
+            .register(Box::new(NamedProbeTool("probe-read")));
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "audit the workspace".into())
+            .expect("the turn is accepted");
+        let _ = record(&mut events).await;
+
+        let mut staged = Vec::new();
+        for _ in 0..100 {
+            let pending = handle.inner.learning.pending_proposals();
+            if !pending.is_empty() {
+                staged = pending;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            staged.len(),
+            1,
+            "the review's proposal waits for the operator like any other"
+        );
+        assert_eq!(staged[0].kind, "memory");
+        assert_eq!(staged[0].content, "prefers pnpm");
+        assert_eq!(
+            handle
+                .inner
+                .memory
+                .list("user")
+                .expect("memory reads")
+                .iter()
+                .filter(|(_, value)| value == "prefers pnpm")
+                .count(),
+            0,
+            "a model's sentence is not a memory until a human says yes"
+        );
+        assert_eq!(
+            provider.taken().len(),
+            3,
+            "two turn requests and the review"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chat_only_turn_is_not_evidence_of_anything() {
+        let (_provider, handle) = grow_through_tools(
+            vec![vec![
+                ProviderEvent::TextDelta("here is what I think".into()),
+                finished(),
+            ]],
+            &[],
+        )
+        .await;
+        let experiences = handle
+            .inner
+            .evolution
+            .lock()
+            .expect("evolution lock")
+            .experience
+            .count()
+            .expect("the store reads");
+        assert_eq!(experiences, 0, "nothing was done, so nothing was learned");
+        assert!(handle.inner.learning.pending_proposals().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_operator_that_disabled_learning_grows_nothing() {
+        use crate::learning::LearningPolicy;
+        let first = ToolCall::new("probe-read", serde_json::json!({}));
+        let second = ToolCall::new("probe-write", serde_json::json!({}));
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![ProviderEvent::ToolCall(first), finished()],
+            vec![ProviderEvent::ToolCall(second), finished()],
+            vec![finished()],
+        ]));
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        handle
+            .inner
+            .tools
+            .register(Box::new(NamedProbeTool("probe-read")));
+        handle
+            .inner
+            .tools
+            .register(Box::new(NamedProbeTool("probe-write")));
+        handle
+            .inner
+            .learning
+            .set_policy_memory(LearningPolicy::Disabled);
+        handle
+            .inner
+            .learning
+            .set_policy_skill(LearningPolicy::Disabled);
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "audit the workspace".into())
+            .expect("the turn is accepted");
+        let _ = record(&mut events).await;
+
+        let experiences = handle
+            .inner
+            .evolution
+            .lock()
+            .expect("evolution lock")
+            .experience
+            .count()
+            .expect("the store reads");
+        assert_eq!(experiences, 0, "a disabled policy means off, not quiet");
+        assert!(handle.inner.learning.pending_proposals().is_empty());
     }
 }

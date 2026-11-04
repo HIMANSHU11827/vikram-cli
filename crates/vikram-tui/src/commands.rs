@@ -78,7 +78,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "tasks",
-        aliases: &["background"],
+        aliases: &[],
         description: "Background tasks; choosing one stops it",
         outcome: Outcome::Picker(PickerKind::Task),
     },
@@ -161,6 +161,12 @@ pub const COMMANDS: &[Command] = &[
         outcome: Outcome::Picker(PickerKind::Context),
     },
     Command {
+        name: "compact",
+        aliases: &["summarise", "summarize"],
+        description: "Fold this conversation's older turns into a summary now",
+        outcome: Outcome::Action,
+    },
+    Command {
         name: "settings",
         aliases: &["prefs", "preferences"],
         description: "Interface preferences that apply now",
@@ -225,6 +231,12 @@ pub const COMMANDS: &[Command] = &[
         aliases: &["quit"],
         description: "Quit VIKRAM",
         outcome: Outcome::Picker(PickerKind::Exit),
+    },
+    Command {
+        name: "schedule",
+        aliases: &["cron"],
+        description: "Scheduled jobs and the daemon that runs them",
+        outcome: Outcome::Picker(PickerKind::Background),
     },
 ];
 

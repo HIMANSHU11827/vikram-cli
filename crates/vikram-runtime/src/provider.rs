@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::pin::Pin;
 use vikram_contracts::{Message, ToolCall, VikramError};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,

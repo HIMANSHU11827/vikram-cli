@@ -1044,6 +1044,9 @@ mod tests {
         ToolContext {
             workspace_root: PathBuf::from("."),
             sandbox: crate::sandbox::Sandbox::disabled("test context"),
+            spill: crate::spill::Spill::disabled(),
+            runtime: None,
+            session: None,
         }
     }
 

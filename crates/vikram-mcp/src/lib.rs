@@ -1,18 +1,21 @@
-//! VIKRAM MCP Ecosystem — Server, Private Runtime, Discovery, Visibility.
+//! VIKRAM MCP Ecosystem — one client, one server, visibility.
 //!
 //! This crate provides:
+//! - The MCP client ([`client::McpRegistry`]): spawns and speaks JSON-RPC to third-party servers.
+//!   The runtime owns configuration; this crate owns the wire.
 //! - MCP Server (JSON-RPC 2.0 over STDIO) exposing approved VIKRAM tools
-//! - Private MCP Runtime (process lifecycle management for third-party servers)
 //! - Discovery (catalog of available MCP servers)
 //! - Visibility management (Private/Public per-server toggle)
 
+pub mod client;
 pub mod discovery;
-pub mod runtime;
 pub mod server;
 pub mod visibility;
 
+pub use client::{
+    McpRegistry, PromptInfo, ResourceInfo, ServerSpec, ServerState, ToolInfo, parse_tools_response,
+};
 pub use discovery::{DiscoveryCatalog, ServerEntry};
-pub use runtime::{PrivateRuntime, ServerInstance, ServerStatus};
 pub use server::{McpServer, McpServerConfig as ServerConfig};
 pub use visibility::{Visibility, VisibilityManager};
 

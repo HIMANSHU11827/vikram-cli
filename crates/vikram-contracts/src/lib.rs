@@ -1,14 +1,16 @@
 //! Stable typed contracts for VIKRAM.
 //!
 //! Anything that crosses a replacement boundary lives here: identifiers, the error taxonomy,
-//! contract versioning, content with its provenance, the permission vocabulary, and the journal
-//! record shape. Crates below the kernel depend on nothing but this crate, which is what lets a
-//! component be swapped without the components around it changing.
+//! contract versioning, content with its provenance, the permission vocabulary, the journal record
+//! shape, and the two primitives every layer prices or stops work with. Every other crate depends
+//! on nothing but this one, which is what lets a component be swapped without the components around
+//! it changing.
 
 pub mod error;
 pub mod ids;
 pub mod journal;
 pub mod message;
+pub mod meter;
 pub mod policy;
 pub mod ticket;
 pub mod trust;
@@ -17,14 +19,15 @@ pub mod version;
 pub use error::{Result, ToolOutcome, VikramError};
 pub use journal::{Appended, InMemoryJournal, JournalRecord, JournalSink, NewRecord, RecordKind};
 pub use message::{Block, Message, Role, ToolCall};
+pub use meter::{CancellationToken, TokenMeter};
 pub use policy::{
     ActionKind, Decision, PermissionMode, PermissionPolicy, PermissionRequest, Posture,
     RuleOutcome, SideEffect, amendment_for,
 };
 pub use trust::Trust;
 pub use version::{
-    ContractDecl, ContractSpec, EFFECT_HANDLER, JOURNAL_SINK, KERNEL_LIFECYCLE, MEMORY_STORE,
-    MODEL_PROVIDER, POLICY_EVALUATOR, TOOL_EXECUTOR, Versioned,
+    ContractDecl, ContractSpec, JOURNAL_SINK, MEMORY_STORE, MODEL_PROVIDER, POLICY_EVALUATOR,
+    TOOL_EXECUTOR, Versioned,
 };
 
 pub use ids::{

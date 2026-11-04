@@ -525,6 +525,20 @@ fn open_command(
         }
     }
 
+    if command.name == "compact" {
+        match handle.compact_now(session) {
+            Ok(report) => app.push_notice(
+                NoticeLevel::Info,
+                format!(
+                    "folded {} messages into a summary: {} -> {} tokens, {} kept verbatim",
+                    report.folded, report.before_tokens, report.after_tokens, report.kept
+                ),
+            ),
+            Err(err) => app.push_notice(NoticeLevel::Warn, err.to_string()),
+        }
+        return;
+    }
+
     match command.outcome {
         Outcome::Picker(kind) => open_panel(handle, app, kind),
         Outcome::Info => {
@@ -692,7 +706,16 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
             });
         }
         PickerKind::Memory => {
-            let entries = handle.memory_list_all();
+            let entries = match handle.memory_list_all() {
+                Ok(entries) => entries,
+                Err(err) => {
+                    app.push_notice(
+                        NoticeLevel::Warn,
+                        format!("memory could not be read: {err}"),
+                    );
+                    Vec::new()
+                }
+            };
             let items: Vec<PickerItem> = entries
                 .iter()
                 .map(|(scope, key, value)| {
@@ -925,6 +948,81 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
             }
             app.open_picker(Picker::new(kind, "Tools", items));
         }
+        PickerKind::Background => {
+            // The daemon is a separate process with its own rows in the same database, so this
+            // panel reads state instead of asking the runtime: what is scheduled, when it runs
+            // next, and how the last attempt ended.
+            let mut items = Vec::new();
+            let mut note = None;
+            match vikram_daemon::cli::store() {
+                Ok(store) => {
+                    let home = vikram_daemon::cli::home();
+                    let daemon = match vikram_daemon::daemon::owner(&home) {
+                        Ok(Some(owner)) if owner.alive => {
+                            format!("running · pid {}", owner.pid)
+                        }
+                        Ok(Some(owner)) => format!("stale lock · pid {} is gone", owner.pid),
+                        Ok(None) => "not running · cron waits for it".to_owned(),
+                        Err(err) => format!("unreadable lock: {err}"),
+                    };
+                    items.push(PickerItem::new("daemon", daemon, "daemon".to_owned()));
+                    let enabled = store.state_bool("heartbeat.enabled", true).unwrap_or(true);
+                    let interval = store
+                        .state_ms("heartbeat.interval_ms")
+                        .ok()
+                        .flatten()
+                        .map(|ms| vikram_daemon::time::humanize_ms(ms))
+                        .unwrap_or_else(|| "1m".to_owned());
+                    items.push(PickerItem::new(
+                        "heartbeat",
+                        format!(
+                            "{} · every {interval} · enter turns it {}",
+                            if enabled { "on" } else { "off" },
+                            if enabled { "off" } else { "on" }
+                        ),
+                        "heartbeat".to_owned(),
+                    ));
+                    let manager = vikram_daemon::jobs::JobManager::new(store.clone());
+                    match manager.list() {
+                        Ok(jobs) if jobs.is_empty() => {
+                            note = Some(
+                                "nothing is scheduled · `vikram cron add` puts work here"
+                                    .to_owned(),
+                            )
+                        }
+                        Ok(jobs) => {
+                            for job in jobs {
+                                let zone = vikram_daemon::time::Zone::parse(&job.timezone)
+                                    .unwrap_or(vikram_daemon::time::Zone::Local);
+                                let next = job
+                                    .next_run_ms
+                                    .map(|at| vikram_daemon::time::format_ms(zone, at))
+                                    .unwrap_or_else(|| "no next run".to_owned());
+                                let mut item = PickerItem::new(
+                                    job.name.clone(),
+                                    format!(
+                                        "{} · next {next} · last {}",
+                                        job.schedule, job.last_status
+                                    ),
+                                    job.id.clone(),
+                                );
+                                if job.enabled {
+                                    item = item.as_current();
+                                }
+                                items.push(item);
+                            }
+                        }
+                        Err(err) => note = Some(format!("jobs could not be read: {err}")),
+                    }
+                }
+                Err(err) => note = Some(err),
+            }
+            let picker = Picker::new(kind, "Background", items);
+            app.open_picker(match note {
+                Some(note) => picker.with_note(note),
+                None => picker,
+            });
+        }
         PickerKind::Status => {
             let snapshot = handle.snapshot();
             let metrics = snapshot.metrics.clone();
@@ -1042,15 +1140,46 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
             let metrics = handle.snapshot().metrics;
             let mut items = vec![PickerItem::new(
                 "used",
-                format!("{} tokens", metrics.context_used),
+                format!(
+                    "{} tokens{}",
+                    metrics.context_used,
+                    if metrics.context_measured {
+                        " (measured; newest tail estimated)"
+                    } else {
+                        " (estimated, self-calibrated)"
+                    }
+                ),
                 "used".to_owned(),
             )];
             match metrics.context_window {
                 Some(window) if window > 0 => {
                     items.push(PickerItem::new(
                         "window",
-                        format!("{window} tokens"),
+                        format!(
+                            "{window} tokens{}",
+                            if metrics.context_limit_assumed {
+                                " (assumed: nothing advertised one)"
+                            } else {
+                                ""
+                            }
+                        ),
                         "window".to_owned(),
+                    ));
+                    items.push(PickerItem::new(
+                        "usable",
+                        format!(
+                            "{} tokens (after reply reserve, tool schemas, safety margin)",
+                            metrics.context_usable
+                        ),
+                        "usable".to_owned(),
+                    ));
+                    items.push(PickerItem::new(
+                        "left",
+                        format!(
+                            "{} tokens",
+                            metrics.context_usable.saturating_sub(metrics.context_used)
+                        ),
+                        "left".to_owned(),
                     ));
                     if let Some(ratio) = metrics.context_ratio() {
                         items.push(PickerItem::new(
@@ -1059,12 +1188,45 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                             "ratio".to_owned(),
                         ));
                     }
+                    items.push(PickerItem::new(
+                        "folds",
+                        format!(
+                            "{} (older turns summarised; originals stay in the journal)",
+                            metrics.context_compactions
+                        ),
+                        "folds".to_owned(),
+                    ));
                 }
                 _ => items.push(PickerItem::new(
                     "window",
                     "not known for this model".to_owned(),
                     "window".to_owned(),
                 )),
+            }
+            // What the last request actually carried, part by part, when one has gone out.
+            if let Some((_, meter)) = app
+                .context_detail
+                .as_ref()
+                .filter(|(id, _)| app.active_session().is_some_and(|s| s.id == *id))
+            {
+                for part in &meter.parts {
+                    items.push(PickerItem::new(
+                        format!("  {}", part.label),
+                        format!("{} tokens", part.tokens),
+                        "part".to_owned(),
+                    ));
+                }
+                items.push(PickerItem::new(
+                    "reply reserve",
+                    format!("{} tokens", meter.output_reserve),
+                    "reserve".to_owned(),
+                ));
+            } else {
+                items.push(PickerItem::new(
+                    "! no request has gone out yet: these are totals, not one prompt".to_owned(),
+                    String::new(),
+                    "hint".to_owned(),
+                ));
             }
             app.open_picker(Picker::new(kind, "Context", items));
         }
@@ -1427,6 +1589,39 @@ fn apply_act(
                 app.push_notice(NoticeLevel::Info, format!("tool `{value}` enabled"));
             }
         }
+        (PickerKind::Background, Verb::Toggle) => {
+            // One panel, two kinds of row: the heartbeat row flips the beat, a job row flips that
+            // job. Both write to the store the daemon reads, so the change takes effect on its
+            // next tick without restarting anything.
+            let outcome = (|| -> Result<String, String> {
+                let store = vikram_daemon::cli::store()?;
+                if value == "heartbeat" {
+                    let on = store
+                        .state_bool("heartbeat.enabled", true)
+                        .map_err(|err| err.to_string())?;
+                    return vikram_daemon::cli::heartbeat_set_enabled(!on);
+                }
+                if value == "daemon" {
+                    return Err(
+                        "the daemon row only reports; `vikram daemon start` runs it".to_owned()
+                    );
+                }
+                let job = store
+                    .get_job(&value)
+                    .map_err(|err| err.to_string())?
+                    .ok_or_else(|| format!("{value} is no longer scheduled"))?;
+                if job.enabled {
+                    vikram_daemon::cli::cron_pause(&job.id)
+                } else {
+                    vikram_daemon::cli::cron_resume(&job.id)
+                }
+            })();
+            match outcome {
+                Ok(text) => app.push_notice(NoticeLevel::Info, text),
+                Err(err) => app.push_notice(NoticeLevel::Warn, err),
+            }
+            open_panel(handle, app, PickerKind::Background);
+        }
         (PickerKind::Status, _) => {
             // Info panel - just close
         }
@@ -1604,10 +1799,18 @@ fn apply_act(
                 Some(parts) => parts,
                 None => return,
             };
-            let entry = handle
-                .memory_list_all()
-                .into_iter()
-                .find(|(entry_scope, entry_key, _)| entry_scope == scope && entry_key == key);
+            let entry = match handle.memory_list_all() {
+                Ok(entries) => entries
+                    .into_iter()
+                    .find(|(entry_scope, entry_key, _)| entry_scope == scope && entry_key == key),
+                Err(err) => {
+                    app.push_notice(
+                        NoticeLevel::Warn,
+                        format!("memory could not be read: {err}"),
+                    );
+                    return;
+                }
+            };
             match entry {
                 Some((scope, key, remembered)) => {
                     let mut lines: Vec<String> = remembered.lines().map(str::to_owned).collect();
@@ -1843,6 +2046,8 @@ mod tests {
                 queued: 0,
                 project_id: None,
                 status: "active".to_owned(),
+                title_source: "generic".to_owned(),
+                title_status: "pending".to_owned(),
             }));
         app
     }
@@ -1876,7 +2081,7 @@ mod tests {
 
         let session = app.active_session().expect("a session is shown");
         assert!(
-            session.thought_expanded(hit.key),
+            !session.turn_folded(hit.key),
             "clicking the header opens exactly that block"
         );
         assert!(app.selection.is_none(), "a header click is not a drag");

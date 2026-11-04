@@ -2594,6 +2594,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "vikram-contracts",
+ "vikram-daemon",
  "vikram-mcp",
  "vikram-runtime",
  "vikram-skills",
@@ -2611,6 +2612,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "vikram-daemon"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "vikram-contracts",
+ "vikram-runtime",
+ "vikram-store",
+]
+
+[[package]]
 name = "vikram-evolution"
 version = "0.1.0"
 dependencies = [
@@ -2619,16 +2637,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
-]
-
-[[package]]
-name = "vikram-kernel"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "vikram-contracts",
- "vikram-policy",
 ]
 
 [[package]]
@@ -2669,7 +2677,6 @@ dependencies = [
  "tungstenite",
  "vikram-contracts",
  "vikram-evolution",
- "vikram-kernel",
  "vikram-mcp",
  "vikram-policy",
  "vikram-skills",
@@ -2710,7 +2717,6 @@ dependencies = [
  "tempfile",
  "unicode-width",
  "vikram-contracts",
- "vikram-kernel",
  "vikram-runtime",
 ]
 

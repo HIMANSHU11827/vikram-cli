@@ -7,13 +7,14 @@
 use crate::editor::Editor;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use vikram_contracts::TokenMeter;
 use vikram_contracts::{
-    AgentId, ApprovalId, Message, PermissionMode, SessionId, ToolCallId, TurnId,
+    AgentId, ApprovalId, Message, PermissionMode, Role, SessionId, ToolCallId, TurnId,
 };
-use vikram_kernel::TokenMeter;
 use vikram_runtime::types::{
-    AgentSnapshot, AgentState, ApprovalPrompt, BackgroundTask, Metrics, NoticeLevel, RuntimeEvent,
-    RuntimeStatus, SessionSnapshot, StateSnapshot, TaskState, TeamSnapshot, TurnState, now_ms,
+    AgentSnapshot, AgentState, ApprovalPrompt, BackgroundTask, ContextMeter, Metrics, NoticeLevel,
+    RuntimeEvent, RuntimeStatus, SessionSnapshot, StateSnapshot, TaskState, TeamSnapshot,
+    TurnState, now_ms,
 };
 
 #[derive(Clone, Debug)]
@@ -45,6 +46,9 @@ pub struct TabHit {
 /// A stream that has not been committed to a message yet gets [`STREAMING_THOUGHT`].
 pub type ThoughtKey = (usize, usize);
 pub const STREAMING_THOUGHT: ThoughtKey = (usize::MAX, 0);
+/// Where a turn's own work is folded away. No message index can reach this marker, so a turn header
+/// and a thinking block never collide inside one fold map.
+pub(crate) const TURN_HEADERS: usize = usize::MAX - 3;
 
 /// The header line of a thinking block, as it was drawn. The draw writes it and the mouse reads it,
 /// so a click names the block it landed on instead of guessing at the geometry.
@@ -360,6 +364,8 @@ pub struct SessionView {
     pub tokens: TokenMeter,
     pub created_ms: u64,
     pub updated_ms: u64,
+    /// `generic`, `auto` or `manual` — how this session got its name.
+    pub title_source: String,
     pub agent: Option<AgentId>,
     pub editor: Editor,
     pub scroll: usize,
@@ -382,6 +388,10 @@ pub struct SessionView {
     pub turn_started_ms: Option<u64>,
     /// How long the last finished turn took. Kept after the turn ends, because the header says so.
     pub turn_elapsed_ms: u64,
+    /// How long each finished turn took, keyed by the last message it wrote. A transcript scrolls
+    /// back through several turns, so a receipt has to belong to its own turn instead of to the
+    /// session's latest one.
+    pub turn_times: std::collections::HashMap<usize, u64>,
     pub unread: usize,
 }
 
@@ -399,6 +409,7 @@ impl SessionView {
             tokens: snapshot.tokens,
             created_ms: snapshot.created_ms,
             updated_ms: snapshot.updated_ms,
+            title_source: snapshot.title_source,
             agent: snapshot.agent,
             editor: Editor::new(),
             scroll: 0,
@@ -413,6 +424,7 @@ impl SessionView {
             payloads: HashMap::new(),
             turn_started_ms: None,
             turn_elapsed_ms: 0,
+            turn_times: std::collections::HashMap::new(),
             unread: 0,
         }
     }
@@ -426,10 +438,28 @@ impl SessionView {
             .unwrap_or(self.expanded_thought)
     }
 
-    /// Flip one block, leaving the others where they were.
+    /// Flip one block, leaving the others where they were. A turn header answers "hide this turn"
+    /// and a thinking block answers "open this thought", so the flip is inverted between them; the
+    /// row's first half says which question the key belongs to.
     pub fn toggle_thought(&mut self, key: ThoughtKey) {
-        let next = !self.thought_expanded(key);
+        let next = if key.0 == TURN_HEADERS {
+            !self.turn_folded(key)
+        } else {
+            !self.thought_expanded(key)
+        };
         self.thought_folds.insert(key, next);
+    }
+
+    /// Whether one turn's work is folded away. A header starts open: the session-wide thinking
+    /// default is about the thinking rows, not about the turn they sit in.
+    pub fn turn_folded(&self, key: ThoughtKey) -> bool {
+        self.turn_fold(key).unwrap_or(true)
+    }
+
+    /// What the operator decided about this turn, if he decided anything. `None` means nobody has
+    /// touched it, which is the state the header needs so it can pick its own default.
+    pub fn turn_fold(&self, key: ThoughtKey) -> Option<bool> {
+        self.thought_folds.get(&key).copied()
     }
 
     /// Whether one tool row shows its payload. There is no session-wide default: a payload is
@@ -512,7 +542,21 @@ impl SessionView {
     pub fn mark_settled(&mut self) {
         if let Some(started) = self.turn_started_ms.take() {
             self.turn_elapsed_ms = now_ms().saturating_sub(started);
+            // Pin the duration to the message this turn ended with, so the receipt stays on the
+            // turn it belongs to once the next turn starts.
+            if let Some(index) = self
+                .messages
+                .iter()
+                .rposition(|m| m.role == Role::Assistant)
+            {
+                self.turn_times.insert(index, self.turn_elapsed_ms);
+            }
         }
+    }
+
+    /// How long the turn that ended at `index` took, if it was timed.
+    pub fn turn_time(&self, index: usize) -> Option<u64> {
+        self.turn_times.get(&index).copied()
     }
 
     /// Seconds the turn on screen has run, live while it works and final once it is done.
@@ -532,6 +576,7 @@ impl SessionView {
         self.turn = snapshot.turn;
         self.tokens = snapshot.tokens;
         self.updated_ms = snapshot.updated_ms;
+        self.title_source = snapshot.title_source;
         self.agent = snapshot.agent;
         self.queued = snapshot.queued;
         // The turn state is the only authority on whether work is happening. Reading it after the
@@ -557,6 +602,8 @@ pub struct App {
     pub approvals: Vec<ApprovalPrompt>,
     pub status: RuntimeStatus,
     pub metrics: Metrics,
+    /// The last request one session actually sent, priced part by part, and which session it was.
+    pub context_detail: Option<(SessionId, ContextMeter)>,
     pub notices: VecDeque<Notice>,
     pub overlay: Option<Overlay>,
     pub focus: Focus,
@@ -620,6 +667,7 @@ impl App {
             approvals: Vec::new(),
             status: RuntimeStatus::Initializing,
             metrics: Metrics::default(),
+            context_detail: None,
             notices: VecDeque::new(),
             overlay: None,
             focus: Focus::Input,
@@ -1146,6 +1194,38 @@ impl App {
                 self.metrics.skills_discovered = discovered;
                 self.metrics.skills_loaded = loaded;
             }
+            RuntimeEvent::ContextCompacted {
+                session,
+                folded,
+                before_tokens,
+                after_tokens,
+                ..
+            } => {
+                // A fold the operator cannot see is a fold they will not trust the answer after.
+                if self.active_session().map(|s| s.id.clone()).as_ref() == Some(&session) {
+                    self.push_notice(
+                        NoticeLevel::Info,
+                        format!(
+                            "context folded: {folded} messages into a summary, {before_tokens} -> {after_tokens} tokens"
+                        ),
+                    );
+                }
+            }
+            RuntimeEvent::ContextMetered { session, meter } => {
+                self.context_detail = Some((session, meter));
+            }
+            RuntimeEvent::ContextPruned {
+                session,
+                replaced,
+                saved_tokens,
+            } => {
+                if self.active_session().map(|s| s.id.clone()).as_ref() == Some(&session) {
+                    self.push_notice(
+                        NoticeLevel::Info,
+                        format!("context pruned: {replaced} tool output(s) digested, {saved_tokens} tokens"),
+                    );
+                }
+            }
             RuntimeEvent::ModelsListed { models, error } => {
                 self.models_loading = false;
                 self.models_error = error;
@@ -1338,6 +1418,8 @@ mod tests {
                 queued: 0,
                 project_id: None,
                 status: "active".to_owned(),
+                title_source: "generic".to_owned(),
+                title_status: "pending".to_owned(),
             }));
         app
     }
@@ -1495,6 +1577,8 @@ mod selection_and_folds {
             queued: 0,
             project_id: None,
             status: "active".to_owned(),
+            title_source: "generic".to_owned(),
+            title_status: "pending".to_owned(),
         });
         session.toggle_thought((0, 0));
         assert!(session.thought_expanded((0, 0)));

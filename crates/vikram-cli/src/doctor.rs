@@ -146,7 +146,7 @@ pub fn checks(config: &Config) -> Vec<Check> {
         ),
     ));
     if !mcp.servers.is_empty() {
-        let registry = McpRegistry::load(mcp);
+        let registry = McpRegistry::load(mcp.into_specs());
         out.push(Check::new(
             Level::Info,
             format!("configured servers: {}", registry.configured_count()),

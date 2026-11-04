@@ -25,12 +25,23 @@ pub struct Config {
     pub search: SearchConfig,
     /// Context window advertised by the chosen model, if the operator knows it.
     pub context_window: Option<u64>,
+    /// Context engineering and token budgeting.
+    #[serde(default)]
+    pub context: ContextConfig,
     /// Root that writes are confined to. Defaults to the process working directory.
     pub workspace_root: Option<PathBuf>,
     /// Hard cap on tool/step iterations inside one turn.
     pub max_steps: u32,
     /// Cap on generated tokens per completion request.
     pub max_output_tokens: Option<u32>,
+    /// Every Nth tool-bearing turn gets a background model review of its transcript, which spends
+    /// tokens. `0` — the default — never asks a model to review; the free experience pipeline runs
+    /// regardless.
+    pub learning_review_every: u64,
+    /// A cheaper model used only to name sessions. Empty means the main model is used. Title
+    /// generation is a few words of output, so spending the reasoning model on it is waste the
+    /// operator pays for on every new conversation.
+    pub title_model: String,
     /// Two-frame ASCII fallback for terminals without the Unicode set.
     pub ascii_fallback: bool,
     /// Whether the selected model/provider has thinking/reasoning enabled. Drives Thinking vs Working labels.
@@ -276,6 +287,57 @@ fn env_requirements() -> SecurityConfig {
     }
 }
 
+/// Context engineering knobs. Every default is safe: compaction is on, and the thresholds leave
+/// real headroom rather than running the model up to its published limit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextConfig {
+    /// Turn automatic compaction off. Manual `/compact` still works.
+    pub auto_compact: bool,
+    /// Percentage of the usable window at which a fold begins.
+    pub trigger_percent: u8,
+    /// Messages kept verbatim at the end of the transcript after a fold.
+    pub keep_recent: u32,
+    /// Absolute token ceiling for the auto-compact trigger. When set it wins over the percentage,
+    /// which is what a fixed-cost workflow needs.
+    pub auto_compact_limit: Option<u64>,
+    /// Percentage of the model window held back from all budgeting.
+    pub safety_margin_percent: u8,
+    /// A single tool result above this many characters is digested in place.
+    pub tool_output_ceiling: u32,
+    /// Retrieve relevant memory into the prompt each turn, within `memory_budget_tokens`.
+    pub memory_retrieval: bool,
+    /// Ceiling on tokens spent on retrieved memory per turn.
+    pub memory_budget_tokens: u64,
+    /// Ceiling on the project and entity instructions (AGENTS.md, SOUL.md and the rest) that are
+    /// assembled into every request. The loader stops adding files once the bundle reaches it.
+    pub project_budget_tokens: u64,
+    /// Ceiling on what crosses a delegation boundary in either direction: the brief a parent sends
+    /// down and the answer a child sends back. Neither is the whole transcript.
+    pub delegation_budget_tokens: u64,
+    /// Ceiling on the shared transcript a Hive participant is asked to answer from. Participants get
+    /// the most recent exchange that fits, not the whole hive log.
+    pub hive_budget_tokens: u64,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            auto_compact: true,
+            trigger_percent: 72,
+            keep_recent: 12,
+            auto_compact_limit: None,
+            safety_margin_percent: 8,
+            tool_output_ceiling: 6_000,
+            memory_retrieval: true,
+            memory_budget_tokens: 1_200,
+            project_budget_tokens: 4_000,
+            delegation_budget_tokens: 1_200,
+            hive_budget_tokens: 2_000,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -284,9 +346,12 @@ impl Default for Config {
             api_key_env: "OPENAI_API_KEY".into(),
             search: SearchConfig::default(),
             context_window: None,
+            context: ContextConfig::default(),
             workspace_root: None,
             max_steps: 24,
             max_output_tokens: None,
+            learning_review_every: 0,
+            title_model: String::new(),
             ascii_fallback: false,
             thinking: false,
             mode: PermissionMode::default(),
@@ -404,7 +469,14 @@ pub fn ensure_home() -> Result<PathBuf, RuntimeError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
+        // `home` holds `.env` with provider API keys. A directory we could not make private must
+        // not be reported as ready, or the keys keep being written somewhere world-readable.
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            RuntimeError::Config {
+                path: home.clone(),
+                reason: format!("could not make the secrets directory private (0o700): {e}"),
+            }
+        })?;
     }
     Ok(home)
 }
@@ -487,6 +559,19 @@ impl McpConfig {
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default()
+    }
+
+    /// The same servers in the wire-level shape the `vikram-mcp` client consumes.
+    pub fn into_specs(self) -> Vec<vikram_mcp::ServerSpec> {
+        self.servers
+            .into_iter()
+            .map(|server| vikram_mcp::ServerSpec {
+                name: server.name,
+                command: server.command,
+                args: server.args,
+                env: server.env,
+            })
+            .collect()
     }
 }
 
@@ -574,6 +659,42 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(cfg.api_key().as_deref(), Some("from-the-environment"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_secrets_home_is_made_private_instead_of_left_as_created() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("vikram");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _guard = isolated_home(&home);
+        ensure_home().expect("a creatable home is ready");
+        let mode = std::fs::metadata(&home).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "the home holds `.env` keys, so a group/world-readable one must be tightened"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_home_that_cannot_be_created_is_reported_instead_of_reported_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"").unwrap();
+        let home = blocker.join("vikram-home");
+
+        let _guard = isolated_home(&home);
+        let err =
+            ensure_home().expect_err("a home that does not exist and cannot be made is not ready");
+        let text = err.to_string();
+        assert!(
+            text.contains("vikram-home"),
+            "the error names the path the operator has to fix: {text}"
+        );
     }
 
     #[test]

@@ -40,7 +40,28 @@ pub struct SessionRow {
     pub status: String,
     /// Optional project association. `None` means a session workspace is used.
     pub project_id: Option<ProjectId>,
+    /// Who owns the title: `generic` (still the placeholder), `auto` (derived from the
+    /// conversation) or `manual` (the operator named it). A `manual` title is never overwritten.
+    pub title_source: String,
+    /// `pending` until a title has been derived, `ready` once it has, `failed` when derivation was
+    /// tried and refused — the last two stop the runtime from re-asking on every message.
+    pub title_status: String,
 }
+
+/// `title_source` values.
+pub const TITLE_GENERIC: &str = "generic";
+pub const TITLE_AUTO: &str = "auto";
+pub const TITLE_MANUAL: &str = "manual";
+
+/// `title_status` values.
+pub const TITLE_PENDING: &str = "pending";
+pub const TITLE_READY: &str = "ready";
+pub const TITLE_FAILED: &str = "failed";
+
+/// The projection every session read uses. Appending a column here keeps the six `SELECT` sites
+/// and [`map_session_row`] in step; the positional reader below depends on this exact order.
+const SESSION_COLS: &str = "id, title, cwd, model, agent_id, created_ms, updated_ms, status, \
+                            project_id, title_source, title_status";
 
 /// A project directory Vikram manages. `path` is the real location; internal projects live under
 /// `projects/`, external projects keep their original path and are never copied.
@@ -104,6 +125,30 @@ pub struct FileChangeRow {
     /// Managed copy of the original content for recovery, when a checkpoint was taken.
     pub checkpoint_path: Option<PathBuf>,
     pub ts_ms: u64,
+}
+
+/// One accounting entry: what a single provider exchange cost. `measured` distinguishes a figure
+/// the provider actually reported from one the estimator produced, so the ledger never presents an
+/// estimate as a bill. `id` is assigned by SQLite and is `0` before the row is stored.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageRow {
+    pub id: i64,
+    pub session: SessionId,
+    pub ts_ms: u64,
+    pub model: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub measured: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageTotals {
+    pub requests: u64,
+    pub measured_requests: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,6 +436,19 @@ impl Store {
         model: Option<&str>,
         now_ms: u64,
     ) -> Result<SessionRow> {
+        // A caller that names the session at creation owns that name: nothing later derives over it.
+        self.create_session_with_title(title, cwd, model, now_ms, TITLE_AUTO, TITLE_READY)
+    }
+
+    pub fn create_session_with_title(
+        &self,
+        title: &str,
+        cwd: &Path,
+        model: Option<&str>,
+        now_ms: u64,
+        title_source: &str,
+        title_status: &str,
+    ) -> Result<SessionRow> {
         let row = SessionRow {
             id: SessionId::generate(),
             title: title.to_owned(),
@@ -401,10 +459,12 @@ impl Store {
             updated_ms: now_ms,
             status: "active".to_owned(),
             project_id: None,
+            title_source: title_source.to_owned(),
+            title_status: title_status.to_owned(),
         };
         self.lock().execute(
-            "INSERT INTO sessions (id, title, cwd, model, agent_id, created_ms, updated_ms, status, project_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', NULL)",
+            "INSERT INTO sessions (id, title, cwd, model, agent_id, created_ms, updated_ms, status, project_id, title_source, title_status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', NULL, ?8, ?9)",
             params![
                 row.id.as_str(),
                 row.title,
@@ -412,7 +472,9 @@ impl Store {
                 row.model,
                 row.agent.as_ref().map(|a| a.as_str().to_owned()),
                 row.created_ms as i64,
-                row.updated_ms as i64
+                row.updated_ms as i64,
+                row.title_source,
+                row.title_status
             ],
         )?;
         Ok(row)
@@ -437,12 +499,57 @@ impl Store {
         Ok(())
     }
 
+    /// Record the session that delegated this one, and how deep the chain goes. Depth is stored
+    /// rather than walked so the delegation gate can be checked without loading the lineage.
+    pub fn set_session_lineage(
+        &self,
+        session: &SessionId,
+        parent: Option<&SessionId>,
+        depth: u32,
+    ) -> Result<()> {
+        self.lock().execute(
+            "UPDATE sessions SET parent_session = ?2, delegation_depth = ?3 WHERE id = ?1",
+            params![session.as_str(), parent.map(|p| p.as_str()), depth as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn session_lineage(&self, session: &SessionId) -> Result<Option<(SessionId, u32)>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT parent_session, delegation_depth FROM sessions WHERE id = ?1")?;
+        let found = stmt
+            .query_map(params![session.as_str()], |row| {
+                let parent: Option<String> = row.get(0)?;
+                let depth: i64 = row.get(1)?;
+                Ok(parent.map(|p| (SessionId::new(p), depth.max(0) as u32)))
+            })?
+            .next()
+            .and_then(|r| r.ok())
+            .flatten();
+        Ok(found)
+    }
+
     pub fn list_sessions(&self) -> Result<Vec<SessionRow>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, title, cwd, model, agent_id, created_ms, updated_ms, status, project_id
-             FROM sessions WHERE status = 'active' ORDER BY created_ms ASC",
-        )?;
+        let sql = format!(
+            "SELECT {SESSION_COLS} FROM sessions WHERE status = 'active' ORDER BY created_ms ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], map_session_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Active sessions ordered by most recent activity — the order the session list uses, so a
+    /// conversation the operator just had floats to the top instead of hiding under its birth date.
+    pub fn list_recent_sessions(&self) -> Result<Vec<SessionRow>> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {SESSION_COLS} FROM sessions WHERE status = 'active' ORDER BY updated_ms DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map([], map_session_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -452,10 +559,8 @@ impl Store {
     /// Every session including archived ones, newest first.
     pub fn list_all_sessions(&self) -> Result<Vec<SessionRow>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, title, cwd, model, agent_id, created_ms, updated_ms, status, project_id
-             FROM sessions ORDER BY updated_ms DESC",
-        )?;
+        let sql = format!("SELECT {SESSION_COLS} FROM sessions ORDER BY updated_ms DESC");
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map([], map_session_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -464,31 +569,42 @@ impl Store {
 
     pub fn get_session(&self, id: &SessionId) -> Result<Option<SessionRow>> {
         let conn = self.lock();
-        conn.query_row(
-            "SELECT id, title, cwd, model, agent_id, created_ms, updated_ms, status, project_id
-             FROM sessions WHERE id = ?1",
-            params![id.as_str()],
-            map_session_row,
-        )
-        .optional()
-        .map_err(Into::into)
+        let sql = format!("SELECT {SESSION_COLS} FROM sessions WHERE id = ?1");
+        conn.query_row(&sql, params![id.as_str()], map_session_row)
+            .optional()
+            .map_err(Into::into)
     }
 
-    /// Session search over titles and working directories (conversation search is journal-based).
+    /// Sessions matching a term in their title, working directory, or journaled conversation text.
+    /// Message content lives in the journal rather than the `sessions` row, so it is reached with an
+    /// `EXISTS` rather than a join — a transcript with twenty matches must still list one session.
     pub fn search_sessions(&self, query: &str, include_archived: bool) -> Result<Vec<SessionRow>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return if include_archived {
+                self.list_all_sessions()
+            } else {
+                self.list_recent_sessions()
+            };
+        }
         let conn = self.lock();
-        let like = format!("%{query}%");
-        let sql = if include_archived {
-            "SELECT id, title, cwd, model, agent_id, created_ms, updated_ms, status, project_id
-             FROM sessions WHERE title LIKE ?1 OR cwd LIKE ?1 ORDER BY updated_ms DESC"
+        let like = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+        let status = if include_archived {
+            String::new()
         } else {
-            "SELECT id, title, cwd, model, agent_id, created_ms, updated_ms, status, project_id
-             FROM sessions WHERE status = 'active' AND (title LIKE ?1 OR cwd LIKE ?1)
-             ORDER BY updated_ms DESC"
+            "AND status = 'active'".to_owned()
         };
-        let mut stmt = conn.prepare(sql)?;
+        let sql = format!(
+            "SELECT {SESSION_COLS} FROM sessions \
+             WHERE (title LIKE ?1 ESCAPE '\\' OR cwd LIKE ?1 ESCAPE '\\' \
+                    OR EXISTS (SELECT 1 FROM journal j \
+                               WHERE j.session = sessions.id \
+                                 AND j.payload LIKE ?2 ESCAPE '\\')) {status} \
+             ORDER BY updated_ms DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![like], map_session_row)?
+            .query_map(params![like, like], map_session_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -534,10 +650,14 @@ impl Store {
             updated_ms: now_ms,
             status: "active".to_owned(),
             project_id: src.project_id.clone(),
+            // A copy of a named session is still a named session: the operator's title carries over,
+            // so `manual` provenance carries over with it and automatic naming stays away.
+            title_source: src.title_source.clone(),
+            title_status: TITLE_READY.to_owned(),
         };
         self.lock().execute(
-            "INSERT INTO sessions (id, title, cwd, model, agent_id, created_ms, updated_ms, status, project_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8)",
+            "INSERT INTO sessions (id, title, cwd, model, agent_id, created_ms, updated_ms, status, project_id, title_source, title_status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10)",
             params![
                 copy.id.as_str(),
                 copy.title,
@@ -547,15 +667,50 @@ impl Store {
                 copy.created_ms as i64,
                 copy.updated_ms as i64,
                 copy.project_id.as_ref().map(|p| p.as_str().to_owned()),
+                copy.title_source,
+                copy.title_status,
             ],
         )?;
         Ok(Some(copy))
     }
 
+    /// The operator named this session. A manual title is the one thing automatic naming may never
+    /// touch, so the provenance moves to `manual` here and stays there.
     pub fn rename_session(&self, id: &SessionId, title: &str, now_ms: u64) -> Result<()> {
         self.lock().execute(
-            "UPDATE sessions SET title = ?2, updated_ms = ?3 WHERE id = ?1",
+            "UPDATE sessions SET title = ?2, updated_ms = ?3, title_source = 'manual', title_status = 'ready' WHERE id = ?1",
             params![id.as_str(), title, now_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Adopt a derived title, but only while the session has no name of its own. The `WHERE` is the
+    /// whole guarantee: a manually renamed session returns `false` and keeps its title, so two
+    /// writers cannot race the operator's own choice.
+    pub fn set_session_auto_title(&self, id: &SessionId, title: &str, now_ms: u64) -> Result<bool> {
+        let changed = self.lock().execute(
+            "UPDATE sessions SET title = ?2, updated_ms = ?3, title_source = 'auto', title_status = 'ready'
+             WHERE id = ?1 AND title_source != 'manual'",
+            params![id.as_str(), title, now_ms as i64],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Record how title derivation went without changing the name.
+    pub fn set_session_title_status(&self, id: &SessionId, status: &str) -> Result<()> {
+        self.lock().execute(
+            "UPDATE sessions SET title_status = ?2 WHERE id = ?1",
+            params![id.as_str(), status],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a session as needing a derived name — how `/retitle` asks for a fresh one, and how a
+    /// manual title can be handed back to the automatic path.
+    pub fn mark_session_title_pending(&self, id: &SessionId, source: &str) -> Result<()> {
+        self.lock().execute(
+            "UPDATE sessions SET title_source = ?2, title_status = 'pending' WHERE id = ?1",
+            params![id.as_str(), source],
         )?;
         Ok(())
     }
@@ -608,13 +763,11 @@ impl Store {
         tx.execute(
             "UPDATE teams SET session_id = NULL WHERE session_id = ?1",
             params![id.as_str()],
-        )
-        .ok();
+        )?;
         tx.execute(
             "UPDATE hive_sessions SET session_id = NULL WHERE session_id = ?1",
             params![id.as_str()],
-        )
-        .ok();
+        )?;
         tx.execute(
             "DELETE FROM session_workspaces WHERE session = ?1",
             params![id.as_str()],
@@ -627,6 +780,7 @@ impl Store {
             "DELETE FROM file_changes WHERE session = ?1",
             params![id.as_str()],
         )?;
+        tx.execute("DELETE FROM usage WHERE session = ?1", params![id.as_str()])?;
         tx.execute("DELETE FROM sessions WHERE id = ?1", params![id.as_str()])?;
         tx.commit()?;
         Ok(())
@@ -894,6 +1048,103 @@ impl Store {
     pub fn delete_file_changes_for_session(&self, session: &SessionId) -> Result<()> {
         self.lock().execute(
             "DELETE FROM file_changes WHERE session = ?1",
+            params![session.as_str()],
+        )?;
+        Ok(())
+    }
+
+    // ---- usage ----------------------------------------------------------
+
+    pub fn record_usage(&self, row: &UsageRow) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO usage (session, ts_ms, model, prompt_tokens, completion_tokens, total_tokens, measured)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                row.session.as_str(),
+                row.ts_ms as i64,
+                row.model,
+                row.prompt_tokens as i64,
+                row.completion_tokens as i64,
+                row.total_tokens as i64,
+                row.measured as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_usage(&self, session: &SessionId) -> Result<Vec<UsageRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, session, ts_ms, model, prompt_tokens, completion_tokens, total_tokens, measured
+             FROM usage WHERE session = ?1 ORDER BY ts_ms ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![session.as_str()], |r| {
+                Ok(UsageRow {
+                    id: r.get(0)?,
+                    session: SessionId::new(r.get::<_, String>(1)?),
+                    ts_ms: r.get::<_, i64>(2)? as u64,
+                    model: r.get(3)?,
+                    prompt_tokens: r.get::<_, i64>(4)? as u64,
+                    completion_tokens: r.get::<_, i64>(5)? as u64,
+                    total_tokens: r.get::<_, i64>(6)? as u64,
+                    measured: r.get::<_, i64>(7)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn usage_totals(&self, session: &SessionId) -> Result<UsageTotals> {
+        let conn = self.lock();
+        let totals = conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(measured), 0),
+                    COALESCE(SUM(prompt_tokens), 0),
+                    COALESCE(SUM(completion_tokens), 0),
+                    COALESCE(SUM(total_tokens), 0)
+             FROM usage WHERE session = ?1",
+            params![session.as_str()],
+            |r| {
+                Ok(UsageTotals {
+                    requests: r.get::<_, i64>(0)? as u64,
+                    measured_requests: r.get::<_, i64>(1)? as u64,
+                    prompt_tokens: r.get::<_, i64>(2)? as u64,
+                    completion_tokens: r.get::<_, i64>(3)? as u64,
+                    total_tokens: r.get::<_, i64>(4)? as u64,
+                })
+            },
+        )?;
+        Ok(totals)
+    }
+
+    /// Account-wide totals, for the monitoring view that spans every session.
+    pub fn usage_grand_totals(&self) -> Result<UsageTotals> {
+        let conn = self.lock();
+        let totals = conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(measured), 0),
+                    COALESCE(SUM(prompt_tokens), 0),
+                    COALESCE(SUM(completion_tokens), 0),
+                    COALESCE(SUM(total_tokens), 0)
+             FROM usage",
+            [],
+            |r| {
+                Ok(UsageTotals {
+                    requests: r.get::<_, i64>(0)? as u64,
+                    measured_requests: r.get::<_, i64>(1)? as u64,
+                    prompt_tokens: r.get::<_, i64>(2)? as u64,
+                    completion_tokens: r.get::<_, i64>(3)? as u64,
+                    total_tokens: r.get::<_, i64>(4)? as u64,
+                })
+            },
+        )?;
+        Ok(totals)
+    }
+
+    pub fn delete_usage_for_session(&self, session: &SessionId) -> Result<()> {
+        self.lock().execute(
+            "DELETE FROM usage WHERE session = ?1",
             params![session.as_str()],
         )?;
         Ok(())
@@ -1208,8 +1459,7 @@ impl Store {
         tx.execute(
             "UPDATE active_identity SET user_id = NULL, profile_id = NULL, main_agent = NULL WHERE user_id = ?1",
             params![id.as_str()],
-        )
-        .ok();
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -2363,7 +2613,9 @@ fn migrate(conn: &Connection) -> Result<()> {
             model       TEXT,
             agent_id    TEXT,
             created_ms  INTEGER NOT NULL,
-            updated_ms  INTEGER NOT NULL
+            updated_ms  INTEGER NOT NULL,
+            title_source TEXT NOT NULL DEFAULT 'manual',
+            title_status TEXT NOT NULL DEFAULT 'ready'
         );
 
         CREATE TABLE IF NOT EXISTS agents (
@@ -2401,6 +2653,19 @@ fn migrate(conn: &Connection) -> Result<()> {
 
         CREATE UNIQUE INDEX IF NOT EXISTS journal_effect
             ON journal(session, effect) WHERE effect IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS usage (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            session           TEXT NOT NULL,
+            ts_ms             INTEGER NOT NULL,
+            model             TEXT NOT NULL,
+            prompt_tokens     INTEGER NOT NULL,
+            completion_tokens INTEGER NOT NULL,
+            total_tokens      INTEGER NOT NULL,
+            measured          INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS usage_by_session ON usage(session, ts_ms);
 
         CREATE TABLE IF NOT EXISTS users (
             id          TEXT PRIMARY KEY,
@@ -2629,6 +2894,14 @@ fn migrate(conn: &Connection) -> Result<()> {
     ensure_column(conn, "sessions", "profile_id", "TEXT")?;
     ensure_column(conn, "sessions", "status", "TEXT NOT NULL DEFAULT 'active'")?;
     ensure_column(conn, "sessions", "project_id", "TEXT")?;
+    // Delegation lineage: which session spawned this one, and how far from the operator it sits.
+    ensure_column(conn, "sessions", "parent_session", "TEXT")?;
+    ensure_column(
+        conn,
+        "sessions",
+        "delegation_depth",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     ensure_column(conn, "entities", "title", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(
         conn,
@@ -2637,6 +2910,93 @@ fn migrate(conn: &Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT ''",
     )?;
     ensure_column(conn, "entities", "status", "TEXT NOT NULL DEFAULT 'active'")?;
+
+    // Title provenance. The default is `manual` because a row that predates this column already had
+    // its name chosen by whoever created it, and an unrecognised title must never be overwritten by
+    // a guess. The classification below then moves the rows that are *known* not to be operator-
+    // named: the old positional placeholders, and names the runtime derived from a truncated request.
+    ensure_column(
+        conn,
+        "sessions",
+        "title_source",
+        "TEXT NOT NULL DEFAULT 'manual'",
+    )?;
+    ensure_column(
+        conn,
+        "sessions",
+        "title_status",
+        "TEXT NOT NULL DEFAULT 'ready'",
+    )?;
+    if title_migration_needed(conn)? {
+        // First upgrade only: sort the existing names into `generic` (a placeholder worth replacing)
+        // and `auto` (derived, so replaceable but already meaningful). A second run must not re-judge
+        // titles the operator has since renamed by hand.
+        classify_legacy_titles(conn)?;
+        mark_title_migration_done(conn)?;
+    }
+
+    Ok(())
+}
+
+/// Titles the old runtime invented from a session's position or its first truncated message.
+/// Matching is deliberately narrow: an unrecognised title is left as operator-owned.
+fn is_placeholder_title(title: &str) -> bool {
+    let t = title.trim();
+    if t.eq_ignore_ascii_case("session") || t.eq_ignore_ascii_case("new session") {
+        return true;
+    }
+    // "Session 1", "Session 42" — the positional names `format!("Session {count}")` produced.
+    if let Some(rest) = t.strip_prefix("Session ") {
+        return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
+    }
+    false
+}
+
+/// Names the runtime derived itself: a clipped request (the `…` marker headless naming appends) or
+/// a delegated session's `agent · task` label. Both may be replaced by a generated title.
+fn is_derived_title(title: &str) -> bool {
+    title.chars().any(|c| c == '…') || title.contains(" · ")
+}
+
+fn classify_legacy_titles(conn: &Connection) -> Result<()> {
+    let rows: Vec<(String, String)> = {
+        let mut stmt = conn.prepare("SELECT id, title FROM sessions")?;
+        let found = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        found
+    };
+    for (id, title) in rows {
+        let (source, status) = if is_placeholder_title(&title) {
+            (TITLE_GENERIC, TITLE_PENDING)
+        } else if is_derived_title(&title) {
+            (TITLE_AUTO, TITLE_READY)
+        } else {
+            continue;
+        };
+        conn.execute(
+            "UPDATE sessions SET title_source = ?2, title_status = ?3 WHERE id = ?1",
+            params![id, source, status],
+        )?;
+    }
+    Ok(())
+}
+
+/// Bumped once the title provenance columns exist and legacy names have been classified. `PRAGMA
+/// user_version` is per-database and needs no table of its own.
+const TITLE_SCHEMA_VERSION: u32 = 1;
+
+fn title_migration_needed(conn: &Connection) -> Result<bool> {
+    let current: u32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap_or(0);
+    Ok(current < TITLE_SCHEMA_VERSION)
+}
+
+fn mark_title_migration_done(conn: &Connection) -> Result<()> {
+    conn.execute_batch(&format!("PRAGMA user_version = {TITLE_SCHEMA_VERSION}"))?;
     Ok(())
 }
 
@@ -2677,6 +3037,8 @@ fn map_session_row(row: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
         updated_ms: row.get::<_, i64>(6)? as u64,
         status: row.get(7)?,
         project_id: row.get::<_, Option<String>>(8)?.map(ProjectId::new),
+        title_source: row.get(9)?,
+        title_status: row.get(10)?,
     })
 }
 
@@ -2817,6 +3179,44 @@ mod tests {
         assert!(
             store.list_all_sessions().unwrap().is_empty(),
             "the stamped session must cascade with its owner"
+        );
+    }
+
+    #[test]
+    fn a_broken_session_cascade_is_reported_instead_of_committed_as_success() {
+        let store = Store::open_in_memory().unwrap();
+        let row = store
+            .create_session("Session 1", Path::new("/work"), Some("m"), 10)
+            .unwrap();
+        {
+            let conn = store.lock();
+            conn.execute("DROP TABLE teams", []).unwrap();
+        }
+        let err = store
+            .delete_session(&row.id)
+            .expect_err("a failed cascade must not be swallowed and committed");
+        assert!(err.to_string().contains("teams"), "names the table: {err}");
+        assert!(
+            store
+                .list_sessions()
+                .unwrap()
+                .iter()
+                .any(|s| s.id == row.id),
+            "the transaction rolls back, so the session is not half-deleted"
+        );
+    }
+
+    #[test]
+    fn a_broken_identity_clear_is_reported_when_a_user_is_deleted() {
+        let store = Store::open_in_memory().unwrap();
+        let user = store.create_user("Himanshu", 1).unwrap();
+        {
+            let conn = store.lock();
+            conn.execute("DROP TABLE active_identity", []).unwrap();
+        }
+        assert!(
+            store.delete_user(&user.id).is_err(),
+            "a failed cascade is not a clean delete"
         );
     }
 
@@ -3142,5 +3542,104 @@ mod tests {
         store.delete_profile(&profile.id).unwrap();
         assert!(store.get_profile(&profile.id).unwrap().is_none());
         let _ = sess;
+    }
+
+    #[test]
+    fn usage_ledger_round_trips_and_separates_measured_from_estimated() {
+        let store = Store::open_in_memory().unwrap();
+        let sess = store
+            .create_session("s", std::path::Path::new("/w"), Some("gpt"), 1)
+            .unwrap();
+
+        store
+            .record_usage(&UsageRow {
+                id: 0,
+                session: sess.id.clone(),
+                ts_ms: 10,
+                model: "gpt".into(),
+                prompt_tokens: 100,
+                completion_tokens: 40,
+                total_tokens: 140,
+                measured: true,
+            })
+            .unwrap();
+        store
+            .record_usage(&UsageRow {
+                id: 0,
+                session: sess.id.clone(),
+                ts_ms: 20,
+                model: "gpt".into(),
+                prompt_tokens: 30,
+                completion_tokens: 10,
+                total_tokens: 40,
+                measured: false,
+            })
+            .unwrap();
+
+        let rows = store.list_usage(&sess.id).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].ts_ms, 10);
+        assert!(rows[0].measured);
+        assert!(!rows[1].measured);
+        assert_eq!(rows[0].prompt_tokens, 100);
+
+        let totals = store.usage_totals(&sess.id).unwrap();
+        assert_eq!(totals.requests, 2);
+        assert_eq!(
+            totals.measured_requests, 1,
+            "only the reported exchange counts as measured"
+        );
+        assert_eq!(totals.prompt_tokens, 130);
+        assert_eq!(totals.completion_tokens, 50);
+        assert_eq!(totals.total_tokens, 180);
+    }
+
+    #[test]
+    fn usage_grand_totals_span_sessions_and_delete_cascades() {
+        let store = Store::open_in_memory().unwrap();
+        let a = store
+            .create_session("a", std::path::Path::new("/w"), None, 1)
+            .unwrap();
+        let b = store
+            .create_session("b", std::path::Path::new("/w"), None, 1)
+            .unwrap();
+        for (session, tokens) in [(&a.id, 500u64), (&b.id, 250u64)] {
+            store
+                .record_usage(&UsageRow {
+                    id: 0,
+                    session: session.clone(),
+                    ts_ms: 1,
+                    model: "m".into(),
+                    prompt_tokens: tokens / 2,
+                    completion_tokens: tokens - tokens / 2,
+                    total_tokens: tokens,
+                    measured: true,
+                })
+                .unwrap();
+        }
+
+        let grand = store.usage_grand_totals().unwrap();
+        assert_eq!(grand.requests, 2);
+        assert_eq!(grand.total_tokens, 750);
+
+        store.delete_session(&a.id).unwrap();
+        assert!(
+            store.list_usage(&a.id).unwrap().is_empty(),
+            "usage must cascade with the session"
+        );
+        assert_eq!(store.usage_grand_totals().unwrap().total_tokens, 250);
+    }
+
+    #[test]
+    fn an_empty_ledger_reports_zero_totals() {
+        let store = Store::open_in_memory().unwrap();
+        let sess = store
+            .create_session("s", std::path::Path::new("/w"), None, 1)
+            .unwrap();
+        assert_eq!(
+            store.usage_totals(&sess.id).unwrap(),
+            UsageTotals::default()
+        );
+        assert_eq!(store.usage_grand_totals().unwrap(), UsageTotals::default());
     }
 }
