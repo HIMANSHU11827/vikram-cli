@@ -79,3 +79,16 @@ schedule, next run and last status, plus a row for the daemon and one for the he
 Enter on a job pauses or resumes it; Enter on the heartbeat row turns the beat on or off.
 Both write to the same rows the daemon reads, so the change lands on its next tick without
 restarting anything.
+
+## The audit log
+
+Every change that decides what runs is written to `$VIKRAM_HOME/daemon/audit.log` as one
+timestamped line — `cron add`, `edit`, `pause`, `resume`, `run`, `remove`, `jobs cancel`,
+`heartbeat enable/paused`, `daemon start`, `daemon stop`. A scheduled job can fire hours after
+the command that made it, so the decision has to stay readable. If the line cannot be written
+the command still succeeds, but says so on stderr rather than swallowing it.
+
+Webhook delivery was checked against a real socket, not only against its failure paths: a
+`--target http://127.0.0.1:PORT/hook` job posts
+`{"job","name","status","summary","session","at","at_text"}`, and only a 2xx counts as
+delivered on the run record.

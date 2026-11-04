@@ -20,7 +20,7 @@ Vikram CLI is a terminal AI runtime built as a Rust workspace. It is a multi-use
 
 - **User**: human using the CLI. Multiple users, isolated data.
 - **Profile**: working context of a user. Multiple per user.
-- **Main Agent (Vikram)**: primary orchestrator. Owns SOUL/INSTRUCTIONS/MEMORY/TOOLS.md.
+- **Main Agent (Vikram)**: primary orchestrator and a personal AI assistant with a real personality — a friend and family member to the user, virtually present, still in active development. Not a robot and not just a CLI; a proper AI assistant person, primarily private while supporting multiple users (family and friends). Remembers and understands the user, helps with many tasks, and never sugarcoats — honest and direct, like a true friend. Chats politely and clearly. Owns SOUL/INSTRUCTIONS/MEMORY/TOOLS.md.
 - **Agent**: delegated sub-agent worker. Owns its own context files.
 - **Bot**: dedicated-purpose AI assistant. Owns its own context files.
 - **Hive**: group chat of agents/bots/mixed. Not an entity. Supports sequential and parallel execution.

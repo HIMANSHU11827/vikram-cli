@@ -308,4 +308,67 @@ mod tests {
         let report = deliver(&Destination::None, &notice(), home.path(), None).await;
         assert!(report.delivered);
     }
+
+    /// A webhook has only ever been checked against its failure paths, so this stands up a real
+    /// socket, answers once, and reports what it was actually sent. Anything less would be a claim
+    /// that a request goes out, not evidence.
+    fn once_responder(status: u16) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut seen = Vec::new();
+            let mut chunk = [0u8; 2048];
+            loop {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&seen).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length = text
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if seen.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let reason = if status == 200 { "OK" } else { "Server Error" };
+            let reply = format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 2\r\n\r\nok");
+            let _ = stream.write_all(reply.as_bytes());
+            let _ = stream.flush();
+            String::from_utf8_lossy(&seen).to_string()
+        });
+        (format!("http://127.0.0.1:{port}/hook"), server)
+    }
+
+    #[tokio::test]
+    async fn a_webhook_that_answers_200_really_receives_the_notice() {
+        let home = tempfile::tempdir().unwrap();
+        let (url, server) = once_responder(200);
+        let report = deliver(&Destination::Webhook(url), &notice(), home.path(), None).await;
+        let request = server.join().expect("server");
+        assert!(report.delivered, "{report:?}");
+        assert!(request.starts_with("POST /hook "), "{request}");
+        assert!(request.contains("nightly"), "{request}");
+        assert!(request.contains("3 findings"), "{request}");
+    }
+
+    #[tokio::test]
+    async fn a_webhook_that_answers_500_is_not_a_delivery() {
+        let home = tempfile::tempdir().unwrap();
+        let (url, server) = once_responder(500);
+        let report = deliver(&Destination::Webhook(url), &notice(), home.path(), None).await;
+        let _ = server.join();
+        assert!(!report.delivered, "{report:?}");
+        assert!(report.detail.contains("500"), "{report:?}");
+    }
 }

@@ -50,6 +50,36 @@ pub fn open(path: &Path) -> Result<ScheduleStore, String> {
     open_at(path)
 }
 
+/// Where the record of who changed what lives.
+pub fn audit_path(home: &Path) -> PathBuf {
+    home.join("daemon").join("audit.log")
+}
+
+/// Note a change in the audit log.
+///
+/// A scheduled job can fire hours after the command that made it, so the decisions that decide what
+/// runs have to stay readable. Losing the line is not worth failing the command the operator asked
+/// for, but it is not swallowed either: it is said on stderr, where the operator will see it.
+fn audit(home: &Path, what: &str) {
+    use std::io::Write;
+    let path = audit_path(home);
+    if let Some(parent) = path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("vikram: audit log {}: {err}", parent.display());
+        return;
+    }
+    let line = format!("{}  {what}", format_ms(Zone::Local, now_ms()));
+    let written = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| writeln!(file, "{line}"));
+    if let Err(err) = written {
+        eprintln!("vikram: audit log {}: {err}", path.display());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // daemon
 // ---------------------------------------------------------------------------
@@ -160,6 +190,7 @@ pub fn spawn() -> Result<String, String> {
         .stderr(err_log)
         .spawn()
         .map_err(|err| format!("could not start the daemon: {err}"))?;
+    audit(&home, &format!("daemon start pid {}", child.id()));
     Ok(format!(
         "started (pid {})\nlog: {}",
         child.id(),
@@ -190,6 +221,7 @@ pub fn stop() -> Result<String, String> {
             owner(&home),
             Ok(None) | Ok(Some(Owner { alive: false, .. }))
         ) {
+            audit(&home, &format!("daemon stop pid {pid}"));
             return Ok(format!("stopped (pid {pid})"));
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -277,6 +309,7 @@ pub fn heartbeat_set_enabled(on: bool) -> Result<String, String> {
     let store = store()?;
     let beats = Heartbeat::new(&store, Policy::default());
     beats.set_enabled(on).map_err(|err| err.to_string())?;
+    audit(&home(), &format!("heartbeat enable={on}"));
     Ok(if on {
         "heartbeat enabled".into()
     } else {
@@ -288,6 +321,7 @@ pub fn heartbeat_set_paused(paused: bool) -> Result<String, String> {
     let store = store()?;
     let beats = Heartbeat::new(&store, Policy::default());
     beats.set_paused(paused).map_err(|err| err.to_string())?;
+    audit(&home(), &format!("heartbeat paused={paused}"));
     Ok(if paused {
         "heartbeat paused".into()
     } else {
@@ -449,6 +483,15 @@ pub fn cron_add(name: &str, schedule: &str, draft: &Draft) -> Result<String, Str
         .next_run_ms
         .map(|at| format_ms(Zone::Local, at))
         .unwrap_or_else(|| "never".to_string());
+    audit(
+        &home(),
+        &format!(
+            "cron add {} {} mode={}",
+            job.id,
+            job.schedule,
+            job.mode.as_str()
+        ),
+    );
     Ok(format!("added {} ({})\nnext: {next}", job.id, job.schedule))
 }
 
@@ -557,6 +600,7 @@ pub fn cron_edit(needle: &str, draft: &Draft) -> Result<String, String> {
         return Err("a workflow job needs a team: add --agent <team>".into());
     }
     store.update_job(&job).map_err(|err| err.to_string())?;
+    audit(&home(), &format!("cron edit {} {}", job.id, job.schedule));
     Ok(format!("updated {}", job.id))
 }
 
@@ -567,6 +611,7 @@ pub fn cron_pause(needle: &str) -> Result<String, String> {
     manager
         .enable(&job.id, false, now_ms())
         .map_err(|err| err.to_string())?;
+    audit(&home(), &format!("cron pause {}", job.id));
     Ok(format!("paused {}", job.id))
 }
 
@@ -577,6 +622,7 @@ pub fn cron_resume(needle: &str) -> Result<String, String> {
     let job = manager
         .enable(&job.id, true, now_ms())
         .map_err(|err| err.to_string())?;
+    audit(&home(), &format!("cron resume {}", job.id));
     Ok(format!(
         "resumed {}\nnext: {}",
         job.id,
@@ -595,6 +641,7 @@ pub fn cron_run(needle: &str) -> Result<String, String> {
     manager
         .run_now(&job.id, now_ms())
         .map_err(|err| err.to_string())?;
+    audit(&home(), &format!("cron run {}", job.id));
     Ok(format!(
         "{} is due now; the daemon will pick it up on its next tick",
         job.id
@@ -606,6 +653,7 @@ pub fn cron_remove(needle: &str) -> Result<String, String> {
     let manager = JobManager::new(store);
     let job = manager.find(needle).map_err(|err| err.to_string())?;
     manager.remove(&job.id).map_err(|err| err.to_string())?;
+    audit(&home(), &format!("cron remove {}", job.id));
     Ok(format!("removed {} and its history", job.id))
 }
 
@@ -709,31 +757,32 @@ fn resolve_run(store: &ScheduleStore, needle: &str) -> Result<Run, String> {
     let jobs = JobManager::new(store.clone());
     let job = jobs.find(needle).map_err(|err| err.to_string())?;
     let runs = store.runs_for(&job.id, 10).map_err(|err| err.to_string())?;
-    let running = runs.iter().find(|run| run.status == RunStatus::Running);
-    match (running, runs.first()) {
-        (Some(run), _) => Ok(run.clone()),
-        (None, Some(last)) => Err(format!(
-            "{} has nothing running; its last run finished as {}",
-            job.id,
-            last.status.as_str()
-        )),
-        (None, None) => Err(format!("{} has never run", job.id)),
+    runs.first()
+        .cloned()
+        .ok_or_else(|| format!("{} has never run", job.id))
+}
+
+/// The run to stop: a named job means the one it is running now, so asking to cancel work that has
+/// already finished is answered rather than silently obeyed.
+fn resolve_running(store: &ScheduleStore, needle: &str) -> Result<Run, String> {
+    let run = resolve_run(store, needle)?;
+    if run.status == RunStatus::Running {
+        return Ok(run);
     }
+    Err(format!(
+        "{} has nothing running; its last run finished as {}",
+        run.job_id,
+        run.status.as_str()
+    ))
 }
 
 pub fn jobs_cancel(needle: &str) -> Result<String, String> {
     let store = store()?;
-    let run = resolve_run(&store, needle)?;
-    if run.status != RunStatus::Running {
-        return Ok(format!(
-            "{} already finished as {}",
-            run.id,
-            run.status.as_str()
-        ));
-    }
+    let run = resolve_running(&store, needle)?;
     store
         .set_state(&format!("cancel.{}", run.id), "1")
         .map_err(|err| err.to_string())?;
+    audit(&home(), &format!("jobs cancel {} ({})", run.id, run.job_id));
     Ok(format!("asked {} to stop", run.id))
 }
 
@@ -792,6 +841,45 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = open(&dir.path().join("vikram.db")).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn a_job_name_finds_its_last_run_and_a_finished_one_cannot_be_cancelled() {
+        let (_dir, store) = fixture();
+        let manager = JobManager::new(store.clone());
+        let job = manager
+            .create(
+                NewJob::new("nightly", "every 5m").payload("check"),
+                now_ms(),
+            )
+            .unwrap();
+        assert!(
+            resolve_run(&store, "nightly")
+                .unwrap_err()
+                .contains("has never run")
+        );
+        let run = store.begin_run(&job, now_ms(), None).unwrap();
+        store
+            .finish_run(&run.id, RunStatus::Ok, "fine", "", Delivery::None)
+            .unwrap();
+        assert_eq!(resolve_run(&store, "nightly").unwrap().id, run.id);
+        assert!(
+            resolve_running(&store, "nightly")
+                .unwrap_err()
+                .contains("nothing running")
+        );
+    }
+
+    #[test]
+    fn the_audit_log_keeps_every_change_in_the_order_it_happened() {
+        let dir = TempDir::new().unwrap();
+        audit(dir.path(), "cron add nightly mode=agent");
+        audit(dir.path(), "cron pause nightly");
+        let log = std::fs::read_to_string(audit_path(dir.path())).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        assert!(lines[0].ends_with("cron add nightly mode=agent"), "{log}");
+        assert!(lines[1].ends_with("cron pause nightly"), "{log}");
     }
 
     #[test]

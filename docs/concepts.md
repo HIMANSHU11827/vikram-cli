@@ -15,9 +15,13 @@ profile, never the account as a whole. A user may have multiple profiles.
 
 ## Main Agent (Vikram)
 
-The primary orchestrator. Owns its own context files (SOUL/INSTRUCTIONS/MEMORY/TOOLS.md).
-Receives user requests and decides: respond directly, delegate to a sub-agent, invoke a
-bot, or run a Hive team.
+The primary orchestrator and a personal AI assistant with a real personality — a friend and
+family member to the user, virtually present, still in active development. Not a robot and not
+just a CLI; a proper AI assistant person, primarily private to the user while supporting
+multiple users (family and friends). Owns its own context files (SOUL/INSTRUCTIONS/MEMORY/TOOLS.md).
+Remembers and understands the user, helps with many tasks, and never sugarcoats — honest and
+direct, like a true friend. Chats politely and clearly. Receives user requests and decides:
+respond directly, delegate to a sub-agent, invoke a bot, or run a Hive team.
 
 ## Agent (sub-agent)
 

@@ -55,7 +55,7 @@ AI assistant, and keeps a respectful tone in every conversation.
 
 | Area | Highlights |
 |---|---|
-| 🧠 **Runtime** | Turn loop, operation/effect kernel, cancellation, token meter, event bus |
+| 🧠 **Runtime** | Turn loop (kernel removed; turn loop is the execution path), cancellation, token meter, event bus |
 | 🔐 **Security** | Deny-first policy, mandatory floor, 7 posture modes, durable allow-list, posture resolution |
 | 💾 **Persistence** | SQLite (WAL), sessions, agents, teams, hives, tickets, journal, users, profiles, entities, projects, artifacts, file changes |
 | 🎫 **Tickets** | One unified engine for Hive teams, bots and sub-agents — conversations, participants, permissions, assignments, reports, recovery |
@@ -140,8 +140,8 @@ vikram-skills / vikram-mcp / vikram-evolution  (supporting crates)
 - **Journal-first**: every effect is journalled before it is applied; an effect id already
   present means the action is skipped rather than repeated (crash-safe).
 - **Auditable**: the journal is the record of what happened and what policy said.
-- **Safe by construction**: permission is evaluated in the kernel against the trust of the
-  content that produced the request.
+- **Safe by construction**: permission is evaluated in the turn loop (turn-based) against the
+  trust of the content that produced the request.
 
 ---
 
@@ -273,9 +273,8 @@ Override via flags: `--model`, `--base-url`, `--workspace`, `--mode`, `--ascii`.
 | [`docs/tickets.md`](docs/tickets.md) | Unified Ticket System (Hive, bots, sub-agents) |
 | [`docs/agents.md`](docs/agents.md) | Agents, bots, Hive, teams, assignments |
 | [`docs/permissions.md`](docs/permissions.md) | Permission model, postures, floor, allow-list |
-| [`docs/kernel.md`](docs/kernel.md) | Kernel execution architecture |
+| [`docs/runtime.md`](docs/runtime.md) | Turn-based execution architecture and runtime host integration (turn loop is the path; kernel removed) |
 | [`docs/store.md`](docs/store.md) | Durable SQLite state and tables |
-| [`docs/runtime.md`](docs/runtime.md) | Runtime host integration |
 | [`docs/memory.md`](docs/memory.md) | Memory and self-improvement |
 | [`docs/context.md`](docs/context.md) | Context loader |
 | [`docs/tools.md`](docs/tools.md) | Tool surface and execution |
@@ -306,7 +305,7 @@ cargo fmt --all
 cargo clippy --workspace --all-targets
 ```
 
-Suites: contracts · kernel · policy · store (sessions + tickets) · runtime (incl. ticket
+Suites: contracts · policy · store (sessions + tickets) · runtime (turn loop, incl. ticket
 workflows) · skills · tui · cli · mcp · evolution.
 
 ---

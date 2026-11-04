@@ -1,8 +1,8 @@
 # Runtime — Host Integration
 
-`vikram-runtime` supplies everything the kernel is deliberately ignorant of: where
-sessions live, which model answers, which tools exist, MCP, plugins, skills, memory,
-context, learning, hive, tickets, workspace, sandbox.
+`vikram-runtime` supplies the turn loop (the kernel is no longer used; the turn loop is the
+execution path) and everything else: where sessions live, which model answers, which tools
+exist, MCP, plugins, skills, memory, context, learning, hive, tickets, workspace, sandbox.
 
 ## Core
 
