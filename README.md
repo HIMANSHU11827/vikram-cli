@@ -285,7 +285,7 @@ Override via flags: `--model`, `--base-url`, `--workspace`, `--mode`, `--ascii`.
 | [`docs/security.md`](docs/security.md) | Security model and gaps |
 | [`docs/session-workspace.md`](docs/session-workspace.md) | Sessions, workspaces, projects, artifacts, checkpoints |
 | [`docs/evolution.md`](docs/evolution.md) | Self-evolution engine |
-| [`docs/roadmap.md`](docs/roadmap.md) | Roadmap (cross-platform + features, contributor guide) |
+| [`docs/roadmap.md`](docs/roadmap.md) | Prioritised roadmap: cross-platform, gateway capabilities, providers, CI |
 | [`docs/docker.md`](docs/docker.md) | Docker usage |
 | [`docs/kubernetes.md`](docs/kubernetes.md) | Kubernetes usage |
 | [`docs/termux.md`](docs/termux.md) | Termux / Android usage |

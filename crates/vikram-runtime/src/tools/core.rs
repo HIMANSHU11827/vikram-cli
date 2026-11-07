@@ -208,6 +208,12 @@ impl ToolRegistry {
         registry.register(Box::new(SearchText));
         registry.register(Box::new(RunShell));
         registry.register(Box::new(Git));
+        registry.register(Box::new(GitStatus));
+        registry.register(Box::new(GitDiff));
+        registry.register(Box::new(GitLog));
+        registry.register(Box::new(GitStatusTool));
+        registry.register(Box::new(GitDiffTool));
+        registry.register(Box::new(GitLogTool));
         registry.register(Box::new(BuildRun));
         registry.register(Box::new(TestRun));
         registry.register(Box::new(VerifyRun));

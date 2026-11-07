@@ -30,7 +30,7 @@ const HELP_ROWS: [(&str, &str); 19] = [
     ("Ctrl+B", "toggle the BOTS panel"),
     ("Ctrl+T", "show or fold the thinking"),
     ("Ctrl+O", "approvals"),
-    ("Ctrl+R", "rename the session"),
+    ("Ctrl+R", "reverse-search input history"),
     ("r", "resume selected bot"),
     ("F2", "background tasks"),
     ("F3", "MCP servers"),
@@ -693,6 +693,36 @@ fn overlay_content(app: &App, overlay: &Overlay, theme: &Theme) -> (String, Vec<
         ),
         Overlay::AddAgent { selected } => add_agent_lines(app, *selected, theme),
         Overlay::RenameSession { editor } => rename_lines(app, editor, theme),
+        Overlay::HistorySearch { query, selected } | Overlay::ReverseSearch { query, selected } => {
+            let matches = crate::input::history_matches(app, query);
+            let selected = *selected;
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            lines.push(Line::from(vec![
+                Span::styled("  query ", theme.muted()),
+                Span::styled(
+                    query.clone(),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("▌", theme.muted()),
+            ]));
+            if matches.is_empty() {
+                lines.push(Line::from(Span::styled("  no matches", theme.secondary())));
+            } else {
+                for (i, entry) in matches.iter().enumerate() {
+                    let style = if i == selected {
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        theme.secondary()
+                    };
+                    lines.push(Line::from(Span::styled(format!("  {}", entry), style)));
+                }
+            }
+            ("Reverse search".to_owned(), lines)
+        }
         Overlay::Autocomplete { .. } => ("Autocomplete".to_owned(), vec![]),
         Overlay::Skills => skills_lines(app, theme),
         Overlay::Info { title, lines } => (title.clone(), info_lines(lines, theme)),
@@ -1517,7 +1547,10 @@ mod tests {
         });
         assert!(rendered.contains("Keys"), "got {rendered}");
         assert!(rendered.contains("Ctrl+O"), "got {rendered}");
-        assert!(rendered.contains("rename the session"), "got {rendered}");
+        assert!(
+            rendered.contains("reverse-search input history"),
+            "got {rendered}"
+        );
     }
 
     #[test]

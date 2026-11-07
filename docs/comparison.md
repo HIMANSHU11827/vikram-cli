@@ -243,3 +243,12 @@ cargo run -p vikram-bench --release
   only, no vendor SDKs), a young ACP implementation (2 tests), and eight gateway modules without
   outbound media (A2A artifacts, Buzz/Buzz CLI, Google Chat user OAuth, SimpleX XFTP, and
   IRC/ntfy/raft/SMS, which have no media path in the reference).
+
+
+## 7. Where the remaining work is tracked
+
+The ordered plan for closing the gaps in this table is [`docs/roadmap.md`](roadmap.md):
+P0 covers inbound-media hardening, ledger coverage and provider conformance; P1 covers voice
+notes, remaining cards/reactions/polls and the last media adapters; P2 covers extra providers,
+evolution actuators and the performance gate. Nothing in this document claims a capability that
+is not already in the repository.

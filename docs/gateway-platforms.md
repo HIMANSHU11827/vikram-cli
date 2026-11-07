@@ -4,6 +4,9 @@ Source of truth: `~/.hermes/hermes-agent/plugins/platforms/` (27 adapters). This
 each platform actually is, measured from that source, and the port state in
 `crates/vikram-gateway/src/platforms/`.
 
+Remaining gateway work (voice notes, batches, extra cards/reactions/polls, A2A streaming) is
+tracked in [`docs/roadmap.md`](roadmap.md).
+
 Measurement: file counts and Python LOC from the source tree; inbound transport classified by the
 libraries and loop shapes the adapter uses; limits from the adapter's own
 `MAX_MESSAGE_LENGTH`/`max_message_length`; auth keys from each `plugin.yaml`.

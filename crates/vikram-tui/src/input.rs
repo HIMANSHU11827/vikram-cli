@@ -12,7 +12,6 @@ use crate::app::{
     UiCommand,
 };
 use crate::commands;
-use crate::editor::Editor;
 use crate::widgets::{Picker, PickerItem, PickerKind};
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
@@ -172,12 +171,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             return true;
         }
         KeyCode::Char('r') if ctrl => {
-            let title = app
-                .active_session()
-                .map(|s| s.title.clone())
-                .unwrap_or_default();
-            app.overlay = Some(Overlay::RenameSession {
-                editor: Editor::from_text(&title),
+            // Reverse (Ctrl+R) search over this session's submitted input history. The session's
+            // own draft is left untouched until a match is accepted.
+            app.overlay = Some(Overlay::HistorySearch {
+                query: String::new(),
+                selected: 0,
             });
             return true;
         }
@@ -1329,6 +1327,75 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
             }
             _ => true,
         },
+        Overlay::HistorySearch { query, selected } | Overlay::ReverseSearch { query, selected } => {
+            let matches = history_matches(app, &query);
+            let selected = selected.min(matches.len().saturating_sub(1));
+            match key.code {
+                KeyCode::Esc => {
+                    app.overlay = None;
+                    true
+                }
+                KeyCode::Enter => {
+                    if let Some(chosen) = matches.get(selected).cloned()
+                        && let Some(session) = app.active_session_mut()
+                    {
+                        session.editor.set_text(&chosen);
+                    }
+                    app.overlay = None;
+                    true
+                }
+                KeyCode::Up => {
+                    let len = matches.len();
+                    let next = if len == 0 {
+                        0
+                    } else {
+                        selected.saturating_sub(1)
+                    };
+                    app.overlay = Some(Overlay::HistorySearch {
+                        query: query.clone(),
+                        selected: next,
+                    });
+                    true
+                }
+                KeyCode::Down => {
+                    let len = matches.len();
+                    let next = if len == 0 {
+                        0
+                    } else {
+                        (selected + 1).min(len - 1)
+                    };
+                    app.overlay = Some(Overlay::HistorySearch {
+                        query: query.clone(),
+                        selected: next,
+                    });
+                    true
+                }
+                KeyCode::Backspace => {
+                    let mut query = query.clone();
+                    query.pop();
+                    app.overlay = Some(Overlay::HistorySearch { query, selected: 0 });
+                    true
+                }
+                KeyCode::Char(ch)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    let mut query = query.clone();
+                    query.push(ch);
+                    app.overlay = Some(Overlay::HistorySearch { query, selected: 0 });
+                    true
+                }
+                _ => {
+                    // Keep the overlay's identity stable (HistorySearch) for callers that
+                    // named it after the feature rather than the keystroke.
+                    app.overlay = Some(Overlay::HistorySearch {
+                        query: query.clone(),
+                        selected,
+                    });
+                    true
+                }
+            }
+        }
         Overlay::RenameSession { mut editor } => match key.code {
             KeyCode::Esc => {
                 app.overlay = None;
@@ -1464,6 +1531,14 @@ pub fn handle_paste(app: &mut App, text: &str) -> bool {
         editor.insert_str(text);
         return true;
     }
+    if let Some(Overlay::HistorySearch { query, .. }) = &mut app.overlay {
+        query.push_str(text);
+        return true;
+    }
+    if let Some(Overlay::ReverseSearch { query, .. }) = &mut app.overlay {
+        query.push_str(text);
+        return true;
+    }
     if let Some(session) = app.active_session_mut() {
         session.editor.insert_str(text);
         return true;
@@ -1476,11 +1551,27 @@ pub fn open_inspector(app: &mut App, kind: InspectorKind) {
     app.overlay = Some(Overlay::Inspector(kind));
 }
 
+/// Filter a session's submitted input history by `query` (case-insensitive substring), newest first.
+pub(crate) fn history_matches(app: &App, query: &str) -> Vec<String> {
+    let Some(session) = app.active_session() else {
+        return Vec::new();
+    };
+    let needle = query.to_lowercase();
+    let mut matches: Vec<String> = session
+        .editor
+        .history()
+        .iter()
+        .rev()
+        .filter(|line| needle.is_empty() || line.to_lowercase().contains(&needle))
+        .cloned()
+        .collect();
+    matches.dedup();
+    matches
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
-
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }

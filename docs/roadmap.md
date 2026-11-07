@@ -1,7 +1,7 @@
 # VIKRAM Roadmap
 
-This roadmap is written so **anyone can pick up a task and ship it**. Each item has a
-scope, files to touch, acceptance criteria and (where useful) a starting point.
+This roadmap is written so **anyone can pick up a task and ship it**. Each item has a scope,
+acceptance criteria and (where useful) a starting point.
 
 Status legend: ✅ done · 🟡 in progress · ⬜ not started · 🔬 research.
 
@@ -14,15 +14,30 @@ inside Docker containers and VMs, from any shell (bash, zsh, fish, cmd, PowerShe
 Termux sh), over SSH, in CI. Same binary, same behaviour, platform-aware degradation
 where a feature genuinely cannot run (e.g. desktop automation on a headless server).
 
+Guiding rules:
+
+- Never fabricate a capability. A refusal with a reason beats a stub that reports success.
+- Every claim has a test or a reproducible command. External-framework claims stay `unverified`
+  until evidenced in this repository.
+- Offline-friendly verification: mock transports for wire behaviour, real local servers for
+  end-to-end paths.
+- `cargo fmt` clean, **zero** clippy warnings, whole workspace green before a phase closes.
+
 ---
 
-## 1. Current state (2026-11-03)
+## 1. Current state (2026-11-07)
 
-- Builds on Linux/macOS (primary). Windows compiles for most code paths but has gaps
-  (see §3). Termux works with caveats.
-- 10 crates, ~15k LOC, ~900 tests, all passing.
-- Unified Ticket System (Hive/bots/sub-agents) implemented.
-- Cross-platform gaps documented in §3.
+- 16 crates, ~172k lines of Rust, **2,523 tests passing**, clippy clean, `rust-version = 1.89`.
+- Builds on Linux/macOS; Windows compiles with the gaps listed in §3; Termux works with caveats.
+- Gateway: **27 messaging platforms wired** (Telegram, Discord, Slack, WhatsApp bridge + Cloud,
+  Matrix, Mattermost, Signal, BlueBubbles, ntfy, Twilio SMS, Feishu, LINE, DingTalk + Stream,
+  Google Chat, Teams, QQ Bot, Photon, Weixin, WeCom, SimpleX, IRC, Yuanbao, Buzz/Nostr, raft,
+  A2A, email), with pairing, access control, routing and a delivery ledger.
+- Capabilities: **media 20/28 modules**, **rich cards 5**, **reactions 5**, **polls 1**,
+  **draft streaming 2**, and inbound images reaching the model through a guarded fetcher.
+- Runtime: OpenAI-compatible + native Anthropic Messages providers; sandbox; memory with hybrid
+  recall; code index; browser (CDP) and computer-use tools.
+- Tooling: `vikram-bench` (13 real operations) and `docs/comparison.md` with an evidence legend.
 
 ---
 
@@ -34,7 +49,7 @@ where a feature genuinely cannot run (e.g. desktop automation on a headless serv
 | macOS (x86_64, aarch64) | ✅ | Seatbelt sandbox, browser paths |
 | Windows 10/11 (x86_64) | 🟡 Partial | PTY shell default, skills home, LSP URIs, plugin runners, computer module |
 | Termux / Android | 🟡 Partial | Works via HOME/sh; desktop automation unsupported; PATH helpers |
-| Docker (linux) | ⬜ | Should work; needs image + docs |
+| Docker (linux) | 🟡 | Scaffolding done; image build/docs pending |
 | VMs (any guest OS) | ⬜ | Depends on guest OS support |
 | WSL | 🟡 | Treated as Linux; sandbox may need tuning |
 
@@ -44,86 +59,114 @@ where a feature genuinely cannot run (e.g. desktop automation on a headless serv
 
 ### P0 — make Windows actually work
 
-- [x] **PTY default shell on Windows.** `crates/vikram-runtime/src/pty.rs:76-80`. ✅ Implemented.
-  Default to `%COMSPEC%` (cmd.exe) or `powershell.exe` when `sh` is absent. Acceptance:
-  `vikram` PTY session opens on a clean Windows install without Git Bash.
-- [x] **Skills home resolution.** `crates/vikram-skills/src/paths.rs:18-32`. ✅ Implemented (USERPROFILE fallback).
-  Add `USERPROFILE` fallback (mirror `config.rs::vikram_home`). Acceptance: skills
-  discovered under `%USERPROFILE%\.vikram` on Windows.
-- [x] **LSP file URIs on Windows.** `crates/vikram-runtime/src/lsp.rs:254-266`. ✅ Implemented.
-  Convert `\` → `/`, prepend `/` for drive letters (`file:///C:/...`). Acceptance: LSP
-  server receives valid URIs and navigation works.
-- [x] **`which()` Windows-aware.** `crates/vikram-runtime/src/computer.rs:83-92` and
-  `plugins.rs`. Append extensions from `PATHEXT`. Acceptance: helper detection works for
-  `.exe`/`.cmd`/`.bat`.
-- [x] **Plugin runners on Windows.** `crates/vikram-runtime/src/plugins.rs:531-551`. ✅ Implemented.
-  Resolve `python`/`python3`, allow `.cmd`/`.bat`. Acceptance: a Python plugin runs on
-  Windows.
-- [x] **Computer module platform status.** `crates/vikram-runtime/src/computer.rs`. ✅ Implemented.
-  Report "unsupported on this platform" on Windows/Termux instead of apt hints.
-  Acceptance: `computer status` is honest on non-Linux.
+- [x] **PTY default shell on Windows.** `crates/vikram-runtime/src/pty.rs`. Default to
+  `%COMSPEC%` / `powershell.exe` when `sh` is absent. ✅
+- [x] **Skills home resolution.** `crates/vikram-skills/src/paths.rs`. `USERPROFILE` fallback. ✅
+- [x] **LSP file URIs on Windows.** `crates/vikram-runtime/src/lsp.rs`. Drive-letter URIs. ✅
+- [x] **`which()` Windows-aware.** `crates/vikram-runtime/src/computer.rs`, `plugins.rs`.
+  `PATHEXT` extensions. ✅
+- [x] **Plugin runners on Windows.** `crates/vikram-runtime/src/plugins.rs`. ✅
+- [x] **Computer module platform status.** Honest "unsupported" on Windows/Termux instead of
+  Linux apt hints. ✅
 
 ### P1 — quality & coverage
 
-- [ ] **Shell tool shell selection.** Already uses `cmd /C` on Windows, `sh -c` elsewhere.
-  Add fish/zsh awareness? Keep simple: respect `$SHELL` on Unix, `%COMSPEC%` on Windows.
-- [x] **Docker image + docs.** Add `Dockerfile` and `docs/docker.md`. ✅ Scaffolding done (image build pending network).
-- [ ] **CI matrix.** GitHub Actions on ubuntu/macos/windows (and maybe termux via qemu). (pending)
-  Acceptance: `cargo test --workspace` green on all three.
-- [ ] **Windows sandbox (Job Objects).** Optional isolation. Acceptance: documented.
-- [x] **Termux docs.** `docs/termux.md` with install steps (`pkg install rust clang`). ✅ Done.
+- [ ] **Shell tool shell selection.** Respect `$SHELL` on Unix, `%COMSPEC%` on Windows.
+- [ ] **CI matrix.** GitHub Actions on ubuntu/macos/windows (Termux optional). Acceptance:
+  `cargo test --workspace` green on all three, with browser/computer tests skipped explicitly.
+- [ ] **Windows sandbox (Job Objects).** Optional isolation; documented behaviour.
 - [ ] **PowerShell/cmd examples** in docs for Windows users.
+- [x] **Termux docs.** `docs/termux.md`. ✅
+- [x] **Docker scaffolding.** `Dockerfile` present; image build pending network parity.
 
 ### P2 — polish
 
 - [ ] Cross-platform path tests.
-- [ ] Avoid `/tmp` assumptions; use `std::env::temp_dir()`.
-- [ ] Windows console VT handling / truecolor detection in TUI.
+- [ ] Avoid `/tmp` assumptions; always `std::env::temp_dir()`.
+- [ ] Windows console VT handling / truecolor detection in the TUI.
 
 ---
 
-## 4. Feature roadmap (from audit)
+## 4. Product roadmap (gateway, runtime, providers)
 
-See `docs/audit/DEVELOPMENT_ROADMAP.md` for the full prioritized P0-P3 list (with
-complexity), and `docs/audit/VIKRAM-AZ-AUDIT.md` §19/§21 for the dependency graph.
-Highlights:
+### P0 — trust and correctness hardening
 
-**P0 (critical):** kernel trust propagation, MCP serve implementation, MCP stdio,
-silent-error fixes, OS sandbox, verification loop, durable mid-turn resume.
+1. **Inbound media hardening** ⬜ — resolve-and-recheck hosts before connecting (DNS rebinding),
+   re-guard redirect targets, enforce the byte cap while streaming, and deliver audio/video/PDF
+   instead of skipping them. Tests: mock resolver, redirect-to-private, mid-stream cap, each mime.
+2. **Delivery ledger coverage for new verbs** ⬜ — route `send_media`, `send_card`, `send_poll`,
+   `send_draft`, reactions through the same retry/partial-overflow path as text; record draft ids.
+3. **Provider robustness + conformance suite** 🟡 — Anthropic retry loop (`Retry-After`, 529) and a
+   shared suite both providers must pass. Anthropic has 32 tests today.
+4. **ACP depth** ⬜ — initialize, sessions, streaming updates, cancellation, errors under test.
+5. **Codec fuzzing** ⬜ — property tests for `truncate_message`, Yuanbao protobuf, JWT parsing and
+   multipart builders: random bytes error, never panic.
 
-**P1 (high):** consolidate team model, unify learning, wire evolution, code indexing,
-ACP client+server, scheduling/triggers, local model support, git integration,
-test discovery/execution, build validation, checkpoint/undo, code review agent.
+### P1 — feature parity depth
 
-**P2 (medium):** agent-to-agent messaging, independent review agent, memory
-consolidation, semantic memory, hybrid search, knowledge graph, A2A.
+6. **Voice notes and multi-attachment sends** ⬜ — `send_voice` (Telegram `sendVoice`, WhatsApp
+   `ptt`, Matrix MSC3245) and `send_media_batch` (albums/media groups) with truthful per-item results.
+7. **Rich cards for remaining platforms** 🟡 — 5 done (Slack, Feishu, Teams, Google Chat, Discord);
+   open: Mattermost attachments, DingTalk AI cards, LINE Flex, WeCom templates, WhatsApp templates,
+   Yuanbao.
+8. **Reactions for remaining platforms** 🟡 — 5 done (Telegram, Discord, Slack, Matrix, Feishu);
+   open: WhatsApp Cloud, Mattermost, Signal, Teams (only with a contract carrying author/timestamp
+   where required).
+9. **Polls** 🟡 — WhatsApp bridge done; Telegram, Discord, Signal, Feishu open (implement against the
+   platform API and label them ported-from-API, not from the vendored reference).
+10. **Last media adapters** 🟡 — 20/28 done; open: A2A file parts, Buzz CLI subprocess, Google Chat
+    user-OAuth upload, DingTalk stream markdown, with IRC/ntfy/raft/SMS documented as no-API.
+11. **A2A streaming and artifacts** ⬜ — `message/stream` as SSE task updates or a tested, documented
+    subset; file parts on `message/send` and artifacts.
 
-**P3 (low):** polish, configurability, dead-code removal, property/fuzz/concurrency/
-security/E2E tests.
+### P2 — platform and ecosystem
 
-**P4 (research):** crash-recovery state machine, Wasm components, VRP protocol, TUF,
-deterministic token meter, taint labels.
+12. **Providers beyond two** 🟡 — OpenAI-compatible + Anthropic done; Gemini, Bedrock (SigV4) and
+    native Ollama open, all behind the conformance suite; model capability catalog (context window,
+    vision, tools) so the runtime stops guessing.
+13. **Evolution actuators** 🟡 — MAPEK only re-queues failed reflection jobs for real; give
+    self-adaptation a config control handle and verify post-conditions before reporting success.
+14. **Performance regression gate** 🟡 — `vikram-bench` exists (chunker now linear, ~0.26 ms/64 KiB);
+    open: CI thresholds, `memory.recall` profiling (~0.72 ms), optional cross-framework harness that
+    actually runs other CLIs before any comparative number is published.
+15. **TUI/UX polish** 🟡 — shared activity indent done; open: streaming/approval ergonomics,
+    accessibility, session search, documented keymap.
+
+### P3 — operations
+
+16. **CI/CD** ⬜ — matrix build, MSRV enforcement, fmt/clippy/test gates, browser/computer tests
+    conditionally skipped with reasons, nightly fuzz, release artifacts and checksums.
+17. **Documentation** 🟡 — auto-generate the per-adapter fidelity table from module headers; gateway
+    deployment/provider runbooks; keep `docs/comparison.md` honest (`unverified` until reproduced).
 
 ---
 
-## 5. How to contribute
+## 5. Explicitly out of scope
 
-1. Pick an item from §3 or §4.
+- Claiming to beat another framework without reproducible measurements.
+- Faking media/card/reaction delivery when a platform lacks the API.
+- Hand-rolling cryptographic signing where no vetted crate exists.
+
+---
+
+## 6. How to contribute
+
+1. Pick an unchecked item from §3 or §4.
 2. Create a branch: `git checkout -b feat/<short-name>`.
 3. Follow existing patterns in the relevant crate.
 4. Add tests (unit in crate `#[cfg(test)]`, integration in `tests/`).
-5. Run: `cargo fmt --all && cargo clippy --workspace --all-targets && cargo test --workspace`.
+5. Run: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets && cargo test --workspace`.
 6. Open a PR. Keep changes focused; one item per PR.
 
 ### Good first issues
 
-- P0 cross-platform items in §3 (PTY shell, skills home, LSP URIs, which()).
-- Docs: improve any `docs/*.md`.
-- Tests: add Windows-path unit tests behind `#[cfg(windows)]`.
+- Cross-platform items in §3 (shell selection, PowerShell docs, Windows path tests).
+- Docs: improve any `docs/*.md`; generate the adapter fidelity table.
+- Tests: Windows-path unit tests behind `#[cfg(windows)]`.
 
 ### Conventions
 
-- Rust 2024, rust-version 1.86.
+- Rust 2024, `rust-version = 1.89`.
 - No comments unless necessary.
 - Deny-first permissions; never widen the floor.
 - Backend enforces security, not UI.
@@ -131,19 +174,20 @@ deterministic token meter, taint labels.
 
 ---
 
-## 6. Definition of done
+## 7. Definition of done
 
 An item is done when:
 
-- Code compiles on Linux, macOS and Windows (`cargo build --workspace`).
-- Tests pass (`cargo test --workspace`).
-- clippy clean (warnings acceptable, no errors).
-- Docs updated (README + relevant docs/*).
+- Code compiles on Linux, macOS and Windows (`cargo build --workspace`), or the platform gap is
+  explicitly documented.
+- Tests pass (`cargo test --workspace`), including a new test for the behaviour.
+- `cargo clippy --workspace --all-targets` reports **zero warnings**; `cargo fmt --check` is clean.
+- Docs updated (README, `CONTINUE.md`, the relevant `docs/*`).
 - Cross-platform behaviour verified or explicitly degraded with a clear message.
 
 ---
 
-## 7. Owners / contact
+## 8. Owners / contact
 
 Repository: https://github.com/HIMANSHU11827/vikram-cli
 License: MIT OR Apache-2.0

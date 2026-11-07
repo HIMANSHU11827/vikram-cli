@@ -230,6 +230,17 @@ pub enum Overlay {
         editor: Editor,
         action: PromptAction,
     },
+    /// Reverse (Ctrl+R) search over previously submitted input lines. `query` filters by substring;
+    /// `selected` is an index into the filtered match list.
+    HistorySearch {
+        query: String,
+        selected: usize,
+    },
+    /// Alias of [`Overlay::HistorySearch`] kept for callers that name it after the keystroke.
+    ReverseSearch {
+        query: String,
+        selected: usize,
+    },
 }
 
 /// What a text panel's Enter means. A closed set, so a prompt can never submit something the host

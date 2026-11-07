@@ -166,7 +166,7 @@ fn run_step(workspace_root: &Path, step: &PlanStep) -> StepResult {
     }
 }
 
-fn shell_cmd(command: &str) -> Command {
+pub(crate) fn shell_cmd(command: &str) -> Command {
     #[cfg(windows)]
     {
         let comspec = std::env::var("COMSPEC")
@@ -191,7 +191,7 @@ fn shell_cmd(command: &str) -> Command {
     }
 }
 
-fn wait_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process::Output> {
+pub(crate) fn wait_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process::Output> {
     use std::io::Read;
     let mut child = cmd
         .stdout(std::process::Stdio::piped())

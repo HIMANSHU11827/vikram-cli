@@ -626,6 +626,8 @@ enum ConfigAction {
     Set { key: String, value: String },
     /// Print the configuration file path.
     Path,
+    /// Validate the configuration loaded from the default path.
+    Validate,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -1987,6 +1989,18 @@ fn config_command(action: ConfigAction, mut config: Config) -> std::process::Exi
             println!("home: {}", vikram_home().display());
             std::process::ExitCode::SUCCESS
         }
+        ConfigAction::Validate => {
+            // Reload from the default path so validation reflects the durable file rather than any
+            // in-memory overrides applied by global flags.
+            let loaded = match Config::load() {
+                Ok(c) => c,
+                Err(err) => {
+                    eprintln!("vikram: {err}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            config_validate(&loaded)
+        }
         ConfigAction::Init => match config.save() {
             Ok(()) => {
                 println!("wrote {}", vikram_runtime::config::config_path().display());
@@ -2110,6 +2124,94 @@ fn config_command(action: ConfigAction, mut config: Config) -> std::process::Exi
                 }
             }
         }
+    }
+}
+
+/// Validate a configuration loaded from the default path, printing one line per check.
+fn config_validate(config: &Config) -> std::process::ExitCode {
+    // Each entry: (label, ok, detail).
+    let mut checks: Vec<(&str, bool, String)> = Vec::new();
+
+    let model_ok = !config.model.trim().is_empty();
+    checks.push((
+        "model",
+        model_ok,
+        if model_ok {
+            config.model.clone()
+        } else {
+            "empty".to_owned()
+        },
+    ));
+
+    let base_ok = !config.base_url.trim().is_empty();
+    checks.push((
+        "base_url",
+        base_ok,
+        if base_ok {
+            config.base_url.clone()
+        } else {
+            "empty".to_owned()
+        },
+    ));
+
+    let env_name_ok = !config.api_key_env.trim().is_empty();
+    let key_present = config.api_key().is_some();
+    let api_ok = env_name_ok && key_present;
+    let api_detail = if !env_name_ok {
+        "env var name is empty".to_owned()
+    } else if key_present {
+        format!("{} is set", config.api_key_env)
+    } else {
+        format!("{} is not set", config.api_key_env)
+    };
+    checks.push(("api_key_env", api_ok, api_detail));
+
+    let (workspace_ok, workspace_detail) = match &config.workspace_root {
+        Some(path) => {
+            if path.exists() {
+                (true, path.display().to_string())
+            } else {
+                (false, format!("{} does not exist", path.display()))
+            }
+        }
+        None => (true, "not set".to_owned()),
+    };
+    checks.push(("workspace_root", workspace_ok, workspace_detail));
+
+    let steps_ok = config.max_steps > 0;
+    checks.push(("max_steps", steps_ok, config.max_steps.to_string()));
+
+    let (tokens_ok, tokens_detail) = match config.max_output_tokens {
+        Some(n) => {
+            if n == 0 {
+                (false, "0 is not reasonable".to_owned())
+            } else if n > 1_000_000 {
+                (false, format!("{n} is not reasonable"))
+            } else {
+                (true, n.to_string())
+            }
+        }
+        None => (true, "not set".to_owned()),
+    };
+    checks.push(("max_output_tokens", tokens_ok, tokens_detail));
+
+    let total = checks.len();
+    let mut passed = 0usize;
+    for (label, ok, detail) in &checks {
+        if *ok {
+            passed += 1;
+            println!("\u{2705} {label}: {detail}");
+        } else {
+            println!("\u{274c} {label}: {detail}");
+        }
+    }
+    println!();
+    if passed == total {
+        println!("summary: all {total} checks passed");
+        std::process::ExitCode::SUCCESS
+    } else {
+        println!("summary: {passed}/{total} checks passed");
+        std::process::ExitCode::FAILURE
     }
 }
 

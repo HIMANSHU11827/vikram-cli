@@ -1,6 +1,8 @@
 # VIKRAM — what is still open
 
-The transcript work is built, tested and installed. This file holds only what remains.
+Status: **2,523 tests passing, clippy clean, working tree committed at `a1fecc9`.**
+The prioritised plan lives in [`docs/roadmap.md`](docs/roadmap.md); this file keeps the
+running list of concrete leftovers.
 
 ## Checks that decide "done"
 
