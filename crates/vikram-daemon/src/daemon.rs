@@ -743,10 +743,9 @@ mod tests {
         let settled = store.get_run(&run.id).unwrap().unwrap();
         assert_eq!(settled.status, RunStatus::Cancelled);
         assert!(
-            store
+            !store
                 .state_bool(&format!("cancel.{}", run.id), false)
-                .unwrap_or(true)
-                == false,
+                .unwrap_or(true),
             "the request is cleared once honoured"
         );
     }

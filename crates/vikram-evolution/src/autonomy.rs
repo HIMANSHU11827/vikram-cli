@@ -236,7 +236,7 @@ impl AutonomyManager {
 
     /// Audit an action.
     pub fn audit_action(&self, action: &ActionRecord) -> Result<()> {
-        let _ = self.store.save_event(&crate::types::LearningEvent {
+        self.store.save_event(&crate::types::LearningEvent {
             id: gen_id("evt"),
             timestamp_ms: now_ms(),
             agent_id: "system".to_string(),
@@ -248,7 +248,7 @@ impl AutonomyManager {
                 "approved": action.approved,
                 "executed": action.executed,
             }),
-        });
+        })?;
         Ok(())
     }
 
@@ -263,7 +263,7 @@ impl AutonomyManager {
     }
 
     fn record_event(&self, action: &ActionRecord) -> Result<()> {
-        let _ = self.store.save_event(&crate::types::LearningEvent {
+        self.store.save_event(&crate::types::LearningEvent {
             id: gen_id("evt"),
             timestamp_ms: now_ms(),
             agent_id: "system".to_string(),
@@ -273,7 +273,7 @@ impl AutonomyManager {
                 "action_id": action.id,
                 "autonomy_level": format!("{:?}", action.autonomy_level),
             }),
-        });
+        })?;
         Ok(())
     }
 }

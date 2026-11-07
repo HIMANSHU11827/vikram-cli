@@ -364,8 +364,21 @@ pub fn status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         theme.status_style(StatusSegment::Value),
     ));
 
-    // ctx [bar] pct%
-    if let Some(ratio) = app.metrics.context_ratio() {
+    // ctx — a percentage only when the window is a real figure. When no source advertised or
+    // configured one, the denominator would be invented, so the measured cost stands alone.
+    if app.metrics.context_limit_assumed {
+        if app.metrics.context_used > 0 {
+            left.push(Span::raw(sep.to_owned()));
+            left.push(Span::styled(
+                "ctx ",
+                theme.status_style(StatusSegment::Label),
+            ));
+            left.push(Span::styled(
+                format!("{} tok", human(app.metrics.context_used)),
+                theme.status_style(StatusSegment::Value),
+            ));
+        }
+    } else if let Some(ratio) = app.metrics.context_ratio() {
         let pct = (f64::from(ratio) * 100.0).round() as u64;
         let bar = context_bar(ratio, 10, theme);
         // A tilde says the figure is the estimator's, not the provider's; an asterisk says the
@@ -391,16 +404,8 @@ pub fn status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ));
     }
 
-    // runtime timing (uptime)
-    if app.metrics.elapsed_ms > 0 {
-        left.push(Span::raw(sep.to_owned()));
-        left.push(Span::styled(
-            format!("{}s", app.metrics.elapsed_ms / 1000),
-            theme.status_style(StatusSegment::Value),
-        ));
-    }
-
-    // ⏱ turn timing
+    // ⏱ turn timing — the number an operator actually waits on. Process uptime used to sit beside
+    // it and read as a stalled turn, so it is gone.
     if let Some(ms) = app.metrics.turn_elapsed_ms {
         left.push(Span::raw(sep.to_owned()));
         let t_glyph = if theme.ascii { "T" } else { "⏱" };
@@ -743,6 +748,15 @@ pub const APPROVAL_ACTIONS: [&str; 4] = [
     "Add to the allow list",
     "Approve and add to the allow list",
 ];
+
+/// How many rows the approvals panel needs when it is docked under the transcript.
+///
+/// The caller reserves exactly this many rows so the question never covers the rows it is asking
+/// about: the transcript is laid out above the reserved strip and stays readable behind it.
+pub fn approval_panel_height(app: &App, theme: &Theme) -> u16 {
+    let (_, lines) = approval_lines(app, theme);
+    (lines.len() as u16 + 2).clamp(3, 16)
+}
 
 fn approval_lines(app: &App, theme: &Theme) -> (String, Vec<Line<'static>>) {
     let mut lines: Vec<Line> = Vec::new();
@@ -1620,7 +1634,7 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_marks_estimated_counts_and_assumed_limits() {
+    fn status_bar_shows_tokens_when_the_window_is_assumed_and_a_percentage_when_it_is_real() {
         let mut app = app_with_default_bots();
         app.metrics = Metrics {
             context_used: 50_000,
@@ -1629,12 +1643,21 @@ mod tests {
             context_limit_assumed: true,
             ..Metrics::default()
         };
+        let assumed = draw(130, 1, |frame| {
+            status_bar(frame, frame.area(), &app, &Theme::new(false))
+        });
+        // No source knows this model's window, so a percentage would divide by an invented number.
+        assert!(assumed.contains("ctx 50.0k tok"), "got {assumed}");
+        assert!(
+            !assumed.contains('%') && !assumed.contains('*'),
+            "an assumed window carries no percentage: {assumed}"
+        );
+        app.metrics.context_limit_assumed = false;
         let estimated = draw(130, 1, |frame| {
             status_bar(frame, frame.area(), &app, &Theme::new(false))
         });
-        assert!(estimated.contains("~50%*"), "got {estimated}");
+        assert!(estimated.contains("~50%"), "got {estimated}");
         app.metrics.context_measured = true;
-        app.metrics.context_limit_assumed = false;
         let measured = draw(130, 1, |frame| {
             status_bar(frame, frame.area(), &app, &Theme::new(false))
         });

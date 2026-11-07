@@ -556,14 +556,14 @@ impl SelfAwarenessEngine {
         let _key = format!("self-model:{}", model.id);
         let _value = serde_json::to_string(model)
             .map_err(|e| crate::error::EvolutionError::Serde(e.to_string()))?;
-        let _ = self.store.save_event(&crate::types::LearningEvent {
+        self.store.save_event(&crate::types::LearningEvent {
             id: gen_id("evt"),
             timestamp_ms: now_ms(),
             agent_id: "system".to_string(),
             kind: "self_model_update".to_string(),
             summary: "Self-model updated".to_string(),
             payload: serde_json::json!({"model_id": model.id, "version": model.version}),
-        });
+        })?;
         Ok(())
     }
 

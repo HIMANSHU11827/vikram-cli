@@ -123,21 +123,40 @@ impl ContextLoader {
         }
     }
 
+    fn cache_lock(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, CachedFile>> {
+        let guard = self.cache.lock();
+        match guard {
+            Ok(g) => g,
+            Err(poisoned) => {
+                eprintln!("vikram: context cache mutex poisoned; recovering inner map");
+                poisoned.into_inner()
+            }
+        }
+    }
+
     /// Read one file with caching + mtime-based invalidation. Returns None if missing.
+    /// A poisoned cache lock no longer swallows the read: it recovers the inner map.
     pub fn read_file(&self, path: &Path) -> Option<String> {
         // Fast path: cache hit with unchanged mtime.
         let mtime = fs::metadata(path).ok().and_then(|m| m.modified().ok());
         {
-            let cache = self.cache.lock().ok()?;
-            if let Some(cached) = cache.get(path) {
-                if cached.mtime == mtime {
-                    return Some(cached.content.clone());
-                }
+            let cache = self.cache_lock();
+            if let Some(cached) = cache.get(path)
+                && cached.mtime == mtime
+            {
+                return Some(cached.content.clone());
             }
         }
-        // Read from disk.
-        let content = fs::read_to_string(path).ok()?;
-        let mut cache = self.cache.lock().ok()?;
+        // Read from disk. A read error other than NotFound is logged, not silently dropped.
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                eprintln!("vikram: context file {} unreadable: {e}", path.display());
+                return None;
+            }
+        };
+        let mut cache = self.cache_lock();
         cache.insert(
             path.to_path_buf(),
             CachedFile {
@@ -150,16 +169,12 @@ impl ContextLoader {
 
     /// Invalidate the cache entry for a path (call after an edit).
     pub fn invalidate(&self, path: &Path) {
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.remove(path);
-        }
+        self.cache_lock().remove(path);
     }
 
     /// Invalidate everything (e.g. on profile switch).
     pub fn invalidate_all(&self) {
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.clear();
-        }
+        self.cache_lock().clear();
     }
 
     fn try_add(&self, bundle: &mut ContextBundle, file: ContextFile, path: PathBuf) -> bool {
@@ -241,15 +256,15 @@ impl ContextLoader {
 
         // Authorized user/profile context is passed by caller via task_context appended as a section
         // only if explicitly provided and within budget.
-        if let Some(tc) = task_context {
-            if bundle.total_tokens() < self.token_budget {
-                bundle.sections.push(ContextSection {
-                    file: ContextFile::Instructions,
-                    path: PathBuf::from("<task>"),
-                    content: tc.to_owned(),
-                    tokens: vikram_contracts::TokenMeter::estimate(tc),
-                });
-            }
+        if let Some(tc) = task_context
+            && bundle.total_tokens() < self.token_budget
+        {
+            bundle.sections.push(ContextSection {
+                file: ContextFile::Instructions,
+                path: PathBuf::from("<task>"),
+                content: tc.to_owned(),
+                tokens: vikram_contracts::TokenMeter::estimate(tc),
+            });
         }
 
         self.load_project_agents(&mut bundle);
@@ -289,15 +304,15 @@ impl ContextLoader {
         self.try_add(&mut bundle, ContextFile::Memory, dir.join("MEMORY.md"));
         self.try_add(&mut bundle, ContextFile::Tools, dir.join("TOOLS.md"));
 
-        if let Some(tc) = task_context {
-            if bundle.total_tokens() < self.token_budget {
-                bundle.sections.push(ContextSection {
-                    file: ContextFile::Instructions,
-                    path: PathBuf::from("<task>"),
-                    content: tc.to_owned(),
-                    tokens: vikram_contracts::TokenMeter::estimate(tc),
-                });
-            }
+        if let Some(tc) = task_context
+            && bundle.total_tokens() < self.token_budget
+        {
+            bundle.sections.push(ContextSection {
+                file: ContextFile::Instructions,
+                path: PathBuf::from("<task>"),
+                content: tc.to_owned(),
+                tokens: vikram_contracts::TokenMeter::estimate(tc),
+            });
         }
 
         self.load_project_agents(&mut bundle);
@@ -339,8 +354,14 @@ impl ContextLoader {
     }
 
     /// Scaffold default markdown files for a new entity directory if missing.
-    pub fn scaffold_entity(&self, dir: &Path, name: &str, kind: &str, title: &str) {
-        let _ = fs::create_dir_all(dir);
+    pub fn scaffold_entity(
+        &self,
+        dir: &Path,
+        name: &str,
+        kind: &str,
+        title: &str,
+    ) -> Result<(), String> {
+        fs::create_dir_all(dir).map_err(|e| format!("scaffold {}: {e}", dir.display()))?;
         let title_line = if title.is_empty() {
             kind.to_owned()
         } else {
@@ -371,8 +392,10 @@ impl ContextLoader {
         for (file, content) in &defaults {
             let path = dir.join(file.filename());
             if !path.exists() {
-                let _ = fs::write(&path, content);
+                fs::write(&path, content)
+                    .map_err(|e| format!("scaffold {}: {e}", path.display()))?;
             }
         }
+        Ok(())
     }
 }

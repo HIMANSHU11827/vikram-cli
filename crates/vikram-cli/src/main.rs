@@ -5,6 +5,7 @@
 
 mod chat;
 mod doctor;
+mod gateway;
 mod skills;
 mod terminal;
 mod tools;
@@ -60,6 +61,13 @@ enum Command {
         /// Do not create or continue a session; always start a fresh one.
         #[arg(long)]
         fresh: bool,
+        /// Stay in the prompt: each line is one turn on the same session. `/help` lists the
+        /// commands the prompt understands (`/new`, `/session <id>`, `/mode <name>`, `/exit`).
+        #[arg(long, short = 'i')]
+        interactive: bool,
+        /// Attach an image from a local file. Repeat the flag for more than one.
+        #[arg(long, value_name = "PATH")]
+        image: Vec<PathBuf>,
     },
     /// Steer a running session with a new instruction.
     Steer { id: String, message: Vec<String> },
@@ -162,6 +170,8 @@ enum Command {
         #[command(subcommand)]
         action: Option<JobsAction>,
     },
+    /// Run configured chat platforms against this runtime (env-configured credentials).
+    Gateway,
 }
 
 #[derive(Debug, Subcommand)]
@@ -533,6 +543,28 @@ enum SessionsAction {
     Archive { id: String },
     /// Duplicate a session's metadata and conversation.
     Duplicate { id: String },
+    /// Fork a session: a new session that continues from the source's transcript, with the
+    /// journal copied and the source recorded as its parent.
+    Fork { id: String },
+    /// Export a session as JSON or Markdown. Prints to stdout, or to `--output` when given.
+    Export {
+        id: String,
+        /// `json` or `markdown`.
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Write to this path instead of stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Recover a session whose journal ends in the middle of a tool call. Appends a synthetic
+    /// result for every pending call so the transcript is complete again.
+    Recover { id: String },
+    /// List sessions whose journal ends mid-work. Add `--recover` to complete them all.
+    Interrupted {
+        /// Recover every interrupted session instead of only listing them.
+        #[arg(long)]
+        recover: bool,
+    },
     /// Delete a session, its journal and its metadata. Project files are never touched.
     Rm { id: String },
 }
@@ -664,7 +696,26 @@ fn main() -> std::process::ExitCode {
     let command = cli.command.unwrap_or(Command::Tui);
     match command {
         Command::Tui => run_tui(config),
-        Command::Chat { message, fresh } => {
+        Command::Chat {
+            message,
+            fresh,
+            interactive,
+            image,
+        } => {
+            if interactive {
+                // The prompt reads one line per turn, and a line cannot carry an attachment: the
+                // images would be dropped without a word, so the combination is refused instead.
+                if !image.is_empty() {
+                    eprintln!("vikram: --image cannot be combined with --interactive");
+                    return std::process::ExitCode::FAILURE;
+                }
+                let first = if message.is_empty() {
+                    None
+                } else {
+                    Some(message.join(" "))
+                };
+                return run_async(chat::run_interactive(config, first, fresh));
+            }
             let text = if message.is_empty() {
                 use std::io::Read;
                 let mut buffer = String::new();
@@ -677,7 +728,11 @@ fn main() -> std::process::ExitCode {
             } else {
                 message.join(" ")
             };
-            run_async(chat::run(config, text, fresh))
+            if image.is_empty() {
+                run_async(chat::run(config, text, fresh))
+            } else {
+                run_async(chat::run_with_images(config, text, fresh, image))
+            }
         }
         Command::Steer { id, message } => {
             let text = message.join(" ");
@@ -714,6 +769,7 @@ fn main() -> std::process::ExitCode {
         Command::Heartbeat { action } => heartbeat(action.unwrap_or(HeartbeatAction::Status)),
         Command::Cron { action } => cron(action.unwrap_or(CronAction::List)),
         Command::Jobs { action } => jobs(action.unwrap_or(JobsAction::List { limit: 20 })),
+        Command::Gateway => run_async(gateway::run(config)),
     }
 }
 
@@ -900,6 +956,73 @@ fn sessions(action: SessionsAction) -> std::process::ExitCode {
                     .map_err(|e| e.to_string())?
                     .ok_or_else(|| format!("session {id} not found"))?;
                 println!("{}", copy.id);
+            }
+            SessionsAction::Fork { id } => {
+                let id = vikram_contracts::SessionId::new(id);
+                let fork = store
+                    .fork_session(&id, now)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("session {id} not found"))?;
+                println!("{}", fork.id);
+            }
+            SessionsAction::Export { id, format, output } => {
+                let id = vikram_contracts::SessionId::new(id);
+                let parsed = vikram_store::ExportFormat::parse(&format).ok_or_else(|| {
+                    format!("unknown export format `{format}`; use json or markdown")
+                })?;
+                let text = store
+                    .export_session_text(&id, parsed, now)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("session {id} not found"))?;
+                match output {
+                    Some(path) => {
+                        std::fs::write(&path, &text)
+                            .map_err(|e| format!("write {}: {e}", path.display()))?;
+                        println!("exported {id} ({}) to {}", parsed.as_str(), path.display());
+                    }
+                    None => println!("{text}"),
+                }
+            }
+            SessionsAction::Recover { id } => {
+                let id = vikram_contracts::SessionId::new(id);
+                if store.get_session(&id).map_err(|e| e.to_string())?.is_none() {
+                    return Err(format!("session {id} not found"));
+                }
+                let answered = store
+                    .recover_interrupted_session(&id, now)
+                    .map_err(|e| e.to_string())?;
+                for call in &answered {
+                    println!("answered pending call {call}");
+                }
+                if answered.is_empty() {
+                    println!("session {id} was not interrupted; nothing to recover");
+                }
+            }
+            SessionsAction::Interrupted { recover } => {
+                let interrupted = store
+                    .list_interrupted_sessions()
+                    .map_err(|e| e.to_string())?;
+                if interrupted.is_empty() {
+                    println!("no interrupted sessions");
+                }
+                for session in &interrupted {
+                    let tool = session.tool_preview.as_deref().unwrap_or("unfinished work");
+                    println!(
+                        "{}  {} pending call(s) · last seq {} · {}",
+                        session.id,
+                        session.pending_calls.len(),
+                        session.last_seq,
+                        tool
+                    );
+                    if recover {
+                        for call in store
+                            .recover_interrupted_session(&session.id, now)
+                            .map_err(|e| e.to_string())?
+                        {
+                            println!("  recovered {call}");
+                        }
+                    }
+                }
             }
             SessionsAction::Rm { id } => {
                 let id = vikram_contracts::SessionId::new(id);
@@ -1204,8 +1327,7 @@ fn entities(action: EntitiesAction) -> std::process::ExitCode {
             EntitiesAction::List { kind } => {
                 let rows = match kind {
                     Some(k) => {
-                        let ek = vikram_store::EntityKind::parse(&k)
-                            .ok_or_else(|| format!("unknown kind {k}"))?;
+                        let ek = vikram_store::EntityKind::parse(&k).map_err(|e| e.to_string())?;
                         store.list_entities_by_kind(ek).map_err(|e| e.to_string())?
                     }
                     None => store.list_entities().map_err(|e| e.to_string())?,
@@ -1230,7 +1352,7 @@ fn entities(action: EntitiesAction) -> std::process::ExitCode {
                 description,
             } => {
                 use vikram_store::EntityKind;
-                let ek = EntityKind::parse(&kind).ok_or_else(|| format!("unknown kind {kind}"))?;
+                let ek = EntityKind::parse(&kind).map_err(|e| e.to_string())?;
                 let now = vikram_runtime::types::now_ms();
                 let row = vikram_store::EntityRow {
                     id: vikram_contracts::EntityId::generate(),
@@ -1269,7 +1391,7 @@ fn entities(action: EntitiesAction) -> std::process::ExitCode {
                     base.clone(),
                     std::env::current_dir().unwrap_or_default(),
                 );
-                loader.scaffold_entity(&dir, &row.name, ek.as_str(), &row.title);
+                loader.scaffold_entity(&dir, &row.name, ek.as_str(), &row.title)?;
                 println!("{}", row.id);
             }
             EntitiesAction::Rm { id } => {
@@ -1791,10 +1913,15 @@ async fn mcp_serve() -> Result<(), String> {
         ));
     }
 
-    let mut server_cfg = vikram_mcp::ServerConfig::default();
-    server_cfg.approved_tools = serve_config.approved_tools.clone();
-    server_cfg.auth_required = serve_config.auth_required;
-    server_cfg.auth_token = serve_config.auth_token.clone();
+    let server_cfg = vikram_mcp::ServerConfig {
+        approved_tools: serve_config.approved_tools.clone(),
+        auth_required: serve_config.auth_required,
+        auth_token: serve_config.auth_token.clone(),
+        ..vikram_mcp::ServerConfig::default()
+    };
+    // Fail fast on auth misconfiguration instead of starting a server that
+    // rejects every request.
+    server_cfg.validate().map_err(|err| err.to_string())?;
 
     let app_config = Config::load().unwrap_or_default();
     let workspace_root = app_config
@@ -1810,7 +1937,8 @@ async fn mcp_serve() -> Result<(), String> {
         }
     }
 
-    let mut server = vikram_mcp::McpServer::new(server_cfg);
+    let mut server = vikram_mcp::McpServer::try_new(server_cfg)
+        .map_err(|err| format!("invalid MCP server configuration: {err}"))?;
     for name in &serve_config.approved_tools {
         let spec = registry
             .get(name)

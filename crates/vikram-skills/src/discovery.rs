@@ -460,17 +460,16 @@ fn walk(
         }
         match find_skill_file(&path) {
             Some(file) => {
-                if !opts.follow_symlinks {
-                    if let Ok(file_meta) = fs::symlink_metadata(&file) {
-                        if file_meta.file_type().is_symlink() {
-                            diagnostics.push(Diagnostic::new(
-                                DiagnosticLevel::Warning,
-                                &file,
-                                "SKILL.md is a symlink; refused",
-                            ));
-                            continue;
-                        }
-                    }
+                if !opts.follow_symlinks
+                    && let Ok(file_meta) = fs::symlink_metadata(&file)
+                    && file_meta.file_type().is_symlink()
+                {
+                    diagnostics.push(Diagnostic::new(
+                        DiagnosticLevel::Warning,
+                        &file,
+                        "SKILL.md is a symlink; refused",
+                    ));
+                    continue;
                 }
                 found.push(path);
             }

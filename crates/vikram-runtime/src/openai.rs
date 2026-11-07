@@ -101,6 +101,120 @@ pub fn model_ids(body: &Value) -> Vec<String> {
     ids
 }
 
+/// The longest server-directed wait a turn will sit through. Beyond this the operator is better off
+/// being told to wait than watching a silent clock, so nothing is retried.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(10);
+
+/// Statuses a model endpoint asks us to try again on, rather than treat as a final refusal. Every
+/// 5xx qualifies, because gateways disagree about which of them are permanent (529 overloaded, for
+/// one) and a single retry costs less than a wrong failure.
+fn retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 425 | 429) || status.is_server_error()
+}
+
+/// Exponential backoff with a ceiling: 0.5s, 1s, 2s, then 4s.
+fn backoff(attempt: u32) -> Duration {
+    let factor = 2u64.saturating_pow(attempt.saturating_sub(1)).min(8);
+    Duration::from_millis(500 * factor)
+}
+
+/// `Retry-After` when the server names a delay; capped so a hostile header cannot stall a turn.
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let value = response.headers().get(reqwest::header::RETRY_AFTER)?;
+    let seconds = value.to_str().ok()?.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds.min(300)))
+}
+
+/// Bodies that mean "this account cannot pay for a request", whatever status carries them. OpenAI
+/// answers 429 with `insufficient_quota`, others answer 402 or 403.
+fn credit_exhausted(body: &str) -> bool {
+    let body = body.to_lowercase();
+    [
+        "insufficient_quota",
+        "insufficient quota",
+        "quota exceeded",
+        "exceeded your current quota",
+        "credit balance",
+        "out of credit",
+        "no credit",
+        "billing",
+        "payment required",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle))
+}
+
+/// Put a refused request into words the operator can act on. The raw provider body is kept, because
+/// it is often the only place the request id and the exact reason appear, but it never leads.
+fn explain_rejection(status: reqwest::StatusCode, body: &str, endpoint: &str) -> String {
+    let detail = truncate(body, 240);
+    if status.as_u16() == 402 || credit_exhausted(body) {
+        return format!(
+            "the account has no credit left for {endpoint} ({status}). Top up, or switch with \
+             `vikram config set model <name>` (and `--base-url` for another provider). \
+             Provider said: {detail}"
+        );
+    }
+    match status.as_u16() {
+        401 | 403 => format!(
+            "credentials refused ({status}) by {endpoint}. Check the key named by `api_key_env` \
+             in `vikram config show`. Provider said: {detail}"
+        ),
+        404 => format!(
+            "no endpoint or model at ({status}) {endpoint}. Check `model` and `base_url`. \
+             Provider said: {detail}"
+        ),
+        429 => format!(
+            "rate limited ({status}) by {endpoint} after retries. Wait for the window to reset, \
+             or switch model. Provider said: {detail}"
+        ),
+        500..=599 => format!(
+            "provider unavailable ({status}) at {endpoint} after retries; this is their side, not \
+             the request. Retry in a moment. Provider said: {detail}"
+        ),
+        _ => format!("{status} from {endpoint}. Provider said: {detail}"),
+    }
+}
+
+/// The same for a failure that never reached a status line: the transport broke.
+/// The error and everything that caused it, as text. `reqwest`'s own `Display` stops at "error
+/// sending request", while the reason (a DNS lookup failure, a refused connect) lives in the chain.
+fn error_chain(err: &reqwest::Error) -> String {
+    let mut text = err.to_string();
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
+fn explain_transport(err: &reqwest::Error, endpoint: &str, attempts: u32) -> String {
+    let text = error_chain(err).to_lowercase();
+    if text.contains("dns") || text.contains("lookup address") {
+        format!(
+            "cannot resolve the host for {endpoint} after {attempts} attempts: DNS is not \
+             answering, which is what a dropped network looks like."
+        )
+    } else if err.is_timeout() {
+        format!("{endpoint} did not answer before the timeout, after {attempts} attempts")
+    } else if err.is_connect() {
+        format!(
+            "cannot reach {endpoint}: the connection failed after {attempts} attempts. \
+             The network or DNS is down, or the endpoint is wrong."
+        )
+    } else {
+        format!("{endpoint} failed after {attempts} attempts: {err}")
+    }
+}
+
+/// A transport error worth another attempt. A refusal by DNS or TLS will say the same thing every
+/// time, and retrying it only makes the operator wait longer for the same message.
+fn retryable_transport(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect() || err.is_request()
+}
+
 /// Ask the configured endpoint what it serves. Kept separate from the provider object because the
 /// listing is a property of the *server*, not of the model currently chosen.
 pub async fn list_models(
@@ -156,35 +270,69 @@ impl Provider for OpenAiProvider {
         let body = build_request_body(&request);
 
         tokio::spawn(async move {
-            let response = match client
-                .post(&endpoint)
-                .bearer_auth(&api_key)
-                .json(&body)
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(err) => {
-                    let _ = tx
-                        .send(Err(VikramError::ProviderTransient(format!(
-                            "request failed: {err}"
-                        ))))
-                        .await;
-                    return;
+            const MAX_ATTEMPTS: u32 = 3;
+            let mut attempt = 0u32;
+            let response = loop {
+                attempt += 1;
+                match client
+                    .post(&endpoint)
+                    .bearer_auth(&api_key)
+                    .json(&body)
+                    .send()
+                    .await
+                {
+                    Ok(response) => {
+                        let status = response.status();
+                        if status.is_success() {
+                            break response;
+                        }
+                        // The body decides between "wait and retry" and "this account cannot pay":
+                        // OpenAI folds quota exhaustion into 429, so the status alone lies.
+                        let wait = retry_after(&response);
+                        let body = response.text().await.unwrap_or_default();
+                        let billing = status.as_u16() == 402 || credit_exhausted(&body);
+                        if !billing && retryable_status(status) && attempt < MAX_ATTEMPTS {
+                            match wait {
+                                Some(delay) if delay > MAX_RETRY_WAIT => {
+                                    let text = format!(
+                                        "{endpoint} asked to wait {}s before retrying ({status}). \
+                                         That would stall the turn, so nothing was retried: wait, \
+                                         then send again.",
+                                        delay.as_secs()
+                                    );
+                                    let _ = tx.send(Err(VikramError::ProviderRejected(text))).await;
+                                    return;
+                                }
+                                other => {
+                                    let delay = other.unwrap_or_else(|| backoff(attempt));
+                                    tokio::time::sleep(delay).await;
+                                    continue;
+                                }
+                            }
+                        }
+                        let text = explain_rejection(status, &body, &endpoint);
+                        let _ = tx
+                            .send(Err(if billing || status.as_u16() == 429 {
+                                VikramError::ProviderRejected(text)
+                            } else {
+                                VikramError::ProviderTransient(text)
+                            }))
+                            .await;
+                        return;
+                    }
+                    Err(err) => {
+                        // A connection that failed before any bytes were sent is safe to retry:
+                        // the request never reached the model, so it cannot run twice.
+                        if attempt < MAX_ATTEMPTS && retryable_transport(&err) {
+                            tokio::time::sleep(backoff(attempt)).await;
+                            continue;
+                        }
+                        let text = explain_transport(&err, &endpoint, attempt);
+                        let _ = tx.send(Err(VikramError::ProviderTransient(text))).await;
+                        return;
+                    }
                 }
             };
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                let _ = tx
-                    .send(Err(VikramError::ProviderRejected(format!(
-                        "{status}: {}",
-                        truncate(&body, 400)
-                    ))))
-                    .await;
-                return;
-            }
 
             let mut stream = response.bytes_stream();
             let mut buffer = String::new();
@@ -210,6 +358,10 @@ impl Provider for OpenAiProvider {
                     let line = buffer[..index].trim_end_matches('\r').to_owned();
                     buffer.drain(..=index);
                     if let Some(events) = parse_sse_line(&line, &mut pending) {
+                        if let Some(text) = pending.error.take() {
+                            let _ = tx.send(Err(VikramError::ProviderRejected(text))).await;
+                            return;
+                        }
                         for event in events {
                             match event {
                                 ProviderEvent::Finished { .. } => {
@@ -343,12 +495,14 @@ pub fn map_messages(messages: &[Message]) -> Vec<Value> {
         let mut text = String::new();
         let mut tool_calls = Vec::new();
         let mut tool_results = Vec::new();
+        let mut images: Vec<&vikram_contracts::ImageSource> = Vec::new();
 
         for block in &message.blocks {
             match block {
                 Block::Text { text: body, .. } => text.push_str(body),
                 // Reasoning is model-authored scratchpad; do not re-send as instruction text.
                 Block::Reasoning { .. } => {}
+                Block::Image { source, .. } => images.push(source),
                 Block::ToolCall { call } => tool_calls.push(json!({
                     "id": call.id.as_str(),
                     "type": "function",
@@ -368,7 +522,23 @@ pub fn map_messages(messages: &[Message]) -> Vec<Value> {
         match message.role {
             Role::Tool => out.extend(tool_results),
             Role::System | Role::User => {
-                out.push(json!({"role": role_name(message.role), "content": text}));
+                if message.role == Role::User && !images.is_empty() {
+                    // Vision requests carry the OpenAI content-parts array; a plain string is
+                    // still the right shape for text-only turns (and for every other role).
+                    let mut parts = Vec::new();
+                    if !text.is_empty() {
+                        parts.push(json!({"type": "text", "text": text}));
+                    }
+                    for image in images {
+                        parts.push(json!({
+                            "type": "image_url",
+                            "image_url": {"url": image.wire_url()},
+                        }));
+                    }
+                    out.push(json!({"role": "user", "content": parts}));
+                } else {
+                    out.push(json!({"role": role_name(message.role), "content": text}));
+                }
                 out.extend(tool_results);
             }
             Role::Assistant => {
@@ -414,10 +584,37 @@ struct ToolAccumulator {
 struct StreamState {
     calls: BTreeMap<usize, ToolAccumulator>,
     finish: Option<(Option<u64>, Option<u64>)>,
+    /// An error the provider reported *inside* a 200 response. OpenAI-compatible endpoints do this
+    /// once the headers are out: the failure is in the body, and ignoring it turns a broken request
+    /// into an empty answer.
+    error: Option<String>,
 }
 
 fn stream_state() -> StreamState {
     StreamState::default()
+}
+
+/// Read a provider's own error object into one sentence, keeping the code when it names one.
+fn summarize_stream_error(error: &Value) -> String {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let code = error
+        .get("code")
+        .or_else(|| error.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match (message.is_empty(), code.is_empty()) {
+        (false, true) => format!("the provider reported an error mid-stream: {message}"),
+        (false, false) => {
+            format!("the provider reported an error mid-stream ({code}): {message}")
+        }
+        _ => format!(
+            "the provider reported an error mid-stream: {}",
+            truncate(&error.to_string(), 240)
+        ),
+    }
 }
 
 /// Parse one SSE line into zero or more provider events.
@@ -431,6 +628,25 @@ fn parse_sse_line(line: &str, state: &mut StreamState) -> Option<Vec<ProviderEve
         return Some(finish_pending(state));
     }
     let value: Value = serde_json::from_str(data).ok()?;
+
+    // A frame can carry a failure instead of a delta. Read it before anything else, or the stream
+    // ends with a synthetic finish and the turn reports success with no words in it.
+    if let Some(error) = value.get("error").filter(|v| !v.is_null()) {
+        state.error = Some(summarize_stream_error(error));
+        return Some(Vec::new());
+    }
+    let finish_reason = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(Value::as_str);
+    if finish_reason == Some("error") {
+        state.error = Some(
+            "the provider ended the stream with finish_reason `error` and no message".to_owned(),
+        );
+        return Some(Vec::new());
+    }
 
     if let Some(usage) = value.get("usage").filter(|v| !v.is_null()) {
         let input = usage.get("prompt_tokens").and_then(Value::as_u64);
@@ -456,16 +672,16 @@ fn parse_sse_line(line: &str, state: &mut StreamState) -> Option<Vec<ProviderEve
     let mut events = Vec::new();
     // Reasoning/thinking deltas (provider-dependent field names).
     for field in ["reasoning_content", "reasoning", "thinking"] {
-        if let Some(thought) = delta.get(field).and_then(Value::as_str) {
-            if !thought.is_empty() {
-                events.push(ProviderEvent::ThinkingDelta(thought.to_owned()));
-            }
+        if let Some(thought) = delta.get(field).and_then(Value::as_str)
+            && !thought.is_empty()
+        {
+            events.push(ProviderEvent::ThinkingDelta(thought.to_owned()));
         }
     }
-    if let Some(content) = delta.get("content").and_then(Value::as_str) {
-        if !content.is_empty() {
-            events.push(ProviderEvent::TextDelta(content.to_owned()));
-        }
+    if let Some(content) = delta.get("content").and_then(Value::as_str)
+        && !content.is_empty()
+    {
+        events.push(ProviderEvent::TextDelta(content.to_owned()));
     }
 
     if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -476,16 +692,16 @@ fn parse_sse_line(line: &str, state: &mut StreamState) -> Option<Vec<ProviderEve
                 .map(|i| i as usize)
                 .unwrap_or(fallback_index);
             let entry = state.calls.entry(index).or_default();
-            if let Some(id) = call.get("id").and_then(Value::as_str) {
-                if !id.is_empty() {
-                    entry.id = Some(id.to_owned());
-                }
+            if let Some(id) = call.get("id").and_then(Value::as_str)
+                && !id.is_empty()
+            {
+                entry.id = Some(id.to_owned());
             }
             if let Some(function) = call.get("function") {
-                if let Some(name) = function.get("name").and_then(Value::as_str) {
-                    if !name.is_empty() {
-                        entry.name = Some(from_wire_name(name));
-                    }
+                if let Some(name) = function.get("name").and_then(Value::as_str)
+                    && !name.is_empty()
+                {
+                    entry.name = Some(from_wire_name(name));
                 }
                 if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
                     entry.arguments.push_str(arguments);
@@ -555,6 +771,133 @@ mod tests {
     use super::*;
     use crate::provider::ToolSpec;
     use vikram_contracts::{ToolCall, ToolCallId, Trust};
+
+    #[test]
+    fn a_payment_refusal_is_explained_as_no_credit_not_as_raw_json() {
+        let status = reqwest::StatusCode::from_u16(402).unwrap();
+        let body = r#"{"error":{"message":"payment required","type":"insufficient_quota"}}"#;
+        let text = explain_rejection(status, body, "https://api.example/v1");
+        assert!(text.contains("no credit left"), "{text}");
+        assert!(text.contains("vikram config set model"), "{text}");
+        assert!(!text.starts_with("402"), "the status must not lead: {text}");
+        // OpenAI reports the same condition as 429 with a quota body.
+        let limited = explain_rejection(
+            reqwest::StatusCode::from_u16(429).unwrap(),
+            r#"{"error":{"code":"insufficient_quota"}}"#,
+            "https://api.example/v1",
+        );
+        assert!(limited.contains("no credit left"), "{limited}");
+    }
+
+    #[test]
+    fn a_refused_key_names_the_setting_to_look_at() {
+        let text = explain_rejection(
+            reqwest::StatusCode::from_u16(401).unwrap(),
+            "invalid api key",
+            "https://api.example/v1",
+        );
+        assert!(text.contains("api_key_env"), "{text}");
+        assert!(text.contains("401"), "{text}");
+    }
+
+    #[test]
+    fn a_missing_model_names_the_address_and_the_setting() {
+        let text = explain_rejection(
+            reqwest::StatusCode::from_u16(404).unwrap(),
+            "",
+            "https://api.example/v1",
+        );
+        assert!(
+            text.contains("model") && text.contains("base_url"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_server_error_is_attributed_to_the_provider_side() {
+        let text = explain_rejection(
+            reqwest::StatusCode::from_u16(503).unwrap(),
+            "upstream busy",
+            "https://api.example/v1",
+        );
+        assert!(text.contains("their side"), "{text}");
+    }
+
+    #[test]
+    fn a_rate_limit_says_to_wait_and_keeps_the_body_bounded() {
+        let long = "x".repeat(4_000);
+        let text = explain_rejection(
+            reqwest::StatusCode::from_u16(429).unwrap(),
+            &long,
+            "https://api.example/v1",
+        );
+        assert!(text.contains("rate limited"), "{text}");
+        assert!(
+            text.len() < 700,
+            "body was not truncated: {} chars",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn every_server_error_is_retried_but_a_payment_refusal_is_not() {
+        for code in [408, 425, 429, 500, 501, 502, 503, 504, 529] {
+            assert!(
+                retryable_status(reqwest::StatusCode::from_u16(code).unwrap()),
+                "{code} should be retried"
+            );
+        }
+        for code in [200, 400, 401, 402, 403, 404, 422] {
+            assert!(
+                !retryable_status(reqwest::StatusCode::from_u16(code).unwrap()),
+                "{code} must not be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn an_error_frame_inside_a_successful_stream_is_captured_not_dropped() {
+        let mut state = stream_state();
+        let events = parse_sse_line(
+            r#"data: {"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}"#,
+            &mut state,
+        );
+        assert_eq!(events.map(|events| events.len()), Some(0));
+        let text = state.error.expect("the failure was captured");
+        assert!(text.contains("insufficient_quota"), "{text}");
+        assert!(text.contains("exceeded your current quota"), "{text}");
+    }
+
+    #[test]
+    fn a_finish_reason_of_error_is_not_read_as_a_finished_answer() {
+        let mut state = stream_state();
+        parse_sse_line(
+            r#"data: {"choices":[{"delta":{},"finish_reason":"error"}]}"#,
+            &mut state,
+        );
+        assert!(state.error.is_some(), "silence must not look like success");
+    }
+
+    #[tokio::test]
+    async fn a_host_that_cannot_be_resolved_is_named_as_dns() {
+        let endpoint = "http://no-such-host-xyz.invalid/v1/chat/completions";
+        let err = reqwest::Client::new()
+            .get(endpoint)
+            .send()
+            .await
+            .expect_err("a reserved TLD cannot resolve");
+        let text = explain_transport(&err, endpoint, 3);
+        assert!(text.contains("DNS"), "the cause must be named: {text}");
+        assert!(text.contains(endpoint), "{text}");
+    }
+
+    #[test]
+    fn backoff_grows_then_stops_growing() {
+        assert_eq!(backoff(1), Duration::from_millis(500));
+        assert_eq!(backoff(2), Duration::from_millis(1000));
+        assert_eq!(backoff(3), Duration::from_millis(2000));
+        assert_eq!(backoff(9), Duration::from_millis(4000));
+    }
 
     #[test]
     fn a_dotted_function_name_is_escaped_for_endpoints_that_reject_dots() {
@@ -687,6 +1030,31 @@ mod tests {
             }
             other => panic!("expected tool call, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn images_become_content_parts_only_for_user_turns() {
+        let message = Message::user_with_images(
+            "describe",
+            vec![vikram_contracts::ImageSource::url("https://x/y.png")],
+        );
+        let mapped = map_messages(&[message]);
+        let content = mapped[0]["content"].as_array().expect("content parts");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "describe");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "https://x/y.png");
+
+        let plain = map_messages(&[Message::user("plain")]);
+        assert_eq!(plain[0]["content"], "plain");
+
+        let mut system = Message::system("sys");
+        system.blocks.push(Block::Image {
+            source: vikram_contracts::ImageSource::url("https://x"),
+            trust: Trust::External,
+        });
+        let mapped = map_messages(&[system]);
+        assert_eq!(mapped[0]["content"], "sys");
     }
 
     #[test]

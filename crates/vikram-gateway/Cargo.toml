@@ -1,0 +1,48 @@
+[package]
+name = "vikram-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Messaging platform gateways for VIKRAM — ingress from chat platforms, agent turns, delivery back out. Complete port of the hermes-agent gateway (see docs/gateway-port-plan.md)."
+
+[dependencies]
+vikram-contracts = { workspace = true }
+vikram-policy = { workspace = true }
+# vikram-runtime and vikram-store are NOT dependencies yet: the vikram-runtime
+# lib is mid-rewrite in the user's uncommitted WIP and does not compile.
+# The gateway foundation (event model, adapter trait, registry, access control,
+# routing, pairing) is runtime-independent by design; runtime wiring lands once
+# the workspace is green again. Track in docs/gateway-port-plan.md.
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+# `socket.rs` builds its TLS line socket on tokio-rustls with the webpki root store; both were
+# imported there but never declared, so the crate did not compile.
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+webpki-roots = "1"
+# Pairing codes and salts come from the OS CSPRNG; `getrandom` is the one primitive that reaches it
+# without `unsafe` (the crate forbids it) and without hand-rolling a DRBG.
+getrandom = "0.3"
+# `jwt.rs` verifies RS256/ES256 with ring; it is a lib module, so the dependency must live here and
+# not only in `[dev-dependencies]`.
+ring = "0.17"
+# Nostr events (buzz) are BIP-340 Schnorr signatures over secp256k1.
+k256 = { version = "0.14", features = ["schnorr"] }
+# Weixin media uploads are AES-128-ECB encrypted.
+aes = "0.8"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+curve25519-dalek = "5"

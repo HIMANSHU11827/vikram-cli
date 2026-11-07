@@ -233,6 +233,8 @@ impl Default for TokenEstimator {
 
 /// Framing cost per message in a chat request. Not measured by `text_body`, and not free.
 const MESSAGE_FRAMING: u64 = 4;
+/// Provider-side cost of one image, mid-range between low- and high-detail accounting.
+const IMAGE_TOKEN_ESTIMATE: u64 = 850;
 /// A tool call costs its name plus JSON scaffolding on top of its arguments.
 const TOOL_CALL_FRAMING: u64 = 8;
 
@@ -249,6 +251,9 @@ impl TokenEstimator {
         for block in &message.blocks {
             total += match block {
                 Block::Text { text, .. } | Block::Reasoning { text, .. } => self.estimate_raw(text),
+                // A provider bills an image by its own accounting, not by the base64 length; a
+                // fixed mid-range estimate is closer than counting characters.
+                Block::Image { .. } => IMAGE_TOKEN_ESTIMATE,
                 Block::ToolCall { call } => {
                     TOOL_CALL_FRAMING
                         + self.estimate_raw(&call.name)

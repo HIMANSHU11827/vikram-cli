@@ -183,10 +183,8 @@ pub fn pairing_is_consistent(messages: &[Message]) -> bool {
         for block in &message.blocks {
             match block {
                 Block::ToolCall { call } => seen_calls.push(call.id.clone()),
-                Block::ToolResult { call, .. } => {
-                    if !seen_calls.iter().any(|id| id == call) {
-                        return false;
-                    }
+                Block::ToolResult { call, .. } if !seen_calls.iter().any(|id| id == call) => {
+                    return false;
                 }
                 _ => {}
             }
@@ -487,6 +485,7 @@ impl FoldNote {
                                 self.remember_files(&call.arguments.to_string());
                             }
                             Block::Reasoning { .. } => {}
+                            Block::Image { .. } => {}
                             Block::ToolResult { .. } => {}
                         }
                     }
@@ -496,7 +495,7 @@ impl FoldNote {
                     for block in &message.blocks {
                         if let Block::ToolResult { content, ok, .. } = block {
                             let key = condense(content, 400);
-                            if !key.is_empty() && seen_results.iter().any(|prior| *prior == key) {
+                            if !key.is_empty() && seen_results.contains(&key) {
                                 self.duplicate_tools += 1;
                                 continue;
                             }
@@ -519,7 +518,7 @@ impl FoldNote {
 
     /// Pull path-looking strings out of a tool call's JSON arguments.
     fn remember_files(&mut self, arguments: &str) {
-        for token in arguments.split(|c: char| c == '"' || c == ',' || c == '{' || c == '}') {
+        for token in arguments.split(['"', ',', '{', '}']) {
             let candidate = token.trim().trim_start_matches("=\"").trim();
             if candidate.len() < 3 || candidate.len() > 200 {
                 continue;

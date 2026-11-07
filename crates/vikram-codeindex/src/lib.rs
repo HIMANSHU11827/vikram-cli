@@ -163,14 +163,14 @@ impl CodeIndex {
                 .to_string();
 
             // Check if unchanged.
-            let stored_mtime: Option<i64> = match self.conn.query_row(
-                "SELECT mtime_ms FROM files WHERE path = ?1",
-                params![rel],
-                |r| r.get(0),
-            ) {
-                Ok(v) => Some(v),
-                Err(_) => None,
-            };
+            let stored_mtime: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT mtime_ms FROM files WHERE path = ?1",
+                    params![rel],
+                    |r| r.get(0),
+                )
+                .ok();
             if stored_mtime == Some(mtime_ms) {
                 stats.unchanged += 1;
                 continue;
@@ -238,6 +238,61 @@ impl CodeIndex {
         }
 
         Ok(stats)
+    }
+
+    pub fn is_indexed(&self) -> Result<bool> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
+        Ok(n > 0)
+    }
+
+    /// Heuristic "contains" check for reference lookup: a file references a symbol
+    /// when the symbol name appears as a token in it. Cheap and honest; the refs
+    /// table built in `index()` uses the same rule.
+    pub fn references_of(&self, symbol: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT from_file FROM refs WHERE to_symbol = ?1")?;
+        let rows = stmt.query_map(params![symbol], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Definitions for a name, preferring exact matches.
+    pub fn definitions_of(&self, name: &str) -> Result<Vec<Symbol>> {
+        let mut out = self.search_symbols(name, 50)?;
+        out.sort_by_key(|s| (s.name != name, s.name.clone(), s.file.clone()));
+        Ok(out)
+    }
+
+    /// Ranked context snippet for a query string: definition matches first, then
+    /// other symbol-name hits, then a repo-map slice. Returns "" when the index is
+    /// empty (caller falls back to grep).
+    pub fn ranked_context(&self, query: &str, limit: usize) -> Result<String> {
+        if !self.is_indexed()? {
+            return Ok(String::new());
+        }
+        let mut lines = Vec::new();
+        for s in self.definitions_of(query)? {
+            let line = format!(
+                "{:?} {} {}:{}",
+                s.kind,
+                s.name,
+                s.file.display(),
+                s.start_line
+            );
+            if !lines.contains(&line) {
+                lines.push(line);
+            }
+        }
+        // Reference files add the "who uses this" half of the picture.
+        for f in self.references_of(query).unwrap_or_default() {
+            lines.push(format!("referenced in {f}"));
+        }
+        if lines.len() > limit {
+            lines.truncate(limit);
+        }
+        Ok(lines.join("\n"))
     }
 
     pub fn search_symbols(&self, query: &str, limit: usize) -> Result<Vec<Symbol>> {
@@ -461,11 +516,11 @@ fn fallback_extract(content: &str, path: &Path) -> Vec<Symbol> {
 }
 
 // ---------- tree-sitter extractors ----------
-// Returns Vec<(name, kind, start_line, end_line, Option<signature>)>.
+/// One extracted symbol: name, kind, start line, end line, optional signature.
+type ExtractedSymbol = (String, SymbolKind, usize, usize, Option<String>);
+type ExtractedSymbols = Vec<ExtractedSymbol>;
 
-fn ts_extract_rust(
-    content: &str,
-) -> Option<Vec<(String, SymbolKind, usize, usize, Option<String>)>> {
+fn ts_extract_rust(content: &str) -> Option<ExtractedSymbols> {
     use tree_sitter::{Parser, Query, QueryCursor};
     let mut parser = Parser::new();
     let lang = tree_sitter_rust::LANGUAGE;
@@ -517,9 +572,7 @@ fn ts_extract_rust(
     Some(out)
 }
 
-fn ts_extract_python(
-    content: &str,
-) -> Option<Vec<(String, SymbolKind, usize, usize, Option<String>)>> {
+fn ts_extract_python(content: &str) -> Option<ExtractedSymbols> {
     use tree_sitter::{Parser, Query, QueryCursor};
     let mut parser = Parser::new();
     let lang = tree_sitter_python::LANGUAGE;
@@ -559,7 +612,7 @@ fn ts_extract_python(
     Some(out)
 }
 
-fn ts_extract_go(content: &str) -> Option<Vec<(String, SymbolKind, usize, usize, Option<String>)>> {
+fn ts_extract_go(content: &str) -> Option<ExtractedSymbols> {
     use tree_sitter::{Parser, Query, QueryCursor};
     let mut parser = Parser::new();
     let lang = tree_sitter_go::LANGUAGE;
@@ -601,7 +654,7 @@ fn ts_extract_go(content: &str) -> Option<Vec<(String, SymbolKind, usize, usize,
     Some(out)
 }
 
-fn ts_extract_ts(content: &str) -> Option<Vec<(String, SymbolKind, usize, usize, Option<String>)>> {
+fn ts_extract_ts(content: &str) -> Option<ExtractedSymbols> {
     use tree_sitter::{Parser, Query, QueryCursor};
     let mut parser = Parser::new();
     let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT;

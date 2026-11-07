@@ -14,6 +14,8 @@ pub enum EvolutionError {
     Validation(String),
     #[error("security error: {0}")]
     Security(String),
+    // Retained for the public API: no caller currently produces these, but
+    // removing a variant is a breaking change for downstream matches.
     #[error("budget exceeded: {0}")]
     Budget(String),
     #[error("conflict: {0}")]

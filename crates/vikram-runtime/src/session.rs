@@ -13,6 +13,7 @@ use vikram_contracts::{CancellationToken, TokenMeter};
 use vikram_store::{SessionRow, TITLE_MANUAL};
 
 use crate::context_engine::{ContextAnchor, TokenEstimator};
+
 use crate::types::{ActivityEvent, SessionSnapshot, TurnState};
 
 /// The per-session half of the context engine: the estimator that this conversation's provider has
@@ -67,6 +68,9 @@ pub struct SessionRuntime {
     /// the child gets a bounded brief and returns a bounded answer, and neither sees the other's
     /// full transcript.
     pub parent: Mutex<Option<SessionId>>,
+    /// The session this one was forked from, when it is a fork. Like `parent`, it is set from
+    /// the stored row on rehydrate; unlike `parent`, a fork *does* share its source's transcript.
+    pub forked_from: Mutex<Option<SessionId>>,
     /// How far from the operator's own session this one sits. Checked against
     /// `max_delegation_depth` before a child is allowed to spawn another child.
     pub depth: AtomicU32,
@@ -82,6 +86,10 @@ pub struct SessionRuntime {
 
 impl SessionRuntime {
     pub fn from_row(row: SessionRow) -> Self {
+        let forked_from = row
+            .forked_from
+            .clone()
+            .or_else(|| row.parent_session.clone());
         Self {
             id: row.id,
             title: Mutex::new(row.title),
@@ -103,6 +111,7 @@ impl SessionRuntime {
             project_id: Mutex::new(row.project_id),
             status: Mutex::new(row.status),
             parent: Mutex::new(None),
+            forked_from: Mutex::new(forked_from),
             depth: AtomicU32::new(0),
             title_source: Mutex::new(row.title_source),
             title_status: Mutex::new(row.title_status),
@@ -111,19 +120,37 @@ impl SessionRuntime {
     }
 
     pub fn title_source(&self) -> String {
-        self.title_source.lock().expect("title source lock").clone()
+        self.title_source
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session title source lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()
     }
 
     pub fn set_title_source(&self, source: &str) {
-        *self.title_source.lock().expect("title source lock") = source.to_owned();
+        *self.title_source.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session title source lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = source.to_owned();
     }
 
     pub fn title_status(&self) -> String {
-        self.title_status.lock().expect("title status lock").clone()
+        self.title_status
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session title status lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()
     }
 
     pub fn set_title_status(&self, status: &str) {
-        *self.title_status.lock().expect("title status lock") = status.to_owned();
+        *self.title_status.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session title status lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = status.to_owned();
     }
 
     /// Whether a derived title may replace this session's name. A human chose a `manual` title, and
@@ -148,11 +175,38 @@ impl SessionRuntime {
     }
 
     pub fn parent(&self) -> Option<SessionId> {
-        self.parent.lock().expect("parent lock").clone()
+        self.parent
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session parent lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()
     }
 
     pub fn set_parent(&self, parent: Option<SessionId>) {
-        *self.parent.lock().expect("parent lock") = parent;
+        *self.parent.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session parent lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = parent;
+    }
+
+    /// The session this one was forked from, when `fork_session` created it.
+    pub fn forked_from(&self) -> Option<SessionId> {
+        self.forked_from
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session forked_from lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()
+    }
+
+    pub fn set_forked_from(&self, forked_from: Option<SessionId>) {
+        *self.forked_from.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session forked_from lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = forked_from;
     }
 
     pub fn depth(&self) -> u32 {
@@ -164,56 +218,107 @@ impl SessionRuntime {
     }
 
     pub fn project_id(&self) -> Option<ProjectId> {
-        self.project_id.lock().expect("project lock").clone()
+        self.project_id
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session project lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()
     }
 
     pub fn set_cwd(&self, cwd: &Path, now_ms: u64) {
-        *self.cwd.lock().expect("cwd lock") = cwd.to_path_buf();
+        *self.cwd.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session cwd lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = cwd.to_path_buf();
         self.updated_ms.store(now_ms, Ordering::Relaxed);
     }
 
     pub fn set_project(&self, project: Option<ProjectId>, now_ms: u64) {
-        *self.project_id.lock().expect("project lock") = project;
+        *self.project_id.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session project lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = project;
         self.updated_ms.store(now_ms, Ordering::Relaxed);
     }
 
     pub fn status(&self) -> String {
-        self.status.lock().expect("status lock").clone()
+        self.status
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session status lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()
     }
 
     pub fn set_status(&self, status: &str, now_ms: u64) {
-        *self.status.lock().expect("status lock") = status.to_owned();
+        *self.status.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session status lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = status.to_owned();
         self.updated_ms.store(now_ms, Ordering::Relaxed);
     }
 
     pub fn title(&self) -> String {
-        self.title.lock().expect("title lock").clone()
+        self.title
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session title lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()
     }
 
     pub fn set_title(&self, title: &str, now_ms: u64) {
-        *self.title.lock().expect("title lock") = title.to_owned();
+        *self.title.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session title lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = title.to_owned();
         self.updated_ms.store(now_ms, Ordering::Relaxed);
     }
 
     pub fn cwd(&self) -> PathBuf {
-        self.cwd.lock().expect("cwd lock").clone()
+        self.cwd
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session cwd lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()
     }
 
     pub fn set_model(&self, model: Option<String>, now_ms: u64) {
-        *self.model.lock().expect("model lock") = model;
+        *self.model.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session model lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = model;
         self.updated_ms.store(now_ms, Ordering::Relaxed);
     }
 
     pub fn model(&self) -> Option<String> {
-        self.model.lock().expect("model lock").clone()
+        self.model
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session model lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()
     }
 
     pub fn turn(&self) -> TurnState {
-        *self.turn.lock().expect("turn lock")
+        *self.turn.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session turn lock mutex poisoned; recovering");
+            e.into_inner()
+        })
     }
 
     pub fn set_turn(&self, state: TurnState) {
-        *self.turn.lock().expect("turn lock") = state;
+        *self.turn.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session turn lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = state;
     }
 
     pub fn is_busy(&self) -> bool {
@@ -225,59 +330,120 @@ impl SessionRuntime {
 
     pub fn push_message(&self, message: Message, now_ms: u64) {
         {
-            let mut context = self.context.lock().expect("context lock");
+            let mut context = self.context.lock().unwrap_or_else(|e| {
+                eprintln!("vikram: session context lock mutex poisoned; recovering");
+                e.into_inner()
+            });
             context.last_fold_len = None;
         }
-        self.messages.lock().expect("messages lock").push(message);
+        self.messages
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session messages lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .push(message);
         self.updated_ms.store(now_ms, Ordering::Relaxed);
     }
 
     pub fn messages(&self) -> Vec<Message> {
-        self.messages.lock().expect("messages lock").clone()
+        self.messages
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session messages lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()
     }
 
     /// Swap the whole transcript, as a compaction does. The journal keeps every message this
     /// replaces, so a fold is a change of view rather than a deletion.
     pub fn replace_messages(&self, messages: Vec<Message>, now_ms: u64) {
-        *self.messages.lock().expect("messages lock") = messages;
+        *self.messages.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session messages lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = messages;
         self.updated_ms.store(now_ms, Ordering::Relaxed);
     }
 
     /// Estimate the transcript with this session's calibrated estimator.
     pub fn transcript_tokens(&self) -> u64 {
-        let estimator = self.context.lock().expect("context lock").estimator.clone();
+        let estimator = self
+            .context
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session context lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .estimator
+            .clone();
         estimator.estimate_messages(&self.messages())
     }
 
     pub fn estimator(&self) -> TokenEstimator {
-        self.context.lock().expect("context lock").estimator.clone()
+        self.context
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session context lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .estimator
+            .clone()
     }
 
     pub fn folds(&self) -> u64 {
-        self.context.lock().expect("context lock").folds
+        self.context
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session context lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .folds
     }
 
     pub fn last_reported_usage(&self) -> Option<(u64, u64)> {
-        self.context.lock().expect("context lock").last_reported
+        self.context
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session context lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .last_reported
     }
 
     /// Record what the provider charged and let the estimator learn from it. The estimate used for
     /// the comparison is passed in rather than recomputed, because the transcript the request was
     /// built from is the only honest basis for the ratio.
     pub fn observe_reported_usage(&self, estimated_input: u64, input: u64, output: u64) {
-        let mut context = self.context.lock().expect("context lock");
+        let mut context = self.context.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session context lock mutex poisoned; recovering");
+            e.into_inner()
+        });
         context.estimator.observe(estimated_input, input);
         context.last_reported = Some((input, output));
         // The provider just told us what the transcript up to here costs. That is the baseline the
         // next step measures against, so it is remembered with the length it describes.
         context.anchor = Some(ContextAnchor {
             input_total: input,
-            messages: self.messages.lock().expect("messages lock").len(),
+            messages: self
+                .messages
+                .lock()
+                .unwrap_or_else(|e| {
+                    eprintln!("vikram: session messages lock mutex poisoned; recovering");
+                    e.into_inner()
+                })
+                .len(),
         });
     }
 
     pub fn anchor(&self) -> Option<ContextAnchor> {
-        self.context.lock().expect("context lock").anchor
+        self.context
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session context lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .anchor
     }
 
     /// Remove the oldest droppable messages after a provider rejected the request for size.
@@ -290,14 +456,23 @@ impl SessionRuntime {
         let kept = messages[offset..].to_vec();
         self.replace_messages(kept, now_ms);
         // The measured baseline described the transcript that no longer exists.
-        self.context.lock().expect("context lock").anchor = None;
+        self.context
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session context lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .anchor = None;
         offset
     }
 
     /// Claim a fold for this session and remember its size, which is what stops the next step from
     /// refolding a transcript that has not grown.
     pub fn note_compaction(&self, folded_len: usize) -> bool {
-        let mut context = self.context.lock().expect("context lock");
+        let mut context = self.context.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session context lock mutex poisoned; recovering");
+            e.into_inner()
+        });
         if context.last_fold_len == Some(folded_len) {
             return false;
         }
@@ -309,11 +484,20 @@ impl SessionRuntime {
     }
 
     pub fn token_snapshot(&self) -> TokenMeter {
-        self.tokens.lock().expect("tokens lock").clone()
+        self.tokens
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session tokens lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()
     }
 
     pub fn record_usage(&self, input: Option<u64>, output: Option<u64>) {
-        let mut tokens = self.tokens.lock().expect("tokens lock");
+        let mut tokens = self.tokens.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session tokens lock mutex poisoned; recovering");
+            e.into_inner()
+        });
         if let (Some(i), Some(o)) = (input, output) {
             tokens.record_reported(i, o);
         } else {
@@ -327,67 +511,127 @@ impl SessionRuntime {
     }
 
     pub fn enqueue(&self, text: String) -> usize {
-        let mut queue = self.queue.lock().expect("queue lock");
+        let mut queue = self.queue.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session queue lock mutex poisoned; recovering");
+            e.into_inner()
+        });
         queue.push_back(text);
         queue.len()
     }
 
     pub fn dequeue(&self) -> Option<String> {
-        self.queue.lock().expect("queue lock").pop_front()
+        self.queue
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session queue lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .pop_front()
     }
 
     pub fn queue_len(&self) -> usize {
-        self.queue.lock().expect("queue lock").len()
+        self.queue
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session queue lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .len()
     }
 
     /// Set a steer instruction to be incorporated at the next safe point.
     pub fn steer(&self, text: String) {
-        *self.steer.lock().expect("steer lock") = Some(text);
+        *self.steer.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session steer lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = Some(text);
     }
 
     /// Take the pending steer instruction, if any.
     pub fn take_steer(&self) -> Option<String> {
-        self.steer.lock().expect("steer lock").take()
+        self.steer
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session steer lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .take()
     }
 
     pub fn has_steer(&self) -> bool {
-        self.steer.lock().expect("steer lock").is_some()
+        self.steer
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session steer lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .is_some()
     }
 
     pub fn set_agent(&self, agent: Option<AgentId>, now_ms: u64) {
-        *self.agent.lock().expect("agent lock") = agent;
+        *self.agent.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session agent lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = agent;
         self.updated_ms.store(now_ms, Ordering::Relaxed);
     }
 
     pub fn agent(&self) -> Option<AgentId> {
-        self.agent.lock().expect("agent lock").clone()
+        self.agent
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session agent lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()
     }
 
     pub fn cancel_handle(&self) -> CancellationToken {
-        self.cancel.lock().expect("cancel lock").clone()
+        self.cancel
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session cancel lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()
     }
 
     /// Requested by a HIVE team control; the turn loop honors it between steps.
     pub fn set_paused(&self, paused: bool) {
-        *self.paused.lock().expect("pause lock") = paused;
+        *self.paused.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session pause lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = paused;
     }
 
     pub fn is_paused(&self) -> bool {
-        *self.paused.lock().expect("pause lock")
+        *self.paused.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session pause lock mutex poisoned; recovering");
+            e.into_inner()
+        })
     }
 
     pub fn begin_turn(&self, now_ms: u64) {
-        let mut cancel = self.cancel.lock().expect("cancel lock");
+        let mut cancel = self.cancel.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session cancel lock mutex poisoned; recovering");
+            e.into_inner()
+        });
         if cancel.is_cancelled() {
             *cancel = CancellationToken::new();
         }
-        *self.turn_started_ms.lock().expect("started lock") = Some(now_ms);
+        *self.turn_started_ms.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session started lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = Some(now_ms);
         self.set_turn(TurnState::Streaming);
     }
 
     pub fn finish_turn(&self, state: TurnState, now_ms: u64) {
         self.set_turn(state);
-        *self.turn_started_ms.lock().expect("started lock") = None;
+        *self.turn_started_ms.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session started lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = None;
         self.updated_ms.store(now_ms, Ordering::Relaxed);
     }
 
@@ -437,6 +681,8 @@ mod tests {
             project_id: None,
             title_source: vikram_store::TITLE_GENERIC.into(),
             title_status: vikram_store::TITLE_PENDING.into(),
+            parent_session: None,
+            forked_from: None,
         })
     }
 
@@ -478,5 +724,31 @@ mod tests {
         assert_eq!(snap.messages.len(), 1);
         assert_eq!(snap.messages[0].role, Role::User);
         assert_eq!(s.snapshot().messages.len(), 2);
+    }
+
+    #[test]
+    fn a_fork_carries_its_source_and_a_plain_session_does_not() {
+        let parent = SessionId::generate();
+        let fork = SessionRuntime::from_row(SessionRow {
+            id: SessionId::generate(),
+            title: "Fork".into(),
+            cwd: "/work".into(),
+            model: None,
+            agent: None,
+            created_ms: 1,
+            updated_ms: 1,
+            status: "active".into(),
+            project_id: None,
+            title_source: vikram_store::TITLE_MANUAL.into(),
+            title_status: vikram_store::TITLE_READY.into(),
+            parent_session: Some(parent.clone()),
+            forked_from: Some(parent.clone()),
+        });
+        assert_eq!(fork.forked_from(), Some(parent.clone()));
+
+        assert_eq!(session().forked_from(), None);
+        let reparented = session();
+        reparented.set_forked_from(Some(parent.clone()));
+        assert_eq!(reparented.forked_from(), Some(parent));
     }
 }

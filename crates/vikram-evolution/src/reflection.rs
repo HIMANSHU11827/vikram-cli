@@ -1,8 +1,24 @@
+//! Reflection: turn experiences into learning proposals.
+//!
+//! `ReflectionEngine` is deliberately *not* a god object: it borrows the
+//! shared [`EvolutionStore`] handle and delegates storage to it. An
+//! earlier version constructed its own `ExperienceCollector` and
+//! `LayeredMemory` subsystems internally, duplicating the store handles
+//! the caller already owned and making the engine impossible to wire
+//! with differently-configured collaborators. It now takes the
+//! reflector as a trait object and exposes `store()`/`collector()`/
+//! `memory()` accessors that share the single store, and offers
+//! `with_subsystems` for callers that need to inject pre-built
+//! collaborators.
+
 use crate::error::Result;
 use crate::experience::ExperienceCollector;
 use crate::memory::LayeredMemory;
 use crate::store::EvolutionStore;
-use crate::types::{Experience, LearningProposal, ReflectionJob, gen_id, now_ms};
+use crate::types::{
+    Experience, ExperienceOutcome, LearningProposal, ProposalKind, ProposalStatus, ReflectionJob,
+    ReflectionJobStatus, gen_id, now_ms,
+};
 use std::sync::Arc;
 
 pub trait Reflector: Send + Sync {
@@ -17,7 +33,7 @@ impl Reflector for HeuristicReflector {
         let mut out = Vec::new();
         let now = now_ms();
         // No-op for trivial success
-        if exp.outcome == "success"
+        if exp.outcome == ExperienceOutcome::Success
             && exp.errors.is_empty()
             && exp.corrections.is_empty()
             && !exp.reusable
@@ -33,43 +49,43 @@ impl Reflector for HeuristicReflector {
                 id: gen_id("prop"),
                 experience_id: Some(exp.id.clone()),
                 agent_id: exp.agent_id.clone(),
-                kind: "add_memory".to_string(),
+                kind: ProposalKind::AddMemory,
                 summary: "Record user correction as user memory".to_string(),
                 details: serde_json::json!({"layer":"user","corrections": exp.corrections}),
                 confidence: 0.8,
                 requires_approval: false,
                 created_ms: now,
-                status: "pending".to_string(),
+                status: ProposalStatus::Pending,
             });
         }
         // Failures -> record issue
-        if exp.outcome == "failure" || !exp.errors.is_empty() {
+        if exp.outcome == ExperienceOutcome::Failure || !exp.errors.is_empty() {
             out.push(LearningProposal {
                 id: gen_id("prop"),
                 experience_id: Some(exp.id.clone()),
                 agent_id: exp.agent_id.clone(),
-                kind: "record_issue".to_string(),
+                kind: ProposalKind::RecordIssue,
                 summary: "Record failure and error pattern".to_string(),
-                details: serde_json::json!({"errors": exp.errors, "outcome": exp.outcome}),
+                details: serde_json::json!({"errors": exp.errors, "outcome": exp.outcome.as_str()}),
                 confidence: 0.7,
                 requires_approval: false,
                 created_ms: now,
-                status: "pending".to_string(),
+                status: ProposalStatus::Pending,
             });
         }
         // Reusable success -> skill candidate
-        if exp.outcome == "success" && exp.reusable && exp.errors.is_empty() {
+        if exp.outcome == ExperienceOutcome::Success && exp.reusable && exp.errors.is_empty() {
             out.push(LearningProposal {
                 id: gen_id("prop"),
                 experience_id: Some(exp.id.clone()),
                 agent_id: exp.agent_id.clone(),
-                kind: "create_skill".to_string(),
+                kind: ProposalKind::CreateSkill,
                 summary: "Create reusable skill from successful workflow".to_string(),
                 details: serde_json::json!({"tools": exp.tools_used, "category": exp.task_category}),
                 confidence: 0.6,
                 requires_approval: true,
                 created_ms: now,
-                status: "pending".to_string(),
+                status: ProposalStatus::Pending,
             });
         }
         // If nothing produced, no-op (valid)
@@ -95,6 +111,25 @@ impl ReflectionEngine {
             reflector,
         }
     }
+
+    /// Inject pre-built collaborators (e.g. an experience collector with
+    /// a different store handle, or a memory with custom configuration).
+    /// The engine still only holds one store handle for its own queries;
+    /// the subsystems are used for experience/memory operations.
+    pub fn with_subsystems(
+        store: EvolutionStore,
+        collector: ExperienceCollector,
+        memory: LayeredMemory,
+        reflector: Arc<dyn Reflector>,
+    ) -> Self {
+        Self {
+            store,
+            collector,
+            memory,
+            reflector,
+        }
+    }
+
     pub fn store(&self) -> &EvolutionStore {
         &self.store
     }
@@ -111,7 +146,7 @@ impl ReflectionEngine {
             id: gen_id("job"),
             experience_id: experience_id.to_string(),
             agent_id: agent_id.to_string(),
-            status: "pending".to_string(),
+            status: ReflectionJobStatus::Pending,
             attempts: 0,
             created_ms: now_ms(),
             updated_ms: now_ms(),
@@ -131,30 +166,31 @@ impl ReflectionEngine {
         for p in &proposals {
             self.store.save_proposal(p)?;
         }
-        // Apply low-risk memory additions automatically
+        // Apply low-risk memory additions automatically. Errors are
+        // propagated, not swallowed with `let _ =`.
         for p in &proposals {
-            if p.kind == "add_memory" && !p.requires_approval {
-                if let Some(corr) = p.details.get("corrections") {
-                    if let Some(arr) = corr.as_array() {
-                        for c in arr {
-                            if let Some(s) = c.as_str() {
-                                let _ = self.memory.remember(
-                                    crate::types::MemoryLayer::User,
-                                    &format!("agent:{}", p.agent_id),
-                                    &format!("correction-{}", gen_id("k")),
-                                    s,
-                                    crate::types::KnowledgeStatus::UserStated,
-                                    p.confidence,
-                                    Some(&exp.id),
-                                    "reflection",
-                                );
-                            }
+            if p.kind == ProposalKind::AddMemory && !p.requires_approval {
+                if let Some(corr) = p.details.get("corrections")
+                    && let Some(arr) = corr.as_array()
+                {
+                    for c in arr {
+                        if let Some(s) = c.as_str() {
+                            self.memory.remember(
+                                crate::types::MemoryLayer::User,
+                                &format!("agent:{}", p.agent_id),
+                                &format!("correction-{}", gen_id("k")),
+                                s,
+                                crate::types::KnowledgeStatus::UserStated,
+                                p.confidence,
+                                Some(&exp.id),
+                                "reflection",
+                            )?;
                         }
                     }
                 }
                 // mark applied
                 let mut pp = p.clone();
-                pp.status = "applied".to_string();
+                pp.status = ProposalStatus::Applied;
                 self.store.save_proposal(&pp)?;
             }
         }
@@ -180,8 +216,8 @@ impl ReflectionEngine {
         let jobs = self.store.list_pending_jobs()?;
         let mut n = 0usize;
         for mut j in jobs {
-            if j.status == "running" {
-                j.status = "pending".to_string();
+            if j.status == ReflectionJobStatus::Running {
+                j.status = ReflectionJobStatus::Pending;
                 j.updated_ms = now_ms();
                 self.store.save_job(&j)?;
                 n += 1;
@@ -195,19 +231,19 @@ impl ReflectionEngine {
         let jobs = self.store.list_pending_jobs()?;
         let mut done = 0usize;
         for mut j in jobs {
-            j.status = "running".to_string();
+            j.status = ReflectionJobStatus::Running;
             j.attempts += 1;
             j.updated_ms = now_ms();
             self.store.save_job(&j)?;
             match self.run_reflection(&j.experience_id) {
                 Ok(_) => {
-                    j.status = "done".to_string();
+                    j.status = ReflectionJobStatus::Done;
                     j.updated_ms = now_ms();
                     self.store.save_job(&j)?;
                     done += 1;
                 }
                 Err(e) => {
-                    j.status = "failed".to_string();
+                    j.status = ReflectionJobStatus::Failed;
                     j.error = Some(e.to_string());
                     j.updated_ms = now_ms();
                     self.store.save_job(&j)?;

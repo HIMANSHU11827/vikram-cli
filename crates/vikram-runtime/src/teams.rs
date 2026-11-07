@@ -14,6 +14,35 @@ pub struct Team {
     pub members: Vec<AgentId>,
     pub created_ms: u64,
     pub task: Option<String>,
+    /// Persisted identity. Old `teams.json` files without it get a deterministic id
+    /// derived from the name on load (`id_from_name`); new teams generate one.
+    #[serde(default = "default_team_id", deserialize_with = "de_team_id")]
+    pub id: vikram_contracts::TeamId,
+}
+
+fn default_team_id() -> vikram_contracts::TeamId {
+    vikram_contracts::TeamId::new("team-legacy")
+}
+
+fn de_team_id<'de, D>(d: D) -> std::result::Result<vikram_contracts::TeamId, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Old `teams.json` files have no persisted identity; a JSON string value (if a
+    // newer file carries one) is accepted and wrapped, anything else falls back
+    // to the deterministic legacy id.
+    match Option::<String>::deserialize(d)? {
+        Some(name) if !name.is_empty() => Ok(vikram_contracts::TeamId::new(name)),
+        _ => Ok(vikram_contracts::TeamId::new("team-legacy")),
+    }
+}
+
+impl Team {
+    pub fn id_from_name(name: &str) -> vikram_contracts::TeamId {
+        // Deterministic legacy id: stable for a given name so snapshots don't churn
+        // across restarts for pre-id files.
+        vikram_contracts::TeamId::new(format!("team-{name}"))
+    }
 }
 
 #[derive(Debug)]
@@ -67,7 +96,12 @@ impl TeamManager {
         let Ok(data) = fs::read_to_string(path) else {
             return;
         };
-        if let Ok(teams) = serde_json::from_str::<Vec<Team>>(&data) {
+        if let Ok(mut teams) = serde_json::from_str::<Vec<Team>>(&data) {
+            for t in &mut teams {
+                if t.id.as_str() == "team-legacy" {
+                    t.id = Team::id_from_name(&t.name);
+                }
+            }
             *self.teams.lock().expect("teams lock") = teams;
         }
     }
@@ -98,6 +132,7 @@ impl TeamManager {
                 members: Vec::new(),
                 created_ms: now_ms(),
                 task: None,
+                id: vikram_contracts::TeamId::generate(),
             });
         }
         self.save()
@@ -184,10 +219,10 @@ impl TeamManager {
                 .iter_mut()
                 .find(|t| t.name == team_name)
                 .ok_or_else(|| format!("team not found: {team_name}"))?;
-            if let Some(agent) = &assigned_to {
-                if !team.members.contains(agent) {
-                    return Err(format!("agent is not a member of team: {agent}"));
-                }
+            if let Some(agent) = &assigned_to
+                && !team.members.contains(agent)
+            {
+                return Err(format!("agent is not a member of team: {agent}"));
             }
             team.task = Some(task);
         }

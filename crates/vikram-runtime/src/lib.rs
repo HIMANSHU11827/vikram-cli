@@ -7,13 +7,16 @@
 //! Nothing here formats terminal output. The TUI is one subscriber among possible others.
 
 pub mod agents;
+pub mod anthropic;
 pub mod browser;
 pub mod bus;
 pub mod compaction;
 pub mod computer;
 pub mod config;
+pub mod consolidation;
 pub mod context;
 pub mod context_engine;
+pub mod dialectic;
 pub mod error;
 pub mod hive_chat;
 pub mod learning;
@@ -54,12 +57,13 @@ pub use config::{
 };
 pub use context::{ContextBundle, ContextLoader};
 pub use context_engine::*;
+pub use dialectic::{DialecticConfig, DialecticEngine, Insight, InsightKind};
 pub use error::{Result, RuntimeError};
 pub use hive_chat::HiveManager;
 pub use learning::{LearningAuditEntry, LearningManager, LearningPolicy, LearningProposal};
 pub use lsp::{LspClient, LspError, LspPool, ServerCommand};
 pub use mcp::McpRegistry;
-pub use memory::MemoryStore;
+pub use memory::{HybridOptions, HybridWeights, MemoryStore, ScoredMemory};
 pub use memory_provider::{BuiltInMemoryProvider, MemoryProvider, MemoryProviderManager};
 pub use plugins::PluginRegistry;
 pub use provider::{CompletionRequest, Provider, ProviderEvent, ProviderStream, ToolSpec};

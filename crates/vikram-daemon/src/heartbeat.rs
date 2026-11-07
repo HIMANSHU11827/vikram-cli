@@ -434,12 +434,8 @@ impl<'a> Heartbeat<'a> {
             BeatKind::Workers => self.workers(now)?,
         };
         self.stamp(kind, now)?;
-        Ok(match beat {
-            ref mut beat => {
-                beat.notify = self.release(beat.issues.clone(), now)?;
-                beat.clone()
-            }
-        })
+        beat.notify = self.release(beat.issues.clone(), now)?;
+        Ok(beat)
     }
 
     /// Which of these issues are past their cooldown. An issue that is no longer present is

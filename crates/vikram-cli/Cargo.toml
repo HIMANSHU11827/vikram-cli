@@ -18,6 +18,7 @@ vikram-tui.workspace = true
 vikram-store.workspace = true
 vikram-mcp.workspace = true
 vikram-daemon.workspace = true
+vikram-gateway = { path = "../vikram-gateway" }
 clap.workspace = true
 tokio.workspace = true
 futures-util.workspace = true

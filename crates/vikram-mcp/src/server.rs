@@ -21,6 +21,19 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 /// Configuration for the MCP server.
+///
+/// Auth: when `auth_required` is true, every request (including `initialize`)
+/// must carry a matching `auth_token` (top-level or in `params`) or it is
+/// rejected with JSON-RPC error `-32001`. A missing or empty `auth_token`
+/// while `auth_required` is set means no client can authenticate — the server
+/// refuses it at construction via [`McpServerConfig::validate`]; there is no
+/// unauthenticated fallback.
+///
+/// Tool allowlist: `approved_tools` is an explicit allowlist with NO implicit
+/// "empty means all" default. A tool may only be called when its name appears
+/// in this list; an empty list therefore exposes nothing, and unlisted tools
+/// are rejected with "tool not approved". `tools/list` also filters to the
+/// allowlist so unapproved tools are not even advertised.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct McpServerConfig {
     pub name: String,
@@ -30,6 +43,32 @@ pub struct McpServerConfig {
     /// Shared secret required when `auth_required` is set. Sent as `auth_token` in requests.
     #[serde(default)]
     pub auth_token: Option<String>,
+}
+
+impl McpServerConfig {
+    /// Reject configurations that can never operate safely: `auth_required`
+    /// without a non-empty `auth_token` would lock out every client (or, worse,
+    /// invite a "no token configured means allow" fallback — which this server
+    /// deliberately does not have).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.auth_required {
+            match self.auth_token.as_deref() {
+                Some(token) if !token.is_empty() => {}
+                _ => {
+                    return Err("auth_required is set but auth_token is missing or empty; \
+                         refusing to start an MCP server no client can authenticate to"
+                        .to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `name` may be called. There is no implicit allow-all: an empty
+    /// `approved_tools` list approves nothing.
+    pub fn is_tool_approved(&self, name: &str) -> bool {
+        self.approved_tools.iter().any(|t| t == name)
+    }
 }
 
 impl Default for McpServerConfig {
@@ -141,6 +180,18 @@ impl McpServer {
         }
     }
 
+    /// Like [`McpServer::new`], but fails fast on an invalid configuration
+    /// (see [`McpServerConfig::validate`]) instead of only rejecting requests
+    /// at runtime.
+    pub fn try_new(config: McpServerConfig) -> Result<Self, String> {
+        config.validate()?;
+        Ok(Self::new(config))
+    }
+
+    pub fn config(&self) -> &McpServerConfig {
+        &self.config
+    }
+
     pub fn register_tool(&mut self, tool: ExposedTool) {
         self.tools.insert(tool.name.clone(), tool);
     }
@@ -234,6 +285,7 @@ impl McpServer {
                 let tools: Vec<Value> = self
                     .tools
                     .values()
+                    .filter(|t| self.config.is_tool_approved(&t.name))
                     .map(|t| {
                         json!({
                             "name": t.name,
@@ -268,7 +320,7 @@ impl McpServer {
                     });
                 }
 
-                if !self.config.approved_tools.contains(&name.to_string()) {
+                if !self.config.is_tool_approved(name) {
                     return json!({
                         "jsonrpc": "2.0",
                         "id": id,
@@ -519,7 +571,11 @@ impl McpServer {
     }
 
     /// Run the MCP server over STDIO (blocking async).
+    /// Fails first if the configuration is invalid (see
+    /// [`McpServerConfig::validate`]) so `auth_required` without a token is a
+    /// startup error, not a silent per-request rejection loop.
     pub async fn run_stdio(&mut self) -> Result<(), String> {
+        self.config.validate()?;
         self.running = true;
         let stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();

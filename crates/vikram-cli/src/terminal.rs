@@ -178,29 +178,30 @@ fn apply_terminal_event(app: &mut App, event: Event) {
                 let x = mouse.column;
                 // A click inside a panel selects the row it landed on. The draw wrote those rows
                 // down, so the click names a real row rather than a guess at the geometry.
-                if let Some((left, right)) = app.picker_x {
-                    if x >= left && x < right {
-                        if let Some(position) = app
-                            .picker_rows
-                            .iter()
-                            .find(|(row, _)| *row == mouse.row)
-                            .map(|(_, position)| *position)
-                        {
-                            if let Some(Overlay::Picker(picker)) = &mut app.overlay {
-                                picker.select_position(position);
-                            }
-                            return;
-                        }
+                if let Some((left, right)) = app.picker_x
+                    && x >= left
+                    && x < right
+                    && let Some(position) = app
+                        .picker_rows
+                        .iter()
+                        .find(|(row, _)| *row == mouse.row)
+                        .map(|(_, position)| *position)
+                {
+                    if let Some(Overlay::Picker(picker)) = &mut app.overlay {
+                        picker.select_position(position);
                     }
+                    return;
                 }
                 // The tab strip and `+ New` live on one row. Matching on the column alone would
                 // swallow every press below them, so the row is part of the hit.
                 if app.overlay.is_none() {
-                    if let Some((row, start, end)) = app.new_session_x {
-                        if mouse.row == row && x >= start && x < end {
-                            app.commands.push(UiCommand::NewSession);
-                            return;
-                        }
+                    if let Some((row, start, end)) = app.new_session_x
+                        && mouse.row == row
+                        && x >= start
+                        && x < end
+                    {
+                        app.commands.push(UiCommand::NewSession);
+                        return;
                     }
                     // close buttons
                     for hit in app.tab_hits.clone() {
@@ -228,20 +229,20 @@ fn apply_terminal_event(app: &mut App, event: Event) {
                 // A header folds its own thinking block. This is checked before a selection starts
                 // so a click on the label does not leave a one-cell drag behind. The fold belongs
                 // to the session on screen, which an agent pane can show without making it active.
-                if app.overlay.is_none() {
-                    if let Some((key, tool)) = app.fold_at(x, mouse.row) {
-                        if let Some(id) = app.display_session().map(|session| session.id.clone()) {
-                            if let Some(index) = app.session_index(&id) {
-                                let session = &mut app.sessions[index];
-                                if tool {
-                                    session.toggle_tool(key);
-                                } else {
-                                    session.toggle_thought(key);
-                                }
-                            }
+                if app.overlay.is_none()
+                    && let Some((key, tool)) = app.fold_at(x, mouse.row)
+                {
+                    if let Some(id) = app.display_session().map(|session| session.id.clone())
+                        && let Some(index) = app.session_index(&id)
+                    {
+                        let session = &mut app.sessions[index];
+                        if tool {
+                            session.toggle_tool(key);
+                        } else {
+                            session.toggle_thought(key);
                         }
-                        return;
                     }
+                    return;
                 }
                 // Nothing else claimed the press, so it starts a drag. A press that never moves
                 // selects nothing and copies nothing.
@@ -319,10 +320,9 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
                         Ok(id) => select(app, &id),
                         Err(err) => report(app, err),
                     }
-                } else if was_active {
-                    if let Some(first) = app.sessions.first().map(|s| s.id.clone()) {
-                        select(app, &first);
-                    }
+                } else if was_active && let Some(first) = app.sessions.first().map(|s| s.id.clone())
+                {
+                    select(app, &first);
                 }
                 app.sync_snapshot(handle.snapshot());
             }
@@ -971,7 +971,7 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                         .state_ms("heartbeat.interval_ms")
                         .ok()
                         .flatten()
-                        .map(|ms| vikram_daemon::time::humanize_ms(ms))
+                        .map(vikram_daemon::time::humanize_ms)
                         .unwrap_or_else(|| "1m".to_owned());
                     items.push(PickerItem::new(
                         "heartbeat",
@@ -1657,11 +1657,11 @@ fn apply_act(
                     lines.push(skill.instructions.clone());
                 } else {
                     // load body on demand
-                    if let Some(full) = handle.skill_get(&value) {
-                        if !full.instructions.is_empty() {
-                            lines.push(String::new());
-                            lines.push(full.instructions.clone());
-                        }
+                    if let Some(full) = handle.skill_get(&value)
+                        && !full.instructions.is_empty()
+                    {
+                        lines.push(String::new());
+                        lines.push(full.instructions.clone());
                     }
                 }
                 app.open_info(format!("Skill · {}", skill.name), lines);

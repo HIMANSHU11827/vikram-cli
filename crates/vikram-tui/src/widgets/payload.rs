@@ -11,6 +11,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{Payload, SessionView, ThoughtKey};
 use crate::theme::Theme;
+use crate::widgets::indent;
 
 /// A click target: the row it sits on, the last column of its label, the fold it toggles, and
 /// whether that fold lives in the tool key space.
@@ -27,9 +28,6 @@ const BODY_CAP: usize = 20;
 
 /// How many search results a single row will list.
 const RESULT_CAP: usize = 8;
-
-/// What every line inside a row is indented by, so the row's own line stays the only header.
-const BODY_INDENT: &str = "     ";
 
 /// One row on screen, with everything the body needs to draw itself.
 pub struct Row<'a> {
@@ -90,7 +88,18 @@ pub fn push_row(lines: &mut Vec<Line<'static>>, marks: &mut Vec<Mark>, row: Row<
     let arrow = pointing(theme, row.open);
 
     let head = format!("{glyph} {label}");
-    draw_head(lines, marks, &row, &head, detail.as_deref(), arrow, glyph);
+    // The row hangs one step under the turn that ran it, and its body steps in once from there:
+    // the same two columns every other row renderer takes from `indent`.
+    draw_head(
+        lines,
+        marks,
+        &row,
+        &head,
+        detail.as_deref(),
+        arrow,
+        glyph,
+        indent::row(indent::TURN),
+    );
 
     if !row.open {
         return;
@@ -102,6 +111,7 @@ pub fn push_row(lines: &mut Vec<Line<'static>>, marks: &mut Vec<Mark>, row: Row<
         session: row.session,
         position: row.position,
         width: row.width,
+        body: indent::spaces(indent::nested(indent::TURN)),
     };
     match kind {
         Kind::Wrote => ctx.file(&args, true, row.payload),
@@ -124,6 +134,7 @@ pub fn push_row(lines: &mut Vec<Line<'static>>, marks: &mut Vec<Mark>, row: Row<
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_head(
     lines: &mut Vec<Line<'static>>,
     marks: &mut Vec<Mark>,
@@ -132,6 +143,7 @@ fn draw_head(
     detail: Option<&str>,
     arrow: &'static str,
     glyph: &'static str,
+    lead: usize,
 ) {
     let theme = row.theme;
     let style = match row.ok {
@@ -141,25 +153,26 @@ fn draw_head(
         None => theme.secondary(),
     };
     let mut spans = vec![
+        Span::raw(indent::spaces(lead)),
         Span::styled(format!("{glyph} "), style),
         Span::styled(
             head.trim_start_matches(glyph).trim_start().to_string(),
             Style::default().fg(theme.text),
         ),
     ];
-    let mut used = UnicodeWidthStr::width(head);
-    if let Some(detail) = detail {
-        if !detail.is_empty() {
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(
-                truncate(
-                    &redact(detail),
-                    row.width.saturating_sub(used).saturating_sub(4),
-                ),
-                theme.muted(),
-            ));
-            used += 2 + UnicodeWidthStr::width(detail);
-        }
+    let mut used = lead + UnicodeWidthStr::width(head);
+    if let Some(detail) = detail
+        && !detail.is_empty()
+    {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            truncate(
+                &redact(detail),
+                row.width.saturating_sub(used).saturating_sub(4),
+            ),
+            theme.muted(),
+        ));
+        used += 2 + UnicodeWidthStr::width(detail);
     }
     // The arrow sits right after the label instead of being pushed to the right edge: a right-aligned
     // arrow has to be measured against the drawable width, and one column of error clips it.
@@ -288,13 +301,15 @@ struct Ctx<'a> {
     session: &'a SessionView,
     position: usize,
     width: usize,
+    /// What every line inside the row is indented by, so the row's own line stays the only header.
+    body: String,
 }
 
 impl Ctx<'_> {
     fn line(&mut self, text: impl Into<String>, style: Style) {
         let text = text.into();
         self.lines.push(Line::from(Span::styled(
-            format!("{BODY_INDENT}{text}"),
+            format!("{}{text}", self.body),
             style,
         )));
     }
@@ -306,12 +321,11 @@ impl Ctx<'_> {
         }
         let value = clip(
             &redact(value),
-            self.width
-                .saturating_sub(BODY_INDENT.len() + name.len() + 2),
+            self.width.saturating_sub(self.body.len() + name.len() + 2),
         );
         let theme = self.theme;
         self.lines.push(Line::from(vec![
-            Span::styled(format!("{BODY_INDENT}{name}  "), theme.muted()),
+            Span::styled(format!("{}{name}  ", self.body), theme.muted()),
             Span::styled(value, theme.body()),
         ]));
     }
@@ -322,7 +336,7 @@ impl Ctx<'_> {
         let lines: Vec<&str> = text.lines().collect();
         for line in lines.iter().take(BODY_CAP) {
             self.line(
-                clip(line, self.width.saturating_sub(BODY_INDENT.len())),
+                clip(line, self.width.saturating_sub(self.body.len())),
                 style,
             );
         }
@@ -349,7 +363,7 @@ impl Ctx<'_> {
                     offset + 1,
                     clip(
                         line,
-                        self.width.saturating_sub(numbers + BODY_INDENT.len() + 2)
+                        self.width.saturating_sub(numbers + self.body.len() + 2)
                     ),
                     numbers = numbers
                 ),
@@ -461,7 +475,7 @@ impl Ctx<'_> {
             );
             if !result.url.is_empty() {
                 self.line(
-                    clip(&result.url, self.width.saturating_sub(BODY_INDENT.len())),
+                    clip(&result.url, self.width.saturating_sub(self.body.len())),
                     Style::default().fg(self.theme.accent),
                 );
             }
@@ -555,12 +569,12 @@ impl Ctx<'_> {
         let head = format!("{title} {arrow}");
         self.marks.push((
             self.lines.len(),
-            (BODY_INDENT.len() + head.width()) as u16,
+            (self.body.len() + head.width()) as u16,
             key,
             true,
         ));
         self.lines.push(Line::from(vec![
-            Span::styled(format!("{BODY_INDENT}{title} "), self.theme.muted()),
+            Span::styled(format!("{}{title} ", self.body), self.theme.muted()),
             Span::styled(arrow, self.theme.muted()),
         ]));
         if open {
@@ -652,10 +666,10 @@ fn arguments(payload: &Payload) -> Value {
 fn string(args: &Value, keys: &[&str]) -> Option<String> {
     let object = args.as_object()?;
     for key in keys {
-        if let Some(value) = object.get(*key).and_then(Value::as_str) {
-            if !value.trim().is_empty() {
-                return Some(value.to_string());
-            }
+        if let Some(value) = object.get(*key).and_then(Value::as_str)
+            && !value.trim().is_empty()
+        {
+            return Some(value.to_string());
         }
     }
     None

@@ -2,8 +2,18 @@
 //!
 //! This engine tracks performance metrics, creates benchmarks, runs evaluations,
 //! and detects regressions.
+//!
+//! A benchmark run does not execute a synthetic task: it evaluates the
+//! *recorded experiences* for the benchmark's `task_type` over the recency
+//! window (see [`crate::metrics`]). Each [`EvaluationResult`] therefore carries
+//! the number of experiences it was computed from (`data_points`) and whether
+//! that is enough to draw a conclusion (`sufficient_data`). Metrics the store
+//! cannot answer — per-model/per-agent performance, resource consumption,
+//! recovery/regression rates, skill effectiveness — are reported as `0.0` and
+//! named in `notes` as *not measured*, never estimated.
 
 use crate::error::{EvolutionError, Result};
+use crate::metrics;
 use crate::store::EvolutionStore;
 use crate::types::{gen_id, now_ms};
 use serde::{Deserialize, Serialize};
@@ -47,6 +57,15 @@ pub struct EvaluationResult {
     pub score: f64,
     pub notes: String,
     pub timestamp_ms: u64,
+    /// How many recorded experiences the metrics were computed from.
+    #[serde(default)]
+    pub data_points: usize,
+    /// `false` when [`Self::data_points`] is below [`metrics::MIN_SAMPLE`]:
+    /// the store does not hold enough evidence for this benchmark, so
+    /// `actual_metrics` is zero-filled rather than estimated and `notes`
+    /// starts with `insufficient data`.
+    #[serde(default)]
+    pub sufficient_data: bool,
 }
 
 /// Regression detection result.
@@ -84,6 +103,11 @@ impl SelfEvaluationEngine {
         }
     }
 
+    /// The shared store every subsystem reads and writes through.
+    pub fn store(&self) -> &EvolutionStore {
+        &self.store
+    }
+
     /// Track a performance metric.
     pub fn track_metric(&mut self, metrics: PerformanceMetrics) {
         self.metrics_history.push((now_ms(), metrics));
@@ -111,6 +135,9 @@ impl SelfEvaluationEngine {
     }
 
     /// Run a benchmark.
+    ///
+    /// The benchmark is evaluated against the experiences recorded for its
+    /// `task_type`; nothing is executed to produce the numbers.
     pub fn run_benchmark(&mut self, benchmark_id: &str) -> Result<EvaluationResult> {
         let benchmark = self
             .benchmarks
@@ -118,17 +145,40 @@ impl SelfEvaluationEngine {
             .find(|b| b.id == benchmark_id)
             .ok_or_else(|| EvolutionError::NotFound("Benchmark not found".to_string()))?;
 
-        let actual = self.execute_benchmark_task(benchmark)?;
-        let (passed, score, notes) = self.compare_metrics(&benchmark.expected_metrics, &actual);
+        let sample = self.execute_benchmark_task(benchmark)?;
+        let (passed, score, comparison_notes) =
+            self.compare_metrics(&benchmark.expected_metrics, &sample.metrics);
+
+        let notes = if sample.sufficient_data {
+            let mut parts = sample.notes.clone();
+            if !comparison_notes.is_empty() {
+                parts.push(comparison_notes);
+            }
+            parts.join("; ")
+        } else {
+            let mut parts = vec![format!(
+                "insufficient data: {} of {} required recorded experience(s) for task_type '{}'",
+                sample.data_points,
+                metrics::MIN_SAMPLE,
+                benchmark.task_type
+            )];
+            parts.extend(sample.notes.clone());
+            parts.push(
+                "no metrics were estimated; zero values above mean 'not measured'".to_string(),
+            );
+            parts.join("; ")
+        };
 
         let result = EvaluationResult {
             id: gen_id("eval"),
             benchmark_id: benchmark_id.to_string(),
-            actual_metrics: actual,
-            passed,
+            actual_metrics: sample.metrics,
+            passed: sample.sufficient_data && passed,
             score,
             notes,
             timestamp_ms: now_ms(),
+            data_points: sample.data_points,
+            sufficient_data: sample.sufficient_data,
         };
 
         self.evaluation_results.push(result.clone());
@@ -225,24 +275,98 @@ impl SelfEvaluationEngine {
         })
     }
 
-    fn execute_benchmark_task(
-        &self,
-        _benchmark: &EvaluationBenchmark,
-    ) -> Result<PerformanceMetrics> {
-        Ok(PerformanceMetrics {
-            task_completion_rate: 0.9,
-            task_correctness: 0.85,
-            tool_success_rate: 0.95,
-            model_performance: 0.8,
-            agent_performance: 0.85,
-            execution_time_ms: 5000,
-            token_consumption: 10000,
-            resource_consumption: 0.7,
-            failure_rate: 0.1,
-            recovery_rate: 0.9,
-            regression_rate: 0.05,
-            user_corrections: 2,
-            skill_effectiveness: 0.8,
+    /// Derive this benchmark's metrics from the experiences recorded for its
+    /// `task_type` in the store.
+    ///
+    /// Mapping (each value is a real aggregate, none is a constant):
+    /// - `task_completion_rate` — share of sampled experiences that did not
+    ///   fail outright (`total - failure`);
+    /// - `task_correctness` — share that succeeded outright (an experience
+    ///   stores an outcome, not a graded answer);
+    /// - `tool_success_rate` — share that recorded no error;
+    /// - `failure_rate` — share that failed;
+    /// - `user_corrections` — experiences that carried a user correction;
+    /// - `execution_time_ms` / `token_consumption` — means of the
+    ///   `metadata.duration_ms` / `metadata.tokens_used` keys producers may
+    ///   record (`0` when nothing recorded them).
+    ///
+    /// Everything else is *not measured*: it is reported as `0.0` and named in
+    /// the `not measured from store data` note by
+    /// [`NOT_MEASURED_FIELDS`].
+    fn execute_benchmark_task(&self, benchmark: &EvaluationBenchmark) -> Result<BenchmarkSample> {
+        let stats = self.store.experience_stats_for(
+            Some(benchmark.task_type.as_str()),
+            metrics::DEFAULT_WINDOW_MS,
+        )?;
+        // Counts and averages always come from the *same* window: the recent
+        // one when it holds enough samples, else the whole recorded history.
+        let (counts, avg_duration_ms, avg_tokens, window_label) =
+            if stats.recent.total >= metrics::MIN_SAMPLE {
+                (
+                    stats.recent,
+                    stats.recent_avg_duration_ms,
+                    stats.recent_avg_tokens,
+                    format!("the last {}h", metrics::DEFAULT_WINDOW_MS / 3_600_000),
+                )
+            } else {
+                (
+                    stats.all_time,
+                    stats.all_time_avg_duration_ms,
+                    stats.all_time_avg_tokens,
+                    "all recorded history".to_string(),
+                )
+            };
+        let data_points = counts.total;
+        let sufficient_data = data_points >= metrics::MIN_SAMPLE;
+
+        let mut notes = Vec::new();
+        if data_points > 0 {
+            notes.push(format!(
+                "{data_points} recorded experience(s) for task_type '{}' from {window_label}",
+                benchmark.task_type
+            ));
+        }
+        if avg_duration_ms.is_none() {
+            notes.push(
+                "execution_time_ms not measured: no experience recorded metadata.duration_ms"
+                    .to_string(),
+            );
+        }
+        if avg_tokens.is_none() {
+            notes.push(
+                "token_consumption not measured: no experience recorded metadata.tokens_used"
+                    .to_string(),
+            );
+        }
+        notes.push(format!(
+            "not measured from store data (reported as 0.0): {}",
+            NOT_MEASURED_FIELDS.join(", ")
+        ));
+
+        let metrics = PerformanceMetrics {
+            task_completion_rate: rate(counts.non_failure(), counts.total),
+            task_correctness: rate(counts.success, counts.total),
+            tool_success_rate: rate(
+                counts.total.saturating_sub(counts.with_errors),
+                counts.total,
+            ),
+            model_performance: 0.0,
+            agent_performance: 0.0,
+            execution_time_ms: avg_duration_ms.unwrap_or(0),
+            token_consumption: avg_tokens.unwrap_or(0),
+            resource_consumption: 0.0,
+            failure_rate: rate(counts.failure, counts.total),
+            recovery_rate: 0.0,
+            regression_rate: 0.0,
+            user_corrections: counts.with_corrections as u32,
+            skill_effectiveness: 0.0,
+        };
+
+        Ok(BenchmarkSample {
+            metrics,
+            data_points,
+            sufficient_data,
+            notes,
         })
     }
 
@@ -324,6 +448,41 @@ pub struct PerformanceComparison {
     pub before: Option<PerformanceMetrics>,
     pub after: Option<PerformanceMetrics>,
     pub improvement_detected: bool,
+}
+
+/// `PerformanceMetrics` fields with no store signal behind them.
+///
+/// Listing them is the point: a benchmark run reports these as `0.0` and names
+/// them in `notes`, instead of filling them with a plausible number.
+const NOT_MEASURED_FIELDS: &[&str] = &[
+    "model_performance",
+    "agent_performance",
+    "resource_consumption",
+    "recovery_rate",
+    "regression_rate",
+    "skill_effectiveness",
+];
+
+/// Outcome of evaluating one benchmark against recorded experiences.
+#[derive(Clone, Debug)]
+struct BenchmarkSample {
+    metrics: PerformanceMetrics,
+    /// Number of recorded experiences the metrics were computed from.
+    data_points: usize,
+    /// Whether `data_points` reaches [`metrics::MIN_SAMPLE`].
+    sufficient_data: bool,
+    /// What was measured, what was not, and from which rows.
+    notes: Vec<String>,
+}
+
+/// `n / total`, or `0.0` when there is no sample at all (the caller says so
+/// via [`BenchmarkSample::sufficient_data`]).
+fn rate(n: usize, total: usize) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        n as f32 / total as f32
+    }
 }
 
 #[derive(Clone, Debug)]

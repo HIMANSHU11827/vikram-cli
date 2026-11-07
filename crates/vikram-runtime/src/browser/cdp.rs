@@ -603,10 +603,10 @@ fn wait_for_port(profile: &Path, child: &mut Child, timeout: Duration) -> Result
     let path = profile.join(DEVTOOLS_FILE);
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Some((port, _endpoint)) = parse_devtools_port(&text) {
-                return Ok(port);
-            }
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && let Some((port, _endpoint)) = parse_devtools_port(&text)
+        {
+            return Ok(port);
         }
         if let Ok(Some(status)) = child.try_wait() {
             return Err(format!(
@@ -654,10 +654,10 @@ fn page_endpoint(port: u16) -> Result<String, String> {
         if target.get("type").and_then(Value::as_str) != Some("page") {
             continue;
         }
-        if let Some(url) = target.get("webSocketDebuggerUrl").and_then(Value::as_str) {
-            if !url.is_empty() {
-                return Ok(url.to_string());
-            }
+        if let Some(url) = target.get("webSocketDebuggerUrl").and_then(Value::as_str)
+            && !url.is_empty()
+        {
+            return Ok(url.to_string());
         }
     }
     let kinds: Vec<&str> = targets

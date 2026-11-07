@@ -1,3 +1,7 @@
+// The process-global home lock is deliberately held across the turn: it is what keeps two tests
+// from sharing one `VIKRAM_HOME`, and the guard is not used as a channel between tasks.
+#![allow(clippy::await_holding_lock)]
+
 use vikram_runtime::{Config, Runtime};
 
 fn isolated_home(dir: &std::path::Path) -> std::sync::MutexGuard<'static, ()> {

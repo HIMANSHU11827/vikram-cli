@@ -440,9 +440,7 @@ fn session_fts_filtered_and_browse() {
     let s2 = store
         .create_session("Other", Path::new("/work"), None, now + 10)
         .unwrap();
-    store
-        .index_session_text(&s2.id, "kafka again")
-        .unwrap();
+    store.index_session_text(&s2.id, "kafka again").unwrap();
 
     let hits = store
         .search_session_text_filtered("kafka", Some(&agent), Some(&p.id), 0, 10)
@@ -460,4 +458,200 @@ fn session_fts_filtered_and_browse() {
     assert_eq!(browsed.len(), 2);
     let total: u64 = browsed.iter().map(|(_, c)| *c).sum();
     assert_eq!(total, 2);
+}
+
+fn journal_message(store: &Store, session: &SessionId, text: &str) {
+    store
+        .journal()
+        .append(&NewRecord::new(
+            session.clone(),
+            RecordKind::Message,
+            serde_json::json!({"message": vikram_contracts::Message::user(text)}),
+        ))
+        .unwrap();
+}
+
+#[test]
+fn a_fork_copies_the_journal_and_points_at_its_source() {
+    let store = Store::open_in_memory().unwrap();
+    let now = now();
+    let s = store
+        .create_session("Build Rust browser", Path::new("/work"), None, now)
+        .unwrap();
+    journal_message(&store, &s.id, "hello");
+    journal_message(&store, &s.id, "and then");
+
+    let fork = store.fork_session(&s.id, now).unwrap().unwrap();
+    assert_ne!(fork.id, s.id);
+    assert_eq!(fork.title, "Build Rust browser (fork)");
+    assert_eq!(fork.parent_session.as_ref(), Some(&s.id));
+    assert_eq!(fork.forked_from.as_ref(), Some(&s.id));
+
+    let source = store.replay_messages(&s.id).unwrap();
+    let copied = store.replay_messages(&fork.id).unwrap();
+    assert_eq!(source.len(), 2);
+    assert_eq!(copied.len(), 2, "the fork carries the whole journal");
+    assert_eq!(copied[0].seq, source[0].seq);
+    assert_eq!(copied[1].payload, source[1].payload);
+
+    // The lineage is queryable both ways.
+    let forks = store.list_session_forks(&s.id).unwrap();
+    assert_eq!(forks.len(), 1);
+    assert_eq!(forks[0].id, fork.id);
+    let stored = store.get_session(&fork.id).unwrap().unwrap();
+    assert_eq!(stored.forked_from.as_ref(), Some(&s.id));
+
+    // A missing source forks to nothing.
+    assert!(
+        store
+            .fork_session(&SessionId::new("ses-missing"), now)
+            .unwrap()
+            .is_none()
+    );
+
+    // A fork of a fork points at the immediate source.
+    let nested = store.fork_session(&fork.id, now).unwrap().unwrap();
+    assert_eq!(nested.forked_from.as_ref(), Some(&fork.id));
+}
+
+#[test]
+fn a_duplicate_of_a_fork_stays_in_the_same_lineage() {
+    let store = Store::open_in_memory().unwrap();
+    let now = now();
+    let s = store
+        .create_session("Story", Path::new("/work"), None, now)
+        .unwrap();
+    let fork = store.fork_session(&s.id, now).unwrap().unwrap();
+    let copy = store.duplicate_session(&fork.id, now).unwrap().unwrap();
+    assert_eq!(copy.forked_from.as_ref(), Some(&s.id));
+    assert_eq!(copy.parent_session.as_ref(), Some(&s.id));
+    // Duplication does not copy the journal; forking does.
+    journal_message(&store, &fork.id, "in the fork");
+    assert!(store.replay_messages(&copy.id).unwrap().is_empty());
+    assert_eq!(store.replay_messages(&fork.id).unwrap().len(), 1);
+}
+
+#[test]
+fn an_interrupted_session_is_found_and_recovered_by_completing_its_calls() {
+    let store = Store::open_in_memory().unwrap();
+    let now = now();
+    let s = store
+        .create_session("Crash mid-tool", Path::new("/work"), None, now)
+        .unwrap();
+    journal_message(&store, &s.id, "do the thing");
+    let call = vikram_contracts::ToolCallId::new("call-crash-1");
+    store
+        .journal()
+        .append(&NewRecord::new(
+            s.id.clone(),
+            RecordKind::ToolCall,
+            serde_json::json!({"call": call.as_str(), "name": "shell.run"}),
+        ))
+        .unwrap();
+
+    let interrupted = store.list_interrupted_sessions().unwrap();
+    assert_eq!(interrupted.len(), 1);
+    assert_eq!(interrupted[0].id, s.id);
+    assert_eq!(interrupted[0].pending_calls, vec![call.clone()]);
+    assert_eq!(interrupted[0].tool_preview.as_deref(), Some("shell.run"));
+
+    let answered = store.recover_interrupted_session(&s.id, now).unwrap();
+    assert_eq!(answered, vec![call]);
+    assert!(
+        store.list_interrupted_sessions().unwrap().is_empty(),
+        "recovery completes the pending calls"
+    );
+
+    // The journal gained rows: the synthetic result and the recovery marker.
+    let records = store.replay_messages(&s.id).unwrap();
+    assert_eq!(records.len(), 4, "nothing was lost, two rows were added");
+    assert_eq!(records[2].kind, RecordKind::ToolResult);
+    assert_eq!(records[3].kind, RecordKind::Status);
+    assert_eq!(
+        records[3].payload.get("recovery").and_then(|v| v.as_str()),
+        Some("interrupted_session")
+    );
+
+    // Recovering again is a no-op: nothing pending, no new rows.
+    let again = store.recover_interrupted_session(&s.id, now).unwrap();
+    assert!(again.is_empty());
+    assert_eq!(store.replay_messages(&s.id).unwrap().len(), 4);
+}
+
+#[test]
+fn a_clean_session_is_not_interrupted() {
+    let store = Store::open_in_memory().unwrap();
+    let now = now();
+    let s = store
+        .create_session("Clean", Path::new("/work"), None, now)
+        .unwrap();
+    journal_message(&store, &s.id, "finished");
+    assert!(store.list_interrupted_sessions().unwrap().is_empty());
+    // A session with no journal at all is not interrupted either.
+    let empty = store
+        .create_session("Empty", Path::new("/work"), None, now)
+        .unwrap();
+    assert!(store.list_interrupted_sessions().unwrap().is_empty());
+    let _ = empty;
+}
+
+#[test]
+fn export_round_trips_through_json_and_renders_markdown() {
+    let store = Store::open_in_memory().unwrap();
+    let now = now();
+    let s = store
+        .create_session("Export me", Path::new("/work"), None, now)
+        .unwrap();
+    journal_message(&store, &s.id, "exportable words");
+    store
+        .record_usage(&vikram_store::UsageRow {
+            id: 0,
+            session: s.id.clone(),
+            ts_ms: now,
+            model: "test".into(),
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            measured: true,
+        })
+        .unwrap();
+
+    let json = store
+        .export_session_text(&s.id, vikram_store::ExportFormat::Json, now)
+        .unwrap()
+        .unwrap();
+    let parsed: vikram_store::SessionExport = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.session.id, s.id);
+    assert_eq!(parsed.journal.len(), 1);
+    assert_eq!(parsed.usage.len(), 1);
+    assert_eq!(parsed.usage[0].total_tokens, 15);
+
+    let markdown = store
+        .export_session_text(&s.id, vikram_store::ExportFormat::Markdown, now)
+        .unwrap()
+        .unwrap();
+    assert!(markdown.starts_with("# Export me"));
+    assert!(markdown.contains("exportable words"));
+    assert!(markdown.contains("## Usage"));
+
+    assert!(
+        store
+            .export_session_text(
+                &SessionId::new("ses-missing"),
+                vikram_store::ExportFormat::Json,
+                now
+            )
+            .unwrap()
+            .is_none()
+    );
+
+    assert_eq!(
+        vikram_store::ExportFormat::parse("json"),
+        Some(vikram_store::ExportFormat::Json)
+    );
+    assert_eq!(
+        vikram_store::ExportFormat::parse("md"),
+        Some(vikram_store::ExportFormat::Markdown)
+    );
+    assert!(vikram_store::ExportFormat::parse("yaml").is_none());
 }

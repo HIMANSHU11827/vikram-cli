@@ -15,6 +15,10 @@ use crate::error::RuntimeError;
 pub struct Config {
     /// OpenAI-compatible endpoint. Any provider speaking `/chat/completions` works.
     pub base_url: String,
+    /// Which backend answers: "openai" (default, OpenAI-compatible) or "anthropic" (native
+    /// Messages API). Other names are reserved for future backends.
+    #[serde(default = "default_provider_kind")]
+    pub provider: String,
     /// Model identifier. Empty means unconfigured, and the runtime reports that rather than
     /// inventing a name.
     pub model: String,
@@ -101,6 +105,10 @@ impl Default for SandboxSettings {
     }
 }
 
+fn default_provider_kind() -> String {
+    "openai".to_owned()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -181,8 +189,15 @@ impl ModeAvailability {
     /// order. A missing or unreadable requirements file means no extra restriction, which is the
     /// normal state on a personal machine.
     pub fn resolve(config: &SecurityConfig) -> Self {
+        Self::try_resolve(config).unwrap_or_else(|e| {
+            eprintln!("vikram: {e}; ignoring system requirements");
+            Self::empty().with_env_and_config(config)
+        })
+    }
+
+    pub fn try_resolve(config: &SecurityConfig) -> Result<Self, RuntimeError> {
         let mut layers = Vec::new();
-        let system = load_requirements(&requirements_path());
+        let system = load_requirements(&requirements_path())?;
         if system != SecurityConfig::default() {
             layers.push(("system requirements", system));
         }
@@ -193,7 +208,18 @@ impl ModeAvailability {
         if *config != SecurityConfig::default() {
             layers.push(("config", config.clone()));
         }
-        Self { layers }
+        Ok(Self { layers })
+    }
+
+    fn with_env_and_config(mut self, config: &SecurityConfig) -> Self {
+        let from_env = env_requirements();
+        if from_env != SecurityConfig::default() {
+            self.layers.push(("environment", from_env));
+        }
+        if *config != SecurityConfig::default() {
+            self.layers.push(("config", config.clone()));
+        }
+        self
     }
 
     pub fn empty() -> Self {
@@ -257,19 +283,26 @@ impl ModeAvailability {
 /// Where the system-level requirements live. `VIKRAM_REQUIREMENTS` overrides it for tests and for
 /// operators who keep the file somewhere else.
 pub fn requirements_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("VIKRAM_REQUIREMENTS") {
-        if !path.is_empty() {
-            return PathBuf::from(path);
-        }
+    if let Some(path) = std::env::var_os("VIKRAM_REQUIREMENTS")
+        && !path.is_empty()
+    {
+        return PathBuf::from(path);
     }
     PathBuf::from("/etc/vikram/requirements.json")
 }
 
-fn load_requirements(path: &Path) -> SecurityConfig {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<SecurityConfig>(&raw).ok())
-        .unwrap_or_default()
+fn load_requirements(path: &Path) -> Result<SecurityConfig, RuntimeError> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str::<SecurityConfig>(&raw).map_err(|e| RuntimeError::Config {
+            path: path.to_path_buf(),
+            reason: format!("system requirements: {e}"),
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SecurityConfig::default()),
+        Err(e) => Err(RuntimeError::Config {
+            path: path.to_path_buf(),
+            reason: format!("system requirements unreadable: {e}"),
+        }),
+    }
 }
 
 /// Host-controlled switches, so a machine can forbid a posture without editing anyone's config.
@@ -326,6 +359,10 @@ pub struct ContextConfig {
     /// Ceiling on the shared transcript a Hive participant is asked to answer from. Participants get
     /// the most recent exchange that fits, not the whole hive log.
     pub hive_budget_tokens: u64,
+    /// Vikram-native dialectic user modelling: heuristic, local derivation of preferences,
+    /// habits and goals from conversation turns.
+    #[serde(default)]
+    pub dialectic: crate::dialectic::DialecticConfig,
 }
 
 impl Default for ContextConfig {
@@ -342,6 +379,7 @@ impl Default for ContextConfig {
             project_budget_tokens: 4_000,
             delegation_budget_tokens: 1_200,
             hive_budget_tokens: 2_000,
+            dialectic: crate::dialectic::DialecticConfig::default(),
         }
     }
 }
@@ -349,6 +387,7 @@ impl Default for ContextConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            provider: default_provider_kind(),
             base_url: "https://api.openai.com/v1".into(),
             model: String::new(),
             api_key_env: "OPENAI_API_KEY".into(),
@@ -448,10 +487,10 @@ fn key_with_source(name: &str) -> Option<(String, &'static str)> {
 
 /// Root for runtime state: `$VIKRAM_HOME`, else `~/.vikram`.
 pub fn vikram_home() -> PathBuf {
-    if let Some(home) = std::env::var_os("VIKRAM_HOME") {
-        if !home.is_empty() {
-            return PathBuf::from(home);
-        }
+    if let Some(home) = std::env::var_os("VIKRAM_HOME")
+        && !home.is_empty()
+    {
+        return PathBuf::from(home);
     }
     let base = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))

@@ -221,6 +221,188 @@ impl Tool for MemoryDelete {
     }
 }
 
+pub(crate) struct MemoryConsolidate;
+
+impl Tool for MemoryConsolidate {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "memory.consolidate".into(),
+            description: "Run the memory consolidation lifecycle: capture staged observations, deduplicate, detect contradictions (same key, differing value), supersede losers with provenance lineage, and expire stale low-score entries. Observations are key/value pairs with source, confidence, importance and timestamps.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["capture", "run", "list", "score"], "description": "capture stages one observation; run consolidates; list shows observations for a scope; score previews ranking. Default: run"},
+                    "key": {"type": "string", "description": "observation key (capture only)"},
+                    "value": {"type": "string", "description": "observation value (capture only)"},
+                    "scope": {"type": "string", "description": "memory scope, default global"},
+                    "source": {"type": "string", "description": "provenance source (capture only), default tool"},
+                    "confidence": {"type": "number", "description": "0.0..1.0 provenance confidence (capture only), default 0.5"},
+                    "importance": {"type": "number", "description": "0.0..1.0 importance weight (capture only), default 0.5"},
+                    "status": {"type": "string", "enum": ["staged", "active", "superseded", "expired"], "description": "filter for list/score"}
+                }
+            }),
+        }
+    }
+
+    fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
+        let action = args.get("action").and_then(Value::as_str).unwrap_or("run");
+        let side_effect = if action == "capture" || action == "run" {
+            SideEffect::LocalMutation
+        } else {
+            SideEffect::None
+        };
+        Ok(PermissionRequest::new(
+            ActionKind::Write,
+            "memory.consolidate",
+            format!("memory:consolidate:{action}"),
+            side_effect,
+            Trust::Model,
+        ))
+    }
+
+    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+        use crate::consolidation::{ConsolidationPolicy, ConsolidationStore, score};
+        let action = args.get("action").and_then(Value::as_str).unwrap_or("run");
+        let scope = args
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("global");
+        let store = ConsolidationStore::open(crate::config::database_path())
+            .map_err(|e| VikramError::Storage(e.to_string()))?;
+        let policy = ConsolidationPolicy::default();
+
+        match action {
+            "capture" => {
+                let key = arg_str(args, "key")?;
+                let value = arg_str(args, "value")?;
+                let source = args.get("source").and_then(Value::as_str).unwrap_or("tool");
+                let confidence = args
+                    .get("confidence")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.5);
+                let importance = args
+                    .get("importance")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.5);
+                let obs = store
+                    .capture(&key, &value, scope, source, confidence, importance)
+                    .map_err(|e| VikramError::Storage(e.to_string()))?;
+                Ok(ToolOutput {
+                    content: format!(
+                        "staged observation `{}` scope=`{}` source=`{}` confidence={:.2} importance={:.2} id=`{}`",
+                        key, scope, source, obs.confidence, obs.importance, obs.id
+                    ),
+                    ok: true,
+                })
+            }
+            "list" => {
+                let observations = store
+                    .load_scope(scope)
+                    .map_err(|e| VikramError::Storage(e.to_string()))?;
+                let status_filter = args.get("status").and_then(Value::as_str);
+                let filtered: Vec<_> = observations
+                    .iter()
+                    .filter(|o| status_filter.is_none_or(|s| o.status.as_str() == s))
+                    .collect();
+                if filtered.is_empty() {
+                    return Ok(ToolOutput {
+                        content: format!("no observations in scope `{scope}`"),
+                        ok: true,
+                    });
+                }
+                let body = filtered
+                    .iter()
+                    .map(|o| {
+                        format!(
+                            "[{}] {}: {} (source={}, confidence={:.2}, importance={:.2}, status={}, created={}, updated={}, accesses={})",
+                            o.scope, o.key, o.value, o.source, o.confidence, o.importance,
+                            o.status.as_str(), o.created_ms, o.updated_ms, o.access_count
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Ok(ToolOutput {
+                    content: truncated(body),
+                    ok: true,
+                })
+            }
+            "score" => {
+                let observations = store
+                    .load_scope(scope)
+                    .map_err(|e| VikramError::Storage(e.to_string()))?;
+                let now = crate::types::now_ms();
+                let mut ranked: Vec<_> = observations.iter().collect();
+                ranked.sort_by(|a, b| {
+                    score(b, now, &policy)
+                        .partial_cmp(&score(a, now, &policy))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                if ranked.is_empty() {
+                    return Ok(ToolOutput {
+                        content: format!("no observations in scope `{scope}`"),
+                        ok: true,
+                    });
+                }
+                let body = ranked
+                    .iter()
+                    .map(|o| {
+                        format!(
+                            "{:.4} {}: {} [{}]",
+                            score(o, now, &policy),
+                            o.key,
+                            o.value,
+                            o.status.as_str()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Ok(ToolOutput {
+                    content: truncated(body),
+                    ok: true,
+                })
+            }
+            // "run" and any unknown action fall through to consolidation.
+            _ => {
+                let (report, observations) = store
+                    .run_consolidation(Some(scope), &policy)
+                    .map_err(|e| VikramError::Storage(e.to_string()))?;
+                let mut body = format!(
+                    "captured={} deduplicated={} contradictions={} superseded={} expired={} active_after={} staged_after={}",
+                    report.captured,
+                    report.deduplicated,
+                    report.contradictions_detected,
+                    report.superseded,
+                    report.expired,
+                    report.active_after,
+                    report.staged_after
+                );
+                if !observations.is_empty() {
+                    body.push_str("\n--- observations (score desc) ---");
+                    for o in &observations {
+                        body.push_str(&format!(
+                            "\n{:.4} [{}] {}: {} (source={}, confidence={:.2}, status={})",
+                            score(o, crate::types::now_ms(), &policy),
+                            o.scope,
+                            o.key,
+                            o.value,
+                            o.source,
+                            o.confidence,
+                            o.status.as_str()
+                        ));
+                        if let Some(by) = &o.superseded_by {
+                            body.push_str(&format!(" superseded_by={}", by));
+                        }
+                    }
+                }
+                Ok(ToolOutput {
+                    content: truncated(body),
+                    ok: true,
+                })
+            }
+        }
+    }
+}
+
 pub(crate) struct MemoryNote;
 
 impl Tool for MemoryNote {
@@ -262,7 +444,7 @@ impl Tool for MemoryNote {
         } else {
             crate::memory_files::memory_file(&home)
         };
-        f.add(&note).map_err(|e| VikramError::Storage(e))?;
+        f.add(&note).map_err(VikramError::Storage)?;
         Ok(ToolOutput {
             content: format!("noted in {target}"),
             ok: true,

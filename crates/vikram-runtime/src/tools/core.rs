@@ -29,6 +29,25 @@ pub struct ToolContext {
     pub(crate) runtime: Option<Arc<crate::runtime::RuntimeInner>>,
     /// The session the call is being made from, so a delegation can record its parent and depth.
     pub session: Option<vikram_contracts::SessionId>,
+    /// The agent identity the call runs as, when the turn belongs to a background agent.
+    pub agent: Option<String>,
+    /// Cancellation handle for the turn. Blocking tools that honor it can stop early;
+    /// the host still enforces cancellation by aborting the spawn_blocking task.
+    pub cancel: Option<vikram_contracts::CancellationToken>,
+}
+
+impl Default for ToolContext {
+    fn default() -> Self {
+        Self {
+            workspace_root: PathBuf::new(),
+            sandbox: crate::sandbox::Sandbox::disabled("default"),
+            spill: crate::spill::Spill::disabled(),
+            runtime: None,
+            session: None,
+            agent: None,
+            cancel: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -40,6 +59,8 @@ impl std::fmt::Debug for ToolContext {
             .field("spill", &self.spill)
             .field("runtime", &self.runtime.as_ref().map(|_| "runtime"))
             .field("session", &self.session)
+            .field("agent", &self.agent)
+            .field("cancel", &self.cancel.as_ref().map(|_| "token"))
             .finish()
     }
 }
@@ -62,6 +83,8 @@ impl ToolContext {
             spill: crate::spill::Spill::disabled(),
             runtime: None,
             session: None,
+            agent: None,
+            cancel: None,
         }
     }
 }
@@ -193,6 +216,7 @@ impl ToolRegistry {
         registry.register(Box::new(MemoryList));
         registry.register(Box::new(MemoryDelete));
         registry.register(Box::new(MemoryNote));
+        registry.register(Box::new(MemoryConsolidate));
         registry.register(Box::new(SessionSearch));
         registry.register(Box::new(WebSearch));
         registry.register(Box::new(TeamCreate));
@@ -324,6 +348,12 @@ impl ToolRegistry {
             .values()
             .cloned()
             .collect()
+    }
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

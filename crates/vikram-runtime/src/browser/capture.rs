@@ -76,11 +76,11 @@ pub fn screenshot_with(
 ) -> Result<String, String> {
     let width = width.clamp(1, MAX_DIMENSION);
     let height = height.clamp(1, MAX_DIMENSION);
-    if let Some(parent) = out_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("cannot create `{}`: {e}", parent.display()))?;
-        }
+    if let Some(parent) = out_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create `{}`: {e}", parent.display()))?;
     }
     let shot = format!("--screenshot={}", out_path.display());
     let window = format!("--window-size={width},{height}");

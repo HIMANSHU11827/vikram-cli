@@ -108,10 +108,10 @@ fn canonical_permission(spelling: &str) -> Option<PluginPermission> {
 pub fn parse_permissions(declared: &[String]) -> Vec<PluginPermission> {
     let mut granted: Vec<PluginPermission> = Vec::new();
     for raw in declared {
-        if let Some(permission) = parse_permission(raw) {
-            if !granted.contains(&permission) {
-                granted.push(permission);
-            }
+        if let Some(permission) = parse_permission(raw)
+            && !granted.contains(&permission)
+        {
+            granted.push(permission);
         }
     }
     granted

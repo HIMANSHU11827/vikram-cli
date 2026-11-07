@@ -342,45 +342,45 @@ fn inline_chars(chars: &[char], base: Style, theme: &Theme, depth: usize) -> Vec
     while index < chars.len() {
         let current = chars[index];
 
-        if current == '`' {
-            if let Some(end) = find_char(chars, index + 1, '`') {
-                push_buffer(&mut out, &mut buffer, base);
-                let code: String = chars[index + 1..end].iter().collect();
-                if !code.is_empty() {
-                    out.push(Piece::new(code, base.fg(theme.tool)));
-                }
-                index = end + 1;
-                continue;
+        if current == '`'
+            && let Some(end) = find_char(chars, index + 1, '`')
+        {
+            push_buffer(&mut out, &mut buffer, base);
+            let code: String = chars[index + 1..end].iter().collect();
+            if !code.is_empty() {
+                out.push(Piece::new(code, base.fg(theme.tool)));
             }
+            index = end + 1;
+            continue;
         }
 
         if current == '*' && depth < MAX_INLINE_DEPTH {
             if index + 1 < chars.len() && chars[index + 1] == '*' {
-                if let Some(end) = find_double_star(chars, index + 2) {
-                    if end > index + 2 {
-                        push_buffer(&mut out, &mut buffer, base);
-                        out.extend(inline_chars(
-                            &chars[index + 2..end],
-                            base.add_modifier(Modifier::BOLD),
-                            theme,
-                            depth + 1,
-                        ));
-                        index = end + 2;
-                        continue;
-                    }
-                }
-            } else if let Some(end) = find_char(chars, index + 1, '*') {
-                if end > index + 1 {
+                if let Some(end) = find_double_star(chars, index + 2)
+                    && end > index + 2
+                {
                     push_buffer(&mut out, &mut buffer, base);
                     out.extend(inline_chars(
-                        &chars[index + 1..end],
-                        base.add_modifier(Modifier::ITALIC),
+                        &chars[index + 2..end],
+                        base.add_modifier(Modifier::BOLD),
                         theme,
                         depth + 1,
                     ));
-                    index = end + 1;
+                    index = end + 2;
                     continue;
                 }
+            } else if let Some(end) = find_char(chars, index + 1, '*')
+                && end > index + 1
+            {
+                push_buffer(&mut out, &mut buffer, base);
+                out.extend(inline_chars(
+                    &chars[index + 1..end],
+                    base.add_modifier(Modifier::ITALIC),
+                    theme,
+                    depth + 1,
+                ));
+                index = end + 1;
+                continue;
             }
         }
 
@@ -510,18 +510,18 @@ fn build_line(prefix: &[Piece], chars: &[(char, Style)]) -> Line<'static> {
     let mut run = String::new();
     let mut run_style: Option<Style> = None;
     for (ch, style) in chars {
-        if let Some(current) = run_style {
-            if current != *style {
-                spans.push(Span::styled(std::mem::take(&mut run), current));
-            }
+        if let Some(current) = run_style
+            && current != *style
+        {
+            spans.push(Span::styled(std::mem::take(&mut run), current));
         }
         run_style = Some(*style);
         run.push(*ch);
     }
-    if let Some(style) = run_style {
-        if !run.is_empty() {
-            spans.push(Span::styled(run, style));
-        }
+    if let Some(style) = run_style
+        && !run.is_empty()
+    {
+        spans.push(Span::styled(run, style));
     }
     Line::from(spans)
 }

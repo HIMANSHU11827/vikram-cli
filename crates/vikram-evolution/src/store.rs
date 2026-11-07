@@ -1,8 +1,40 @@
+//! SQLite persistence for the evolution engine.
+//!
+//! Single source of truth for evolution data. The runtime's
+//! `learning.rs` (`LearningManager`, JSON file) is the *approval surface*
+//! only: it stages proposals for the operator. Everything it learns from
+//! (experiences, layered memory, reflection jobs, candidates, evaluations,
+//! hive lessons, skill versions, learning events) lives here. See the
+//! module doc in `vikram-runtime/src/learning.rs`.
+//!
+//! Conventions (no silent failures):
+//! - Every fallible operation returns `Result`; callers must handle errors.
+//!   There are no `unwrap_or_default()` JSON parses, no rows dropped on
+//!   decode failure, and no `count().unwrap_or(0)` — a corrupt row or a
+//!   failed count is an `EvolutionError`, never an empty list / zero.
+//! - JSON columns are written with `serde_json::to_string(..)?` and read
+//!   with a checked parse that maps failures to `EvolutionError::Serde`.
+//! - Memory listings/recall/search only ever return *live* entries:
+//!   superseded (`superseded_by IS NOT NULL`) and expired
+//!   (`expires_ms <= now`) rows are filtered in SQL, in the same query
+//!   that applies `LIMIT`, so pagination cannot return a short page that
+//!   is actually full of dead rows.
+//! - `EvaluationResult` has its own primary key (`id`), so re-evaluating
+//!   a candidate on the same dataset appends a new row instead of
+//!   silently overwriting the previous evaluation.
+//!
+//! Schema is versioned via `PRAGMA user_version` and migrated
+//! incrementally in [`migrate`]; a pre-versioning database is treated as
+//! version 0 and upgraded in place. Migrations never drop user data.
+
 use crate::error::{EvolutionError, Result};
 use crate::types::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
+
+/// Current schema version. Bump when adding a migration step.
+pub const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone)]
 pub struct EvolutionStore {
@@ -30,6 +62,9 @@ impl EvolutionStore {
         Self::from_connection(conn)
     }
     fn from_connection(conn: Connection) -> Result<Self> {
+        // Pragma failures are surfaced, not ignored: a store that silently
+        // fell back to rollback-journal mode or no foreign keys would
+        // corrupt/race in ways callers cannot see.
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| EvolutionError::Store(e.to_string()))?;
         conn.pragma_update(None, "foreign_keys", "ON")
@@ -43,17 +78,28 @@ impl EvolutionStore {
         self.conn.lock().expect("evolution store mutex")
     }
 
+    /// Run a read-only query closure against the locked connection.
+    ///
+    /// Provided for [`crate::metrics`], which only ever runs aggregate
+    /// `SELECT`s over this schema. Every *write* still goes through a named
+    /// method above/below, so invariants (JSON encoding, supersession
+    /// guards, validation) cannot be bypassed through this hatch.
+    pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let conn = self.lock();
+        f(&conn)
+    }
+
     // ---- experiences ----
     pub fn save_experience(&self, e: &Experience) -> Result<()> {
-        let tools = serde_json::to_string(&e.tools_used).unwrap_or_default();
-        let errs = serde_json::to_string(&e.errors).unwrap_or_default();
-        let corr = serde_json::to_string(&e.corrections).unwrap_or_default();
-        let meta = e.metadata.to_string();
+        let tools = to_json(&e.tools_used)?;
+        let errs = to_json(&e.errors)?;
+        let corr = to_json(&e.corrections)?;
+        let meta = to_json(&e.metadata)?;
         let conn = self.lock();
         conn.execute(
             "INSERT OR REPLACE INTO experiences (id, timestamp_ms, agent_id, project_id, task_category, user_request, outcome, tools_used, errors, corrections, feedback, reusable, sensitivity, metadata)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-            params![e.id, e.timestamp_ms as i64, e.agent_id, e.project_id, e.task_category, e.user_request, e.outcome, tools, errs, corr, e.feedback, e.reusable as i64, e.sensitivity, meta],
+            params![e.id, e.timestamp_ms as i64, e.agent_id, e.project_id, e.task_category, e.user_request, e.outcome.as_str(), tools, errs, corr, e.feedback, e.reusable as i64, e.sensitivity.as_str(), meta],
         ).map_err(|e| EvolutionError::Store(e.to_string()))?;
         Ok(())
     }
@@ -62,25 +108,7 @@ impl EvolutionStore {
         let mut stmt = conn.prepare("SELECT id,timestamp_ms,agent_id,project_id,task_category,user_request,outcome,tools_used,errors,corrections,feedback,reusable,sensitivity,metadata FROM experiences WHERE id=?1")
             .map_err(|e| EvolutionError::Store(e.to_string()))?;
         let row = stmt
-            .query_row(params![id], |r| {
-                Ok(Experience {
-                    id: r.get(0)?,
-                    timestamp_ms: r.get::<_, i64>(1)? as u64,
-                    agent_id: r.get(2)?,
-                    project_id: r.get(3)?,
-                    task_category: r.get(4)?,
-                    user_request: r.get(5)?,
-                    outcome: r.get(6)?,
-                    tools_used: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default(),
-                    errors: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default(),
-                    corrections: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
-                    feedback: r.get(10)?,
-                    reusable: r.get::<_, i64>(11)? != 0,
-                    sensitivity: r.get(12)?,
-                    metadata: serde_json::from_str(&r.get::<_, String>(13)?)
-                        .unwrap_or(serde_json::json!({})),
-                })
-            })
+            .query_row(params![id], map_exp)
             .optional()
             .map_err(|e| EvolutionError::Store(e.to_string()))?;
         Ok(row)
@@ -106,22 +134,52 @@ impl EvolutionStore {
             stmt.query_map(params![limit as i64], map_exp)
                 .map_err(|e| EvolutionError::Store(e.to_string()))?
         };
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(|e| EvolutionError::Store(e.to_string()))?);
-        }
-        Ok(out)
+        collect_rows(rows)
     }
     pub fn count_experiences(&self) -> Result<usize> {
+        count_rows(&self.lock(), "SELECT COUNT(*) FROM experiences")
+    }
+    /// Experiences recorded at or after `since_ms`, newest first.
+    pub fn list_experiences_since(&self, since_ms: u64, limit: usize) -> Result<Vec<Experience>> {
         let conn = self.lock();
-        let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM experiences", [], |r| r.get(0))
+        let mut stmt = conn
+            .prepare("SELECT id,timestamp_ms,agent_id,project_id,task_category,user_request,outcome,tools_used,errors,corrections,feedback,reusable,sensitivity,metadata FROM experiences WHERE timestamp_ms >= ?1 ORDER BY timestamp_ms DESC LIMIT ?2")
             .map_err(|e| EvolutionError::Store(e.to_string()))?;
-        Ok(n as usize)
+        let rows = stmt
+            .query_map(params![since_ms as i64, limit as i64], map_exp)
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        collect_rows(rows)
+    }
+    /// Experiences at or after `since_ms` that either failed outright or
+    /// recorded at least one error, newest first.
+    pub fn list_failed_experiences_since(
+        &self,
+        since_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<Experience>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT id,timestamp_ms,agent_id,project_id,task_category,user_request,outcome,tools_used,errors,corrections,feedback,reusable,sensitivity,metadata FROM experiences WHERE timestamp_ms >= ?1 AND (outcome = 'failure' OR errors <> '[]') ORDER BY timestamp_ms DESC LIMIT ?2")
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![since_ms as i64, limit as i64], map_exp)
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        collect_rows(rows)
     }
 
     // ---- memory entries ----
     pub fn save_memory(&self, m: &MemoryEntry) -> Result<()> {
+        // Guard the supersession chain: an entry must never supersede
+        // itself (a self-loop makes the entry invisible to live listings
+        // while pointing at itself as its replacement).
+        if let Some(by) = &m.superseded_by
+            && by == &m.id
+        {
+            return Err(EvolutionError::Validation(format!(
+                "memory entry {} cannot supersede itself",
+                m.id
+            )));
+        }
         let conn = self.lock();
         conn.execute(
             "INSERT OR REPLACE INTO memory_entries (id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by)
@@ -140,6 +198,9 @@ impl EvolutionStore {
             .map_err(|e| EvolutionError::Store(e.to_string()))?;
         Ok(row)
     }
+    /// Find the live entry for `(layer, scope, key)`, if any. Superseded
+    /// and expired rows are ignored, so a caller never "updates" a dead
+    /// entry and resurrects it.
     pub fn find_memory(
         &self,
         layer: MemoryLayer,
@@ -147,14 +208,21 @@ impl EvolutionStore {
         key: &str,
     ) -> Result<Option<MemoryEntry>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare("SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE layer=?1 AND scope=?2 AND key=?3")
+        let now = crate::types::now_ms() as i64;
+        let mut stmt = conn.prepare("SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE layer=?1 AND scope=?2 AND key=?3 AND superseded_by IS NULL AND (expires_ms IS NULL OR expires_ms > ?4) ORDER BY updated_ms DESC LIMIT 1")
             .map_err(|e| EvolutionError::Store(e.to_string()))?;
         let row = stmt
-            .query_row(params![layer.as_str(), scope, key], map_mem)
+            .query_row(params![layer.as_str(), scope, key, now], map_mem)
             .optional()
             .map_err(|e| EvolutionError::Store(e.to_string()))?;
         Ok(row)
     }
+    /// Text search over live memory entries.
+    ///
+    /// The `LIKE` match and the superseded/expired filter run in SQL
+    /// *before* `LIMIT`, so a page is never short merely because dead
+    /// rows filled it. Matching is done with `LIKE … ESCAPE` on both
+    /// `key` and `value` (case-insensitive for ASCII via `LOWER`).
     pub fn search_memory(
         &self,
         scope: Option<&str>,
@@ -162,32 +230,48 @@ impl EvolutionStore {
         limit: usize,
     ) -> Result<Vec<MemoryEntry>> {
         let conn = self.lock();
+        let now = crate::types::now_ms() as i64;
+        let pattern = format!("%{}%", escape_like(&query.to_lowercase()));
         let sql = if scope.is_some() {
-            "SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE scope=?1 ORDER BY updated_ms DESC LIMIT ?2"
+            "SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE scope=?1 AND superseded_by IS NULL AND (expires_ms IS NULL OR expires_ms > ?2) AND (LOWER(key) LIKE ?3 ESCAPE '\\' OR LOWER(value) LIKE ?3 ESCAPE '\\') ORDER BY updated_ms DESC LIMIT ?4"
         } else {
-            "SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries ORDER BY updated_ms DESC LIMIT ?1"
+            "SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE superseded_by IS NULL AND (expires_ms IS NULL OR expires_ms > ?1) AND (LOWER(key) LIKE ?2 ESCAPE '\\' OR LOWER(value) LIKE ?2 ESCAPE '\\') ORDER BY updated_ms DESC LIMIT ?3"
         };
         let mut stmt = conn
             .prepare(sql)
             .map_err(|e| EvolutionError::Store(e.to_string()))?;
         let rows = if let Some(s) = scope {
-            stmt.query_map(params![s, limit as i64], map_mem)
+            stmt.query_map(params![s, now, pattern, limit as i64], map_mem)
                 .map_err(|e| EvolutionError::Store(e.to_string()))?
         } else {
-            stmt.query_map(params![limit as i64], map_mem)
+            stmt.query_map(params![now, pattern, limit as i64], map_mem)
                 .map_err(|e| EvolutionError::Store(e.to_string()))?
         };
-        let mut out = Vec::new();
-        let ql = query.to_lowercase();
-        for r in rows {
-            let m = r.map_err(|e| EvolutionError::Store(e.to_string()))?;
-            if m.key.to_lowercase().contains(&ql) || m.value.to_lowercase().contains(&ql) {
-                out.push(m);
-            }
-        }
-        Ok(out)
+        collect_rows(rows)
     }
+    /// All live memory entries for a scope (superseded/expired excluded).
     pub fn list_memory(&self, scope: Option<&str>) -> Result<Vec<MemoryEntry>> {
+        let conn = self.lock();
+        let now = crate::types::now_ms() as i64;
+        let sql = if scope.is_some() {
+            "SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE scope=?1 AND superseded_by IS NULL AND (expires_ms IS NULL OR expires_ms > ?2) ORDER BY updated_ms DESC"
+        } else {
+            "SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE superseded_by IS NULL AND (expires_ms IS NULL OR expires_ms > ?1) ORDER BY updated_ms DESC"
+        };
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        let rows = if let Some(s) = scope {
+            stmt.query_map(params![s, now], map_mem)
+                .map_err(|e| EvolutionError::Store(e.to_string()))?
+        } else {
+            stmt.query_map(params![now], map_mem)
+                .map_err(|e| EvolutionError::Store(e.to_string()))?
+        };
+        collect_rows(rows)
+    }
+    /// All memory rows including superseded/expired ones (audit/debug).
+    pub fn list_memory_all(&self, scope: Option<&str>) -> Result<Vec<MemoryEntry>> {
         let conn = self.lock();
         let sql = if scope.is_some() {
             "SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE scope=?1 ORDER BY updated_ms DESC"
@@ -204,11 +288,7 @@ impl EvolutionStore {
             stmt.query_map([], map_mem)
                 .map_err(|e| EvolutionError::Store(e.to_string()))?
         };
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(|e| EvolutionError::Store(e.to_string()))?);
-        }
-        Ok(out)
+        collect_rows(rows)
     }
     pub fn delete_memory(&self, id: &str) -> Result<bool> {
         let conn = self.lock();
@@ -218,21 +298,23 @@ impl EvolutionStore {
         Ok(n > 0)
     }
     pub fn count_memory(&self) -> Result<usize> {
+        let now = crate::types::now_ms() as i64;
         let conn = self.lock();
-        let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM memory_entries", [], |r| r.get(0))
-            .map_err(|e| EvolutionError::Store(e.to_string()))?;
-        Ok(n as usize)
+        count_rows_with(
+            &conn,
+            "SELECT COUNT(*) FROM memory_entries WHERE superseded_by IS NULL AND (expires_ms IS NULL OR expires_ms > ?1)",
+            params![now],
+        )
     }
 
     // ---- proposals ----
     pub fn save_proposal(&self, p: &LearningProposal) -> Result<()> {
-        let details = p.details.to_string();
+        let details = to_json(&p.details)?;
         let conn = self.lock();
         conn.execute(
             "INSERT OR REPLACE INTO proposals (id,experience_id,agent_id,kind,summary,details,confidence,requires_approval,created_ms,status)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![p.id, p.experience_id, p.agent_id, p.kind, p.summary, details, p.confidence, p.requires_approval as i64, p.created_ms as i64, p.status],
+            params![p.id, p.experience_id, p.agent_id, p.kind.as_str(), p.summary, details, p.confidence, p.requires_approval as i64, p.created_ms as i64, p.status.as_str()],
         ).map_err(|e| EvolutionError::Store(e.to_string()))?;
         Ok(())
     }
@@ -253,11 +335,15 @@ impl EvolutionStore {
             stmt.query_map([], map_prop)
                 .map_err(|e| EvolutionError::Store(e.to_string()))?
         };
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(|e| EvolutionError::Store(e.to_string()))?);
-        }
-        Ok(out)
+        collect_rows(rows)
+    }
+    pub fn get_proposal(&self, id: &str) -> Result<Option<LearningProposal>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT id,experience_id,agent_id,kind,summary,details,confidence,requires_approval,created_ms,status FROM proposals WHERE id=?1")
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        stmt.query_row(params![id], map_prop)
+            .optional()
+            .map_err(|e| EvolutionError::Store(e.to_string()))
     }
 
     // ---- reflection jobs ----
@@ -266,7 +352,7 @@ impl EvolutionStore {
         conn.execute(
             "INSERT OR REPLACE INTO reflection_jobs (id,experience_id,agent_id,status,attempts,created_ms,updated_ms,error)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![j.id, j.experience_id, j.agent_id, j.status, j.attempts, j.created_ms as i64, j.updated_ms as i64, j.error],
+            params![j.id, j.experience_id, j.agent_id, j.status.as_str(), j.attempts, j.created_ms as i64, j.updated_ms as i64, j.error],
         ).map_err(|e| EvolutionError::Store(e.to_string()))?;
         Ok(())
     }
@@ -277,16 +363,22 @@ impl EvolutionStore {
         let rows = stmt
             .query_map([], map_job)
             .map_err(|e| EvolutionError::Store(e.to_string()))?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(|e| EvolutionError::Store(e.to_string()))?);
-        }
-        Ok(out)
+        collect_rows(rows)
+    }
+    /// Reflection jobs that ended in `failed`, most recently updated first.
+    pub fn list_failed_jobs(&self, limit: usize) -> Result<Vec<ReflectionJob>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT id,experience_id,agent_id,status,attempts,created_ms,updated_ms,error FROM reflection_jobs WHERE status='failed' ORDER BY updated_ms DESC LIMIT ?1")
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![limit as i64], map_job)
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        collect_rows(rows)
     }
 
     // ---- hive lessons ----
     pub fn save_hive_lesson(&self, h: &HiveLesson) -> Result<()> {
-        let agents = serde_json::to_string(&h.agents).unwrap_or_default();
+        let agents = to_json(&h.agents)?;
         let conn = self.lock();
         conn.execute(
             "INSERT OR REPLACE INTO hive_lessons (id,task_id,agents,outcome,lesson,pattern,created_ms) VALUES (?1,?2,?3,?4,?5,?6,?7)",
@@ -299,40 +391,34 @@ impl EvolutionStore {
         let mut stmt = conn.prepare("SELECT id,task_id,agents,outcome,lesson,pattern,created_ms FROM hive_lessons ORDER BY created_ms DESC")
             .map_err(|e| EvolutionError::Store(e.to_string()))?;
         let rows = stmt
-            .query_map([], |r| {
-                Ok(HiveLesson {
-                    id: r.get(0)?,
-                    task_id: r.get(1)?,
-                    agents: serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default(),
-                    outcome: r.get(3)?,
-                    lesson: r.get(4)?,
-                    pattern: r.get(5)?,
-                    created_ms: r.get::<_, i64>(6)? as u64,
-                })
-            })
+            .query_map([], map_hive)
             .map_err(|e| EvolutionError::Store(e.to_string()))?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(|e| EvolutionError::Store(e.to_string()))?);
-        }
-        Ok(out)
+        collect_rows(rows)
     }
 
     // ---- candidates & evaluations ----
     pub fn save_candidate(&self, c: &OptimizationCandidate) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT OR REPLACE INTO candidates (id,target,parent_version,change_description,content,created_ms,status) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![c.id, c.target, c.parent_version, c.change_description, c.content, c.created_ms as i64, c.status],
+            "INSERT OR REPLACE INTO candidates (id,target,parent_version,change_description,content,created_ms,status,rejection_reason) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![c.id, c.target, c.parent_version, c.change_description, c.content, c.created_ms as i64, c.status.as_str(), c.rejection_reason],
         ).map_err(|e| EvolutionError::Store(e.to_string()))?;
         Ok(())
+    }
+    pub fn get_candidate(&self, id: &str) -> Result<Option<OptimizationCandidate>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT id,target,parent_version,change_description,content,created_ms,status,rejection_reason FROM candidates WHERE id=?1")
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        stmt.query_row(params![id], map_cand)
+            .optional()
+            .map_err(|e| EvolutionError::Store(e.to_string()))
     }
     pub fn list_candidates(&self, target: Option<&str>) -> Result<Vec<OptimizationCandidate>> {
         let conn = self.lock();
         let sql = if target.is_some() {
-            "SELECT id,target,parent_version,change_description,content,created_ms,status FROM candidates WHERE target=?1 ORDER BY created_ms DESC"
+            "SELECT id,target,parent_version,change_description,content,created_ms,status,rejection_reason FROM candidates WHERE target=?1 ORDER BY created_ms DESC"
         } else {
-            "SELECT id,target,parent_version,change_description,content,created_ms,status FROM candidates ORDER BY created_ms DESC"
+            "SELECT id,target,parent_version,change_description,content,created_ms,status,rejection_reason FROM candidates ORDER BY created_ms DESC"
         };
         let mut stmt = conn
             .prepare(sql)
@@ -344,43 +430,29 @@ impl EvolutionStore {
             stmt.query_map([], map_cand)
                 .map_err(|e| EvolutionError::Store(e.to_string()))?
         };
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(|e| EvolutionError::Store(e.to_string()))?);
-        }
-        Ok(out)
+        collect_rows(rows)
     }
     pub fn save_evaluation(&self, e: &EvaluationResult) -> Result<()> {
+        if e.id.is_empty() {
+            return Err(EvolutionError::Validation(
+                "evaluation id must not be empty".to_string(),
+            ));
+        }
         let conn = self.lock();
         conn.execute(
-            "INSERT OR REPLACE INTO evaluations (candidate_id,dataset,metrics,score,passed,notes,created_ms) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![e.candidate_id, e.dataset, e.metrics.to_string(), e.score, e.passed as i64, e.notes, e.created_ms as i64],
+            "INSERT OR REPLACE INTO evaluations (id,candidate_id,dataset,metrics,score,passed,notes,created_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![e.id, e.candidate_id, e.dataset, to_json(&e.metrics)?, e.score, e.passed as i64, e.notes, e.created_ms as i64],
         ).map_err(|e| EvolutionError::Store(e.to_string()))?;
         Ok(())
     }
     pub fn list_evaluations(&self, candidate_id: &str) -> Result<Vec<EvaluationResult>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare("SELECT candidate_id,dataset,metrics,score,passed,notes,created_ms FROM evaluations WHERE candidate_id=?1")
+        let mut stmt = conn.prepare("SELECT id,candidate_id,dataset,metrics,score,passed,notes,created_ms FROM evaluations WHERE candidate_id=?1 ORDER BY created_ms ASC")
             .map_err(|e| EvolutionError::Store(e.to_string()))?;
         let rows = stmt
-            .query_map(params![candidate_id], |r| {
-                Ok(EvaluationResult {
-                    candidate_id: r.get(0)?,
-                    dataset: r.get(1)?,
-                    metrics: serde_json::from_str(&r.get::<_, String>(2)?)
-                        .unwrap_or(serde_json::json!({})),
-                    score: r.get(3)?,
-                    passed: r.get::<_, i64>(4)? != 0,
-                    notes: r.get(5)?,
-                    created_ms: r.get::<_, i64>(6)? as u64,
-                })
-            })
+            .query_map(params![candidate_id], map_eval)
             .map_err(|e| EvolutionError::Store(e.to_string()))?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(|e| EvolutionError::Store(e.to_string()))?);
-        }
-        Ok(out)
+        collect_rows(rows)
     }
 
     // ---- skill versions ----
@@ -411,11 +483,7 @@ impl EvolutionStore {
                 })
             })
             .map_err(|e| crate::error::EvolutionError::Store(e.to_string()))?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(|e| EvolutionError::Store(e.to_string()))?);
-        }
-        Ok(out)
+        collect_rows(rows)
     }
 
     // ---- learning events ----
@@ -423,7 +491,7 @@ impl EvolutionStore {
         let conn = self.lock();
         conn.execute(
             "INSERT OR REPLACE INTO learning_events (id,timestamp_ms,agent_id,kind,summary,payload) VALUES (?1,?2,?3,?4,?5,?6)",
-            params![e.id, e.timestamp_ms as i64, e.agent_id, e.kind, e.summary, e.payload.to_string()],
+            params![e.id, e.timestamp_ms as i64, e.agent_id, e.kind, e.summary, to_json(&e.payload)?],
         ).map_err(|e| EvolutionError::Store(e.to_string()))?;
         Ok(())
     }
@@ -444,15 +512,54 @@ impl EvolutionStore {
             stmt.query_map(params![limit as i64], map_event)
                 .map_err(|e| EvolutionError::Store(e.to_string()))?
         };
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(|e| EvolutionError::Store(e.to_string()))?);
-        }
-        Ok(out)
+        collect_rows(rows)
     }
 }
 
+// ---------- checked (de)serialisation helpers ----------
+
+fn to_json<T: serde::Serialize>(v: &T) -> Result<String> {
+    serde_json::to_string(v).map_err(|e| EvolutionError::Serde(e.to_string()))
+}
+
+fn from_json<T: for<'de> serde::Deserialize<'de>>(s: &str) -> Result<T> {
+    serde_json::from_str(s).map_err(|e| EvolutionError::Serde(e.to_string()))
+}
+
+fn collect_rows<T>(
+    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
+) -> Result<Vec<T>> {
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| EvolutionError::Store(e.to_string()))?);
+    }
+    Ok(out)
+}
+
+fn count_rows(conn: &Connection, sql: &str) -> Result<usize> {
+    let n: i64 = conn
+        .query_row(sql, [], |r| r.get(0))
+        .map_err(|e| EvolutionError::Store(e.to_string()))?;
+    Ok(n as usize)
+}
+
+fn count_rows_with(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> Result<usize> {
+    let n: i64 = conn
+        .query_row(sql, params, |r| r.get(0))
+        .map_err(|e| EvolutionError::Store(e.to_string()))?;
+    Ok(n as usize)
+}
+
+/// Escape `%`, `_` and `\` so a user query cannot act as a LIKE pattern.
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 fn map_exp(r: &rusqlite::Row) -> rusqlite::Result<Experience> {
+    let outcome_s: String = r.get(6)?;
+    let sensitivity_s: String = r.get(12)?;
     Ok(Experience {
         id: r.get(0)?,
         timestamp_ms: r.get::<_, i64>(1)? as u64,
@@ -460,26 +567,99 @@ fn map_exp(r: &rusqlite::Row) -> rusqlite::Result<Experience> {
         project_id: r.get(3)?,
         task_category: r.get(4)?,
         user_request: r.get(5)?,
-        outcome: r.get(6)?,
-        tools_used: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default(),
-        errors: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default(),
-        corrections: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
+        outcome: ExperienceOutcome::parse(&outcome_s).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown experience outcome: {outcome_s}"),
+                )),
+            )
+        })?,
+        tools_used: from_json(&r.get::<_, String>(7)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                )),
+            )
+        })?,
+        errors: from_json(&r.get::<_, String>(8)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                8,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                )),
+            )
+        })?,
+        corrections: from_json(&r.get::<_, String>(9)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                9,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                )),
+            )
+        })?,
         feedback: r.get(10)?,
         reusable: r.get::<_, i64>(11)? != 0,
-        sensitivity: r.get(12)?,
-        metadata: serde_json::from_str(&r.get::<_, String>(13)?).unwrap_or(serde_json::json!({})),
+        sensitivity: Sensitivity::parse(&sensitivity_s).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                12,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown sensitivity: {sensitivity_s}"),
+                )),
+            )
+        })?,
+        metadata: from_json(&r.get::<_, String>(13)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                13,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                )),
+            )
+        })?,
     })
 }
 
 fn map_mem(r: &rusqlite::Row) -> rusqlite::Result<MemoryEntry> {
+    let layer_s: String = r.get(1)?;
+    let status_s: String = r.get(5)?;
     Ok(MemoryEntry {
         id: r.get(0)?,
-        layer: MemoryLayer::parse(&r.get::<_, String>(1)?).unwrap_or(MemoryLayer::Semantic),
+        layer: MemoryLayer::parse(&layer_s).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown memory layer: {layer_s}"),
+                )),
+            )
+        })?,
         scope: r.get(2)?,
         key: r.get(3)?,
         value: r.get(4)?,
-        status: KnowledgeStatus::parse(&r.get::<_, String>(5)?)
-            .unwrap_or(KnowledgeStatus::Observed),
+        status: KnowledgeStatus::parse(&status_s).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown knowledge status: {status_s}"),
+                )),
+            )
+        })?,
         confidence: r.get(6)?,
         source_experience: r.get(7)?,
         provenance: r.get(8)?,
@@ -491,26 +671,65 @@ fn map_mem(r: &rusqlite::Row) -> rusqlite::Result<MemoryEntry> {
 }
 
 fn map_prop(r: &rusqlite::Row) -> rusqlite::Result<LearningProposal> {
+    let kind_s: String = r.get(3)?;
+    let status_s: String = r.get(9)?;
     Ok(LearningProposal {
         id: r.get(0)?,
         experience_id: r.get(1)?,
         agent_id: r.get(2)?,
-        kind: r.get(3)?,
+        kind: ProposalKind::parse(&kind_s).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown proposal kind: {kind_s}"),
+                )),
+            )
+        })?,
         summary: r.get(4)?,
-        details: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or(serde_json::json!({})),
+        details: from_json(&r.get::<_, String>(5)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                )),
+            )
+        })?,
         confidence: r.get(6)?,
         requires_approval: r.get::<_, i64>(7)? != 0,
         created_ms: r.get::<_, i64>(8)? as u64,
-        status: r.get(9)?,
+        status: ProposalStatus::parse(&status_s).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                9,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown proposal status: {status_s}"),
+                )),
+            )
+        })?,
     })
 }
 
 fn map_job(r: &rusqlite::Row) -> rusqlite::Result<ReflectionJob> {
+    let status_s: String = r.get(3)?;
     Ok(ReflectionJob {
         id: r.get(0)?,
         experience_id: r.get(1)?,
         agent_id: r.get(2)?,
-        status: r.get(3)?,
+        status: ReflectionJobStatus::parse(&status_s).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown reflection job status: {status_s}"),
+                )),
+            )
+        })?,
         attempts: r.get::<_, i64>(4)? as u32,
         created_ms: r.get::<_, i64>(5)? as u64,
         updated_ms: r.get::<_, i64>(6)? as u64,
@@ -519,6 +738,7 @@ fn map_job(r: &rusqlite::Row) -> rusqlite::Result<ReflectionJob> {
 }
 
 fn map_cand(r: &rusqlite::Row) -> rusqlite::Result<OptimizationCandidate> {
+    let status_s: String = r.get(6)?;
     Ok(OptimizationCandidate {
         id: r.get(0)?,
         target: r.get(1)?,
@@ -526,7 +746,60 @@ fn map_cand(r: &rusqlite::Row) -> rusqlite::Result<OptimizationCandidate> {
         change_description: r.get(3)?,
         content: r.get(4)?,
         created_ms: r.get::<_, i64>(5)? as u64,
-        status: r.get(6)?,
+        status: CandidateStatus::parse(&status_s).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown candidate status: {status_s}"),
+                )),
+            )
+        })?,
+        rejection_reason: r.get(7)?,
+    })
+}
+
+fn map_hive(r: &rusqlite::Row) -> rusqlite::Result<HiveLesson> {
+    Ok(HiveLesson {
+        id: r.get(0)?,
+        task_id: r.get(1)?,
+        agents: from_json(&r.get::<_, String>(2)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                )),
+            )
+        })?,
+        outcome: r.get(3)?,
+        lesson: r.get(4)?,
+        pattern: r.get(5)?,
+        created_ms: r.get::<_, i64>(6)? as u64,
+    })
+}
+
+fn map_eval(r: &rusqlite::Row) -> rusqlite::Result<EvaluationResult> {
+    Ok(EvaluationResult {
+        id: r.get(0)?,
+        candidate_id: r.get(1)?,
+        dataset: r.get(2)?,
+        metrics: from_json(&r.get::<_, String>(3)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                )),
+            )
+        })?,
+        score: r.get(4)?,
+        passed: r.get::<_, i64>(5)? != 0,
+        notes: r.get(6)?,
+        created_ms: r.get::<_, i64>(7)? as u64,
     })
 }
 
@@ -537,114 +810,182 @@ fn map_event(r: &rusqlite::Row) -> rusqlite::Result<LearningEvent> {
         agent_id: r.get(2)?,
         kind: r.get(3)?,
         summary: r.get(4)?,
-        payload: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or(serde_json::json!({})),
+        payload: from_json(&r.get::<_, String>(5)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                )),
+            )
+        })?,
     })
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS experiences (
-            id TEXT PRIMARY KEY,
-            timestamp_ms INTEGER NOT NULL,
-            agent_id TEXT NOT NULL,
-            project_id TEXT,
-            task_category TEXT NOT NULL,
-            user_request TEXT NOT NULL,
-            outcome TEXT NOT NULL,
-            tools_used TEXT NOT NULL,
-            errors TEXT NOT NULL,
-            corrections TEXT NOT NULL,
-            feedback TEXT,
-            reusable INTEGER NOT NULL,
-            sensitivity TEXT NOT NULL,
-            metadata TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS memory_entries (
-            id TEXT PRIMARY KEY,
-            layer TEXT NOT NULL,
-            scope TEXT NOT NULL,
-            key TEXT NOT NULL,
-            value TEXT NOT NULL,
-            status TEXT NOT NULL,
-            confidence REAL NOT NULL,
-            source_experience TEXT,
-            provenance TEXT NOT NULL,
-            created_ms INTEGER NOT NULL,
-            updated_ms INTEGER NOT NULL,
-            expires_ms INTEGER,
-            superseded_by TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_mem_scope ON memory_entries(scope);
-        CREATE INDEX IF NOT EXISTS idx_mem_layer ON memory_entries(layer);
-        CREATE TABLE IF NOT EXISTS proposals (
-            id TEXT PRIMARY KEY,
-            experience_id TEXT,
-            agent_id TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            summary TEXT NOT NULL,
-            details TEXT NOT NULL,
-            confidence REAL NOT NULL,
-            requires_approval INTEGER NOT NULL,
-            created_ms INTEGER NOT NULL,
-            status TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS reflection_jobs (
-            id TEXT PRIMARY KEY,
-            experience_id TEXT NOT NULL,
-            agent_id TEXT NOT NULL,
-            status TEXT NOT NULL,
-            attempts INTEGER NOT NULL,
-            created_ms INTEGER NOT NULL,
-            updated_ms INTEGER NOT NULL,
-            error TEXT
-        );
-        CREATE TABLE IF NOT EXISTS hive_lessons (
-            id TEXT PRIMARY KEY,
-            task_id TEXT NOT NULL,
-            agents TEXT NOT NULL,
-            outcome TEXT NOT NULL,
-            lesson TEXT NOT NULL,
-            pattern TEXT NOT NULL,
-            created_ms INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS candidates (
-            id TEXT PRIMARY KEY,
-            target TEXT NOT NULL,
-            parent_version TEXT,
-            change_description TEXT NOT NULL,
-            content TEXT NOT NULL,
-            created_ms INTEGER NOT NULL,
-            status TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS evaluations (
-            candidate_id TEXT NOT NULL,
-            dataset TEXT NOT NULL,
-            metrics TEXT NOT NULL,
-            score REAL NOT NULL,
-            passed INTEGER NOT NULL,
-            notes TEXT NOT NULL,
-            created_ms INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS learning_events (
-            id TEXT PRIMARY KEY,
-            timestamp_ms INTEGER NOT NULL,
-            agent_id TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            summary TEXT NOT NULL,
-            payload TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS skill_versions (
-            skill_name TEXT NOT NULL,
-            version INTEGER NOT NULL,
-            content TEXT NOT NULL,
-            created_ms INTEGER NOT NULL,
-            parent_version INTEGER,
-            change_description TEXT NOT NULL,
-            PRIMARY KEY (skill_name, version)
-        );
-        "#,
-    )
-    .map_err(|e| EvolutionError::Store(e.to_string()))?;
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(|e| EvolutionError::Store(e.to_string()))?;
+
+    if version < 1 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS experiences (
+                id TEXT PRIMARY KEY,
+                timestamp_ms INTEGER NOT NULL,
+                agent_id TEXT NOT NULL,
+                project_id TEXT,
+                task_category TEXT NOT NULL,
+                user_request TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                tools_used TEXT NOT NULL,
+                errors TEXT NOT NULL,
+                corrections TEXT NOT NULL,
+                feedback TEXT,
+                reusable INTEGER NOT NULL,
+                sensitivity TEXT NOT NULL,
+                metadata TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS memory_entries (
+                id TEXT PRIMARY KEY,
+                layer TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                status TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                source_experience TEXT,
+                provenance TEXT NOT NULL,
+                created_ms INTEGER NOT NULL,
+                updated_ms INTEGER NOT NULL,
+                expires_ms INTEGER,
+                superseded_by TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_mem_scope ON memory_entries(scope);
+            CREATE INDEX IF NOT EXISTS idx_mem_layer ON memory_entries(layer);
+            CREATE INDEX IF NOT EXISTS idx_mem_live ON memory_entries(scope, superseded_by, expires_ms);
+            CREATE TABLE IF NOT EXISTS proposals (
+                id TEXT PRIMARY KEY,
+                experience_id TEXT,
+                agent_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                details TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                requires_approval INTEGER NOT NULL,
+                created_ms INTEGER NOT NULL,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS reflection_jobs (
+                id TEXT PRIMARY KEY,
+                experience_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL,
+                created_ms INTEGER NOT NULL,
+                updated_ms INTEGER NOT NULL,
+                error TEXT
+            );
+            CREATE TABLE IF NOT EXISTS hive_lessons (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                agents TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                lesson TEXT NOT NULL,
+                pattern TEXT NOT NULL,
+                created_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS candidates (
+                id TEXT PRIMARY KEY,
+                target TEXT NOT NULL,
+                parent_version TEXT,
+                change_description TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_ms INTEGER NOT NULL,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS evaluations (
+                candidate_id TEXT NOT NULL,
+                dataset TEXT NOT NULL,
+                metrics TEXT NOT NULL,
+                score REAL NOT NULL,
+                passed INTEGER NOT NULL,
+                notes TEXT NOT NULL,
+                created_ms INTEGER NOT NULL,
+                PRIMARY KEY (candidate_id, dataset)
+            );
+            CREATE TABLE IF NOT EXISTS learning_events (
+                id TEXT PRIMARY KEY,
+                timestamp_ms INTEGER NOT NULL,
+                agent_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS skill_versions (
+                skill_name TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                created_ms INTEGER NOT NULL,
+                parent_version INTEGER,
+                change_description TEXT NOT NULL,
+                PRIMARY KEY (skill_name, version)
+            );
+            "#,
+        )
+        .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        conn.pragma_update(None, "user_version", 1i64)
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+    }
+
+    if version < 2 {
+        // v2: evaluations gain their own primary key + `id`; candidates
+        // gain `rejection_reason`. Both are additive and preserve rows.
+        //
+        // Recreate `evaluations` with a surrogate PK. Existing rows are
+        // copied with a generated id (`candidate_id || '/' || dataset`)
+        // so history is kept instead of dropped.
+        let has_eval_id: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('evaluations') WHERE name='id'")
+            .and_then(|mut s| s.exists([]))
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        if !has_eval_id {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE evaluations_v2 (
+                    id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL,
+                    dataset TEXT NOT NULL,
+                    metrics TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    passed INTEGER NOT NULL,
+                    notes TEXT NOT NULL,
+                    created_ms INTEGER NOT NULL
+                );
+                INSERT INTO evaluations_v2 (id, candidate_id, dataset, metrics, score, passed, notes, created_ms)
+                    SELECT candidate_id || '/' || dataset, candidate_id, dataset, metrics, score, passed, notes, created_ms FROM evaluations;
+                DROP TABLE evaluations;
+                ALTER TABLE evaluations_v2 RENAME TO evaluations;
+                CREATE INDEX IF NOT EXISTS idx_eval_candidate ON evaluations(candidate_id);
+                "#,
+            )
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        }
+        let has_rejection_reason: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('candidates') WHERE name='rejection_reason'")
+            .and_then(|mut s| s.exists([]))
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        if !has_rejection_reason {
+            conn.execute(
+                "ALTER TABLE candidates ADD COLUMN rejection_reason TEXT",
+                [],
+            )
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        }
+        conn.pragma_update(None, "user_version", 2i64)
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+    }
+
     Ok(())
 }

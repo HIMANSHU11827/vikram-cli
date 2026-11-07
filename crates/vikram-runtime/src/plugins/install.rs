@@ -128,10 +128,10 @@ impl PluginRegistry {
     /// branch of the same run already installed is only visible on disk.
     fn dependency_version(&self, name: &str) -> Option<String> {
         let dir = self.root().join(name);
-        if dir.join("plugin.json").is_file() {
-            if let Ok(manifest) = PluginManifest::from_dir(&dir) {
-                return Some(manifest.version);
-            }
+        if dir.join("plugin.json").is_file()
+            && let Ok(manifest) = PluginManifest::from_dir(&dir)
+        {
+            return Some(manifest.version);
         }
         self.installed_version(name)
     }
@@ -157,13 +157,13 @@ impl PluginRegistry {
         if id == "." || id == ".." || id.contains('/') || id.contains('\\') {
             return Err(format!("`{id}` is not a usable plugin id"));
         }
-        if let Some(entry) = manifest.entry_point() {
-            if !source.join(entry).exists() {
-                return Err(format!(
-                    "declared entry point `{entry}` is missing from {}",
-                    source.display()
-                ));
-            }
+        if let Some(entry) = manifest.entry_point()
+            && !source.join(entry).exists()
+        {
+            return Err(format!(
+                "declared entry point `{entry}` is missing from {}",
+                source.display()
+            ));
         }
         verify_integrity(source, &id)?;
         Ok(manifest)

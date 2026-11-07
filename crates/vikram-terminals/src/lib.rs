@@ -280,6 +280,12 @@ impl TerminalRegistry {
     }
 }
 
+impl Default for TerminalRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

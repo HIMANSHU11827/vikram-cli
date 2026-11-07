@@ -17,7 +17,7 @@ use std::collections::hash_map::Entry;
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, LazyLock, Mutex, TryLockError};
 use std::time::{Duration, Instant};
@@ -227,12 +227,11 @@ pub fn resolve_server(
         path: path.display().to_string(),
     })?;
     let env_key = format!("VIKRAM_LSP_{}", ext.to_uppercase());
-    if let Some(line) = env(&env_key) {
-        if let Some(command) =
+    if let Some(line) = env(&env_key)
+        && let Some(command) =
             ServerCommand::parse(line.trim(), &ext, "the server named in the override")
-        {
-            return Ok(command);
-        }
+    {
+        return Ok(command);
     }
     let Some((_, line, install)) = DEFAULTS.iter().find(|(known, _, _)| *known == ext) else {
         return Err(LspError::Unsupported { ext });
@@ -332,7 +331,10 @@ fn read_frame(reader: &mut impl BufRead) -> Result<Option<Value>, LspError> {
 pub struct LspClient {
     server: ServerCommand,
     child: Child,
-    stdin: ChildStdin,
+    /// Frames go to a dedicated writer thread. A wedged server can fill its stdin pipe, and a
+    /// blocking `write_all` on the caller's thread would then hang the runtime (the old Drop path
+    /// did exactly that). The channel makes every write non-blocking; the thread owns the pipe.
+    writer: std::sync::mpsc::Sender<Vec<u8>>,
     inbox: Receiver<Result<Value, String>>,
     stderr: Arc<Mutex<Vec<String>>>,
     next_id: i64,
@@ -398,6 +400,23 @@ impl LspClient {
             .take()
             .ok_or_else(|| spawn_failed("stderr was not captured".into()))?;
 
+        let (writer, frames) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::Builder::new()
+            .name(format!("lsp-writer-{}", server.program))
+            .spawn(move || {
+                let mut stdin = stdin;
+                for frame in frames {
+                    if stdin
+                        .write_all(&frame)
+                        .and_then(|()| stdin.flush())
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            })
+            .map_err(|e| spawn_failed(format!("cannot start the writer thread: {e}")))?;
+
         let (sender, inbox) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name(format!("lsp-reader-{}", server.program))
@@ -446,7 +465,7 @@ impl LspClient {
         let mut client = Self {
             server: server.clone(),
             child,
-            stdin,
+            writer,
             inbox,
             stderr: tail,
             next_id: 1,
@@ -647,15 +666,15 @@ impl LspClient {
 
     /// Remember a notification. Diagnostics are indexed by URI so a later query can find them.
     fn record(&mut self, method: &str, params: Value) {
-        if method == "textDocument/publishDiagnostics" {
-            if let Some(uri) = params.get("uri").and_then(Value::as_str) {
-                let diagnostics = params
-                    .get("diagnostics")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                self.published.insert(uri.to_string(), diagnostics);
-            }
+        if method == "textDocument/publishDiagnostics"
+            && let Some(uri) = params.get("uri").and_then(Value::as_str)
+        {
+            let diagnostics = params
+                .get("diagnostics")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            self.published.insert(uri.to_string(), diagnostics);
         }
         if self.notifications.len() >= 128 {
             self.notifications.remove(0);
@@ -685,10 +704,9 @@ impl LspClient {
 
     fn send(&mut self, message: &Value) -> Result<(), LspError> {
         let frame = encode_frame(message)?;
-        self.stdin
-            .write_all(&frame)
-            .and_then(|()| self.stdin.flush())
-            .map_err(|e| LspError::Io(format!("cannot write to the language server: {e}")))
+        self.writer
+            .send(frame)
+            .map_err(|_| LspError::Io("the language server writer is gone".into()))
     }
 
     /// Send `textDocument/didOpen`. Re-opening a document that is already open closes it first,
@@ -827,13 +845,23 @@ impl LspClient {
 impl Drop for LspClient {
     fn drop(&mut self) {
         // Polite first, then certain: `shutdown`/`exit` are best-effort (a wedged server ignores
-        // them), the kill is not.
+        // them), the kill is not. Writes are queued, never performed here, so a full or broken
+        // stdin pipe cannot block teardown.
         let id = self.next_id;
         let _ =
             self.send(&json!({"jsonrpc": "2.0", "id": id, "method": "shutdown", "params": null}));
         let _ = self.notify("exit", Value::Null);
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Bounded reap: `wait()` blocks forever if the child cannot be killed or a grandchild
+        // holds the process alive.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) if Instant::now() >= deadline => break,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
     }
 }
 

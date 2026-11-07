@@ -4,6 +4,27 @@
 //! evaluates the conversation snapshot and proposes memory/skill changes. Changes are either
 //! applied (auto mode) or staged for approval. Nothing modifies the live conversation or its
 //! prompt cache. Learning never grants permissions.
+//!
+//! # Single source of truth (unified learning)
+//!
+//! There is exactly one durable learning store: `vikram-evolution`'s SQLite
+//! [`vikram_evolution::EvolutionStore`] (`evolution.db`). This module's
+//! [`LearningManager`] (JSON `learning.json`) is **only the approval
+//! surface** — the operator-facing queue of staged proposals, their
+//! policies, and the audit log. It intentionally does *not* keep a second
+//! copy of experiences, layered memories, reflection jobs, candidates, or
+//! hive lessons: `on_turn_end` / `record_and_reflect` delegate all of
+//! that to `vikram-evolution`, and `proposal_from_evolution` maps
+//! evolution proposals onto the surface. Migrating the surface away
+//! entirely would require the UI to read SQLite directly; until then,
+//! this split is documented and enforced: JSON → approvals + audit only,
+//! SQLite → everything durable.
+//!
+//! The evolution engine is invoked on boot (recovery + drain, see
+//! `Runtime::boot`) and on every tool-bearing turn finish
+//! (`on_turn_end`, called from `turn::finish`), so
+//! `RuntimeHandle::evolution()` is no longer dead — the turn-end path
+//! locks `RuntimeInner::evolution` on every qualifying turn.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -77,6 +98,10 @@ pub struct LearningState {
     pub policy_memory: String,
     #[serde(default = "default_policy_str")]
     pub policy_skill: String,
+    #[serde(default = "default_policy_str")]
+    pub policy_instruction: String,
+    #[serde(default = "default_policy_str")]
+    pub policy_identity: String,
 }
 
 fn default_policy_str() -> String {
@@ -95,6 +120,9 @@ pub struct LearningManager {
     path: Mutex<Option<std::path::PathBuf>>,
     /// Finished turns per session, for the review gate. Not persisted: it bounds this run's spend.
     turns: Mutex<HashMap<SessionId, u64>>,
+    /// Non-empty when the state file could not be read/parsed, so the failure is visible to
+    /// callers that check `load_error` instead of silently starting from scratch.
+    load_error: Mutex<Option<String>>,
 }
 
 impl Default for LearningManager {
@@ -119,38 +147,83 @@ impl LearningManager {
             policy_identity: Mutex::new(LearningPolicy::ApprovalRequired),
             path: Mutex::new(path),
             turns: Mutex::new(HashMap::new()),
+            load_error: Mutex::new(None),
         };
         if let Some(p) = mgr.path.lock().unwrap().clone() {
-            if let Ok(data) = std::fs::read_to_string(&p) {
-                if let Ok(state) = serde_json::from_str::<LearningState>(&data) {
-                    *mgr.proposals.lock().unwrap() = state.proposals;
-                    *mgr.audit.lock().unwrap() = state.audit;
-                    *mgr.policy_memory.lock().unwrap() =
-                        LearningPolicy::parse(&state.policy_memory);
-                    *mgr.policy_skill.lock().unwrap() = LearningPolicy::parse(&state.policy_skill);
+            match std::fs::read_to_string(&p) {
+                Ok(data) => match serde_json::from_str::<LearningState>(&data) {
+                    Ok(state) => {
+                        *mgr.proposals.lock().unwrap() = state.proposals;
+                        *mgr.audit.lock().unwrap() = state.audit;
+                        *mgr.policy_memory.lock().unwrap() =
+                            LearningPolicy::parse(&state.policy_memory);
+                        *mgr.policy_skill.lock().unwrap() =
+                            LearningPolicy::parse(&state.policy_skill);
+                        *mgr.policy_instruction.lock().unwrap() =
+                            LearningPolicy::parse(&state.policy_instruction);
+                        *mgr.policy_identity.lock().unwrap() =
+                            LearningPolicy::parse(&state.policy_identity);
+                    }
+                    Err(e) => {
+                        *mgr.load_error.lock().unwrap() = Some(format!(
+                            "learning state at {} is corrupt; starting empty: {e}",
+                            p.display()
+                        ));
+                        eprintln!(
+                            "vikram: {}",
+                            mgr.load_error.lock().unwrap().as_deref().unwrap_or("")
+                        );
+                    }
+                },
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    *mgr.load_error.lock().unwrap() =
+                        Some(format!("learning state at {} unreadable: {e}", p.display()));
+                    eprintln!(
+                        "vikram: {}",
+                        mgr.load_error.lock().unwrap().as_deref().unwrap_or("")
+                    );
                 }
+                Err(_) => {}
             }
         }
         mgr
     }
 
     pub fn save(&self) {
+        if let Err(e) = self.try_save() {
+            eprintln!("vikram: learning state save failed: {e}");
+        }
+    }
+
+    pub fn try_save(&self) -> Result<(), String> {
         let path = self.path.lock().unwrap().clone();
         let Some(path) = path else {
-            return;
+            return Ok(());
         };
         let state = LearningState {
             proposals: self.proposals.lock().unwrap().clone(),
             audit: self.audit.lock().unwrap().clone(),
             policy_memory: self.policy_memory.lock().unwrap().as_str().to_owned(),
             policy_skill: self.policy_skill.lock().unwrap().as_str().to_owned(),
+            policy_instruction: self.policy_instruction.lock().unwrap().as_str().to_owned(),
+            policy_identity: self.policy_identity.lock().unwrap().as_str().to_owned(),
         };
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        if let Ok(json) = serde_json::to_string_pretty(&state) {
-            let _ = std::fs::write(&path, json);
-        }
+        let json = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
+        std::fs::write(&path, json).map_err(|e| e.to_string())
+    }
+
+    pub fn load_error(&self) -> Option<String> {
+        self.load_error.lock().unwrap().clone()
+    }
+
+    pub fn policy_instruction(&self) -> LearningPolicy {
+        *self.policy_instruction.lock().unwrap()
+    }
+    pub fn policy_identity(&self) -> LearningPolicy {
+        *self.policy_identity.lock().unwrap()
     }
 
     pub fn path(&self) -> Option<std::path::PathBuf> {
@@ -322,11 +395,11 @@ pub fn proposal_from_evolution(
     proposal: &vikram_evolution::LearningProposal,
     session: &SessionId,
 ) -> Option<LearningProposal> {
-    let (kind, action) = match proposal.kind.as_str() {
-        "add_memory" => ("memory", "add"),
-        "update_memory" => ("memory", "replace"),
-        "create_skill" => ("skill", "create"),
-        "improve_skill" => ("skill", "patch"),
+    let (kind, action) = match proposal.kind {
+        vikram_evolution::ProposalKind::AddMemory => ("memory", "add"),
+        vikram_evolution::ProposalKind::UpdateMemory => ("memory", "replace"),
+        vikram_evolution::ProposalKind::CreateSkill => ("skill", "create"),
+        vikram_evolution::ProposalKind::ImproveSkill => ("skill", "patch"),
         _ => return None,
     };
     let (target, content) = if kind == "memory" {
@@ -420,7 +493,7 @@ impl LearningManager {
 /// tool-bearing turn at the configured interval, and never when the operator has switched both
 /// learning policies off or left the interval at zero.
 pub fn review_is_due(turns: u64, had_tools: bool, every: u64, policies_enabled: bool) -> bool {
-    policies_enabled && every > 0 && had_tools && turns % every == 0
+    policies_enabled && every > 0 && had_tools && turns.is_multiple_of(every)
 }
 
 /// The text a review is asked about: the transcript, bounded, oldest first dropped.
@@ -472,12 +545,12 @@ pub(crate) fn on_turn_end(
         return;
     }
     // Both policies off is the operator's switch for the whole feature, not just its output.
-    let policies_enabled = !(inner.learning.policy_memory() == LearningPolicy::Disabled
-        && inner.learning.policy_skill() == LearningPolicy::Disabled);
+    let policies_enabled = !(inner.learning.surface.policy_memory() == LearningPolicy::Disabled
+        && inner.learning.surface.policy_skill() == LearningPolicy::Disabled);
     if !policies_enabled {
         return;
     }
-    let turns = inner.learning.note_turn(&session.id);
+    let turns = inner.learning.surface.note_turn(&session.id);
     if growth.had_tools() || !growth.errors.is_empty() || outcome == TurnState::Failed {
         record_and_reflect(inner, session, request, outcome, growth);
     }
@@ -518,22 +591,22 @@ fn record_and_reflect(
             .unwrap_or_else(|| "conversation".to_owned()),
         user_request: request.chars().take(2_000).collect(),
         outcome: if failed {
-            "failure".to_owned()
+            vikram_evolution::ExperienceOutcome::Failure
         } else if growth.errors.is_empty() {
-            "success".to_owned()
+            vikram_evolution::ExperienceOutcome::Success
         } else {
-            "partial".to_owned()
+            vikram_evolution::ExperienceOutcome::Partial
         },
         tools_used: growth.tools.clone(),
         errors: growth.errors.clone(),
         corrections: Vec::new(),
         feedback: None,
         reusable: !failed && growth.errors.is_empty() && growth.tools.len() >= 2,
-        sensitivity: "private".to_owned(),
+        sensitivity: vikram_evolution::Sensitivity::Private,
         metadata: serde_json::json!({"session": session.id.as_str()}),
     };
     let proposals = {
-        let engine = inner.evolution.lock().expect("evolution lock");
+        let engine = inner.learning.evolution.lock().expect("evolution lock");
         let Ok(recorded) = engine.experience.record(experience) else {
             return;
         };
@@ -558,8 +631,8 @@ pub(crate) fn apply_or_stage(
 ) {
     let scope_kind = proposal.kind.clone();
     let policy = match scope_kind.as_str() {
-        "memory" => inner.learning.policy_memory(),
-        "skill" => inner.learning.policy_skill(),
+        "memory" => inner.learning.surface.policy_memory(),
+        "skill" => inner.learning.surface.policy_skill(),
         other => {
             audit(
                 inner,
@@ -589,16 +662,20 @@ pub(crate) fn apply_or_stage(
             }
         };
         let contents: Vec<String> = existing.into_iter().map(|(_, value)| value).collect();
-        if inner.learning.dedup_memory(&contents, &proposal.content) {
+        if inner
+            .learning
+            .surface
+            .dedup_memory(&contents, &proposal.content)
+        {
             audit(inner, &proposal, "skipped", "already known");
             return;
         }
     }
     if policy != LearningPolicy::Auto {
         proposal.status = "pending".to_owned();
-        inner.learning.stage_proposal(proposal.clone());
+        inner.learning.surface.stage_proposal(proposal.clone());
         audit(inner, &proposal, "staged", &proposal.reason.clone());
-        inner.learning.save();
+        inner.learning.surface.save();
         return;
     }
     let outcome = if proposal.kind == "memory" {
@@ -625,7 +702,7 @@ pub(crate) fn apply_or_stage(
         if applied { "applied" } else { "failed" },
         &outcome,
     );
-    inner.learning.save();
+    inner.learning.surface.save();
 }
 
 fn scope_of(target: &str) -> &'static str {
@@ -646,7 +723,7 @@ fn audit(
     outcome: &str,
     detail: &str,
 ) {
-    inner.learning.audit(LearningAuditEntry {
+    inner.learning.surface.audit(LearningAuditEntry {
         ts_ms: now_ms(),
         session: proposal.session.clone(),
         kind: proposal.kind.clone(),
@@ -662,20 +739,20 @@ mod tests {
     use super::*;
 
     fn evolution_proposal(
-        kind: &str,
+        kind: vikram_evolution::ProposalKind,
         details: serde_json::Value,
     ) -> vikram_evolution::LearningProposal {
         vikram_evolution::LearningProposal {
             id: "prop-1".to_owned(),
             experience_id: Some("exp-1".to_owned()),
             agent_id: "agent".to_owned(),
-            kind: kind.to_owned(),
+            kind,
             summary: "summary".to_owned(),
             details,
             confidence: 0.7,
             requires_approval: true,
             created_ms: 1,
-            status: "pending".to_owned(),
+            status: vikram_evolution::ProposalStatus::Pending,
         }
     }
 
@@ -754,7 +831,7 @@ mod tests {
     fn a_correction_proposal_lands_on_the_memory_policy() {
         let staged = proposal_from_evolution(
             &evolution_proposal(
-                "add_memory",
+                vikram_evolution::ProposalKind::AddMemory,
                 serde_json::json!({"layer": "user", "corrections": ["use pnpm, not npm"]}),
             ),
             &session(),
@@ -769,7 +846,7 @@ mod tests {
     fn a_skill_proposal_lands_on_the_skill_policy() {
         let staged = proposal_from_evolution(
             &evolution_proposal(
-                "create_skill",
+                vikram_evolution::ProposalKind::CreateSkill,
                 serde_json::json!({"tools": ["fs.read", "shell.run"], "category": "audit"}),
             ),
             &session(),
@@ -784,7 +861,10 @@ mod tests {
     fn an_issue_proposal_has_no_home_on_the_approval_surface() {
         assert!(
             proposal_from_evolution(
-                &evolution_proposal("record_issue", serde_json::json!({"errors": ["boom"]})),
+                &evolution_proposal(
+                    vikram_evolution::ProposalKind::RecordIssue,
+                    serde_json::json!({"errors": ["boom"]})
+                ),
                 &session(),
             )
             .is_none(),

@@ -144,13 +144,13 @@ impl Tool for WriteFile {
         let raw = arg_str(args, "path")?;
         let content = arg_str(args, "content")?;
         let (path, _) = canonical_resource(&ctx.workspace_root, &raw)?;
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return Ok(ToolOutput {
-                    content: format!("cannot create `{}`: {e}", parent.display()),
-                    ok: false,
-                });
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            return Ok(ToolOutput {
+                content: format!("cannot create `{}`: {e}", parent.display()),
+                ok: false,
+            });
         }
         let existed = path.is_file();
         let before = if existed {
@@ -238,13 +238,13 @@ impl Tool for EditFile {
             });
         }
         let new_content = content.replace(&old_string, &new_string);
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return Ok(ToolOutput {
-                    content: format!("cannot create `{}`: {e}", parent.display()),
-                    ok: false,
-                });
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            return Ok(ToolOutput {
+                content: format!("cannot create `{}`: {e}", parent.display()),
+                ok: false,
+            });
         }
         match std::fs::write(&path, &new_content) {
             Ok(()) => {

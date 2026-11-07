@@ -28,8 +28,9 @@
 //! combination. [`status`] says all of this on a Wayland session instead of pretending.
 
 use serde_json::{Value, json};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use vikram_contracts::{ActionKind, PermissionRequest, SideEffect, Trust, VikramError};
 
@@ -44,6 +45,9 @@ pub const OCR_TIMEOUT_SECS: u64 = 30;
 
 /// Longer than this and `xdotool type` is measured in minutes rather than seconds.
 const MAX_TYPED_CHARS: usize = 10_000;
+/// Upper bound on what one helper may write to stdout/stderr. Larger output is truncated rather
+/// than allowed to grow the runtime's memory.
+const MAX_HELPER_OUTPUT: u64 = 8 * 1024 * 1024;
 
 /// The helper programs this module can drive. Probed in this order for the status report.
 ///
@@ -228,9 +232,9 @@ fn run_raw(
     })?;
 
     let deadline = Instant::now() + timeout;
-    loop {
+    let status: ExitStatus = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
@@ -244,11 +248,49 @@ fn run_raw(
             }
             Err(e) => return Err(format!("`{program}` failed while waiting: {e}")),
         }
-    }
+    };
 
-    child
-        .wait_with_output()
-        .map_err(|e| format!("`{program}` failed while waiting: {e}"))
+    // Drain the pipes on their own threads with a deadline instead of `wait_with_output`: a helper
+    // that leaves a grandchild holding stdout open keeps that call blocked forever even though the
+    // child we spawned has already exited.
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
+    // Detached readers: the scope must not join them, or a grandchild holding the pipe would block
+    // this call exactly like `wait_with_output` did. They exit when the pipe finally closes.
+    match child.stdout.take() {
+        Some(pipe) => {
+            std::thread::spawn(move || {
+                let mut buffer = Vec::new();
+                let _ = pipe.take(MAX_HELPER_OUTPUT).read_to_end(&mut buffer);
+                let _ = out_tx.send(buffer);
+            });
+        }
+        None => {
+            let _ = out_tx.send(Vec::new());
+        }
+    }
+    match child.stderr.take() {
+        Some(pipe) => {
+            std::thread::spawn(move || {
+                let mut buffer = Vec::new();
+                let _ = pipe.take(MAX_HELPER_OUTPUT).read_to_end(&mut buffer);
+                let _ = err_tx.send(buffer);
+            });
+        }
+        None => {
+            let _ = err_tx.send(Vec::new());
+        }
+    }
+    let drain_deadline = Instant::now() + Duration::from_secs(1);
+    let collect = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
+        rx.recv_timeout(drain_deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_default()
+    };
+    Ok(Output {
+        status,
+        stdout: collect(out_rx),
+        stderr: collect(err_rx),
+    })
 }
 
 /// Run one helper and collect its output, killing it after [`TIMEOUT_SECS`].
@@ -1042,6 +1084,8 @@ mod tests {
 
     fn ctx() -> ToolContext {
         ToolContext {
+            agent: None,
+            cancel: None,
             workspace_root: PathBuf::from("."),
             sandbox: crate::sandbox::Sandbox::disabled("test context"),
             spill: crate::spill::Spill::disabled(),

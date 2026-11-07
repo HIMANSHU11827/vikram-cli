@@ -345,15 +345,15 @@ impl<'a> Block<'a> {
             }
             let after = rest.trim_start();
             let item_indent = indent + 1 + (rest.len() - after.len());
-            if let Some((raw_key, value_rest)) = split_key(after) {
-                if !raw_key.trim().is_empty() {
-                    items.push(Yaml::Map(self.map_item(
-                        raw_key,
-                        value_rest,
-                        item_indent,
-                    )?));
-                    continue;
-                }
+            if let Some((raw_key, value_rest)) = split_key(after)
+                && !raw_key.trim().is_empty()
+            {
+                items.push(Yaml::Map(self.map_item(
+                    raw_key,
+                    value_rest,
+                    item_indent,
+                )?));
+                continue;
             }
             let trimmed = strip_comment(after).trim_end();
             if trimmed.is_empty() {
@@ -545,12 +545,11 @@ fn infer_plain(s: &str) -> Yaml {
         "null" => return Yaml::Null,
         _ => {}
     }
-    if let Ok(i) = t.parse::<i64>() {
-        if t.chars()
+    if let Ok(i) = t.parse::<i64>()
+        && t.chars()
             .all(|c| c.is_ascii_digit() || c == '+' || c == '-')
-        {
-            return Yaml::Int(i);
-        }
+    {
+        return Yaml::Int(i);
     }
     Yaml::Str(t.to_string())
 }

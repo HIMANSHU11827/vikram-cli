@@ -23,6 +23,8 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("corrupt data: {0}")]
+    Parse(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -46,6 +48,15 @@ pub struct SessionRow {
     /// `pending` until a title has been derived, `ready` once it has, `failed` when derivation was
     /// tried and refused — the last two stop the runtime from re-asking on every message.
     pub title_status: String,
+    /// The session this one was forked from, when it is a fork. `None` for an original session.
+    /// This is the parent link `fork_session` writes; `duplicate_session` keeps the source's
+    /// own parent so a copy of a fork stays in the same lineage.
+    #[serde(default)]
+    pub parent_session: Option<SessionId>,
+    /// `fork` when this session was created by `fork_session`, empty otherwise. Kept separate
+    /// from `parent_session` so the lineage column stays purely about delegation.
+    #[serde(default)]
+    pub forked_from: Option<SessionId>,
 }
 
 /// `title_source` values.
@@ -61,7 +72,67 @@ pub const TITLE_FAILED: &str = "failed";
 /// The projection every session read uses. Appending a column here keeps the six `SELECT` sites
 /// and [`map_session_row`] in step; the positional reader below depends on this exact order.
 const SESSION_COLS: &str = "id, title, cwd, model, agent_id, created_ms, updated_ms, status, \
-                            project_id, title_source, title_status";
+                            project_id, title_source, title_status, parent_session, forked_from";
+
+/// How a session's conversation is exported. `Json` is the machine-readable transcript;
+/// `Markdown` is the human-readable one. Both are pure views over the journal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportFormat {
+    #[default]
+    Json,
+    Markdown,
+}
+
+impl ExportFormat {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "json" => Some(Self::Json),
+            "markdown" | "md" => Some(Self::Markdown),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Markdown => "markdown",
+        }
+    }
+}
+
+/// What a crash left behind: a session whose journal ends in the middle of something.
+/// `pending_calls` are tool calls the journal recorded but never answered — the call was
+/// issued and its result never arrived, which is exactly what a crash between the two
+/// journal appends looks like.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterruptedSession {
+    /// The session that did not finish cleanly.
+    pub id: SessionId,
+    /// Tool calls journalled without a matching result, in journal order.
+    pub pending_calls: Vec<vikram_contracts::ToolCallId>,
+    /// `tool_preview` belongs to the first pending call; `None` when there is none.
+    pub tool_preview: Option<String>,
+    /// The sequence number of the last record the journal holds for this session.
+    pub last_seq: u64,
+    /// Time of the last record, in milliseconds since the epoch.
+    pub last_ts_ms: u64,
+}
+
+/// The shape of one exported session in JSON: the metadata row plus the journal it replays to.
+/// `PartialEq` only — `JournalRecord` carries a JSON payload, so this type has no `Eq`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionExport {
+    /// The stored session row.
+    pub session: SessionRow,
+    /// The journal in sequence order; replaying it rebuilds the transcript.
+    pub journal: Vec<JournalRecord>,
+    /// The usage ledger for the session, or empty when nothing has been accounted yet.
+    #[serde(default)]
+    pub usage: Vec<UsageRow>,
+    /// Wall-clock time the export was produced.
+    pub exported_ms: u64,
+}
 
 /// A project directory Vikram manages. `path` is the real location; internal projects live under
 /// `projects/`, external projects keep their original path and are never copied.
@@ -168,6 +239,7 @@ pub struct TeamRow {
     pub name: String,
     pub session_id: Option<SessionId>,
     pub created_ms: u64,
+    pub updated_ms: u64,
 }
 
 /// A human. Accounts never share private data; the id is the boundary every other table hangs off.
@@ -217,12 +289,12 @@ impl EntityKind {
         }
     }
 
-    pub fn parse(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Result<Self> {
         match value {
-            "main_agent" | "main-agent" | "mainagent" => Some(Self::MainAgent),
-            "agent" => Some(Self::Agent),
-            "bot" => Some(Self::Bot),
-            _ => None,
+            "main_agent" | "main-agent" | "mainagent" => Ok(Self::MainAgent),
+            "agent" => Ok(Self::Agent),
+            "bot" => Ok(Self::Bot),
+            _ => Err(StoreError::Parse(format!("unknown entity kind `{value}`"))),
         }
     }
 }
@@ -461,6 +533,8 @@ impl Store {
             project_id: None,
             title_source: title_source.to_owned(),
             title_status: title_status.to_owned(),
+            parent_session: None,
+            forked_from: None,
         };
         self.lock().execute(
             "INSERT INTO sessions (id, title, cwd, model, agent_id, created_ms, updated_ms, status, project_id, title_source, title_status)
@@ -630,16 +704,16 @@ impl Store {
         let mut out = Vec::new();
         let sql = "SELECT session, snippet(session_fts, 1, '[', ']', '…', 12) \
                    FROM session_fts WHERE session_fts MATCH ?1 ORDER BY rank LIMIT ?2";
-        if let Ok(mut stmt) = conn.prepare(sql) {
-            if let Ok(rows) = stmt.query_map(params![query, limit as i64], |r| {
+        if let Ok(mut stmt) = conn.prepare(sql)
+            && let Ok(rows) = stmt.query_map(params![query, limit as i64], |r| {
                 Ok((
                     SessionId::new(r.get::<_, String>(0)?),
                     r.get::<_, String>(1)?,
                 ))
-            }) {
-                for r in rows.flatten() {
-                    out.push(r);
-                }
+            })
+        {
+            for r in rows.flatten() {
+                out.push(r);
             }
         }
         Ok(out)
@@ -666,8 +740,8 @@ impl Store {
                    ORDER BY rank LIMIT ?5";
         let agent = agent_filter.map(|a| a.as_str().to_owned());
         let project = project_filter.map(|p| p.as_str().to_owned());
-        if let Ok(mut stmt) = conn.prepare(sql) {
-            if let Ok(rows) = stmt.query_map(
+        if let Ok(mut stmt) = conn.prepare(sql)
+            && let Ok(rows) = stmt.query_map(
                 params![query, agent, project, since_ms as i64, limit as i64],
                 |r| {
                     Ok((
@@ -675,10 +749,10 @@ impl Store {
                         r.get::<_, String>(1)?,
                     ))
                 },
-            ) {
-                for r in rows.flatten() {
-                    out.push(r);
-                }
+            )
+        {
+            for r in rows.flatten() {
+                out.push(r);
             }
         }
         Ok(out)
@@ -692,10 +766,9 @@ impl Store {
         );
         let sessions: Vec<SessionRow> = {
             let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt
-                .query_map([], map_session_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            rows
+
+            stmt.query_map([], map_session_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut out = Vec::with_capacity(sessions.len());
         for s in sessions {
@@ -736,7 +809,9 @@ impl Store {
         Ok(())
     }
 
-    /// Duplicate a session's metadata (not its files). The copy starts with the same title suffix.
+    /// Duplicate a session's metadata (not its files or its journal). The copy starts with the
+    /// same title suffix. A copy of a fork shares the source's parent, so it stays in the same
+    /// lineage rather than becoming a fork of its source.
     pub fn duplicate_session(&self, id: &SessionId, now_ms: u64) -> Result<Option<SessionRow>> {
         let src = match self.get_session(id)? {
             Some(s) => s,
@@ -756,10 +831,12 @@ impl Store {
             // so `manual` provenance carries over with it and automatic naming stays away.
             title_source: src.title_source.clone(),
             title_status: TITLE_READY.to_owned(),
+            parent_session: src.parent_session.clone(),
+            forked_from: src.forked_from.clone(),
         };
         self.lock().execute(
-            "INSERT INTO sessions (id, title, cwd, model, agent_id, created_ms, updated_ms, status, project_id, title_source, title_status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10)",
+            "INSERT INTO sessions (id, title, cwd, model, agent_id, created_ms, updated_ms, status, project_id, title_source, title_status, parent_session, forked_from)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10, ?11, ?12)",
             params![
                 copy.id.as_str(),
                 copy.title,
@@ -771,9 +848,232 @@ impl Store {
                 copy.project_id.as_ref().map(|p| p.as_str().to_owned()),
                 copy.title_source,
                 copy.title_status,
+                copy.parent_session.as_ref().map(|p| p.as_str().to_owned()),
+                copy.forked_from.as_ref().map(|p| p.as_str().to_owned()),
             ],
         )?;
         Ok(Some(copy))
+    }
+
+    /// Fork a session: a new session that continues *from* the source's conversation. Unlike
+    /// [`Self::duplicate_session`], the fork carries the journal with it, and the fork points
+    /// back at its source via `forked_from` / `parent_session` so the lineage is queryable.
+    /// One transaction: the new row and every copied journal row commit together, or neither.
+    pub fn fork_session(&self, id: &SessionId, now_ms: u64) -> Result<Option<SessionRow>> {
+        let src = match self.get_session(id)? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let fork = SessionRow {
+            id: SessionId::generate(),
+            title: format!("{} (fork)", src.title),
+            cwd: src.cwd.clone(),
+            model: src.model.clone(),
+            agent: src.agent.clone(),
+            created_ms: now_ms,
+            updated_ms: now_ms,
+            status: "active".to_owned(),
+            project_id: src.project_id.clone(),
+            title_source: src.title_source.clone(),
+            title_status: TITLE_READY.to_owned(),
+            parent_session: Some(id.clone()),
+            forked_from: Some(id.clone()),
+        };
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO sessions (id, title, cwd, model, agent_id, created_ms, updated_ms, status, project_id, title_source, title_status, parent_session, forked_from)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10, ?11, ?12)",
+            params![
+                fork.id.as_str(),
+                fork.title,
+                fork.cwd.to_string_lossy(),
+                fork.model,
+                fork.agent.as_ref().map(|a| a.as_str().to_owned()),
+                fork.created_ms as i64,
+                fork.updated_ms as i64,
+                fork.project_id.as_ref().map(|p| p.as_str().to_owned()),
+                fork.title_source,
+                fork.title_status,
+                fork.parent_session.as_ref().map(|p| p.as_str().to_owned()),
+                fork.forked_from.as_ref().map(|p| p.as_str().to_owned()),
+            ],
+        )?;
+        // Copy the journal verbatim: same seq, same effect ids, same payloads. Effect ids
+        // stay unique per session because the idempotency guard keys on (session, effect).
+        tx.execute(
+            "INSERT INTO journal (session, seq, ts_ms, kind, effect, payload)
+             SELECT ?2, seq, ts_ms, kind, effect, payload FROM journal WHERE session = ?1 ORDER BY seq ASC",
+            params![id.as_str(), fork.id.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(Some(fork))
+    }
+
+    /// Sessions forked *from* `parent`, oldest first.
+    pub fn list_session_forks(&self, parent: &SessionId) -> Result<Vec<SessionRow>> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {SESSION_COLS} FROM sessions WHERE forked_from = ?1 ORDER BY created_ms ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![parent.as_str()], map_session_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Build the serializable export of a session: its metadata, its journal and its usage.
+    /// `None` when the session does not exist.
+    pub fn export_session(&self, id: &SessionId, now_ms: u64) -> Result<Option<SessionExport>> {
+        let session = match self.get_session(id)? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        Ok(Some(SessionExport {
+            session,
+            journal: self.replay_messages(id)?,
+            usage: self.list_usage(id)?,
+            exported_ms: now_ms,
+        }))
+    }
+
+    /// Render a session as JSON or Markdown. The text is the export; callers write it to a
+    /// file or stdout. `None` when the session does not exist.
+    pub fn export_session_text(
+        &self,
+        id: &SessionId,
+        format: ExportFormat,
+        now_ms: u64,
+    ) -> Result<Option<String>> {
+        let export = match self.export_session(id, now_ms)? {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        Ok(Some(match format {
+            ExportFormat::Json => serde_json::to_string_pretty(&export)?,
+            ExportFormat::Markdown => render_session_markdown(&export),
+        }))
+    }
+
+    /// Every session whose journal ends mid-work: tool calls recorded but never answered.
+    /// Sessions whose last operation was a tool result, or whose journal is empty, are not
+    /// interrupted and are not returned.
+    pub fn list_interrupted_sessions(&self) -> Result<Vec<InterruptedSession>> {
+        let ids: Vec<SessionId> = {
+            let conn = self.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id FROM sessions WHERE status = 'active' ORDER BY created_ms ASC",
+            )?;
+            let rows = stmt.query_map([], |r| Ok(SessionId::new(r.get::<_, String>(0)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut out = Vec::new();
+        for id in ids {
+            let records = self.replay_messages(&id)?;
+            if records.is_empty() {
+                continue;
+            }
+            let mut pending: Vec<(vikram_contracts::ToolCallId, String)> = Vec::new();
+            let mut answered = std::collections::HashSet::new();
+            for record in &records {
+                match record.kind {
+                    RecordKind::ToolCall => {
+                        if let Some(call) = record.payload.get("call").and_then(|v| v.as_str()) {
+                            let preview = record
+                                .payload
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("tool call")
+                                .to_owned();
+                            pending.push((vikram_contracts::ToolCallId::new(call), preview));
+                        }
+                    }
+                    RecordKind::ToolResult => {
+                        if let Some(call) = record
+                            .payload
+                            .get("call")
+                            .and_then(|v| v.as_str())
+                            .map(vikram_contracts::ToolCallId::new)
+                        {
+                            answered.insert(call);
+                        }
+                        if let Some(message) = record.payload.get("message")
+                            && let Ok(msg) =
+                                serde_json::from_value::<vikram_contracts::Message>(message.clone())
+                        {
+                            for block in &msg.blocks {
+                                if let vikram_contracts::Block::ToolResult { call, .. } = block {
+                                    answered.insert(call.clone());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            pending.retain(|(call, _)| !answered.contains(call));
+            if pending.is_empty() {
+                continue;
+            }
+            let last = records.last().expect("non-empty journal");
+            out.push(InterruptedSession {
+                pending_calls: pending.iter().map(|(call, _)| call.clone()).collect(),
+                tool_preview: pending.first().map(|(_, preview)| preview.clone()),
+                last_seq: last.seq,
+                last_ts_ms: last.ts_ms,
+                id,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Recover an interrupted session: append a synthetic tool result for every pending call,
+    /// so the transcript is complete again, and journal a recovery marker. The journal gains
+    /// rows, never loses any, which is what makes this safe to run more than once — a session
+    /// with nothing pending is a no-op. Returns the calls that were answered.
+    pub fn recover_interrupted_session(
+        &self,
+        id: &SessionId,
+        now_ms: u64,
+    ) -> Result<Vec<vikram_contracts::ToolCallId>> {
+        let interrupted = self
+            .list_interrupted_sessions()?
+            .into_iter()
+            .find(|s| s.id == *id);
+        let Some(interrupted) = interrupted else {
+            return Ok(Vec::new());
+        };
+        for call in &interrupted.pending_calls {
+            let content = "the run ended before this call finished";
+            // JournalSink reports a storage failure as VikramError; surface it through the
+            // store's own error by converting through a JSON error round-trip.
+            let _ = self.journal().append(&NewRecord::new(
+                id.clone(),
+                RecordKind::ToolResult,
+                serde_json::json!({
+                    "call": call.as_str(),
+                    "ok": false,
+                    "content": content,
+                    "message": vikram_contracts::Message::tool_result(
+                        call.clone(),
+                        content,
+                        false
+                    ),
+                }),
+            ));
+        }
+        let _ = self.journal().append(&NewRecord::new(
+            id.clone(),
+            RecordKind::Status,
+            serde_json::json!({
+                "recovery": "interrupted_session",
+                "answered": interrupted.pending_calls.len(),
+                "tool": interrupted.tool_preview,
+            }),
+        ));
+        let _ = self.touch_session(id, now_ms);
+        Ok(interrupted.pending_calls)
     }
 
     /// The operator named this session. A manual title is the one thing automatic naming may never
@@ -868,6 +1168,10 @@ impl Store {
         )?;
         tx.execute(
             "UPDATE hive_sessions SET session_id = NULL WHERE session_id = ?1",
+            params![id.as_str()],
+        )?;
+        tx.execute(
+            "UPDATE tickets SET session_id = NULL WHERE session_id = ?1",
             params![id.as_str()],
         )?;
         tx.execute(
@@ -985,8 +1289,24 @@ impl Store {
     }
 
     pub fn delete_project(&self, id: &ProjectId) -> Result<()> {
-        self.lock()
-            .execute("DELETE FROM projects WHERE id = ?1", params![id.as_str()])?;
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        // Detach dependents rather than leaving dangling references: sessions keep
+        // existing, only their project link is cleared.
+        tx.execute(
+            "UPDATE sessions SET project_id = NULL WHERE project_id = ?1",
+            params![id.as_str()],
+        )?;
+        tx.execute(
+            "UPDATE session_workspaces SET project_id = NULL WHERE project_id = ?1",
+            params![id.as_str()],
+        )?;
+        tx.execute(
+            "UPDATE artifacts SET project_id = NULL WHERE project_id = ?1",
+            params![id.as_str()],
+        )?;
+        tx.execute("DELETE FROM projects WHERE id = ?1", params![id.as_str()])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1307,6 +1627,7 @@ impl Store {
             name: name.to_owned(),
             session_id: None,
             created_ms: now_ms,
+            updated_ms: now_ms,
         };
         self.lock().execute(
             "INSERT INTO teams (id, name, session_id, created_ms, updated_ms)
@@ -1325,7 +1646,7 @@ impl Store {
     pub fn list_teams(&self) -> Result<Vec<TeamRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, name, session_id, created_ms FROM teams ORDER BY created_ms ASC",
+            "SELECT id, name, session_id, created_ms, updated_ms FROM teams ORDER BY created_ms ASC",
         )?;
         let rows = stmt
             .query_map([], |row| {
@@ -1334,6 +1655,7 @@ impl Store {
                     name: row.get(1)?,
                     session_id: row.get::<_, Option<String>>(2)?.map(SessionId::new),
                     created_ms: row.get::<_, i64>(3)? as u64,
+                    updated_ms: row.get::<_, i64>(4)? as u64,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1507,6 +1829,25 @@ impl Store {
             };
             for sid in &prof_session_ids {
                 tx.execute("DELETE FROM journal WHERE session = ?1", params![sid])?;
+                tx.execute(
+                    "UPDATE teams SET session_id = NULL WHERE session_id = ?1",
+                    params![sid],
+                )?;
+                tx.execute(
+                    "UPDATE hive_sessions SET session_id = NULL WHERE session_id = ?1",
+                    params![sid],
+                )?;
+                tx.execute(
+                    "UPDATE tickets SET session_id = NULL WHERE session_id = ?1",
+                    params![sid],
+                )?;
+                tx.execute(
+                    "DELETE FROM session_workspaces WHERE session = ?1",
+                    params![sid],
+                )?;
+                tx.execute("DELETE FROM artifacts WHERE session = ?1", params![sid])?;
+                tx.execute("DELETE FROM file_changes WHERE session = ?1", params![sid])?;
+                tx.execute("DELETE FROM usage WHERE session = ?1", params![sid])?;
                 tx.execute("DELETE FROM sessions WHERE id = ?1", params![sid])?;
             }
             // Cascade hive sessions belonging to this profile.
@@ -1554,8 +1895,32 @@ impl Store {
         };
         for sid in &session_ids {
             tx.execute("DELETE FROM journal WHERE session = ?1", params![sid])?;
+            tx.execute(
+                "UPDATE teams SET session_id = NULL WHERE session_id = ?1",
+                params![sid],
+            )?;
+            tx.execute(
+                "UPDATE hive_sessions SET session_id = NULL WHERE session_id = ?1",
+                params![sid],
+            )?;
+            tx.execute(
+                "UPDATE tickets SET session_id = NULL WHERE session_id = ?1",
+                params![sid],
+            )?;
+            tx.execute(
+                "DELETE FROM session_workspaces WHERE session = ?1",
+                params![sid],
+            )?;
+            tx.execute("DELETE FROM artifacts WHERE session = ?1", params![sid])?;
+            tx.execute("DELETE FROM file_changes WHERE session = ?1", params![sid])?;
+            tx.execute("DELETE FROM usage WHERE session = ?1", params![sid])?;
             tx.execute("DELETE FROM sessions WHERE id = ?1", params![sid])?;
         }
+        // Entities owned by this user may own a profile link; detach before profile delete.
+        tx.execute(
+            "UPDATE entities SET profile_id = NULL WHERE owner_user = ?1",
+            params![id.as_str()],
+        )?;
         tx.execute("DELETE FROM users WHERE id = ?1", params![id.as_str()])?;
         // Fix active_identity if it pointed at this user
         tx.execute(
@@ -1660,8 +2025,35 @@ impl Store {
         };
         for sid in &session_ids {
             tx.execute("DELETE FROM journal WHERE session = ?1", params![sid])?;
+            tx.execute(
+                "UPDATE teams SET session_id = NULL WHERE session_id = ?1",
+                params![sid],
+            )?;
+            tx.execute(
+                "UPDATE hive_sessions SET session_id = NULL WHERE session_id = ?1",
+                params![sid],
+            )?;
+            tx.execute(
+                "UPDATE tickets SET session_id = NULL WHERE session_id = ?1",
+                params![sid],
+            )?;
+            tx.execute(
+                "DELETE FROM session_workspaces WHERE session = ?1",
+                params![sid],
+            )?;
+            tx.execute("DELETE FROM artifacts WHERE session = ?1", params![sid])?;
+            tx.execute("DELETE FROM file_changes WHERE session = ?1", params![sid])?;
+            tx.execute("DELETE FROM usage WHERE session = ?1", params![sid])?;
             tx.execute("DELETE FROM sessions WHERE id = ?1", params![sid])?;
         }
+        tx.execute(
+            "UPDATE entities SET profile_id = NULL WHERE profile_id = ?1",
+            params![id.as_str()],
+        )?;
+        tx.execute(
+            "UPDATE active_identity SET profile_id = NULL WHERE profile_id = ?1",
+            params![id.as_str()],
+        )?;
         // Hive sessions belonging to this profile
         let hive_ids: Vec<String> = {
             let mut stmt = tx.prepare("SELECT id FROM hive_sessions WHERE profile_id = ?1")?;
@@ -1811,8 +2203,26 @@ impl Store {
     }
 
     pub fn delete_entity(&self, id: &EntityId) -> Result<()> {
-        self.lock()
-            .execute("DELETE FROM entities WHERE id = ?1", params![id.as_str()])?;
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM hive_participants WHERE entity = ?1",
+            params![id.as_str()],
+        )?;
+        tx.execute(
+            "UPDATE ticket_participants SET entity_id = NULL WHERE entity_id = ?1",
+            params![id.as_str()],
+        )?;
+        tx.execute(
+            "UPDATE assignments SET entity_id = NULL WHERE entity_id = ?1",
+            params![id.as_str()],
+        )?;
+        tx.execute(
+            "UPDATE active_identity SET main_agent = NULL WHERE main_agent = ?1",
+            params![id.as_str()],
+        )?;
+        tx.execute("DELETE FROM entities WHERE id = ?1", params![id.as_str()])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2000,7 +2410,13 @@ impl Store {
                 Ok(HiveParticipantRow {
                     hive: HiveId::new(row.get::<_, String>(0)?),
                     entity: EntityId::new(row.get::<_, String>(1)?),
-                    kind: EntityKind::parse(&row.get::<_, String>(2)?).unwrap_or(EntityKind::Agent),
+                    kind: EntityKind::parse(&row.get::<_, String>(2)?).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
                     role: row.get(3)?,
                     joined_ms: row.get::<_, i64>(4)? as u64,
                 })
@@ -2547,13 +2963,22 @@ impl Store {
         let rows = stmt
             .query_map(params![ticket.as_str()], |r| {
                 let payload_str: String = r.get(5)?;
+                let event_id: String = r.get(0)?;
                 Ok(TicketEventRow {
                     id: TicketEventId::new(r.get::<_, String>(0)?),
                     ticket: TicketId::new(r.get::<_, String>(1)?),
                     ts_ms: r.get::<_, i64>(2)? as u64,
                     kind: r.get(3)?,
                     actor_key: r.get(4)?,
-                    payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
+                    payload: serde_json::from_str(&payload_str).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Text,
+                            Box::new(StoreError::Parse(format!(
+                                "ticket event {event_id} payload: {e}",
+                            ))),
+                        )
+                    })?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2574,13 +2999,23 @@ impl Store {
             .query_map(params![session.as_str()], |row| {
                 let kind: String = row.get(3)?;
                 let payload: String = row.get(5)?;
+                let sess_str: String = row.get(1)?;
+                let seq_val: i64 = row.get(0)?;
                 Ok(JournalRecord {
                     seq: row.get::<_, i64>(0)? as u64,
                     session: SessionId::new(row.get::<_, String>(1)?),
                     ts_ms: row.get::<_, i64>(2)? as u64,
                     kind: RecordKind::Message,
                     effect: row.get::<_, Option<String>>(4)?.map(EffectId::new),
-                    payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+                    payload: serde_json::from_str(&payload).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Text,
+                            Box::new(StoreError::Parse(format!(
+                                "journal payload for session {sess_str} seq {seq_val}: {e}",
+                            ))),
+                        )
+                    })?,
                 })
                 .map(|mut record| {
                     record.kind = kind_from_str(&kind);
@@ -2603,7 +3038,9 @@ fn parse_entity_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntityRow> {
     Ok(EntityRow {
         id: EntityId::new(row.get::<_, String>(0)?),
         owner_user: row.get::<_, Option<String>>(1)?.map(UserId::new),
-        kind: EntityKind::parse(&kind_str).unwrap_or(EntityKind::Agent),
+        kind: EntityKind::parse(&kind_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+        })?,
         name: row.get(3)?,
         slug: row.get(4)?,
         title: row.get(5)?,
@@ -3004,6 +3441,8 @@ fn migrate(conn: &Connection) -> Result<()> {
         "delegation_depth",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    // Fork provenance: which session this one was forked from.
+    ensure_column(conn, "sessions", "forked_from", "TEXT")?;
     ensure_column(conn, "entities", "title", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(
         conn,
@@ -3069,12 +3508,11 @@ fn is_derived_title(title: &str) -> bool {
 fn classify_legacy_titles(conn: &Connection) -> Result<()> {
     let rows: Vec<(String, String)> = {
         let mut stmt = conn.prepare("SELECT id, title FROM sessions")?;
-        let found = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        found
+
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?
     };
     for (id, title) in rows {
         let (source, status) = if is_placeholder_title(&title) {
@@ -3134,6 +3572,106 @@ impl SqliteJournal {
     }
 }
 
+fn render_session_markdown(export: &SessionExport) -> String {
+    let session = &export.session;
+    let mut out = String::new();
+    out.push_str(&format!("# {}\n\n", session.title));
+    out.push_str(&format!("- id: `{}`\n", session.id.as_str()));
+    out.push_str(&format!("- cwd: `{}`\n", session.cwd.display()));
+    if let Some(model) = &session.model {
+        out.push_str(&format!("- model: `{model}`\n"));
+    }
+    if let Some(parent) = &session.forked_from {
+        out.push_str(&format!("- forked from: `{}`\n", parent.as_str()));
+    }
+    out.push_str(&format!(
+        "- created: {} · updated: {}\n\n",
+        session.created_ms, session.updated_ms
+    ));
+    out.push_str("## Transcript\n\n");
+    for record in &export.journal {
+        match record.kind {
+            RecordKind::Message => {
+                if let Some(raw) = record.payload.get("message")
+                    && let Ok(message) =
+                        serde_json::from_value::<vikram_contracts::Message>(raw.clone())
+                {
+                    let label = match message.role {
+                        vikram_contracts::Role::User => "user",
+                        vikram_contracts::Role::Assistant => "assistant",
+                        vikram_contracts::Role::System => "system",
+                        vikram_contracts::Role::Tool => "tool",
+                    };
+                    out.push_str(&format!("### {label} (seq {})\n\n", record.seq));
+                    out.push_str(&message.text_body());
+                    out.push('\n');
+                    for block in &message.blocks {
+                        if let vikram_contracts::Block::ToolCall { call } = block {
+                            out.push_str(&format!(
+                                "\n- tool call `{}`: `{}`\n",
+                                call.id.as_str(),
+                                call.name
+                            ));
+                        }
+                    }
+                    out.push('\n');
+                }
+            }
+            RecordKind::ToolCall => {
+                if let (Some(call), Some(name)) = (
+                    record.payload.get("call").and_then(|v| v.as_str()),
+                    record.payload.get("name").and_then(|v| v.as_str()),
+                ) {
+                    out.push_str(&format!(
+                        "### tool call `{call}` — {name} (seq {})\n\n",
+                        record.seq
+                    ));
+                }
+            }
+            RecordKind::ToolResult => {
+                if let Some(content) = record.payload.get("content").and_then(|v| v.as_str()) {
+                    out.push_str(&format!(
+                        "### tool result (seq {})\n\n{content}\n\n",
+                        record.seq
+                    ));
+                } else if let Some(raw) = record.payload.get("message")
+                    && let Ok(message) =
+                        serde_json::from_value::<vikram_contracts::Message>(raw.clone())
+                {
+                    out.push_str(&format!(
+                        "### tool result (seq {})\n\n{}\n\n",
+                        record.seq,
+                        message.text_body()
+                    ));
+                }
+            }
+            RecordKind::Compaction => {
+                out.push_str(&format!("_compaction marker (seq {})_\n\n", record.seq));
+            }
+            RecordKind::Status => {
+                if record.payload.get("recovery").is_some() {
+                    out.push_str(&format!(
+                        "_recovered after an interruption (seq {})_\n\n",
+                        record.seq
+                    ));
+                }
+            }
+            RecordKind::Policy
+            | RecordKind::Approval
+            | RecordKind::Cancellation
+            | RecordKind::Activity => {}
+        }
+    }
+    if !export.usage.is_empty() {
+        let totals: u64 = export.usage.iter().map(|u| u.total_tokens).sum();
+        out.push_str(&format!(
+            "## Usage\n\n{} request(s), {totals} token(s)\n",
+            export.usage.len()
+        ));
+    }
+    out
+}
+
 fn map_session_row(row: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
         id: SessionId::new(row.get::<_, String>(0)?),
@@ -3147,6 +3685,8 @@ fn map_session_row(row: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
         project_id: row.get::<_, Option<String>>(8)?.map(ProjectId::new),
         title_source: row.get(9)?,
         title_status: row.get(10)?,
+        parent_session: row.get::<_, Option<String>>(11)?.map(SessionId::new),
+        forked_from: row.get::<_, Option<String>>(12)?.map(SessionId::new),
     })
 }
 
@@ -3239,13 +3779,23 @@ impl JournalSink for SqliteJournal {
                 |row| {
                     let kind: String = row.get(3)?;
                     let payload: String = row.get(5)?;
+                    let sess_str: String = row.get(1)?;
+                    let seq_val: i64 = row.get(0)?;
                     Ok(JournalRecord {
                         seq: row.get::<_, i64>(0)? as u64,
                         session: SessionId::new(row.get::<_, String>(1)?),
                         ts_ms: row.get::<_, i64>(2)? as u64,
                         kind: kind_from_str(&kind),
                         effect: row.get::<_, Option<String>>(4)?.map(EffectId::new),
-                        payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+                        payload: serde_json::from_str(&payload).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Text,
+                                Box::new(StoreError::Parse(format!(
+                                    "journal payload for session {sess_str} seq {seq_val}: {e}",
+                                ))),
+                            )
+                        })?,
                     })
                 },
             )

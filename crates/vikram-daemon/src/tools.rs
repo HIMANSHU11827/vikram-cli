@@ -264,13 +264,27 @@ impl Tool for Simple {
 mod tests {
     use super::*;
 
-    fn fixture() -> tempfile::TempDir {
+    /// `VIKRAM_HOME` is process-global, so the scheduling tests have to take turns: without this
+    /// lock one test's temporary home replaces another's between `schedule.add` and `schedule.list`,
+    /// and a job that was created looks missing.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn fixture() -> Fixture {
+        let guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
-        // The whole crate reads its home from the environment, so a test that schedules anything
-        // has to own it. `unsafe` because this is process-wide and the tests run in parallel —
-        // only the one test that writes touches it.
+        // `unsafe` because this is process-wide; the guard above is what makes it safe.
         unsafe { std::env::set_var("VIKRAM_HOME", dir.path()) };
-        dir
+        Fixture {
+            _dir: dir,
+            _guard: guard,
+        }
     }
 
     fn run(name: &str, args: Value) -> ToolOutput {

@@ -18,7 +18,7 @@ pub mod version;
 
 pub use error::{Result, ToolOutcome, VikramError};
 pub use journal::{Appended, InMemoryJournal, JournalRecord, JournalSink, NewRecord, RecordKind};
-pub use message::{Block, Message, Role, ToolCall};
+pub use message::{Block, ImageSource, Message, Role, ToolCall};
 pub use meter::{CancellationToken, TokenMeter};
 pub use policy::{
     ActionKind, Decision, PermissionMode, PermissionPolicy, PermissionRequest, Posture,

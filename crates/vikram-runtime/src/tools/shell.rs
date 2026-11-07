@@ -5,19 +5,37 @@ use vikram_contracts::{ActionKind, PermissionRequest, SideEffect, Trust, VikramE
 use crate::tools::*;
 /// Shared implementation of the RunShell execution pattern: spawn a shell command in
 /// `ctx.workspace_root`, capture stdout+stderr, enforce a timeout, truncate output.
+///
+/// Enforcement: the command is wrapped by `ctx.sandbox` (bubblewrap on Linux,
+/// Seatbelt on macOS, Job-Objects stub / pass-through elsewhere with a degradation
+/// notice). Policy still gates the call before this runs; the sandbox shrinks what
+/// the running process can do. When the sandbox is not enforced, a one-line notice
+/// is appended so the model never mistakes host execution for isolation.
 fn run_shell_command(command: &str, ctx: &ToolContext, timeout_ms: u64) -> ToolOutput {
     #[cfg(windows)]
     let mut cmd = {
-        let mut c = std::process::Command::new("cmd");
+        let comspec = std::env::var("COMSPEC")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "cmd".to_owned());
+        let mut c = std::process::Command::new(&comspec);
         c.args(["/C", command]);
         c
     };
     #[cfg(not(windows))]
     let mut cmd = {
-        let mut c = std::process::Command::new("sh");
+        let shell = std::env::var("SHELL")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "sh".to_owned());
+        let mut c = std::process::Command::new(&shell);
         c.args(["-c", command]);
         c
     };
+    ctx.sandbox.wrap_command(&mut cmd, &ctx.workspace_root);
+    let sandbox_note = ctx.sandbox.enforcement_notice();
 
     let mut child = match cmd
         .current_dir(&ctx.workspace_root)
@@ -83,9 +101,18 @@ fn run_shell_command(command: &str, ctx: &ToolContext, timeout_ms: u64) -> ToolO
     // The exit code is the one fact a command's row must not guess at, and the platform only hands
     // it over here, so it travels with the output instead of being inferred later.
     body.push_str(&format!("\n[exit {}]", output.status.code().unwrap_or(-1)));
+    append_sandbox_note(&mut body, &sandbox_note);
     ToolOutput {
         content: truncated(body),
         ok: output.status.success(),
+    }
+}
+
+/// Append the degradation notice when the OS sandbox is not enforcing. Kept tiny so
+/// it never drowns the command output it qualifies.
+fn append_sandbox_note(body: &mut String, note: &Option<String>) {
+    if let Some(note) = note {
+        body.push_str(&format!("\n[sandbox] {note}"));
     }
 }
 
@@ -129,17 +156,28 @@ impl Tool for RunShell {
 
         #[cfg(windows)]
         let mut cmd = {
-            let mut c = std::process::Command::new("cmd");
+            let comspec = std::env::var("COMSPEC")
+                .ok()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "cmd".to_owned());
+            let mut c = std::process::Command::new(&comspec);
             c.args(["/C", &command]);
             c
         };
         #[cfg(not(windows))]
         let mut cmd = {
-            let mut c = std::process::Command::new("sh");
+            let shell = std::env::var("SHELL")
+                .ok()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "sh".to_owned());
+            let mut c = std::process::Command::new(&shell);
             c.args(["-c", &command]);
             c
         };
         ctx.sandbox.wrap_command(&mut cmd, &ctx.workspace_root);
+        let sandbox_note = ctx.sandbox.enforcement_notice();
 
         let mut child = match cmd
             .current_dir(&ctx.workspace_root)
@@ -197,6 +235,7 @@ impl Tool for RunShell {
             body = format!("(no output, exit {:?})", output.status.code());
         }
         body.push_str(&format!("\n[exit {}]", output.status.code().unwrap_or(-1)));
+        append_sandbox_note(&mut body, &sandbox_note);
         Ok(ToolOutput {
             content: truncated(body),
             ok: output.status.success(),
@@ -255,8 +294,34 @@ impl Tool for TerminalTool {
                 let rows = args.get("rows").and_then(Value::as_u64).unwrap_or(24) as u16;
                 let cols = args.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16;
                 let name = args.get("session").and_then(Value::as_str);
-                crate::pty::open_named(name, shell, Some(&cwd), rows, cols)
-                    .map(|id| format!("opened terminal session `{id}` in {cwd}"))
+                // Reopening a live name is the caller asking for the session it already has. It is
+                // answered as a success with the session to use, because an error here reads to a
+                // model as "that name is taken" and sends it off inventing new ones.
+                if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty())
+                    && crate::pty::is_open(name)
+                {
+                    Ok(format!(
+                        "terminal session `{name}` is already open — reuse it with action=write/read (no second shell started)"
+                    ))
+                } else {
+                    match crate::pty::open_sandboxed(
+                        &ctx.sandbox,
+                        name,
+                        shell,
+                        Some(&cwd),
+                        rows,
+                        cols,
+                    ) {
+                        Ok(id) => {
+                            let mut msg = format!("opened terminal session `{id}` in {cwd}");
+                            if let Some(note) = ctx.sandbox.enforcement_notice() {
+                                msg.push_str(&format!(" [sandbox] {note}"));
+                            }
+                            Ok(msg)
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
             }
             "write" => {
                 let session = arg_str(args, "session")?;

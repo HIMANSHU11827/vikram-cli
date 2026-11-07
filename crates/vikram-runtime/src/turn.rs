@@ -6,6 +6,7 @@
 //! is checked between every step.
 
 use futures_util::StreamExt;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::oneshot;
@@ -25,6 +26,10 @@ use crate::types::{
     AgentState, ApprovalPrompt, ContextMeter, ContextPart, NoticeLevel, RuntimeEvent, TaskState,
     TurnState, now_ms,
 };
+
+/// How often a streaming turn republishes its live rate. Fast enough to read as real time, slow
+/// enough that building the metrics snapshot costs nothing measurable.
+const LIVE_METRIC_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// An agent turn carries the task record it must close when it finishes.
 pub struct AgentRun {
@@ -78,21 +83,32 @@ example when one thing finished and another begins. These lines are shown to the
 voice between the tool rows, so each must stand alone. Do not narrate every step, do not repeat a \
 line you already wrote, and never describe your private reasoning.";
 
+/// Extract a likely symbol/token query from the user's request for code-index lookup:
+/// the longest word-like token, or "" when nothing looks like an identifier.
+fn codeindex_query(request: &str) -> String {
+    request
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| w.len() >= 4 && w.chars().any(|c| c.is_alphabetic()))
+        .max_by_key(|w| w.len())
+        .unwrap_or("")
+        .to_owned()
+}
+
 pub(crate) fn spawn_turn(
     inner: Arc<RuntimeInner>,
     session: Arc<SessionRuntime>,
-    text: String,
+    message: Message,
     agent: Option<AgentRun>,
 ) {
     tokio::spawn(async move {
-        run_turn(inner, session, text, agent).await;
+        run_turn(inner, session, message, agent).await;
     });
 }
 
 pub(crate) async fn run_turn(
     inner: Arc<RuntimeInner>,
     session: Arc<SessionRuntime>,
-    text: String,
+    message: Message,
     agent: Option<AgentRun>,
 ) {
     let turn = TurnId::generate();
@@ -100,18 +116,17 @@ pub(crate) async fn run_turn(
     let cancel = session.cancel_handle();
 
     // The user's message is durable before any model work begins.
-    let user_message = Message::user(text.clone());
-    let request_text = text.clone();
-    session.push_message(user_message.clone(), now_ms());
+    let request_text = message.text_body();
+    session.push_message(message.clone(), now_ms());
     inner.journal(
         &session.id,
         RecordKind::Message,
-        serde_json::json!({"message": user_message}),
+        serde_json::json!({"message": message}),
     );
     inner.emit(RuntimeEvent::UserMessage {
         session: session.id.clone(),
         turn: turn.clone(),
-        text,
+        text: request_text.clone(),
     });
     inner.touch(&session);
     // The conversation now has something to be named after. Naming runs in the background and is
@@ -140,6 +155,11 @@ pub(crate) async fn run_turn(
     let mut over_limit_retries = 0u32;
     let max_steps = u64::from(inner.config.max_steps);
     let mut steps_used = 0u64;
+    // Guards the two ways a turn spends a minute in silence: the model retrying a tool that has
+    // already failed, and the model keeping busy past the point where the operator is still
+    // waiting for words.
+    let mut guard = RepeatGuard::new(started);
+    let mut live_metrics = Instant::now();
 
     let Some(provider) = inner.provider.read().expect("provider lock").clone() else {
         inner.emit(RuntimeEvent::Error {
@@ -212,9 +232,42 @@ pub(crate) async fn run_turn(
         prefix.push(Message::text(Role::System, PREAMBLE, Trust::External));
         // Memory and project context are assembled against the budget that is left after the
         // transcript, not on top of it.
+        // Two-layer context injection:
+        //   Layer 1 (base context) — durable retrieved memory, project/agent identity.
+        //   Layer 2 (dialectic supplement) — the heuristic user model derived from earlier
+        //   turns (preferences/habits/goals). Labelled separately so the meter can price each.
         if let Some(memory_text) = inner.retrieved_memory(&session) {
             labels.insert(0, "retrieved memory");
             prefix.insert(0, Message::text(Role::System, memory_text, Trust::External));
+        }
+        if let Some(dialectic_text) = inner.dialectic_supplement() {
+            labels.insert(1.min(labels.len()), "dialectic supplement");
+            prefix.insert(
+                1.min(prefix.len()),
+                Message::text(Role::System, dialectic_text, Trust::External),
+            );
+        }
+        // Code-index ranked context: definitions/references for the user's request,
+        // falling back to a grep slice when no index exists. Bounded and labelled.
+        {
+            let q = codeindex_query(&request_text);
+            if !q.is_empty() {
+                let ctx = crate::tools::codeindex::codeindex_context(&inner.workspace_root, &q);
+                if !ctx.trim().is_empty() {
+                    // Only inject when something useful was found (index hits or grep hits).
+                    if ctx.contains("no index") {
+                        // Degraded: tell the model a grep fallback ran, without flooding.
+                        if let Some(marker) = ctx.find("grep fallback") {
+                            let slice = ctx[marker..ctx.len().min(marker + 600)].to_owned();
+                            labels.push("code index (grep fallback)");
+                            prefix.push(Message::text(Role::System, slice, Trust::External));
+                        }
+                    } else {
+                        labels.push("code index");
+                        prefix.push(Message::text(Role::System, ctx, Trust::External));
+                    }
+                }
+            }
         }
         let (transcript, budget) = inner.prepare_context(&session, &prefix);
         let estimator = session.estimator();
@@ -285,7 +338,18 @@ pub(crate) async fn run_turn(
         let mut calls: Vec<ToolCall> = Vec::new();
         let mut stream_failed = false;
 
-        while let Some(item) = stream.next().await {
+        loop {
+            // A provider that thinks for ten seconds before the first token would otherwise freeze
+            // the clock and the rate. On a quiet window, republish what is known so far.
+            let item = match tokio::time::timeout(LIVE_METRIC_INTERVAL, stream.next()).await {
+                Ok(Some(item)) => item,
+                Ok(None) => break,
+                Err(_) => {
+                    live_metrics = Instant::now();
+                    inner.note_stream_progress(started.elapsed(), output_tokens);
+                    continue;
+                }
+            };
             if cancel.is_cancelled() {
                 break;
             }
@@ -299,11 +363,15 @@ pub(crate) async fn run_turn(
                             turn: turn.clone(),
                             text: delta,
                         });
-                        if let Some(run) = &agent {
-                            if run.agent.state() != AgentState::Running {
-                                run.agent.set_state(AgentState::Running);
-                                inner.publish_agent(&run.agent);
-                            }
+                        if live_metrics.elapsed() >= LIVE_METRIC_INTERVAL {
+                            live_metrics = Instant::now();
+                            inner.note_stream_progress(started.elapsed(), output_tokens);
+                        }
+                        if let Some(run) = &agent
+                            && run.agent.state() != AgentState::Running
+                        {
+                            run.agent.set_state(AgentState::Running);
+                            inner.publish_agent(&run.agent);
                         }
                     }
                 }
@@ -315,6 +383,10 @@ pub(crate) async fn run_turn(
                             turn: turn.clone(),
                             text: delta,
                         });
+                        if live_metrics.elapsed() >= LIVE_METRIC_INTERVAL {
+                            live_metrics = Instant::now();
+                            inner.note_stream_progress(started.elapsed(), output_tokens);
+                        }
                     }
                 }
                 Ok(ProviderEvent::ToolCall(call)) => calls.push(call),
@@ -345,9 +417,7 @@ pub(crate) async fn run_turn(
                             break;
                         }
                     }
-                    inner.emit(RuntimeEvent::Error {
-                        text: format!("provider: {text}"),
-                    });
+                    inner.emit(RuntimeEvent::Error { text });
                     stream_failed = true;
                     break;
                 }
@@ -360,7 +430,7 @@ pub(crate) async fn run_turn(
         }
         if cancel.is_cancelled() {
             if !text_buffer.is_empty() {
-                commit_assistant_text(&inner, &session, &text_buffer, &reasoning_buffer);
+                commit_assistant_text(&inner, &session, &text_buffer, &reasoning_buffer, &[]);
                 reasoning_buffer.clear();
             }
             outcome = TurnState::Cancelled;
@@ -368,7 +438,7 @@ pub(crate) async fn run_turn(
         }
         if stream_failed {
             if !text_buffer.is_empty() || !reasoning_buffer.is_empty() {
-                commit_assistant_text(&inner, &session, &text_buffer, &reasoning_buffer);
+                commit_assistant_text(&inner, &session, &text_buffer, &reasoning_buffer, &[]);
                 text_buffer.clear();
                 reasoning_buffer.clear();
             }
@@ -380,8 +450,13 @@ pub(crate) async fn run_turn(
         // the transcript, not at the end of the turn. Committing only when there was text left a
         // reasoning-only step buffered until some later message carried it, which is how thoughts
         // ended up piled under the answer. Both buffers are cleared because they were just spent.
-        if !text_buffer.is_empty() || !reasoning_buffer.is_empty() {
-            commit_assistant_text(&inner, &session, &text_buffer, &reasoning_buffer);
+        //
+        // The calls go in the same message: a tool result is only readable to the model when the
+        // assistant turn that asked for it carries the `tool_calls` it answers. Without them the
+        // transcript says "assistant said nothing" followed by an unexplained result, and a model
+        // that cannot see its own call runs the same tool again under a new name.
+        if !text_buffer.is_empty() || !reasoning_buffer.is_empty() || !calls.is_empty() {
+            commit_assistant_text(&inner, &session, &text_buffer, &reasoning_buffer, &calls);
             text_buffer.clear();
             reasoning_buffer.clear();
         }
@@ -393,33 +468,105 @@ pub(crate) async fn run_turn(
         let mut results: Vec<(ToolCallId, String, bool)> = Vec::new();
         let mut cancelled_mid_tools = false;
 
-        for (index, call) in calls.iter().enumerate() {
-            if cancel.is_cancelled() {
-                cancelled_mid_tools = true;
-                results.extend(answer_unrun(&calls[index..], Abandoned::Cancelled));
-                break;
+        // A batch of read-only calls has no ordering constraint: none of them can observe another's
+        // effect, none can ask for approval, and the model already asked for all of them at once.
+        // Run those together so a turn that inspects five files costs one round-trip, not five.
+        // Anything with a side effect, a missing tool, or a disabled tool stays on the sequential
+        // path, where cancellation and the step budget are enforced per call.
+        let parallel_safe = calls.len() > 1
+            && steps_used + calls.len() as u64 <= max_steps
+            && calls.iter().all(|call| {
+                inner.tools.get(&call.name).is_some_and(|tool| {
+                    inner.tools.is_enabled(&call.name)
+                        && tool
+                            .permission(&call.arguments)
+                            .map(|request| request.action == ActionKind::Read)
+                            .unwrap_or(false)
+                })
+            });
+
+        if parallel_safe {
+            steps_used += calls.len() as u64;
+            // Refusals are settled before the batch runs so the guard sees one consistent view,
+            // and every call the model asked for still gets an answer in the transcript.
+            let mut batch_calls: Vec<&ToolCall> = Vec::new();
+            let mut batch_results: Vec<(ToolCallId, String, bool)> = Vec::new();
+            for call in &calls {
+                match guard.refusal(call) {
+                    Some(text) => batch_results.push((call.id.clone(), text, false)),
+                    None => batch_calls.push(call),
+                }
             }
-            if steps_used >= max_steps {
-                inner.emit(RuntimeEvent::Error {
-                    text: format!("step budget exhausted after {} steps", steps_used),
+            let batch = futures_util::future::join_all(
+                batch_calls
+                    .iter()
+                    .map(|call| run_tool(&inner, &session, call, &cancel, &agent, Origin::Model)),
+            )
+            .await;
+            for (call, (content, ok)) in batch_calls.iter().zip(batch) {
+                guard.record(call, ok);
+                growth.record_call(&call.name);
+                if !ok {
+                    growth.record_failure(&call.name, &content);
+                }
+                batch_results.push((call.id.clone(), content, ok));
+            }
+            if let Some(refusals) = guard.take_announcement() {
+                inner.emit(RuntimeEvent::Notice {
+                    level: NoticeLevel::Warn,
+                    text: format!(
+                        "repeat guard: {refusals} tool call(s) refused — the model was retrying calls that already failed this turn"
+                    ),
                 });
-                outcome = TurnState::Failed;
-                cancelled_mid_tools = true;
-                results.extend(answer_unrun(&calls[index..], Abandoned::OutOfSteps));
-                break;
             }
-            steps_used += 1;
-            let (content, ok) =
-                run_tool(&inner, &session, &call, &cancel, &agent, Origin::Model).await;
-            growth.record_call(&call.name);
-            if !ok {
-                growth.record_failure(&call.name, &content);
-            }
-            results.push((call.id.clone(), content, ok));
+            results.extend(batch_results);
             if cancel.is_cancelled() {
                 cancelled_mid_tools = true;
-                results.extend(answer_unrun(&calls[index + 1..], Abandoned::Cancelled));
-                break;
+            }
+        } else {
+            for (index, call) in calls.iter().enumerate() {
+                if cancel.is_cancelled() {
+                    cancelled_mid_tools = true;
+                    results.extend(answer_unrun(&calls[index..], Abandoned::Cancelled));
+                    break;
+                }
+                if steps_used >= max_steps {
+                    inner.emit(RuntimeEvent::Error {
+                        text: format!("step budget exhausted after {} steps", steps_used),
+                    });
+                    outcome = TurnState::Failed;
+                    cancelled_mid_tools = true;
+                    results.extend(answer_unrun(&calls[index..], Abandoned::OutOfSteps));
+                    break;
+                }
+                // A refused call still costs a step: it costs a model round-trip, and charging it
+                // is what stops a model that keeps re-asking from looping forever.
+                steps_used += 1;
+                if let Some(text) = guard.refusal(call) {
+                    if let Some(refusals) = guard.take_announcement() {
+                        inner.emit(RuntimeEvent::Notice {
+                            level: NoticeLevel::Warn,
+                            text: format!(
+                                "repeat guard: {refusals} tool call(s) refused — the model was retrying calls that already failed this turn"
+                            ),
+                        });
+                    }
+                    results.push((call.id.clone(), text, false));
+                    continue;
+                }
+                let (content, ok) =
+                    run_tool(&inner, &session, call, &cancel, &agent, Origin::Model).await;
+                guard.record(call, ok);
+                growth.record_call(&call.name);
+                if !ok {
+                    growth.record_failure(&call.name, &content);
+                }
+                results.push((call.id.clone(), content, ok));
+                if cancel.is_cancelled() {
+                    cancelled_mid_tools = true;
+                    results.extend(answer_unrun(&calls[index + 1..], Abandoned::Cancelled));
+                    break;
+                }
             }
         }
 
@@ -510,6 +657,121 @@ enum Abandoned {
 /// reads has to say what happened to each one: silence is what makes a resumed conversation
 /// unreadable, and the honest line differs depending on whether a person stopped the turn or the
 /// step budget did.
+/// Repeated-call and wall-clock breaker for the tool phase of a turn.
+///
+/// Two things turn a turn into a minute of silence instead of an answer: a model that re-asks for
+/// a tool that has already failed (the step budget converts that into pure waiting), and a model
+/// that keeps working long past the point where the operator is still watching. Both are bounded
+/// here, because only the turn loop can see them.
+struct RepeatGuard {
+    /// Exact call (name + canonical arguments) -> failures this turn.
+    by_call: HashMap<String, u32>,
+    /// Tool name -> failures this turn, across every set of arguments.
+    by_tool: HashMap<String, u32>,
+    /// When the tool phase stops being worth continuing.
+    deadline: Instant,
+    refusals: u32,
+    announced: bool,
+}
+
+impl RepeatGuard {
+    /// The same exact call may fail this many times before it is refused.
+    const CALL_FAILURES: u32 = 2;
+    /// Any single tool may fail this many times per turn before every further call to it is refused.
+    const TOOL_FAILURES: u32 = 4;
+    /// The tool phase gets this long before the model is told to answer in words. Generous enough
+    /// for real multi-step work, short enough that a runaway turn cannot sit silent for minutes.
+    const TOOL_PHASE: std::time::Duration = std::time::Duration::from_secs(120);
+
+    fn new(started: Instant) -> Self {
+        Self {
+            by_call: HashMap::new(),
+            by_tool: HashMap::new(),
+            deadline: started + Self::TOOL_PHASE,
+            refusals: 0,
+            announced: false,
+        }
+    }
+
+    /// Why this call must not run, or `None` when it may.
+    fn refusal(&mut self, call: &ToolCall) -> Option<String> {
+        let text = if Instant::now() >= self.deadline {
+            format!(
+                "refused: this turn has spent {}s in tool calls. Answer now, in words, with what you already have. Do not call another tool.",
+                Self::TOOL_PHASE.as_secs()
+            )
+        } else if self
+            .by_call
+            .get(&Self::key(call))
+            .is_some_and(|failures| *failures >= Self::CALL_FAILURES)
+        {
+            format!(
+                "refused: {} was already called with these exact arguments and failed {} times this turn. It will fail the same way again. Change the approach, or answer with what you have.",
+                call.name,
+                Self::CALL_FAILURES
+            )
+        } else if self
+            .by_tool
+            .get(&call.name)
+            .is_some_and(|failures| *failures >= Self::TOOL_FAILURES)
+        {
+            format!(
+                "refused: {} has failed {} times this turn. Stop using it: answer with what you have, or use a different tool.",
+                call.name,
+                Self::TOOL_FAILURES
+            )
+        } else {
+            return None;
+        };
+        self.refusals += 1;
+        Some(text)
+    }
+
+    /// Records the outcome of a call that actually ran.
+    fn record(&mut self, call: &ToolCall, ok: bool) {
+        if ok {
+            return;
+        }
+        *self.by_call.entry(Self::key(call)).or_insert(0) += 1;
+        *self.by_tool.entry(call.name.clone()).or_insert(0) += 1;
+    }
+
+    /// The refusal count, returned exactly once per turn so the operator learns why the model
+    /// suddenly stopped using tools.
+    fn take_announcement(&mut self) -> Option<u32> {
+        if self.refusals > 0 && !self.announced {
+            self.announced = true;
+            return Some(self.refusals);
+        }
+        None
+    }
+
+    /// Identity of a call: its name plus arguments with object keys sorted, so a model that
+    /// reorders the same arguments is still recognised as repeating itself.
+    fn key(call: &ToolCall) -> String {
+        format!("{}\u{1f}{}", call.name, canonical_json(&call.arguments))
+    }
+}
+
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let body: Vec<String> = keys
+                .into_iter()
+                .map(|key| format!("{key}:{}", canonical_json(&map[key])))
+                .collect();
+            format!("{{{}}}", body.join(","))
+        }
+        serde_json::Value::Array(items) => {
+            let body: Vec<String> = items.iter().map(canonical_json).collect();
+            format!("[{}]", body.join(","))
+        }
+        other => other.to_string(),
+    }
+}
+
 fn answer_unrun(calls: &[ToolCall], why: Abandoned) -> Vec<(ToolCallId, String, bool)> {
     let text = match why {
         Abandoned::Cancelled => "cancelled before completion",
@@ -526,6 +788,7 @@ fn commit_assistant_text(
     session: &Arc<SessionRuntime>,
     text: &str,
     reasoning: &str,
+    calls: &[ToolCall],
 ) {
     let mut blocks = Vec::new();
     if !reasoning.is_empty() {
@@ -539,6 +802,9 @@ fn commit_assistant_text(
             text: text.to_owned(),
             trust: Trust::Model,
         });
+    }
+    for call in calls {
+        blocks.push(Block::ToolCall { call: call.clone() });
     }
     if blocks.is_empty() {
         return;
@@ -594,6 +860,11 @@ fn finish(
     *inner.last_tokens_per_sec.lock().expect("tps metric") = tps;
 
     session.finish_turn(outcome, now_ms());
+    // Dialectic user modeling: derive preferences/habits/goals from this turn's user
+    // request (heuristic, local, deterministic) for future turns' supplement layer.
+    if outcome != TurnState::Cancelled {
+        inner.observe_dialectic_turn(request);
+    }
     // Growth runs before the turn is announced finished, so an interface that reads what was
     // learned on this event never sees a turn that has not yet been learned from.
     crate::learning::on_turn_end(inner, session, request, outcome, growth);
@@ -645,7 +916,14 @@ fn finish(
                 task_id: bg.id.clone(),
             }
         });
-        spawn_turn(Arc::clone(inner), Arc::clone(session), next, queued_agent);
+        // The queue holds text only, so a follow-up that was queued while this turn ran starts
+        // without the images that were refused at submit time.
+        spawn_turn(
+            Arc::clone(inner),
+            Arc::clone(session),
+            Message::user(next),
+            queued_agent,
+        );
     } else if session.queue_len() > 0 {
         inner.emit(RuntimeEvent::Notice {
             level: NoticeLevel::Warn,
@@ -911,6 +1189,10 @@ async fn run_tool(
     let mut context = inner.tool_context_for(&session.id);
     // Tools whose subject is the running system (delegation) need the live runtime, not a file.
     context.runtime = Some(Arc::clone(inner));
+    // Enrich with session/agent identity and the turn's cancellation handle so a
+    // blocking tool can observe cancellation directly instead of only via abort.
+    context.agent = agent.as_ref().map(|run| run.agent.profile.name.clone());
+    context.cancel = Some(cancel.clone());
     let arguments = call.arguments.clone();
     let handle = tool.clone();
     let mut blocking = tokio::task::spawn_blocking(move || handle.run(&arguments, &context));
@@ -1108,6 +1390,10 @@ fn truncate(text: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    // The process-global home lock is deliberately held across the turn: it is what keeps two
+    // tests from sharing one `VIKRAM_HOME`, and the guard is not used as a channel between tasks.
+    #![allow(clippy::await_holding_lock)]
+
     use super::parse_question;
     use super::*;
     use crate::config::{Config, ContextConfig};
@@ -1119,6 +1405,102 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::broadcast;
     use vikram_contracts::{ActionKind, PermissionRequest, SessionId, SideEffect, VikramError};
+
+    fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall::new(name, arguments)
+    }
+
+    #[test]
+    fn a_call_that_keeps_failing_is_refused_once_it_has_failed_twice() {
+        let mut guard = RepeatGuard::new(Instant::now());
+        let failing = call(
+            "browser.fetch",
+            serde_json::json!({"url": "https://a.example"}),
+        );
+
+        assert!(guard.refusal(&failing).is_none());
+        guard.record(&failing, false);
+        assert!(guard.refusal(&failing).is_none());
+        guard.record(&failing, false);
+
+        let refusal = guard.refusal(&failing).expect("third attempt is refused");
+        assert!(refusal.contains("browser.fetch"));
+        assert!(refusal.contains("failed 2 times"));
+        assert_eq!(guard.take_announcement(), Some(1));
+        assert_eq!(guard.take_announcement(), None, "announced once per turn");
+    }
+
+    #[test]
+    fn reordered_arguments_still_identify_the_same_call() {
+        let mut guard = RepeatGuard::new(Instant::now());
+        let first = call(
+            "web.search",
+            serde_json::json!({"query": "ai news", "count": 5}),
+        );
+        let reordered = call(
+            "web.search",
+            serde_json::json!({"count": 5, "query": "ai news"}),
+        );
+
+        guard.record(&first, false);
+        guard.record(&reordered, false);
+
+        assert!(guard.refusal(&first).is_some());
+        assert!(guard.refusal(&reordered).is_some());
+    }
+
+    #[test]
+    fn a_tool_is_refused_by_name_after_four_failures_even_with_new_arguments() {
+        let mut guard = RepeatGuard::new(Instant::now());
+        for url in [
+            "https://a.example",
+            "https://b.example",
+            "https://c.example",
+        ] {
+            let call = call("browser.fetch", serde_json::json!({"url": url}));
+            assert!(guard.refusal(&call).is_none());
+            guard.record(&call, false);
+        }
+        let fourth = call(
+            "browser.fetch",
+            serde_json::json!({"url": "https://d.example"}),
+        );
+        assert!(guard.refusal(&fourth).is_none());
+        guard.record(&fourth, false);
+
+        let fresh_url = call(
+            "browser.fetch",
+            serde_json::json!({"url": "https://e.example"}),
+        );
+        let refusal = guard.refusal(&fresh_url).expect("fifth attempt is refused");
+        assert!(refusal.contains("has failed 4 times"));
+    }
+
+    #[test]
+    fn a_call_that_worked_is_never_refused() {
+        let mut guard = RepeatGuard::new(Instant::now());
+        let ok = call("file.read", serde_json::json!({"path": "README.md"}));
+        for _ in 0..10 {
+            guard.record(&ok, true);
+            assert!(guard.refusal(&ok).is_none());
+        }
+    }
+
+    #[test]
+    fn the_tool_phase_deadline_refuses_every_call() {
+        let started = Instant::now()
+            .checked_sub(RepeatGuard::TOOL_PHASE + std::time::Duration::from_secs(5))
+            .expect("earlier instant");
+        let mut guard = RepeatGuard::new(started);
+
+        let refusal = guard
+            .refusal(&call(
+                "web.search",
+                serde_json::json!({"query": "anything"}),
+            ))
+            .expect("refused on time");
+        assert!(refusal.contains("Answer now, in words"));
+    }
 
     #[test]
     fn an_ask_user_reply_yields_the_request_id_the_question_and_the_choices() {
@@ -1241,6 +1623,49 @@ mod tests {
         ) -> Result<ToolOutput, VikramError> {
             Ok(ToolOutput {
                 content: "probe: done".into(),
+                ok: true,
+            })
+        }
+    }
+
+    /// A read-only tool that reports how many siblings were running beside it. Used to prove the
+    /// batch really is concurrent rather than merely scheduled together.
+    struct OverlapTool {
+        active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Tool for OverlapTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "overlap".into(),
+                description: "observes its own concurrency".into(),
+                schema: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+
+        fn permission(&self, _args: &serde_json::Value) -> Result<PermissionRequest, VikramError> {
+            Ok(PermissionRequest::new(
+                ActionKind::Read,
+                "overlap.run",
+                "overlap",
+                SideEffect::None,
+                Trust::Model,
+            ))
+        }
+
+        fn run(
+            &self,
+            _args: &serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolOutput, VikramError> {
+            use std::sync::atomic::Ordering;
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(ToolOutput {
+                content: "overlap: done".into(),
                 ok: true,
             })
         }
@@ -1440,6 +1865,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tool_only_step_still_records_the_call_it_made() {
+        // No speech, no reasoning, one call: the transcript must still contain the assistant turn
+        // that asked for it. Otherwise the next request is an unexplained tool result and a model
+        // that cannot see its own call repeats it under a new name.
+        let call = ToolCall::new("probe", serde_json::json!({"step": 1}));
+        let call_id = call.id.clone();
+        let (_, messages) = run_scripted(vec![
+            vec![
+                ProviderEvent::ToolCall(call),
+                ProviderEvent::Finished {
+                    input_tokens: None,
+                    output_tokens: None,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("done".into()),
+                ProviderEvent::Finished {
+                    input_tokens: None,
+                    output_tokens: None,
+                },
+            ],
+        ])
+        .await;
+
+        let made: Vec<&ToolCallId> = messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .filter_map(|block| match block {
+                Block::ToolCall { call } => Some(&call.id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(made, vec![&call_id], "the call travels in the transcript");
+        let asking = messages
+            .iter()
+            .position(|message| message.role == Role::Assistant)
+            .expect("an assistant turn was committed");
+        let answered = messages
+            .iter()
+            .position(|message| message.role == Role::Tool)
+            .expect("the result was committed");
+        assert!(
+            asking < answered,
+            "the call must be recorded before the result that answers it"
+        );
+        assert!(
+            crate::compaction::pairing_is_consistent(&messages),
+            "every call keeps its result, so a fold cannot orphan one"
+        );
+    }
+
+    #[tokio::test]
     async fn speech_arriving_before_a_tool_call_is_committed_before_the_call_runs() {
         let call = ToolCall::new("probe", serde_json::json!({}));
         let call_id = call.id.clone();
@@ -1556,6 +2033,145 @@ mod tests {
                 "Both are clean.".to_owned(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn read_only_calls_in_one_batch_run_concurrently() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::new(ScriptedProvider::new(vec![
+                vec![
+                    ProviderEvent::ToolCall(ToolCall::new("overlap", serde_json::json!({}))),
+                    ProviderEvent::ToolCall(ToolCall::new("overlap", serde_json::json!({}))),
+                    finished(),
+                ],
+                vec![finished()],
+            ])),
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        handle.inner.tools.register(Box::new(OverlapTool {
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+        }));
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "look at both at once".into())
+            .expect("the turn is accepted");
+        run_to_end(&mut events).await;
+
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "both read-only calls must be in flight together"
+        );
+        let results = handle
+            .inner
+            .session(&session)
+            .expect("session survives the turn")
+            .messages()
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .count();
+        assert_eq!(results, 2, "every call still gets a result message");
+    }
+
+    #[tokio::test]
+    async fn a_model_repeating_a_failing_call_is_cut_off_instead_of_burning_the_step_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let stuck = serde_json::json!({"url": "https://techcrunch.com/tagged/ai/"});
+        let mut script: Vec<Vec<ProviderEvent>> = (0..8)
+            .map(|_| {
+                vec![
+                    ProviderEvent::ToolCall(ToolCall::new("flaky", stuck.clone())),
+                    finished(),
+                ]
+            })
+            .collect();
+        script.push(vec![finished()]);
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::new(ScriptedProvider::new(script)),
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        let runs = Arc::new(AtomicUsize::new(0));
+        handle.inner.tools.register(Box::new(AlwaysFailsTool {
+            runs: Arc::clone(&runs),
+        }));
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "what is the news".into())
+            .expect("the turn is accepted");
+        run_to_end(&mut events).await;
+
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "the tool runs twice; every later identical call is refused without running"
+        );
+        let messages = handle
+            .inner
+            .session(&session)
+            .expect("session survives the turn")
+            .messages();
+        let refusals = messages
+            .iter()
+            .filter(|message| message.role == Role::Tool && message.text_body().contains("refused"))
+            .count();
+        assert!(refusals > 0, "the model is told why the call was refused");
+        assert_eq!(
+            messages.iter().filter(|m| m.role == Role::Tool).count(),
+            8,
+            "every call the model asked for still gets an answer"
+        );
+    }
+
+    struct AlwaysFailsTool {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Tool for AlwaysFailsTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "flaky".into(),
+                description: "fails every time".into(),
+                schema: serde_json::json!({"type": "object", "properties": {"url": {"type": "string"}}}),
+            }
+        }
+
+        fn permission(&self, _args: &serde_json::Value) -> Result<PermissionRequest, VikramError> {
+            Ok(PermissionRequest::new(
+                ActionKind::Read,
+                "flaky.run",
+                "flaky",
+                SideEffect::None,
+                Trust::Model,
+            ))
+        }
+
+        fn run(
+            &self,
+            _args: &serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolOutput, VikramError> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolOutput {
+                content: "fetch failed: 403 Forbidden".into(),
+                ok: false,
+            })
+        }
     }
 
     #[tokio::test]
@@ -1727,8 +2343,7 @@ mod tests {
         assert_eq!(requests.len(), 1, "one request went out");
         let sent = &requests[0];
         assert!(
-            sent.iter()
-                .any(|m| crate::compaction::is_compaction_summary(m)),
+            sent.iter().any(crate::compaction::is_compaction_summary),
             "the summary travels with the request"
         );
         assert!(
@@ -2313,6 +2928,7 @@ mod tests {
 
         let experiences = handle
             .inner
+            .learning
             .evolution
             .lock()
             .expect("evolution lock")
@@ -2321,7 +2937,7 @@ mod tests {
             .expect("the store reads");
         assert_eq!(experiences, 1, "the turn became one experience");
 
-        let pending = handle.inner.learning.pending_proposals();
+        let pending = handle.inner.learning.surface.pending_proposals();
         assert_eq!(
             pending.len(),
             1,
@@ -2333,7 +2949,7 @@ mod tests {
             "the operator decides, not the model"
         );
 
-        let audit = handle.inner.learning.audit_log();
+        let audit = handle.inner.learning.surface.audit_log();
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].outcome, "staged");
 
@@ -2376,7 +2992,7 @@ mod tests {
             "and the runtime says when it is done learning"
         );
         assert!(!handle.learning_busy());
-        let staged = handle.inner.learning.pending_proposals();
+        let staged = handle.inner.learning.surface.pending_proposals();
         assert!(
             staged
                 .iter()
@@ -2430,7 +3046,7 @@ mod tests {
 
         let mut staged = Vec::new();
         for _ in 0..100 {
-            let pending = handle.inner.learning.pending_proposals();
+            let pending = handle.inner.learning.surface.pending_proposals();
             if !pending.is_empty() {
                 staged = pending;
                 break;
@@ -2475,6 +3091,7 @@ mod tests {
         .await;
         let experiences = handle
             .inner
+            .learning
             .evolution
             .lock()
             .expect("evolution lock")
@@ -2482,7 +3099,7 @@ mod tests {
             .count()
             .expect("the store reads");
         assert_eq!(experiences, 0, "nothing was done, so nothing was learned");
-        assert!(handle.inner.learning.pending_proposals().is_empty());
+        assert!(handle.inner.learning.surface.pending_proposals().is_empty());
     }
 
     #[tokio::test]
@@ -2513,10 +3130,12 @@ mod tests {
         handle
             .inner
             .learning
+            .surface
             .set_policy_memory(LearningPolicy::Disabled);
         handle
             .inner
             .learning
+            .surface
             .set_policy_skill(LearningPolicy::Disabled);
         let mut events = handle.events();
         let session = named_session(&handle);
@@ -2527,6 +3146,7 @@ mod tests {
 
         let experiences = handle
             .inner
+            .learning
             .evolution
             .lock()
             .expect("evolution lock")
@@ -2534,7 +3154,7 @@ mod tests {
             .count()
             .expect("the store reads");
         assert_eq!(experiences, 0, "a disabled policy means off, not quiet");
-        assert!(handle.inner.learning.pending_proposals().is_empty());
+        assert!(handle.inner.learning.surface.pending_proposals().is_empty());
     }
 
     #[tokio::test]
@@ -2560,6 +3180,11 @@ mod tests {
         assert!(handle.inner.memory_nudge_due(&session));
 
         // A zero interval never nudges.
+        //
+        // `isolated_home` takes a process-global, non-reentrant lock. Take turns instead of
+        // holding the first guard while asking for the second, or this test deadlocks itself and
+        // every sibling test queued behind it.
+        drop(_home);
         let dir2 = tempfile::tempdir().expect("temp dir");
         let _home2 = isolated_home(dir2.path());
         let config2 = Config {
@@ -2568,14 +3193,14 @@ mod tests {
             memory_nudge_interval: 0,
             ..Config::default()
         };
-        let runtime2 = Runtime::start_with_provider(config2, Arc::new(ScriptedProvider::new(vec![])))
-            .await
-            .expect("runtime starts");
+        let runtime2 =
+            Runtime::start_with_provider(config2, Arc::new(ScriptedProvider::new(vec![])))
+                .await
+                .expect("runtime starts");
         let handle2 = runtime2.handle();
         let sid2 = handle2.snapshot().sessions[0].id.clone();
         let session2 = handle2.inner.session(&sid2).expect("session");
         session2.push_message(vikram_contracts::Message::user("one"), 1);
         assert!(!handle2.inner.memory_nudge_due(&session2));
     }
-
 }

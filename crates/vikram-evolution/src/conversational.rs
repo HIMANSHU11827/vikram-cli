@@ -52,6 +52,11 @@ impl ConversationalControl {
         }
     }
 
+    /// The shared store every subsystem reads and writes through.
+    pub fn store(&self) -> &EvolutionStore {
+        &self.store
+    }
+
     /// Handle a natural language command.
     pub fn handle_command(&mut self, command: ConversationalCommand) -> Result<CommandResponse> {
         let response = match &command {

@@ -182,10 +182,10 @@ impl Rule {
         if self.actions.is_empty() || !self.actions.contains(&req.action) {
             return false;
         }
-        if let Some(prefix) = &self.verb_prefix {
-            if !req.verb.starts_with(prefix.as_str()) {
-                return false;
-            }
+        if let Some(prefix) = &self.verb_prefix
+            && !req.verb.starts_with(prefix.as_str())
+        {
+            return false;
         }
         self.matches_resource(req)
     }

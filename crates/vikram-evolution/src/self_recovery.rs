@@ -79,6 +79,11 @@ impl SelfRecoveryEngine {
         }
     }
 
+    /// The shared store every subsystem reads and writes through.
+    pub fn store(&self) -> &EvolutionStore {
+        &self.store
+    }
+
     /// Create a snapshot of current system state.
     pub fn create_snapshot(&mut self) -> Result<SystemSnapshot> {
         let snapshot = SystemSnapshot {

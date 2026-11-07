@@ -142,10 +142,10 @@ async fn turn(config: Config, request: AgentRequest, title: String) -> RunOutcom
         Ok(session) => session,
         Err(err) => return RunOutcome::failed(format!("could not open a session: {err}")),
     };
-    if let Some(model) = &request.model {
-        if let Err(err) = handle.set_model(&session, model.clone()) {
-            return RunOutcome::failed(format!("could not use model {model}: {err}"));
-        }
+    if let Some(model) = &request.model
+        && let Err(err) = handle.set_model(&session, model.clone())
+    {
+        return RunOutcome::failed(format!("could not use model {model}: {err}"));
     }
     if request.unattended
         && handle.mode() == PermissionMode::Ask
@@ -473,6 +473,7 @@ struct Fanout {
 /// One runtime rather than one per bot, because they share a provider, a store and a permission
 /// posture — a second runtime would be a second set of credentials to keep in step. Each agent
 /// still gets its own session, which is what makes the identities separable.
+#[allow(clippy::too_many_arguments)]
 async fn delegated(
     config: Config,
     agents: Vec<AgentId>,
@@ -524,16 +525,16 @@ async fn delegated(
         }
     };
     fanout.parent = Some(parent.to_string());
-    if let Some(model) = &model {
-        if let Err(err) = handle.set_model(&parent, model.clone()) {
-            let why = format!("could not use model {model}: {err}");
-            for agent in agents {
-                fanout
-                    .results
-                    .push((agent, RunOutcome::failed(why.clone())));
-            }
-            return fanout;
+    if let Some(model) = &model
+        && let Err(err) = handle.set_model(&parent, model.clone())
+    {
+        let why = format!("could not use model {model}: {err}");
+        for agent in agents {
+            fanout
+                .results
+                .push((agent, RunOutcome::failed(why.clone())));
         }
+        return fanout;
     }
     if unattended
         && handle.mode() == PermissionMode::Ask
@@ -563,7 +564,7 @@ async fn delegated(
                 let state = finished
                     .iter()
                     .find(|(session, _)| *session == sid)
-                    .map(|(_, state)| state.clone());
+                    .map(|(_, state)| *state);
                 let outcome = if stopped.contains(&agent) {
                     RunOutcome::failed(format!("{} was stopped by the operator", agent.as_str()))
                 } else {
@@ -606,7 +607,7 @@ async fn delegated(
                     let state = finished
                         .iter()
                         .find(|(session, _)| *session == sid)
-                        .map(|(_, state)| state.clone());
+                        .map(|(_, state)| *state);
                     let outcome = if stopped.contains(&child) {
                         RunOutcome::failed(format!(
                             "{} was stopped by the operator",
@@ -658,7 +659,7 @@ fn children_of(
     for snapshot in handle.agent_snapshots() {
         if let (Some(session), true) = (
             snapshot.session.clone(),
-            started.iter().any(|agent| *agent == snapshot.profile.id),
+            started.contains(&snapshot.profile.id),
         ) {
             children.push((session, snapshot.profile.id.clone()));
         }

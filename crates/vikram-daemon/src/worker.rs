@@ -297,10 +297,9 @@ impl WorkerPool {
         receiver: &mut UnboundedReceiver<Finished>,
         wait: Duration,
     ) -> Option<Finished> {
-        match tokio::time::timeout(wait, receiver.recv()).await {
-            Ok(finished) => finished,
-            Err(_) => None,
-        }
+        tokio::time::timeout(wait, receiver.recv())
+            .await
+            .unwrap_or_default()
     }
 }
 

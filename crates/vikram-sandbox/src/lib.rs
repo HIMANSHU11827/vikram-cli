@@ -24,6 +24,8 @@ pub enum SandboxMechanism {
     Bubblewrap,
     Seatbelt,
     Landlock,
+    /// Windows Job Objects stub: best-effort child tracking only; no ACL enforced.
+    JobObjects,
     PassThrough,
 }
 
@@ -38,23 +40,12 @@ pub struct Sandbox {
     resource_limits: ResourceLimits,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ResourceLimits {
     pub max_memory_bytes: Option<u64>,
     pub max_cpu_seconds: Option<u64>,
     pub max_open_files: Option<u64>,
     pub max_processes: Option<u64>,
-}
-
-impl Default for ResourceLimits {
-    fn default() -> Self {
-        Self {
-            max_memory_bytes: None,
-            max_cpu_seconds: None,
-            max_open_files: None,
-            max_processes: None,
-        }
-    }
 }
 
 impl Sandbox {
@@ -104,6 +95,16 @@ impl Sandbox {
                     Some("sandbox-exec not available; OS isolation inactive".into()),
                 )
             }
+        } else if cfg!(target_os = "windows") {
+            // Windows has no supported OS isolation here; Job objects only track the
+            // child so it does not outlive the host. Degrade gracefully, never fake it.
+            (
+                SandboxMechanism::JobObjects,
+                Some(
+                    "windows: Job Objects stub only (child tracking, no ACL); degraded to pass-through"
+                        .into(),
+                ),
+            )
         } else {
             (
                 SandboxMechanism::PassThrough,
@@ -168,6 +169,41 @@ impl Sandbox {
         )
     }
 
+    /// True only when an OS mechanism is actually armed, not a pass-through or the
+    /// Windows Job-Objects stub. Callers gate degraded messaging on this.
+    pub fn is_enforced(&self) -> bool {
+        matches!(
+            self.mechanism,
+            SandboxMechanism::Bubblewrap | SandboxMechanism::Seatbelt
+        )
+    }
+
+    /// Human-readable degradation notice, or None when enforced / no reason given.
+    pub fn enforcement_notice(&self) -> Option<String> {
+        if self.is_enforced() {
+            return None;
+        }
+        let reason = self.passthrough_reason.clone()?;
+        Some(format!(
+            "OS sandbox not enforced ({}): running on host; policy still applies.{}",
+            self.describe(),
+            reason
+        ))
+    }
+
+    /// Name of the platform this binary runs on, for diagnostics.
+    pub fn platform() -> &'static str {
+        if cfg!(target_os = "linux") {
+            "linux"
+        } else if cfg!(target_os = "macos") {
+            "macos"
+        } else if cfg!(target_os = "windows") {
+            "windows"
+        } else {
+            "other"
+        }
+    }
+
     /// Wrap `cmd` so it runs inside the sandbox.
     pub fn wrap_command(&self, cmd: &mut Command, workspace_root: &Path) {
         match self.mechanism {
@@ -192,6 +228,10 @@ impl Sandbox {
                 // Landlock applied via env marker; actual enforcement happens in a wrapper binary.
                 // For now, fall through to pass-through but mark reason.
                 // A future landlock-exec wrapper will enforce. We do not pretend enforcement here.
+            }
+            SandboxMechanism::JobObjects => {
+                // Stub: on Windows we cannot enforce an ACL from Command; the child
+                // runs on the host. Degradation is surfaced via enforcement_notice().
             }
             SandboxMechanism::PassThrough => {}
         }
@@ -255,6 +295,12 @@ impl Sandbox {
                 (sandbox_exec_available(), "sandbox-exec available".into())
             }
             SandboxMechanism::Landlock => (landlock_available(), "landlock available".into()),
+            SandboxMechanism::JobObjects => (
+                false,
+                self.passthrough_reason
+                    .clone()
+                    .unwrap_or_else(|| "windows job objects stub only".into()),
+            ),
             SandboxMechanism::PassThrough => (
                 false,
                 self.passthrough_reason
@@ -287,10 +333,10 @@ fn rewrap<S: Into<String>>(cmd: &mut Command, wrapper: &str, preargs: Vec<S>) {
     for arg in args {
         new_cmd.arg(arg);
     }
-    if let Some(dir) = dir {
-        if dir.to_str().is_some() {
-            new_cmd.current_dir(dir);
-        }
+    if let Some(dir) = dir
+        && dir.to_str().is_some()
+    {
+        new_cmd.current_dir(dir);
     }
 }
 
@@ -372,5 +418,27 @@ mod extra_tests {
         let s = Sandbox::disabled("x");
         let (ok, _) = s.verify();
         assert!(!ok);
+    }
+    #[test]
+    fn disabled_is_not_enforced_and_has_notice() {
+        let s = Sandbox::disabled("off");
+        assert!(!s.is_enforced());
+        assert!(s.enforcement_notice().unwrap().contains("not enforced"));
+    }
+    #[test]
+    fn no_sandbox_mode_reports_platform() {
+        assert!(matches!(
+            Sandbox::platform(),
+            "linux" | "macos" | "windows" | "other"
+        ));
+    }
+    #[test]
+    fn full_mode_on_linux_detects_something_honest() {
+        let s = Sandbox::detect(SandboxMode::Full, false, vec![]);
+        // Either an enforced mechanism or an honest degradation message.
+        assert!(!s.is_enforced() || s.enforcement_notice().is_none());
+        let (ok, msg) = s.verify();
+        assert_eq!(ok, s.is_enforced());
+        assert!(!msg.is_empty());
     }
 }

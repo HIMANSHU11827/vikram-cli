@@ -226,16 +226,15 @@ impl Selector {
                     reasons.push(format!("tag:{label}"));
                 }
             }
-            if let Some(project) = input.project {
-                if let (Ok(dir), Ok(root)) = (
+            if let Some(project) = input.project
+                && let (Ok(dir), Ok(root)) = (
                     summary.dir.canonicalize(),
                     std::path::Path::new(project).canonicalize(),
-                ) {
-                    if dir.starts_with(&root) {
-                        score += 2.0;
-                        reasons.push("project".to_string());
-                    }
-                }
+                )
+                && dir.starts_with(&root)
+            {
+                score += 2.0;
+                reasons.push("project".to_string());
             }
             if let Some(role) = input.agent_role {
                 let role = role.to_ascii_lowercase();

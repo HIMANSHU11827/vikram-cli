@@ -239,9 +239,8 @@ impl SelfConfigurationEngine {
         for change in &self.change_history {
             if !change.applied {
                 issues.push(format!(
-                    "Pending change not applied: {} = {}",
-                    format!("{:?}", change.target),
-                    change.new_value
+                    "Pending change not applied: {:?} = {}",
+                    change.target, change.new_value
                 ));
             }
         }
@@ -251,14 +250,14 @@ impl SelfConfigurationEngine {
 
     /// Rollback a configuration change.
     pub fn rollback_change(&mut self, change_id: &str) -> Result<()> {
-        if let Some(change) = self.change_history.iter_mut().find(|c| c.id == change_id) {
-            if let Some(rollback_value) = &change.rollback_value {
-                let previous = change.previous_value.clone();
-                change.previous_value = Some(change.new_value.clone());
-                change.new_value = rollback_value.clone();
-                change.rollback_value = previous;
-                change.applied = false;
-            }
+        if let Some(change) = self.change_history.iter_mut().find(|c| c.id == change_id)
+            && let Some(rollback_value) = &change.rollback_value
+        {
+            let previous = change.previous_value.clone();
+            change.previous_value = Some(change.new_value.clone());
+            change.new_value = rollback_value.clone();
+            change.rollback_value = previous;
+            change.applied = false;
         }
         Ok(())
     }
@@ -272,14 +271,14 @@ impl SelfConfigurationEngine {
     pub fn apply_change(&mut self, change_id: &str) -> Result<()> {
         if let Some(change) = self.change_history.iter_mut().find(|c| c.id == change_id) {
             change.applied = true;
-            let _ = self.store.save_event(&crate::types::LearningEvent {
+            self.store.save_event(&crate::types::LearningEvent {
                 id: gen_id("evt"),
                 timestamp_ms: now_ms(),
                 agent_id: "system".to_string(),
                 kind: "config_applied".to_string(),
                 summary: format!("Configuration applied: {:?}", change.target),
                 payload: serde_json::json!({"change_id": change.id}),
-            });
+            })?;
         }
         Ok(())
     }

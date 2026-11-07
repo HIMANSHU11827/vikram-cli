@@ -97,14 +97,14 @@ impl RuleBook {
     }
 
     pub fn add(&mut self, rule: Rule) -> Result<bool> {
-        if let Some(root) = &self.workspace_root {
-            if vikram_policy::allow_reaches_outside(&rule, root) {
-                let resource = rule.resource.to_wire();
-                return Err(RuntimeError::InvalidState(format!(
-                    "`{resource}` is outside the workspace ({})",
-                    root.display()
-                )));
-            }
+        if let Some(root) = &self.workspace_root
+            && vikram_policy::allow_reaches_outside(&rule, root)
+        {
+            let resource = rule.resource.to_wire();
+            return Err(RuntimeError::InvalidState(format!(
+                "`{resource}` is outside the workspace ({})",
+                root.display()
+            )));
         }
         if self.rules.contains(&rule) {
             return Ok(false);

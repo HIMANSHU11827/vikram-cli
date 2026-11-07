@@ -354,11 +354,85 @@ mod tests {
         let back: JsonRpcRequest = serde_json::from_str(&s).unwrap();
         assert_eq!(back.method, "initialize");
         assert_eq!(back.id, serde_json::json!(1));
+        assert_eq!(back.jsonrpc, "2.0");
     }
     #[test]
     fn content_block_text() {
         let c = ContentBlock::text("hi");
         assert_eq!(c.kind, "text");
         assert_eq!(c.text.as_deref(), Some("hi"));
+    }
+    #[test]
+    fn initialize_params_roundtrip() {
+        let p = InitializeParams {
+            protocol_version: 1,
+            client_capabilities: serde_json::json!({"fs": true}),
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["protocolVersion"], 1);
+        let back: InitializeParams = serde_json::from_value(v).unwrap();
+        assert_eq!(back.protocol_version, 1);
+    }
+    #[test]
+    fn new_session_result_roundtrip() {
+        let r = NewSessionResult {
+            session_id: "sess-42".into(),
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["sessionId"], "sess-42");
+        let back: NewSessionResult = serde_json::from_value(v).unwrap();
+        assert_eq!(back.session_id, "sess-42");
+    }
+    #[test]
+    fn prompt_params_camel_case() {
+        let p = PromptParams {
+            session_id: "s1".into(),
+            prompt: vec![ContentBlock::text("hello")],
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["sessionId"], "s1");
+        assert_eq!(v["prompt"][0]["type"], "text");
+        assert_eq!(v["prompt"][0]["text"], "hello");
+    }
+    #[test]
+    fn cancel_params_camel_case() {
+        let p = CancelParams {
+            session_id: "s9".into(),
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["sessionId"], "s9");
+    }
+    #[test]
+    fn jsonrpc_response_error_shape() {
+        let e = JsonRpcError {
+            code: -32600,
+            message: "bad".into(),
+            data: Some(serde_json::json!({"x": 1})),
+        };
+        let resp = JsonRpcResponse {
+            jsonrpc: "2.0".into(),
+            id: serde_json::json!(7),
+            result: None,
+            error: Some(e),
+        };
+        let s = serde_json::to_string(&resp).unwrap();
+        let back: JsonRpcResponse = serde_json::from_str(&s).unwrap();
+        assert!(back.result.is_none());
+        assert_eq!(back.error.unwrap().code, -32600);
+    }
+    #[test]
+    fn acp_client_starts_at_id_one() {
+        let c = AcpClient::new();
+        assert_eq!(c.next_id, 1);
+    }
+    #[test]
+    fn acp_server_agent_name() {
+        let s = AcpServer::new("vikram");
+        assert_eq!(s.agent_name(), "vikram");
+    }
+    #[test]
+    fn acp_client_spawn_missing_binary_errors() {
+        let res = AcpClient::spawn("/definitely/not/a/binary", &[]);
+        assert!(res.is_err());
     }
 }

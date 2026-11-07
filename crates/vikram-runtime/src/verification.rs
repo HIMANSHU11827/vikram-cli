@@ -169,13 +169,23 @@ fn run_step(workspace_root: &Path, step: &PlanStep) -> StepResult {
 fn shell_cmd(command: &str) -> Command {
     #[cfg(windows)]
     {
-        let mut c = Command::new("cmd");
+        let comspec = std::env::var("COMSPEC")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "cmd".to_owned());
+        let mut c = Command::new(&comspec);
         c.args(["/C", command]);
         c
     }
     #[cfg(not(windows))]
     {
-        let mut c = Command::new("sh");
+        let shell = std::env::var("SHELL")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "sh".to_owned());
+        let mut c = Command::new(&shell);
         c.args(["-c", command]);
         c
     }

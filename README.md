@@ -6,7 +6,7 @@
 > virtually present, still in active development. Not a robot and not just a CLI; a proper AI assistant
 > person, primarily private to the user while supporting multiple users. Chats politely and clearly.
 
-[![Rust](https://img.shields.io/badge/rust-1.86%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.89%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![Edition](https://img.shields.io/badge/edition-2024-blue)]()
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)]()
 [![Status](https://img.shields.io/badge/status-pre--release-yellow)]()
@@ -82,7 +82,7 @@ cargo build --release
 ./target/release/vikram
 ```
 
-Requires **Rust 1.86+**. SQLite is compiled in (`rusqlite/bundled`) — no system `libsqlite3`.
+Requires **Rust 1.89+**. SQLite is compiled in (`rusqlite/bundled`) — no system `libsqlite3`.
 
 ### First run
 
@@ -248,6 +248,7 @@ Config lives in `~/.vikram/config.json`:
 {
   "model": "...",
   "base_url": "...",
+  "provider": "openai",
   "api_key_env": "OPENAI_API_KEY",
   "context_window": 128000,
   "workspace_root": "/work",

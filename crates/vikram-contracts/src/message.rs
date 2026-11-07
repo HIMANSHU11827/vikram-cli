@@ -28,6 +28,42 @@ impl ToolCall {
     }
 }
 
+/// Where an image comes from. Both forms are accepted by OpenAI-compatible endpoints: a URL the
+/// provider fetches, or inline base64 (`data:` URL) for a local file or a pasted screenshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ImageSource {
+    Url {
+        url: String,
+    },
+    Data {
+        media_type: String,
+        /// Base64 of the raw bytes, without a `data:` prefix.
+        data: String,
+    },
+}
+
+impl ImageSource {
+    pub fn url(url: impl Into<String>) -> Self {
+        Self::Url { url: url.into() }
+    }
+
+    pub fn data(media_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Self::Data {
+            media_type: media_type.into(),
+            data: data.into(),
+        }
+    }
+
+    /// The `image_url.url` value an OpenAI-compatible request carries.
+    pub fn wire_url(&self) -> String {
+        match self {
+            Self::Url { url } => url.clone(),
+            Self::Data { media_type, data } => format!("data:{media_type};base64,{data}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Block {
@@ -37,6 +73,11 @@ pub enum Block {
     },
     Reasoning {
         text: String,
+        trust: Trust,
+    },
+    Image {
+        source: ImageSource,
+        /// An image is external content: it can inform the model, never authorize an action.
         trust: Trust,
     },
     ToolCall {
@@ -74,6 +115,30 @@ impl Message {
 
     pub fn user(text: impl Into<String>) -> Self {
         Self::text(Role::User, text, Trust::User)
+    }
+
+    /// A user turn with one or more images. The images are `Trust::External`: pixels can carry
+    /// instructions, so they may inform the model but never authorize an action.
+    pub fn user_with_images(text: impl Into<String>, images: Vec<ImageSource>) -> Self {
+        let mut blocks = vec![Block::Text {
+            text: text.into(),
+            trust: Trust::User,
+        }];
+        blocks.extend(images.into_iter().map(|source| Block::Image {
+            source,
+            trust: Trust::External,
+        }));
+        Self {
+            role: Role::User,
+            blocks,
+        }
+    }
+
+    pub fn images(&self) -> impl Iterator<Item = &ImageSource> {
+        self.blocks.iter().filter_map(|block| match block {
+            Block::Image { source, .. } => Some(source),
+            _ => None,
+        })
     }
 
     pub fn tool_result(call: ToolCallId, content: impl Into<String>, ok: bool) -> Self {
@@ -125,6 +190,7 @@ impl Block {
         match self {
             Block::Text { trust, .. } => *trust,
             Block::Reasoning { trust, .. } => *trust,
+            Block::Image { trust, .. } => *trust,
             Block::ToolCall { .. } => Trust::Model,
             Block::ToolResult { trust, .. } => *trust,
         }
@@ -168,5 +234,37 @@ mod tests {
             trust: Trust::User,
         });
         assert_eq!(msg.text_body(), "one\ntwo");
+    }
+
+    #[test]
+    fn images_are_external_and_survive_serialization() {
+        let msg = Message::user_with_images(
+            "what is this?",
+            vec![
+                ImageSource::url("https://example.test/a.png"),
+                ImageSource::data("image/jpeg", "AAAA"),
+            ],
+        );
+        assert_eq!(msg.images().count(), 2);
+        assert!(msg.carries_untrusted_content());
+
+        let encoded = serde_json::to_string(&msg).expect("serializes");
+        let decoded: Message = serde_json::from_str(&encoded).expect("round trips");
+        assert_eq!(decoded, msg);
+        assert_eq!(
+            decoded.images().next().expect("first").wire_url(),
+            "https://example.test/a.png"
+        );
+        assert_eq!(
+            decoded.images().nth(1).expect("second").wire_url(),
+            "data:image/jpeg;base64,AAAA"
+        );
+    }
+
+    #[test]
+    fn a_text_only_user_turn_has_no_image_blocks() {
+        let msg = Message::user_with_images("plain", Vec::new());
+        assert_eq!(msg.images().count(), 0);
+        assert_eq!(msg.blocks.len(), 1);
     }
 }

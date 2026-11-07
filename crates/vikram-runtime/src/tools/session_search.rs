@@ -1,5 +1,7 @@
 use serde_json::{Value, json};
-use vikram_contracts::{ActionKind, AgentId, PermissionRequest, ProjectId, SideEffect, Trust, VikramError};
+use vikram_contracts::{
+    ActionKind, AgentId, PermissionRequest, ProjectId, SideEffect, Trust, VikramError,
+};
 use vikram_store::Store;
 
 use crate::config::database_path;
@@ -40,10 +42,7 @@ impl Tool for SessionSearch {
     fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let q = arg_str(args, "query")?;
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
-        let agent = args
-            .get("agent")
-            .and_then(Value::as_str)
-            .map(AgentId::new);
+        let agent = args.get("agent").and_then(Value::as_str).map(AgentId::new);
         let project = args
             .get("project")
             .and_then(Value::as_str)

@@ -14,6 +14,40 @@
 //! - MAPE-K Loop: Monitor-Analyze-Plan-Execute over shared Knowledge
 //! - Autonomy Manager: Implement autonomy levels and safety controls
 //! - Conversational Control: Natural language interface for evolution control
+//!
+//! # Concurrency model
+//!
+//! [`EvolutionStore`] is the single shared handle (an `Arc<Mutex<Connection>>`)
+//! behind every subsystem; subsystems are cheap clones of it. The engine
+//! itself is a plain struct of those subsystems — it is not `Sync` for
+//! the stateful `self_*` engines (they hold in-memory `Vec`s), so the
+//! runtime keeps the whole engine behind a `Mutex`, exactly as before.
+//!
+//! # Background runner
+//!
+//! There is no implicit thread: [`EvolutionEngine::recover_and_process`]
+//! drains reflection jobs synchronously and is what the runtime calls on
+//! boot (recovery) and after turn-end recording; a host that wants a
+//! background loop can `spawn` a task that calls it periodically. See
+//! `vikram-runtime`'s `Runtime::boot`, which calls it before serving,
+//! and `learning::on_turn_end`, which invokes evolution on every
+//! tool-bearing turn.
+//!
+//! # Store trait
+//!
+//! Subsystems take a concrete [`EvolutionStore`] rather than a trait
+//! object: the store is already a cheap `Arc` clone, and a trait would
+//! force `dyn` dispatch on every query. The `store()` accessors on each
+//! subsystem expose the shared handle for composition (e.g. wiring a
+//! custom collector into `ReflectionEngine::with_subsystems`).
+//!
+//! # Single source of truth for learning
+//!
+//! All durable learning data lives in this crate's SQLite store. The
+//! runtime's `learning.rs` (`LearningManager`, JSON) is only the approval
+//! surface: it stages proposals for the operator and hands model-shaped
+//! proposals to the same policy gate. It never writes a second copy of
+//! experiences, memories, or reflection jobs.
 
 pub mod autonomy;
 pub mod conversational;
@@ -23,6 +57,7 @@ pub mod experience;
 pub mod hive;
 pub mod mapek;
 pub mod memory;
+pub mod metrics;
 pub mod optimization;
 pub mod redact;
 pub mod reflection;
@@ -45,6 +80,9 @@ pub use experience::ExperienceCollector;
 pub use hive::HiveLearning;
 pub use mapek::{CycleResult, HealthStatus, MapekLoop};
 pub use memory::LayeredMemory;
+pub use metrics::{
+    CategoryStats, ExperienceStats, MIN_SAMPLE, OutcomeCounts, ProposalStats, ReflectionStats,
+};
 pub use optimization::OptimizationEngine;
 pub use reflection::{HeuristicReflector, ReflectionEngine, Reflector};
 pub use self_adaptation::{
@@ -64,6 +102,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Top-level facade.
+///
+/// Fields are `pub` for ergonomic composition (`engine.memory.remember(..)`)
+/// but each subsystem is immutable through `&self` (they only hold the
+/// shared store handle), so callers cannot corrupt engine state by
+/// mutating a field — the only mutable state lives behind the store's
+/// mutex or inside the `self_*` engines' own `Vec`s, which require `&mut`.
 pub struct EvolutionEngine {
     pub store: EvolutionStore,
     pub experience: ExperienceCollector,
@@ -88,46 +132,14 @@ pub struct EvolutionEngine {
 impl EvolutionEngine {
     pub fn open(db_path: PathBuf, skills_root: PathBuf) -> Result<Self> {
         let store = EvolutionStore::open(db_path)?;
-        let experience = ExperienceCollector::new(store.clone());
-        let memory = LayeredMemory::new(store.clone());
-        let reflection = ReflectionEngine::new(store.clone(), Arc::new(HeuristicReflector));
-        let skills = SkillEvolution::new(store.clone(), skills_root);
-        let optimization = OptimizationEngine::new(store.clone());
-        let hive = HiveLearning::new(store.clone());
-        let dashboard = Dashboard::new(store.clone());
-        let self_awareness = SelfAwarenessEngine::new(store.clone());
-        let self_config = SelfConfigurationEngine::new(store.clone());
-        let self_adaptation = SelfAdaptationEngine::new(store.clone());
-        let self_improvement = SelfImprovementEngine::new(store.clone());
-        let self_development = SelfDevelopmentEngine::new(store.clone());
-        let self_evaluation = SelfEvaluationEngine::new(store.clone());
-        let self_recovery = SelfRecoveryEngine::new(store.clone());
-        let mapek = MapekLoop::new(store.clone());
-        let autonomy = AutonomyManager::new(store.clone());
-        let conversational = ConversationalControl::new(store.clone());
-        Ok(Self {
-            store,
-            experience,
-            memory,
-            reflection,
-            skills,
-            optimization,
-            hive,
-            dashboard,
-            self_awareness,
-            self_config,
-            self_adaptation,
-            self_improvement,
-            self_development,
-            self_evaluation,
-            self_recovery,
-            mapek,
-            autonomy,
-            conversational,
-        })
+        Ok(Self::from_store(store, skills_root))
     }
     pub fn open_in_memory(skills_root: PathBuf) -> Result<Self> {
         let store = EvolutionStore::open_in_memory()?;
+        Ok(Self::from_store(store, skills_root))
+    }
+
+    fn from_store(store: EvolutionStore, skills_root: PathBuf) -> Self {
         let experience = ExperienceCollector::new(store.clone());
         let memory = LayeredMemory::new(store.clone());
         let reflection = ReflectionEngine::new(store.clone(), Arc::new(HeuristicReflector));
@@ -145,7 +157,7 @@ impl EvolutionEngine {
         let mapek = MapekLoop::new(store.clone());
         let autonomy = AutonomyManager::new(store.clone());
         let conversational = ConversationalControl::new(store.clone());
-        Ok(Self {
+        Self {
             store,
             experience,
             memory,
@@ -164,6 +176,15 @@ impl EvolutionEngine {
             mapek,
             autonomy,
             conversational,
-        })
+        }
+    }
+
+    /// Recover interrupted reflection jobs (e.g. after a crash) and drain
+    /// any that were pending. Returns `(recovered, processed)`.
+    /// Safe to call on every boot; idempotent.
+    pub fn recover_and_process(&self) -> Result<(usize, usize)> {
+        let recovered = self.reflection.recover_jobs()?;
+        let processed = self.reflection.process_pending()?;
+        Ok((recovered, processed))
     }
 }

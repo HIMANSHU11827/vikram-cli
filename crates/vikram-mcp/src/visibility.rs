@@ -49,6 +49,9 @@ pub struct VisibilityManager {
 }
 
 impl VisibilityManager {
+    /// An in-memory manager with no persistence. Call [`VisibilityManager::save`]
+    /// explicitly, or use [`VisibilityManager::with_persist_path`] to load
+    /// existing entries from disk and persist every mutation.
     pub fn new() -> Self {
         Self {
             entries: std::collections::HashMap::new(),
@@ -94,9 +97,17 @@ impl VisibilityManager {
         Ok(())
     }
 
-    /// Set the persist path after construction.
+    /// Set the persist path after construction. Existing entries on disk are
+    /// loaded so a manager created with `new()` and then pointed at a file
+    /// does not clobber state written by an earlier process.
     pub fn set_persist_path(&mut self, path: std::path::PathBuf) {
-        self.persist_path = Some(path);
+        self.persist_path = Some(path.clone());
+        if let Ok(raw) = std::fs::read_to_string(&path)
+            && let Ok(entries) =
+                serde_json::from_str::<std::collections::HashMap<String, ServerVisibility>>(&raw)
+        {
+            self.entries = entries;
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<&ServerVisibility> {
@@ -118,6 +129,9 @@ impl VisibilityManager {
         let _ = self.save();
     }
 
+    /// Set the exposed-tool list for `name` and persist it, exactly like
+    /// [`VisibilityManager::set_visibility`]. Previously this mutated only
+    /// in-memory state, so exposed tools silently reverted on restart.
     pub fn set_exposed_tools(&mut self, name: &str, tools: Vec<String>) {
         if let Some(entry) = self.entries.get_mut(name) {
             entry.exposed_tools = tools;
@@ -140,10 +154,14 @@ impl VisibilityManager {
         self.entries.values().collect()
     }
 
+    /// Register a server for visibility tracking and persist the new entry.
+    /// Registering an already-known server is a no-op (and does not rewrite
+    /// the file), so existing visibility/exposed-tool state is preserved.
     pub fn register(&mut self, name: String) {
         if !self.entries.contains_key(&name) {
             self.entries
                 .insert(name.clone(), ServerVisibility::new(name));
+            let _ = self.save();
         }
     }
 }

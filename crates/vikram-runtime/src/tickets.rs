@@ -5,6 +5,10 @@
 //! never the storage or lifecycle. Persistence goes through `vikram_store`,
 //! so tickets, participants, messages, assignments and events survive restarts.
 
+// Every method maps a row of the ticket schema; grouping those fields into a struct would only
+// move the same parameters one level down.
+#![allow(clippy::too_many_arguments)]
+
 use std::sync::Arc;
 
 use vikram_contracts::{
@@ -419,10 +423,10 @@ impl TicketManager {
             .create_assignment(&row)
             .map_err(|e| e.to_string())?;
         // Update ticket status to in_progress if it was open.
-        if let Ok(Some(t)) = self.store.get_ticket(ticket) {
-            if t.status == "open" || t.status == "reopened" {
-                let _ = self.store.set_ticket_status(ticket, "in_progress", now_ms);
-            }
+        if let Ok(Some(t)) = self.store.get_ticket(ticket)
+            && (t.status == "open" || t.status == "reopened")
+        {
+            let _ = self.store.set_ticket_status(ticket, "in_progress", now_ms);
         }
         let _ = self.record_event(
             ticket,

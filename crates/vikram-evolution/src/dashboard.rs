@@ -22,9 +22,17 @@ impl Dashboard {
     pub fn new(store: EvolutionStore) -> Self {
         Self { store }
     }
+    /// Accessor for the underlying store (shares the same `Arc`).
+    pub fn store(&self) -> EvolutionStore {
+        self.store.clone()
+    }
     pub fn snapshot(&self) -> Result<LearningDashboard> {
+        use crate::types::ProposalStatus;
         let proposals = self.store.list_proposals(None)?;
-        let pending = proposals.iter().filter(|p| p.status == "pending").count();
+        let pending = proposals
+            .iter()
+            .filter(|p| p.status == ProposalStatus::Pending)
+            .count();
         let jobs = self.store.list_pending_jobs()?;
         Ok(LearningDashboard {
             experiences: self.store.count_experiences()?,

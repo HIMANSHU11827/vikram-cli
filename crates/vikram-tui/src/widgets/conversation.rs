@@ -4,6 +4,10 @@
 //! command, or invents information. In particular there is no clock anywhere — a transcript line
 //! says who spoke and what was said, never when.
 
+// Each renderer receives the same small set of layout inputs; threading them through a struct
+// would add indirection to every call without making the call sites clearer.
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::{HashMap, HashSet};
 
 use ratatui::Frame;
@@ -19,8 +23,7 @@ use crate::app::{
     ThoughtKey,
 };
 use crate::theme::Theme;
-use crate::widgets::markdown;
-use crate::widgets::payload;
+use crate::widgets::{indent, markdown, payload};
 
 /// A tool result longer than this is elided: the transcript is a summary, not a log file.
 const TOOL_LINE_CAP: usize = 12;
@@ -131,7 +134,7 @@ pub fn conversation(
     theme: &Theme,
 ) -> Vec<ThoughtHit> {
     let width = area.width.saturating_sub(2) as usize;
-    let (mut lines, marks) = conversation_lines_with_hits(app, session, width, theme);
+    let (lines, marks) = conversation_lines_with_hits(app, session, width, theme);
 
     // A running turn draws exactly where a finished one does: its header sits under the request
     // that started it and the work grows beneath it. A header pinned to the top of the viewport
@@ -398,9 +401,7 @@ fn push_user(
     for (block_index, block) in message.blocks.iter().enumerate() {
         let key = (message_index, block_index);
         match block {
-            Block::Text { text, .. } => {
-                lines.extend(markdown::markdown_lines_styled(text, width, theme, base))
-            }
+            Block::Text { text, .. } => push_message_body(lines, text, width, theme, Some(base)),
             Block::Reasoning { text, .. } => push_reasoning(
                 lines,
                 text,
@@ -418,8 +419,16 @@ fn push_user(
                 } else {
                     Style::default().fg(theme.error)
                 };
-                lines.extend(markdown::markdown_lines_styled(
-                    content, width, theme, style,
+                push_message_body(lines, content, width, theme, Some(style));
+            }
+            Block::Image { source, .. } => {
+                lines.push(Line::styled(
+                    format!(
+                        "{}[image: {}]",
+                        indent::row_prefix(indent::TURN),
+                        image_label(source)
+                    ),
+                    theme.muted(),
                 ));
             }
         }
@@ -449,6 +458,10 @@ fn push_assistant(
             _ => None,
         })
         .next_back();
+    // A turn whose last words are missing has no answer to fold down to: a tool-only turn (the
+    // model reasoned, called a tool, and stopped) would collapse to a bare name row. It opens
+    // instead, so the work it did stays readable.
+    let has_answer = answer.is_some();
     let ctx = TurnCtx {
         session,
         waiting,
@@ -470,7 +483,7 @@ fn push_assistant(
         theme,
         &clock,
         (ACTIVITY_TURN, message_index),
-        false,
+        !has_answer,
     );
     if folded {
         // The fold hides the work, never the answer: the one sentence a turn is worth reading
@@ -550,8 +563,25 @@ fn push_blocks(
             } => {
                 // The row above already renders this result; a paired block adds nothing.
                 if !index.paired(call) {
-                    push_tool_payload(lines, content, *ok, width, theme);
+                    push_tool_payload(
+                        lines,
+                        content,
+                        *ok,
+                        width,
+                        theme,
+                        indent::nested(indent::TURN),
+                    );
                 }
+            }
+            Block::Image { source, .. } => {
+                lines.push(Line::styled(
+                    format!(
+                        "{}[image: {}]",
+                        indent::row_prefix(indent::TURN),
+                        image_label(source)
+                    ),
+                    theme.muted(),
+                ));
             }
         }
     }
@@ -606,6 +636,9 @@ fn push_turn(
                 .any(|(_, _, block)| matches!(block, Block::ToolCall { .. }))
         })
         .map(|index| (blocks[index].0, blocks[index].1));
+    // A turn with no answer text has nothing a fold could leave behind, so it opens by default
+    // rather than collapsing to a name row with the work invisible.
+    let has_answer = answer.is_some();
     let ctx = TurnCtx {
         session: ctx.session,
         waiting: ctx.waiting,
@@ -628,7 +661,7 @@ fn push_turn(
         ctx.theme,
         &clock,
         (ACTIVITY_TURN, start),
-        ctx.session.busy(),
+        ctx.session.busy() || !has_answer,
     );
     if folded {
         // The fold hides the work, never the answer: the turn's last spoken block is the one line
@@ -694,7 +727,14 @@ fn push_turn(
                         drawn.insert(position);
                         continue;
                     }
-                    push_tool_payload(lines, content, *ok, ctx.width, ctx.theme);
+                    push_tool_payload(
+                        lines,
+                        content,
+                        *ok,
+                        ctx.width,
+                        ctx.theme,
+                        indent::nested(indent::TURN),
+                    );
                 }
             }
             Role::System => push_system(
@@ -841,9 +881,10 @@ fn push_speech(
         // every terminal and read as a stray cloud in front of the speaker.
         lines.push(Line::styled(format!("> {AGENT}"), theme.title()));
     }
-    let inner = width.saturating_sub(3).max(1);
+    let inner = width.saturating_sub(indent::row(indent::TURN)).max(1);
+    let prefix = indent::row_prefix(indent::TURN);
     for line in markdown::markdown_lines(text, inner, theme) {
-        lines.push(indent(line, "   "));
+        lines.push(indent_line(line, &prefix));
     }
 }
 
@@ -858,12 +899,11 @@ fn push_system(
 ) {
     lines.push(Line::from(""));
     lines.push(Line::styled(dim_label(theme, "system"), theme.muted()));
-    let style = theme.muted();
     for (block_index, block) in message.blocks.iter().enumerate() {
         let key = (message_index, block_index);
         match block {
             Block::Text { text, .. } => {
-                lines.extend(markdown::markdown_lines_styled(text, width, theme, style))
+                push_message_body(lines, text, width, theme, Some(theme.muted()))
             }
             Block::Reasoning { text, .. } => {
                 push_reasoning(lines, text, false, false, key, marks, width, theme)
@@ -883,8 +923,25 @@ fn push_system(
                 call, content, ok, ..
             } => {
                 if !index.paired(call) {
-                    push_tool_payload(lines, content, *ok, width, theme);
+                    push_tool_payload(
+                        lines,
+                        content,
+                        *ok,
+                        width,
+                        theme,
+                        indent::nested(indent::TURN),
+                    );
                 }
+            }
+            Block::Image { source, .. } => {
+                lines.push(Line::styled(
+                    format!(
+                        "{}[image: {}]",
+                        indent::row_prefix(indent::TURN),
+                        image_label(source)
+                    ),
+                    theme.muted(),
+                ));
             }
         }
     }
@@ -907,21 +964,34 @@ fn push_tool(
                 if index.paired(call) || index.activity.contains_key(call) {
                     continue;
                 }
-                push_tool_payload(lines, content, *ok, width, theme);
+                push_tool_payload(
+                    lines,
+                    content,
+                    *ok,
+                    width,
+                    theme,
+                    indent::nested(indent::TURN),
+                );
             }
             Block::Text { text, .. } | Block::Reasoning { text, .. } => {
                 if !text.trim().is_empty() {
-                    lines.extend(markdown::markdown_lines_styled(
-                        text,
-                        width,
-                        theme,
-                        theme.muted(),
-                    ));
+                    push_message_body(lines, text, width, theme, Some(theme.muted()));
                 }
+            }
+            Block::Image { source, .. } => {
+                lines.push(Line::styled(
+                    format!(
+                        "{}[image: {}]",
+                        indent::row_prefix(indent::TURN),
+                        image_label(source)
+                    ),
+                    theme.muted(),
+                ));
             }
             Block::ToolCall { call } => {
                 let label = tool_label(call, theme);
                 lines.push(Line::from(vec![
+                    Span::raw(indent::row_prefix(indent::TURN)),
                     Span::styled(format!("{} ", theme.chevron()), theme.secondary()),
                     Span::styled(label.name, Style::default().fg(theme.tool)),
                 ]));
@@ -973,9 +1043,15 @@ fn push_tool_row(
     };
     let label = tool_label(call, theme);
     let head = format!("{glyph} {}", label.name);
-    marks.push((lines.len(), head.width() as u16, key, true));
+    marks.push((
+        lines.len(),
+        (indent::row(indent::TURN) + head.width()) as u16,
+        key,
+        true,
+    ));
 
     let mut spans = vec![
+        Span::raw(indent::row_prefix(indent::TURN)),
         Span::styled(format!("{glyph} "), style),
         Span::styled(label.name, Style::default().fg(theme.text)),
     ];
@@ -994,10 +1070,15 @@ fn push_tool_row(
     }
     lines.push(Line::from(spans));
 
-    if expanded {
-        if let Some((content, ok)) = outcome {
-            push_tool_payload(lines, content, ok, width, theme);
-        }
+    if expanded && let Some((content, ok)) = outcome {
+        push_tool_payload(
+            lines,
+            content,
+            ok,
+            width,
+            theme,
+            indent::nested(indent::TURN),
+        );
     }
 }
 
@@ -1028,8 +1109,14 @@ fn push_activity_tool_row(
     };
     let label = tool_label_from_text(&activity.text, theme);
     let head = format!("{glyph} {}", label.name);
-    marks.push((lines.len(), head.width() as u16, key, true));
+    marks.push((
+        lines.len(),
+        (indent::row(indent::TURN) + head.width()) as u16,
+        key,
+        true,
+    ));
     let mut spans = vec![
+        Span::raw(indent::row_prefix(indent::TURN)),
         Span::styled(format!("{glyph} "), style),
         Span::styled(label.name, Style::default().fg(theme.text)),
     ];
@@ -1046,7 +1133,14 @@ fn push_activity_tool_row(
     ));
     lines.push(Line::from(spans));
     if expanded {
-        push_tool_payload(lines, content, ok, width, theme);
+        push_tool_payload(
+            lines,
+            content,
+            ok,
+            width,
+            theme,
+            indent::nested(indent::TURN),
+        );
     }
 }
 
@@ -1152,14 +1246,19 @@ fn humanize(name: &str) -> String {
 }
 
 /// The payload behind a tool row, shown only when that row is opened.
+///
+/// `column` is where the body starts, which [`indent::nested`] decides for every row that has one:
+/// a payload is a block inside the row, so it steps in once rather than lining up with the row's
+/// text.
 fn push_tool_payload(
     lines: &mut Vec<Line<'static>>,
     content: &str,
     ok: bool,
     width: usize,
     theme: &Theme,
+    column: usize,
 ) {
-    let inner = width.saturating_sub(4).max(1);
+    let inner = width.saturating_sub(column).max(1);
     let style = if ok {
         Style::default().fg(theme.tool)
     } else {
@@ -1167,13 +1266,14 @@ fn push_tool_payload(
     };
     let body = markdown::markdown_lines_styled(content, inner, theme, style);
     let total = body.len();
+    let prefix = indent::spaces(column);
     for line in body.into_iter().take(TOOL_LINE_CAP) {
-        lines.push(indent(line, "    "));
+        lines.push(indent_line(line, &prefix));
     }
     if total > TOOL_LINE_CAP {
         lines.push(Line::styled(
             format!(
-                "    {} ({} more lines)",
+                "{prefix}{} ({} more lines)",
                 ellipsis(theme),
                 total - TOOL_LINE_CAP
             ),
@@ -1214,8 +1314,14 @@ fn push_reasoning(
     };
     let head = format!("{glyph} {heading}");
     // Only the label folds the block, so a drag that starts on the text after it is still a copy.
-    marks.push((lines.len(), head.width() as u16, key, false));
+    marks.push((
+        lines.len(),
+        (indent::row(indent::TURN) + head.width()) as u16,
+        key,
+        false,
+    ));
     let mut spans = vec![
+        Span::raw(indent::row_prefix(indent::TURN)),
         Span::styled(format!("{glyph} "), glyph_style),
         Span::styled(heading.to_string(), label),
     ];
@@ -1225,7 +1331,11 @@ fn push_reasoning(
             theme.muted(),
         ));
         lines.push(Line::from(spans));
-        lines.extend(markdown::markdown_lines(text, width, theme));
+        let column = indent::body(indent::TURN, glyph);
+        let text = markdown::markdown_lines(text, width.saturating_sub(column).max(1), theme);
+        for line in text {
+            lines.push(indent_line(line, &indent::spaces(column)));
+        }
         return;
     }
     let mut row = text.lines().map(str::trim).filter(|line| !line.is_empty());
@@ -1250,6 +1360,7 @@ fn push_tool_call(
 ) {
     let bullet = if theme.ascii { "-" } else { "·" };
     lines.push(Line::from(vec![
+        Span::raw(indent::row_prefix(indent::TURN)),
         Span::styled(format!("{bullet} "), theme.muted()),
         Span::styled("tool call", theme.secondary()),
         Span::styled(format!("  {}", call.name), Style::default().fg(theme.tool)),
@@ -1257,9 +1368,12 @@ fn push_tool_call(
 
     let summary = argument_summary(&call.arguments, ARGUMENT_CAP, ellipsis(theme));
     if !summary.is_empty() {
-        let inner = width.saturating_sub(2).max(1);
-        for line in markdown::wrap_plain(&summary, inner, theme.muted()) {
-            lines.push(indent(line, "  "));
+        let column = indent::body(indent::TURN, bullet);
+        let prefix = indent::spaces(column);
+        for line in
+            markdown::wrap_plain(&summary, width.saturating_sub(column).max(1), theme.muted())
+        {
+            lines.push(indent_line(line, &prefix));
         }
     }
 }
@@ -1368,58 +1482,47 @@ fn push_activity(
         ActivityKind::Agent => (theme.subagents_glyph().to_owned(), theme.secondary()),
     };
 
-    let prefix_width = glyph.width() + 1;
-    let inner = width.saturating_sub(prefix_width).max(1);
+    // One row, one prefix. The fold mark that opens the row rides at the end of its first line —
+    // where every other folding row in the transcript keeps it — so the glyph and the text after it
+    // land in the same columns as a tool call's whether this row can fold or not. Leading the row
+    // with the mark was what pushed activity rows two columns right of the tool rows beside them.
+    let is_tool = activity.kind == ActivityKind::Tool;
+    let column = indent::body(indent::TURN, &glyph);
+    let mark = if is_tool {
+        format!("  {toggle}")
+    } else {
+        String::new()
+    };
+    let inner = width.saturating_sub(column + mark.width()).max(1);
     let mut wrapped = markdown::wrap_plain(&activity.text, inner, style).into_iter();
 
-    // Toggle indicator prefix for tool activities.
-    let is_tool = activity.kind == ActivityKind::Tool;
-
+    let mut spans = vec![
+        Span::styled(row_gutter(selected), theme.muted()),
+        Span::styled(glyph.clone(), style),
+    ];
     match wrapped.next() {
         Some(first) => {
-            let mut spans = Vec::new();
-            if is_tool {
-                spans.push(Span::styled(
-                    format!("{toggle} "),
-                    Style::default().fg(theme.accent),
-                ));
-            }
-            if selected {
-                spans.push(Span::styled("> ", theme.muted()));
-            }
-            spans.push(Span::styled(glyph.clone(), style));
             spans.push(Span::raw(" "));
             spans.extend(first.spans);
+            if !mark.is_empty() {
+                spans.push(Span::styled(mark, Style::default().fg(theme.accent)));
+            }
             lines.push(Line::from(spans));
         }
         None => {
-            let mut spans = Vec::new();
-            if is_tool {
-                spans.push(Span::styled(
-                    format!("{toggle} "),
-                    Style::default().fg(theme.accent),
-                ));
-            }
-            if selected {
-                spans.push(Span::styled("> ", theme.muted()));
-            }
-            spans.push(Span::styled(glyph, style));
             lines.push(Line::from(spans));
             return;
         }
     }
 
-    // Collapsed: the glance stops at the first line. Expanded: reveal every wrapped
-    // line so the toggle indicator (▶/▼) actually changes what the user sees. Only
-    // `fs.edit` / `fs.delete` activities took this path before, so a plain tool call
-    // would flip its arrow without ever growing — that was the reported bug.
+    // Collapsed: the glance stops at the first line. Expanded: reveal every wrapped line so the
+    // toggle (▶/▼) actually changes what the operator sees, each one starting under the text of the
+    // first so a wrapped row still reads as one row.
     if activity.expanded {
+        let prefix = indent::spaces(column);
         for line in wrapped {
-            lines.push(indent(line, &" ".repeat(prefix_width)));
+            lines.push(indent_line(line, &prefix));
         }
-    } else if wrapped.next().is_some() {
-        // Collapsed still trims a wrapped second line rather than leaving a dangling
-        // iterator; the content is intentionally capped at the first line.
     }
 }
 
@@ -1443,15 +1546,16 @@ fn push_fs_activity(
         Some(false) => Style::default().fg(theme.error),
     };
 
-    let mut spans = vec![Span::styled(
-        format!("{toggle} "),
-        Style::default().fg(theme.accent),
-    )];
-    if selected {
-        spans.push(Span::styled("> ", theme.muted()));
-    }
-    spans.push(Span::styled(format!("→ {label} {path}"), style));
-    lines.push(Line::from(spans));
+    // The same prefix every other row of the turn wears: the indent, then the glyph, then the text.
+    // The fold mark trails the line so this row's glyph sits in the column of a tool call's.
+    let glyph = fs_glyph(theme);
+    let column = indent::body(indent::TURN, glyph);
+    lines.push(Line::from(vec![
+        Span::styled(row_gutter(selected), theme.muted()),
+        Span::styled(format!("{glyph} "), style),
+        Span::styled(format!("{label} {path}"), style),
+        Span::styled(format!("  {toggle}"), Style::default().fg(theme.accent)),
+    ]));
 
     // Expanded: show the full content (diff / deleted content).
     if !activity.expanded {
@@ -1464,12 +1568,13 @@ fn push_fs_activity(
         .split_once('·')
         .map(|(_, rest)| rest.trim().to_owned())
         .unwrap_or_default();
+    let prefix = indent::spaces(column);
 
     if is_edit {
         if !summary.is_empty() {
-            let inner = width.saturating_sub(2).max(1);
+            let inner = width.saturating_sub(column).max(1);
             for line in markdown::wrap_plain(&summary, inner, style) {
-                lines.push(indent(line, "  "));
+                lines.push(indent_line(line, &prefix));
             }
         }
     } else {
@@ -1484,11 +1589,11 @@ fn push_fs_activity(
         let cap = 10usize;
         let total = content_lines.len();
         for line in content_lines.into_iter().take(cap) {
-            lines.push(Line::styled(format!("  {line}"), style));
+            lines.push(Line::styled(format!("{prefix}{line}"), style));
         }
         if total > cap {
             lines.push(Line::styled(
-                format!("  {} ({} more lines)", ellipsis(theme), total - cap),
+                format!("{prefix}{} ({} more lines)", ellipsis(theme), total - cap),
                 theme.muted(),
             ));
         }
@@ -1498,6 +1603,42 @@ fn push_fs_activity(
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// A message body: what a message says, drawn one step in from the label that names it.
+///
+/// `style` overrides the markdown renderer's own colours when the whole body is tinted — a system
+/// note or a tool result — and is `None` for speech, whose inline styling is the markdown's.
+fn push_message_body(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    width: usize,
+    theme: &Theme,
+    style: Option<Style>,
+) {
+    let column = indent::row(indent::TURN);
+    let prefix = indent::spaces(column);
+    let inner = width.saturating_sub(column).max(1);
+    let body = match style {
+        Some(style) => markdown::markdown_lines_styled(text, inner, theme, style),
+        None => markdown::markdown_lines(text, inner, theme),
+    };
+    for line in body {
+        lines.push(indent_line(line, &prefix));
+    }
+}
+
+/// A short, safe label for an image block; the bytes are never rendered in a terminal.
+fn image_label(source: &vikram_contracts::ImageSource) -> String {
+    match source {
+        vikram_contracts::ImageSource::Url { url } => url
+            .rsplit('/')
+            .next()
+            .filter(|part| !part.is_empty())
+            .unwrap_or("linked image")
+            .to_string(),
+        vikram_contracts::ImageSource::Data { media_type, .. } => media_type.clone(),
+    }
+}
 
 fn separator_line(width: usize, theme: &Theme) -> Line<'static> {
     Line::styled(
@@ -1519,7 +1660,27 @@ fn ellipsis(theme: &Theme) -> &'static str {
     if theme.ascii { "..." } else { "…" }
 }
 
-fn indent(line: Line<'static>, prefix: &str) -> Line<'static> {
+/// The run of columns every row of a turn starts with.
+///
+/// The indent and the selection cursor are the same columns: a cursor that pushed the row it sits
+/// on one step sideways would break the alignment the indent exists to keep, so it *is* the indent
+/// when the operator has walked to that row.
+fn row_gutter(selected: bool) -> String {
+    let width = indent::row(indent::TURN);
+    if selected && width > 0 {
+        format!(">{}", indent::spaces(width - 1))
+    } else {
+        indent::spaces(width)
+    }
+}
+
+/// The arrow an `fs.edit` / `fs.delete` row opens with, in the same ascii-safe form as the rest.
+fn fs_glyph(theme: &Theme) -> &'static str {
+    if theme.ascii { "->" } else { "→" }
+}
+
+/// Put `prefix` in front of a line the renderer already built.
+fn indent_line(line: Line<'static>, prefix: &str) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 1);
     spans.push(Span::raw(prefix.to_owned()));
     spans.extend(line.spans);
@@ -1667,6 +1828,44 @@ mod tests {
 
     fn transcript(lines: &[Line<'_>]) -> Vec<String> {
         lines.iter().map(text_of).collect()
+    }
+
+    /// The columns a rendered row occupies before its first glyph.
+    ///
+    /// A row the operator has walked to spends its indent on the selection cursor instead of
+    /// spaces, so this counts spaces rather than measuring the gutter.
+    fn lead(row: &str) -> usize {
+        row.chars().take_while(|ch| *ch == ' ').count()
+    }
+
+    /// The glyph a row opens with: the first word after the row's indent, or after the selection
+    /// cursor that stands in the indent's place.
+    fn glyph_of(row: &str) -> &str {
+        let rest = row.trim_start_matches(' ');
+        rest.strip_prefix('>')
+            .map(str::trim_start)
+            .unwrap_or(rest)
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+    }
+
+    /// The column a row's glyph sits in, cursor or no cursor.
+    fn glyph_column(row: &str) -> usize {
+        row.find(glyph_of(row)).unwrap_or_default()
+    }
+
+    /// The column the text after a row's glyph starts at.
+    fn text_column(row: &str) -> usize {
+        glyph_column(row) + glyph_of(row).width() + 1
+    }
+
+    /// What a row at a turn's depth opens with: the indent, the glyph, and the space after it.
+    ///
+    /// Written out rather than derived from the row, because a renderer that put anything else in
+    /// front of the glyph would still have a first word for [`glyph_of`] to find.
+    fn opens_with(glyph: &str) -> String {
+        format!("{}{glyph} ", indent::row_prefix(indent::TURN))
     }
 
     /// A crude clock detector: two digits, a colon, two digits.
@@ -1876,6 +2075,341 @@ mod tests {
             "a plain tool activity must grow when expanded (collapsed={}, expanded={})",
             collapsed.len(),
             expanded.len(),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // the indent rule
+    //
+    // A turn is named at depth zero — `> VIKRAM`, `❯ User`, `· system` — and everything it did
+    // hangs one step under that name. Four renderers draw an activity row (`push_activity`,
+    // `push_fs_activity`, `push_activity_tool_row` and `payload::push_row`) and they used to pick
+    // their own prefixes, so a report sat flush left while the speech above it did not. These
+    // tests pin the columns of all four plus the message row they sit beside.
+    // -----------------------------------------------------------------------
+
+    /// A turn with one request in it, which is all an activity needs to have somewhere to hang.
+    fn turn_session(request: &str) -> SessionView {
+        let mut session = sample_session();
+        session.messages.push(Message::user(request));
+        session
+    }
+
+    #[test]
+    fn a_top_level_activity_row_starts_in_the_turn_indent() {
+        let app = App::new(false);
+        let mut session = turn_session("look around");
+        session.activity.push(Activity {
+            kind: ActivityKind::Notice,
+            text: "screen redrawn".to_owned(),
+            call: None,
+            ok: None,
+            expanded: false,
+        });
+        let theme = Theme::new(false);
+        let rows = transcript(&shown(&app, &mut session, 60, &theme));
+
+        let row = rows
+            .iter()
+            .find(|row| row.contains("screen redrawn"))
+            .unwrap_or_else(|| panic!("the notice is drawn: {rows:#?}"));
+        assert_eq!(
+            lead(row),
+            indent::row(indent::TURN),
+            "a row the turn reported sits one step under the name row: {rows:#?}"
+        );
+        assert!(
+            row.starts_with(&opens_with(theme.bullet())),
+            "the glyph opens the row, right after the indent: {rows:#?}"
+        );
+        assert_eq!(
+            text_column(row),
+            indent::body(indent::TURN, theme.bullet()),
+            "the text starts one glyph past the row's column: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn an_activity_row_under_a_tool_call_lines_up_with_the_call() {
+        let app = App::new(false);
+        let mut session = turn_session("check the middleware");
+
+        // A call the transcript keeps a block for: the row is drawn from that block.
+        let read = ToolCall::new("fs.read", serde_json::json!({"path": "src/api/jwt.rs"}));
+        let id = read.id.clone();
+        session.messages.push(Message {
+            role: Role::Assistant,
+            blocks: vec![Block::ToolCall { call: read }],
+        });
+        session
+            .messages
+            .push(Message::tool_result(id, "fn main() {}", true));
+
+        // A call the runtime only reported: the row is drawn from the report instead.
+        let run = ToolCallId::generate();
+        session.activity.push(Activity {
+            kind: ActivityKind::Tool,
+            text: "shell.run  command=cargo test --all".to_owned(),
+            call: Some(run.clone()),
+            ok: Some(true),
+            expanded: false,
+        });
+        session
+            .messages
+            .push(Message::tool_result(run, "test result: ok", true));
+
+        let theme = Theme::new(false);
+        let rows = transcript(&shown(&app, &mut session, 70, &theme));
+        let call = rows
+            .iter()
+            .find(|row| row.contains("src/api/jwt.rs"))
+            .unwrap_or_else(|| panic!("the call row is drawn: {rows:#?}"));
+        let report = rows
+            .iter()
+            .find(|row| row.contains("cargo test --all"))
+            .unwrap_or_else(|| panic!("the activity row is drawn: {rows:#?}"));
+
+        assert!(
+            call.starts_with(&opens_with(theme.check())),
+            "the call row opens in the turn indent: {rows:#?}"
+        );
+        assert!(
+            report.starts_with(&opens_with(theme.check())),
+            "an activity row under a tool call opens in the same columns: {rows:#?}"
+        );
+        assert_eq!(
+            lead(report),
+            indent::row(indent::TURN),
+            "an activity row under a tool call sits in the turn indent: {rows:#?}"
+        );
+        assert_eq!(
+            glyph_column(report),
+            glyph_column(call),
+            "the activity's glyph and the call's share one column: {rows:#?}"
+        );
+        assert_eq!(
+            text_column(report),
+            text_column(call),
+            "and so does the text after them: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_activity_line_keeps_the_indent_of_its_row() {
+        let app = App::new(false);
+        let mut session = turn_session("look around");
+        session.activity.push(Activity {
+            kind: ActivityKind::Tool,
+            text: "shell · ls -la --color=auto /very/long/path/that/wraps/because/it/is/long"
+                .to_owned(),
+            call: None,
+            ok: Some(true),
+            expanded: true,
+        });
+        let theme = Theme::new(false);
+        let rows = transcript(&shown(&app, &mut session, 40, &theme));
+
+        let head = rows
+            .iter()
+            .position(|row| row.contains("shell"))
+            .unwrap_or_else(|| panic!("the activity row is drawn: {rows:#?}"));
+        let glyph = theme.check();
+        assert!(
+            rows[head].starts_with(&opens_with(glyph)),
+            "the row that folds opens in the turn indent, even with its arrow at the end: {rows:#?}"
+        );
+        let column = indent::body(indent::TURN, glyph);
+        assert_eq!(
+            text_column(&rows[head]),
+            column,
+            "its text sits one glyph past its column: {rows:#?}"
+        );
+
+        let wrapped = &rows[head + 1..];
+        assert!(
+            !wrapped.is_empty(),
+            "the row has to wrap at this width to test a wrapped line: {rows:#?}"
+        );
+        for row in wrapped {
+            assert_eq!(
+                lead(row),
+                column,
+                "a wrapped line continues under the text it continues: {rows:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_message_row_and_an_activity_row_share_the_turn_indent() {
+        let app = App::new(false);
+        let mut session = turn_session("check the middleware");
+        session.messages.push(Message::text(
+            Role::Assistant,
+            "here is what I found",
+            Trust::Host,
+        ));
+        session.activity.push(Activity {
+            kind: ActivityKind::Notice,
+            text: "screen redrawn".to_owned(),
+            call: None,
+            ok: None,
+            expanded: false,
+        });
+        session.turn = TurnState::Idle;
+        let theme = Theme::new(false);
+        let rows = transcript(&shown(&app, &mut session, 70, &theme));
+
+        let message = rows
+            .iter()
+            .find(|row| row.contains("here is what I found"))
+            .unwrap_or_else(|| panic!("the message is drawn: {rows:#?}"));
+        let activity = rows
+            .iter()
+            .find(|row| row.contains("screen redrawn"))
+            .unwrap_or_else(|| panic!("the activity is drawn: {rows:#?}"));
+
+        assert_eq!(
+            lead(message),
+            indent::row(indent::TURN),
+            "what the agent says hangs one step under the name row: {rows:#?}"
+        );
+        assert!(
+            activity.starts_with(&opens_with(theme.bullet())),
+            "and so does the glyph of a row the turn reported: {rows:#?}"
+        );
+        assert_eq!(
+            glyph_column(activity),
+            lead(message),
+            "the glyph of a reported row sits in the column the message hangs from: {rows:#?}"
+        );
+        assert_eq!(
+            indent::body(indent::TURN, theme.bullet()) - lead(message),
+            indent::STEP,
+            "the text of a row is exactly one step past the column rows share: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_payload_row_is_indented_like_the_call_it_belongs_to() {
+        let app = App::new(false);
+        let mut session = turn_session("run the tests");
+        let call = ToolCallId::generate();
+        session.payloads.insert(
+            call.clone(),
+            crate::app::Payload {
+                name: "shell.run".to_owned(),
+                resource: "cargo test".to_owned(),
+                arguments: serde_json::json!({"command": "cargo test"}).to_string(),
+                content: "running one\n[exit 0]".to_owned(),
+                cwd: "/work".to_owned(),
+                duration_ms: 1_200,
+            },
+        );
+        session.activity.push(Activity {
+            kind: ActivityKind::Tool,
+            text: "shell.run · cargo test".to_owned(),
+            call: Some(call),
+            ok: Some(true),
+            expanded: false,
+        });
+        let position = session.activity.len() - 1;
+        session.tool_folds.insert((ACTIVITY_TOOL, position), true);
+
+        let theme = Theme::new(false);
+        let rows = transcript(&shown(&app, &mut session, 70, &theme));
+        let head = rows
+            .iter()
+            .position(|row| row.contains("cargo test"))
+            .unwrap_or_else(|| panic!("the row is drawn: {rows:#?}"));
+        assert!(
+            rows[head].starts_with(&opens_with(theme.check())),
+            "a receipt row is a row of the turn like any other: {rows:#?}"
+        );
+
+        let body = &rows[head + 1..];
+        assert!(!body.is_empty(), "the open row shows its body: {rows:#?}");
+        for row in body {
+            assert_eq!(
+                lead(row),
+                indent::nested(indent::TURN),
+                "the body of a row steps in exactly one step from it: {rows:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_fs_activity_row_shares_the_activity_column() {
+        let app = App::new(false);
+        let mut session = turn_session("edit the entry point");
+        session.activity.push(Activity {
+            kind: ActivityKind::Tool,
+            text: "fs.edit path=src/main.rs · one two three four five six seven eight nine ten"
+                .to_owned(),
+            call: None,
+            ok: Some(true),
+            expanded: true,
+        });
+        let theme = Theme::new(false);
+        let rows = transcript(&shown(&app, &mut session, 50, &theme));
+
+        let head = rows
+            .iter()
+            .position(|row| row.contains("Edited"))
+            .unwrap_or_else(|| panic!("the edit row is drawn: {rows:#?}"));
+        assert!(
+            rows[head].starts_with(&opens_with("→")),
+            "an edit row is an activity row, so it keeps the same column: {rows:#?}"
+        );
+        let body = &rows[head + 1..];
+        assert!(
+            !body.is_empty(),
+            "the expanded row shows the summary it edited: {rows:#?}"
+        );
+        for row in body {
+            assert_eq!(
+                lead(row),
+                indent::nested(indent::TURN),
+                "its body steps in one step from it: {rows:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_selection_cursor_uses_the_indent_instead_of_pushing_the_row_along() {
+        let app = App::new(false);
+        let mut session = turn_session("look around");
+        for text in ["screen redrawn", "policy reloaded"] {
+            session.activity.push(Activity {
+                kind: ActivityKind::Notice,
+                text: text.to_owned(),
+                call: None,
+                ok: None,
+                expanded: false,
+            });
+        }
+        let theme = Theme::new(false);
+        let plain = transcript(&shown(&app, &mut session, 60, &theme));
+
+        session.selected_activity = Some(0);
+        let chosen = transcript(&shown(&app, &mut session, 60, &theme));
+
+        let first = plain
+            .iter()
+            .position(|row| row.contains("screen redrawn"))
+            .unwrap_or_else(|| panic!("the first row is drawn: {plain:#?}"));
+        assert_eq!(
+            chosen[first].find(theme.bullet()),
+            Some(indent::row(indent::TURN)),
+            "the cursor takes the indent's place rather than adding to it: {chosen:#?}"
+        );
+        assert!(
+            chosen[first].starts_with('>'),
+            "the cursor is visible in the leftmost column: {chosen:#?}"
+        );
+        assert_eq!(
+            lead(&chosen[first + 1]),
+            indent::row(indent::TURN),
+            "and the row beside it does not move: {chosen:#?}"
         );
     }
 
@@ -2403,12 +2937,12 @@ mod tests {
             .collect();
         assert_eq!(labelled.len(), 1, "one call is one row: {rows:#?}");
         assert!(
-            labelled[0].starts_with(theme.check()),
+            glyph_of(labelled[0]) == theme.check(),
             "a finished call ends on the check glyph, not the running arrow: {rows:#?}"
         );
         assert_eq!(
             rows.iter()
-                .filter(|row| row.starts_with(theme.check()))
+                .filter(|row| glyph_of(row) == theme.check())
                 .count(),
             1,
             "the call and its result is one done row, not two: {rows:#?}"
@@ -2611,6 +3145,29 @@ mod tests {
         assert!(
             all.contains("Worked · 10s"),
             "the second turn has no clock: {all}"
+        );
+    }
+
+    #[test]
+    fn a_turn_with_no_answer_shows_what_it_did_instead_of_a_bare_name_row() {
+        let call = ToolCall::new("terminal", serde_json::json!({"action": "open"}));
+        let id = call.id.clone();
+        let mut session = sample_session();
+        session.messages = vec![
+            Message::user("run the game"),
+            Message {
+                role: Role::Assistant,
+                blocks: vec![Block::ToolCall { call }],
+            },
+            Message::tool_result(id, "opened terminal session `snake-game`", true),
+        ];
+        session.turn = TurnState::Idle;
+        let app = App::new(false);
+        let theme = Theme::new(false);
+        let all = transcript(&conversation_lines(&app, &session, 80, &theme)).join("\n");
+        assert!(
+            all.contains("Terminal"),
+            "a tool-only turn must not fold to an empty name row: {all}"
         );
     }
 

@@ -238,8 +238,8 @@ fn counts(bytes: &[u8], header: usize) -> Option<[usize; 6]> {
         return None;
     }
     let mut out = [0usize; 6];
-    for (slot, chunk) in out.iter_mut().zip(raw.chunks_exact(4)) {
-        *slot = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as usize;
+    for (slot, chunk) in out.iter_mut().zip(raw.as_chunks::<4>().0) {
+        *slot = u32::from_be_bytes(*chunk) as usize;
     }
     Some(out)
 }
@@ -279,7 +279,7 @@ fn parse_zone_file(bytes: &[u8]) -> Option<ZoneFile> {
         });
     }
     let mut kinds = Vec::with_capacity(kind_count);
-    for chunk in kinds_raw.chunks_exact(6) {
+    for chunk in kinds_raw.as_chunks::<6>().0 {
         kinds.push((
             i32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
             chunk[4] != 0,

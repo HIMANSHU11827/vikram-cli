@@ -45,42 +45,83 @@ impl ManagedAgent {
     }
 
     pub fn set_state(&self, state: AgentState) {
-        *self.state.lock().expect("agent state") = state;
+        *self.state.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: agent agent state mutex poisoned; recovering");
+            e.into_inner()
+        }) = state;
     }
 
     pub fn state(&self) -> AgentState {
-        *self.state.lock().expect("agent state")
+        *self.state.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: agent agent state mutex poisoned; recovering");
+            e.into_inner()
+        })
     }
 
     pub fn set_task(&self, task: Option<String>) {
-        *self.current_task.lock().expect("task lock") = task;
+        *self.current_task.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: agent task lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = task;
     }
 
     pub fn set_session(&self, session: Option<SessionId>) {
-        *self.session.lock().expect("session lock") = session;
+        *self.session.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: agent session lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = session;
     }
 
     pub fn cancel_handle(&self) -> CancellationToken {
-        self.cancel.lock().expect("agent cancel").clone()
+        self.cancel
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: agent agent cancel mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()
     }
 
     pub fn is_paused(&self) -> bool {
-        *self.paused.lock().expect("pause lock")
+        *self.paused.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: agent pause lock mutex poisoned; recovering");
+            e.into_inner()
+        })
     }
 
     pub fn snapshot(&self) -> AgentSnapshot {
         AgentSnapshot {
             profile: self.profile.clone(),
             state: self.state(),
-            current_task: self.current_task.lock().expect("task lock").clone(),
-            progress: *self.progress.lock().expect("progress lock"),
-            session: self.session.lock().expect("session lock").clone(),
+            current_task: self
+                .current_task
+                .lock()
+                .unwrap_or_else(|e| {
+                    eprintln!("vikram: agent task lock mutex poisoned; recovering");
+                    e.into_inner()
+                })
+                .clone(),
+            progress: *self.progress.lock().unwrap_or_else(|e| {
+                eprintln!("vikram: agent progress lock mutex poisoned; recovering");
+                e.into_inner()
+            }),
+            session: self
+                .session
+                .lock()
+                .unwrap_or_else(|e| {
+                    eprintln!("vikram: agent session lock mutex poisoned; recovering");
+                    e.into_inner()
+                })
+                .clone(),
             unread: self.unread.load(Ordering::Relaxed),
         }
     }
 
     pub fn push_activity(&self, event: ActivityEvent) {
-        let mut acts = self.activities.lock().expect("activities lock");
+        let mut acts = self.activities.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: agent activities lock mutex poisoned; recovering");
+            e.into_inner()
+        });
         acts.push(event);
         const CAP: usize = 500;
         if acts.len() > CAP {
@@ -90,7 +131,13 @@ impl ManagedAgent {
     }
 
     pub fn activities(&self) -> Vec<ActivityEvent> {
-        self.activities.lock().expect("activities lock").clone()
+        self.activities
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: agent activities lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()
     }
 }
 
@@ -105,11 +152,20 @@ impl AgentManager {
     }
 
     pub fn install(&self, agents: Vec<Arc<ManagedAgent>>) {
-        *self.agents.lock().expect("agents lock") = agents;
+        *self.agents.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: agent agents lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = agents;
     }
 
     pub fn list(&self) -> Vec<Arc<ManagedAgent>> {
-        self.agents.lock().expect("agents lock").clone()
+        self.agents
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: agent agents lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()
     }
 
     pub fn snapshots(&self) -> Vec<AgentSnapshot> {
@@ -121,11 +177,20 @@ impl AgentManager {
     }
 
     pub fn add(&self, agent: Arc<ManagedAgent>) {
-        self.agents.lock().expect("agents lock").push(agent);
+        self.agents
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: agent agents lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .push(agent);
     }
 
     pub fn remove(&self, id: &AgentId) -> bool {
-        let mut agents = self.agents.lock().expect("agents lock");
+        let mut agents = self.agents.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: agent agents lock mutex poisoned; recovering");
+            e.into_inner()
+        });
         let before = agents.len();
         agents.retain(|a| a.profile.id != *id);
         agents.len() != before
@@ -177,7 +242,10 @@ impl TaskManager {
     }
 
     pub fn finish(&self, id: &str, state: TaskState) -> Option<BackgroundTask> {
-        let mut tasks = self.tasks.lock().expect("tasks lock");
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: agent tasks lock mutex poisoned; recovering");
+            e.into_inner()
+        });
         let task = tasks.get_mut(id)?;
         task.state = state;
         Some(task.clone())

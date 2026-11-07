@@ -212,12 +212,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             return true;
         }
         KeyCode::Esc => {
-            if app.active_session().is_some_and(|s| s.is_busy()) {
-                if let Some(session) = app.active_session() {
-                    app.commands.push(UiCommand::Cancel {
-                        session: session.id.clone(),
-                    });
-                }
+            if app.active_session().is_some_and(|s| s.is_busy())
+                && let Some(session) = app.active_session()
+            {
+                app.commands.push(UiCommand::Cancel {
+                    session: session.id.clone(),
+                });
             }
             return true;
         }
@@ -476,20 +476,20 @@ fn handle_conversation(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('e') => {
-            if let Some(session) = app.active_session_mut() {
-                if !session.activity.is_empty() {
-                    let idx = session
-                        .selected_activity
-                        .unwrap_or(session.activity.len() - 1)
-                        .min(session.activity.len() - 1);
-                    session.selected_activity = Some(idx);
-                    if let Some(activity) = session.activity.get_mut(idx) {
-                        activity.expanded = !activity.expanded;
-                        if activity.expanded {
-                            session.expanded_activities.insert(idx);
-                        } else {
-                            session.expanded_activities.remove(&idx);
-                        }
+            if let Some(session) = app.active_session_mut()
+                && !session.activity.is_empty()
+            {
+                let idx = session
+                    .selected_activity
+                    .unwrap_or(session.activity.len() - 1)
+                    .min(session.activity.len() - 1);
+                session.selected_activity = Some(idx);
+                if let Some(activity) = session.activity.get_mut(idx) {
+                    activity.expanded = !activity.expanded;
+                    if activity.expanded {
+                        session.expanded_activities.insert(idx);
+                    } else {
+                        session.expanded_activities.remove(&idx);
                     }
                 }
             }
@@ -1336,13 +1336,13 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
             }
             KeyCode::Enter => {
                 let title = editor.text().trim().to_owned();
-                if !title.is_empty() {
-                    if let Some(session) = app.active_session() {
-                        app.commands.push(UiCommand::RenameSession {
-                            session: session.id.clone(),
-                            title,
-                        });
-                    }
+                if !title.is_empty()
+                    && let Some(session) = app.active_session()
+                {
+                    app.commands.push(UiCommand::RenameSession {
+                        session: session.id.clone(),
+                        title,
+                    });
                 }
                 app.overlay = None;
                 true
@@ -1442,11 +1442,11 @@ fn handle_autocomplete_overlay(
             true
         }
         KeyCode::Enter | KeyCode::Tab => {
-            if let Some(chosen) = candidates.get(selected).cloned() {
-                if let Some(session) = app.active_session_mut() {
-                    session.editor.clear();
-                    session.editor.insert_str(&chosen);
-                }
+            if let Some(chosen) = candidates.get(selected).cloned()
+                && let Some(session) = app.active_session_mut()
+            {
+                session.editor.clear();
+                session.editor.insert_str(&chosen);
             }
             app.overlay = None;
             true

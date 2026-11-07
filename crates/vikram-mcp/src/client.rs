@@ -383,7 +383,7 @@ impl McpRegistry {
 
     pub async fn disconnect(&mut self, name: &str) -> std::result::Result<(), String> {
         if let Some(mut conn) = self.connections.remove(name) {
-            let _ = conn.child.kill().await;
+            terminate(&mut conn.child).await?;
         }
         if let Some(state) = self.states.iter_mut().find(|s| s.name == name) {
             state.connected = false;
@@ -391,6 +391,18 @@ impl McpRegistry {
             state.error = None;
         }
         Ok(())
+    }
+
+    /// Kill and reap every connected child, awaiting each one so no zombie or
+    /// orphaned server process is left behind. Returns per-server failures, if any.
+    pub async fn shutdown_all(mut self) -> Vec<String> {
+        let mut failures = Vec::new();
+        for (name, mut conn) in std::mem::take(&mut self.connections) {
+            if let Err(err) = terminate(&mut conn.child).await {
+                failures.push(format!("{name}: {err}"));
+            }
+        }
+        failures
     }
 
     pub async fn call_tool(
@@ -470,9 +482,11 @@ async fn establish(
         .envs(&server.env)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
         .kill_on_drop(true);
 
+    // stdin/stdout are piped for JSON-RPC; stderr is inherited so server-side
+    // diagnostics stay visible without corrupting the protocol stream on stdout.
     let mut child = command
         .spawn()
         .map_err(|err| format!("spawn `{}`: {err}", server.command))?;
@@ -497,8 +511,13 @@ async fn establish(
     let init_value: Value = serde_json::from_str(&init_line)
         .map_err(|err| format!("initialize response was not JSON: {err}"))?;
     if init_value.get("error").is_some() {
-        let _ = child.kill().await;
-        return Err(format!("initialize rejected: {}", init_value["error"]));
+        // Best-effort cleanup of the just-spawned child; report both failures if any.
+        let cleanup = terminate(&mut child).await;
+        let rejected = format!("initialize rejected: {}", init_value["error"]);
+        return Err(match cleanup {
+            Ok(()) => rejected,
+            Err(err) => format!("{rejected} (also failed to stop child: {err})"),
+        });
     }
 
     write_line(
@@ -650,6 +669,30 @@ async fn establish(
     }
 
     Ok((child, stdin, lines, tools, resources, prompts))
+}
+
+/// Kill a child and await its exit so it is reaped rather than left as a zombie.
+/// A kill error for an already-exited child is not a failure; a wait error is.
+async fn terminate(child: &mut Child) -> std::result::Result<(), String> {
+    match child.kill().await {
+        Ok(()) => {}
+        Err(err) => {
+            // Child may already have exited on its own; only a still-running
+            // child that refuses to die is an error.
+            let status = child
+                .try_wait()
+                .map_err(|wait_err| format!("kill failed: {err}; wait check failed: {wait_err}"))?;
+            if status.is_none() {
+                let _ = child.wait().await;
+                return Err(format!("kill failed: {err}"));
+            }
+        }
+    }
+    child
+        .wait()
+        .await
+        .map(|_| ())
+        .map_err(|err| format!("failed to reap child: {err}"))
 }
 
 async fn write_line(stdin: &mut ChildStdin, value: &Value) -> std::result::Result<(), String> {

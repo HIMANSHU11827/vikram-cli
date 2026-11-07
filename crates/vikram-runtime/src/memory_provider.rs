@@ -160,20 +160,11 @@ impl MemoryProvider for BuiltInMemoryProvider {
     fn on_memory_write(&self, _action: &str, _target: &str, _content: &str) {}
 }
 
+#[derive(Default)]
 pub struct MemoryProviderManager {
     providers: Vec<Box<dyn MemoryProvider>>,
     tool_providers: HashMap<String, String>,
     has_external: bool,
-}
-
-impl Default for MemoryProviderManager {
-    fn default() -> Self {
-        Self {
-            providers: Vec::new(),
-            tool_providers: HashMap::new(),
-            has_external: false,
-        }
-    }
 }
 
 impl MemoryProviderManager {
@@ -193,14 +184,15 @@ impl MemoryProviderManager {
         for raw in provider.get_tool_schemas() {
             if let Some(name) = raw.get("name").and_then(Value::as_str) {
                 if !self.tool_providers.contains_key(name) {
-                    self.tool_providers.insert(name.to_owned(), provider.name().to_owned());
+                    self.tool_providers
+                        .insert(name.to_owned(), provider.name().to_owned());
                 }
-            } else if let Some(function) = raw.get("function") {
-                if let Some(name) = function.get("name").and_then(Value::as_str) {
-                    if !self.tool_providers.contains_key(name) {
-                        self.tool_providers.insert(name.to_owned(), provider.name().to_owned());
-                    }
-                }
+            } else if let Some(function) = raw.get("function")
+                && let Some(name) = function.get("name").and_then(Value::as_str)
+                && !self.tool_providers.contains_key(name)
+            {
+                self.tool_providers
+                    .insert(name.to_owned(), provider.name().to_owned());
             }
         }
         if is_builtin {
@@ -233,7 +225,10 @@ impl MemoryProviderManager {
     }
 
     pub fn get_provider(&self, name: &str) -> Option<&dyn MemoryProvider> {
-        self.providers.iter().find(|p| p.name() == name).map(|p| p.as_ref())
+        self.providers
+            .iter()
+            .find(|p| p.name() == name)
+            .map(|p| p.as_ref())
     }
 
     pub fn initialize_all(&self, session_id: &str) {
@@ -251,10 +246,10 @@ impl MemoryProviderManager {
         let mut blocks = Vec::new();
         for p in &self.providers {
             let p = p.as_ref();
-            if let Ok(block) = catch_unwind(AssertUnwindSafe(|| p.system_prompt_block())) {
-                if !block.trim().is_empty() {
-                    blocks.push(block);
-                }
+            if let Ok(block) = catch_unwind(AssertUnwindSafe(|| p.system_prompt_block()))
+                && !block.trim().is_empty()
+            {
+                blocks.push(block);
             }
         }
         blocks.join("\n\n")
@@ -268,10 +263,10 @@ impl MemoryProviderManager {
         let mut parts = Vec::new();
         for p in &self.providers {
             let p = p.as_ref();
-            if let Ok(result) = catch_unwind(AssertUnwindSafe(|| p.prefetch(query, session_id))) {
-                if !result.trim().is_empty() {
-                    parts.push(result);
-                }
+            if let Ok(result) = catch_unwind(AssertUnwindSafe(|| p.prefetch(query, session_id)))
+                && !result.trim().is_empty()
+            {
+                parts.push(result);
             }
         }
         parts.join("\n\n")
@@ -315,11 +310,11 @@ impl MemoryProviderManager {
                     } else {
                         raw
                     };
-                    if let Some(name) = schema.get("name").and_then(Value::as_str) {
-                        if !seen.contains(name) {
-                            seen.insert(name.to_owned());
-                            schemas.push(schema);
-                        }
+                    if let Some(name) = schema.get("name").and_then(Value::as_str)
+                        && !seen.contains(name)
+                    {
+                        seen.insert(name.to_owned());
+                        schemas.push(schema);
                     }
                 }
             }
@@ -344,7 +339,8 @@ impl MemoryProviderManager {
                     });
             }
         }
-        serde_json::json!({"error": format!("no memory provider handles tool '{}'", tool_name)}).to_string()
+        serde_json::json!({"error": format!("no memory provider handles tool '{}'", tool_name)})
+            .to_string()
     }
 
     pub fn on_turn_start(&self, turn_number: usize, message: &str) {
@@ -363,8 +359,11 @@ impl MemoryProviderManager {
     }
 
     pub fn on_memory_write(&self, action: &str, target: &str, content: &str) {
-        let external: Vec<&Box<dyn MemoryProvider>> =
-            self.providers.iter().filter(|p| p.name() != "builtin").collect();
+        let external: Vec<&Box<dyn MemoryProvider>> = self
+            .providers
+            .iter()
+            .filter(|p| p.name() != "builtin")
+            .collect();
         for p in external {
             let p = p.as_ref();
             let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -384,8 +383,8 @@ impl MemoryProviderManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockProvider {
         name: String,
@@ -444,7 +443,9 @@ mod tests {
             if self.name == "builtin" {
                 Vec::new()
             } else {
-                vec![serde_json::json!({"name": format!("{}_tool", self.name), "description": "d", "parameters": {}})]
+                vec![
+                    serde_json::json!({"name": format!("{}_tool", self.name), "description": "d", "parameters": {}}),
+                ]
             }
         }
         fn handle_tool_call(&self, tool_name: &str, _args: &Value) -> String {
@@ -504,19 +505,31 @@ mod tests {
 
     #[test]
     fn manager_fan_out_and_exception_isolation() {
+        // The manager admits one external provider (see `manager_builtin_first_and_one_external`),
+        // so isolation is proven with one panicking provider, then with one healthy provider.
         let mut mgr = MemoryProviderManager::new();
         let mut p1 = MockProvider::new("p1");
         p1.panic_sp = true;
         let p1_sp = p1.sp_calls.clone();
-        let p2 = MockProvider::new("p2");
-        let p2_sp = p2.sp_calls.clone();
         let builtin = BuiltInMemoryProvider::new(MemoryStore::open_in_memory().unwrap());
         mgr.add_provider(Box::new(builtin));
         mgr.add_provider(Box::new(p1));
-        mgr.add_provider(Box::new(p2));
         let block = mgr.system_prompt_block();
-        assert!(block.contains("block:p2"));
+        assert!(
+            block.is_empty(),
+            "a panicking provider contributes no block"
+        );
         assert_eq!(p1_sp.load(Ordering::SeqCst), 0);
+
+        let mut healthy = MemoryProviderManager::new();
+        let p2 = MockProvider::new("p2");
+        let p2_sp = p2.sp_calls.clone();
+        healthy.add_provider(Box::new(BuiltInMemoryProvider::new(
+            MemoryStore::open_in_memory().unwrap(),
+        )));
+        healthy.add_provider(Box::new(p2));
+        let block = healthy.system_prompt_block();
+        assert!(block.contains("block:p2"));
         assert_eq!(p2_sp.load(Ordering::SeqCst), 1);
     }
 

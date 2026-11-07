@@ -94,6 +94,11 @@ impl SelfDevelopmentEngine {
         }
     }
 
+    /// The shared store every subsystem reads and writes through.
+    pub fn store(&self) -> &EvolutionStore {
+        &self.store
+    }
+
     /// Create a new skill.
     pub fn create_skill(
         &mut self,
@@ -237,10 +242,10 @@ impl SelfDevelopmentEngine {
 
     /// Integrate a validated change.
     pub fn integrate_change(&mut self, project_id: &str) -> Result<()> {
-        if let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id) {
-            if project.status == ProjectStatus::Completed {
-                project.status = ProjectStatus::Completed;
-            }
+        if let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id)
+            && project.status == ProjectStatus::Completed
+        {
+            project.status = ProjectStatus::Completed;
         }
         Ok(())
     }

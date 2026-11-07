@@ -14,6 +14,8 @@ fn ctx() -> (tempfile::TempDir, ToolContext) {
         spill: crate::spill::Spill::disabled(),
         runtime: None,
         session: None,
+        agent: None,
+        cancel: None,
     };
     (dir, ctx)
 }
@@ -97,6 +99,7 @@ fn every_builtin_declares_a_permission_shape() {
             "memory.list" => json!({}),
             "memory.delete" => json!({"key": "k"}),
             "memory.note" => json!({"note": "x"}),
+            "memory.consolidate" => json!({"action": "run"}),
             "web.search" => json!({"query": "x"}),
             "team.create" => json!({"name": "t"}),
             "team.list" => json!({}),
@@ -1564,6 +1567,8 @@ fn memory_and_tasks_round_trip_through_their_own_store() {
         spill: crate::spill::Spill::disabled(),
         runtime: None,
         session: None,
+        agent: None,
+        cancel: None,
     };
 
     let saved = MemorySave

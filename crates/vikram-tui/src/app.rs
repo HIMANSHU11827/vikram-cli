@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use vikram_contracts::TokenMeter;
 use vikram_contracts::{
-    AgentId, ApprovalId, Message, PermissionMode, Role, SessionId, ToolCallId, TurnId,
+    AgentId, ApprovalId, Block, Message, PermissionMode, Role, SessionId, ToolCallId, TurnId,
 };
 use vikram_runtime::types::{
     AgentSnapshot, AgentState, ApprovalPrompt, BackgroundTask, ContextMeter, Metrics, NoticeLevel,
@@ -351,6 +351,80 @@ pub enum UiCommand {
     Quit,
 }
 
+/// Rebuild the tool rows and their receipts from a persisted transcript.
+///
+/// The live path gets these from `ToolStarted`/`ToolFinished` events, which are not stored. The
+/// journal does store the calls and their results, so the rows can be reconstructed: one row per
+/// call, answered with the result when one exists, still running when it does not.
+fn replay_activity(messages: &[Message]) -> (Vec<Activity>, HashMap<ToolCallId, Payload>) {
+    let mut activity: Vec<Activity> = Vec::new();
+    let mut payloads: HashMap<ToolCallId, Payload> = HashMap::new();
+    let mut names: HashMap<ToolCallId, String> = HashMap::new();
+
+    for message in messages {
+        for block in &message.blocks {
+            match block {
+                Block::ToolCall { call } => {
+                    let summary = argument_summary(&call.arguments);
+                    names.insert(call.id.clone(), call.name.clone());
+                    payloads.insert(
+                        call.id.clone(),
+                        Payload {
+                            name: call.name.clone(),
+                            resource: summary.clone(),
+                            arguments: call.arguments.to_string(),
+                            content: String::new(),
+                            cwd: String::new(),
+                            duration_ms: 0,
+                        },
+                    );
+                    activity.push(Activity {
+                        kind: ActivityKind::Tool,
+                        text: if summary.is_empty() {
+                            call.name.clone()
+                        } else {
+                            format!("{} · {}", call.name, summary)
+                        },
+                        call: Some(call.id.clone()),
+                        ok: None,
+                        expanded: false,
+                    });
+                }
+                Block::ToolResult {
+                    call, content, ok, ..
+                } => {
+                    if let Some(payload) = payloads.get_mut(call) {
+                        payload.content = content.clone();
+                    }
+                    if let Some(row) = activity
+                        .iter_mut()
+                        .rev()
+                        .find(|row| row.call.as_ref() == Some(call))
+                    {
+                        row.ok = Some(*ok);
+                        if row.text.is_empty() {
+                            row.text = names.get(call).cloned().unwrap_or_default();
+                        }
+                    }
+                }
+                Block::Text { .. } | Block::Reasoning { .. } | Block::Image { .. } => {}
+            }
+        }
+    }
+
+    (activity, payloads)
+}
+
+/// The most useful single field of a call's arguments, for the row label.
+fn argument_summary(args: &serde_json::Value) -> String {
+    for key in ["path", "resource", "query", "url", "pattern", "command"] {
+        if let Some(value) = args.get(key).and_then(|value| value.as_str()) {
+            return format!("{key}={value}");
+        }
+    }
+    String::new()
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionView {
     pub id: SessionId,
@@ -397,6 +471,9 @@ pub struct SessionView {
 
 impl SessionView {
     pub fn from_snapshot(snapshot: SessionSnapshot) -> Self {
+        // The transcript survives a restart, so the rows that describe how it was produced must
+        // too: a reloaded session used to show the messages with every tool call missing.
+        let (activity, payloads) = replay_activity(&snapshot.messages);
         Self {
             id: snapshot.id,
             title: snapshot.title,
@@ -415,13 +492,13 @@ impl SessionView {
             scroll: 0,
             follow: true,
             queued: snapshot.queued,
-            activity: Vec::new(),
+            activity,
             expanded_activities: std::collections::HashSet::new(),
             selected_activity: None,
             expanded_thought: false,
             thought_folds: HashMap::new(),
             tool_folds: HashMap::new(),
-            payloads: HashMap::new(),
+            payloads,
             turn_started_ms: None,
             turn_elapsed_ms: 0,
             turn_times: std::collections::HashMap::new(),
@@ -846,12 +923,11 @@ impl App {
     /// The session currently shown in the conversation pane: an agent's dedicated session when one
     /// is selected, otherwise the active session. Selecting an agent never changes `active`.
     pub fn display_session(&self) -> Option<&SessionView> {
-        if let Some(agent) = self.selected_agent_snapshot() {
-            if let Some(id) = &agent.session {
-                if let Some(view) = self.sessions.iter().find(|s| &s.id == id) {
-                    return Some(view);
-                }
-            }
+        if let Some(agent) = self.selected_agent_snapshot()
+            && let Some(id) = &agent.session
+            && let Some(view) = self.sessions.iter().find(|s| &s.id == id)
+        {
+            return Some(view);
         }
         self.active_session()
     }
@@ -1400,6 +1476,47 @@ impl App {
 mod tests {
     use super::*;
     use vikram_runtime::types::SessionSnapshot;
+
+    #[test]
+    fn a_reloaded_transcript_rebuilds_its_tool_rows() {
+        let call =
+            vikram_contracts::ToolCall::new("fs.read", serde_json::json!({"path": "Cargo.toml"}));
+        let id = call.id.clone();
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                blocks: vec![Block::ToolCall { call }],
+            },
+            Message {
+                role: Role::Tool,
+                blocks: vec![Block::ToolResult {
+                    call: id.clone(),
+                    content: "name = vikram".into(),
+                    trust: vikram_contracts::Trust::External,
+                    ok: true,
+                }],
+            },
+        ];
+
+        let (rows, payloads) = replay_activity(&messages);
+        assert_eq!(rows.len(), 1, "one call means one row");
+        assert_eq!(rows[0].ok, Some(true));
+        assert_eq!(rows[0].text, "fs.read · path=Cargo.toml");
+        let payload = payloads.get(&id).expect("the receipt lives beside the row");
+        assert_eq!(payload.content, "name = vikram");
+        assert_eq!(payload.arguments, r#"{"path":"Cargo.toml"}"#);
+    }
+
+    #[test]
+    fn a_call_without_a_result_is_still_marked_running() {
+        let call = vikram_contracts::ToolCall::new("fs.write", serde_json::json!({"path": "x"}));
+        let (rows, _) = replay_activity(&[Message {
+            role: Role::Assistant,
+            blocks: vec![Block::ToolCall { call }],
+        }]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ok, None, "no result means the call never reported");
+    }
 
     fn app_on(model: Option<&str>) -> App {
         let mut app = App::new(false);
