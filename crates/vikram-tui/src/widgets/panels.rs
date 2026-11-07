@@ -693,7 +693,9 @@ fn overlay_content(app: &App, overlay: &Overlay, theme: &Theme) -> (String, Vec<
         ),
         Overlay::AddAgent { selected } => add_agent_lines(app, *selected, theme),
         Overlay::RenameSession { editor } => rename_lines(app, editor, theme),
-        Overlay::HistorySearch { query, selected } | Overlay::ReverseSearch { query, selected } => {
+        Overlay::HistorySearch { query, selected }
+        | Overlay::ReverseSearch { query, selected }
+        | Overlay::ReverseHistorySearch { query, selected } => {
             let matches = crate::input::history_matches(app, query);
             let selected = *selected;
             let mut lines: Vec<Line<'static>> = Vec::new();
