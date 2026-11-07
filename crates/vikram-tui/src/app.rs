@@ -241,6 +241,11 @@ pub enum Overlay {
         query: String,
         selected: usize,
     },
+    /// Alias used by callers that spell out the full feature name.
+    ReverseHistorySearch {
+        query: String,
+        selected: usize,
+    },
 }
 
 /// What a text panel's Enter means. A closed set, so a prompt can never submit something the host

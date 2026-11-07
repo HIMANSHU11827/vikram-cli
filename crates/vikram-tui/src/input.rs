@@ -1327,7 +1327,9 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
             }
             _ => true,
         },
-        Overlay::HistorySearch { query, selected } | Overlay::ReverseSearch { query, selected } => {
+        Overlay::HistorySearch { query, selected }
+        | Overlay::ReverseSearch { query, selected }
+        | Overlay::ReverseHistorySearch { query, selected } => {
             let matches = history_matches(app, &query);
             let selected = selected.min(matches.len().saturating_sub(1));
             match key.code {
@@ -1539,6 +1541,10 @@ pub fn handle_paste(app: &mut App, text: &str) -> bool {
         query.push_str(text);
         return true;
     }
+    if let Some(Overlay::ReverseHistorySearch { query, .. }) = &mut app.overlay {
+        query.push_str(text);
+        return true;
+    }
     if let Some(session) = app.active_session_mut() {
         session.editor.insert_str(text);
         return true;
@@ -1670,6 +1676,41 @@ mod tests {
         assert!(!app.show_bots);
     }
 
+    #[test]
+    fn ctrl_r_reverse_searches_history_and_enter_accepts_a_match() {
+        let mut app = app_with_session();
+        {
+            let session = app.active_session_mut().unwrap();
+            session.editor.remember("first command");
+            session.editor.remember("second command");
+        }
+        handle_key(&mut app, ctrl(KeyCode::Char('r')));
+        assert!(app.overlay.is_some());
+
+        for ch in "second".chars() {
+            handle_key(&mut app, key(KeyCode::Char(ch)));
+        }
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.overlay.is_none());
+        assert_eq!(
+            app.active_session().unwrap().editor.text(),
+            "second command"
+        );
+    }
+
+    #[test]
+    fn ctrl_r_escape_cancels_without_changing_the_draft() {
+        let mut app = app_with_session();
+        {
+            let session = app.active_session_mut().unwrap();
+            session.editor.remember("remembered");
+            session.editor.insert_str("draft");
+        }
+        handle_key(&mut app, ctrl(KeyCode::Char('r')));
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(app.overlay.is_none());
+        assert_eq!(app.active_session().unwrap().editor.text(), "draft");
+    }
     #[test]
     fn paste_into_a_draft_preserves_newlines() {
         let mut app = app_with_session();

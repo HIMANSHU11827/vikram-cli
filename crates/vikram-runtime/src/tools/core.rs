@@ -217,6 +217,8 @@ impl ToolRegistry {
         registry.register(Box::new(BuildRun));
         registry.register(Box::new(TestRun));
         registry.register(Box::new(VerifyRun));
+        registry.register(Box::new(TestRunTool));
+        registry.register(Box::new(BuildCheck));
         registry.register(Box::new(MemorySave));
         registry.register(Box::new(MemorySearch));
         registry.register(Box::new(MemoryList));
