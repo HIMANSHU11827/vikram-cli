@@ -5,10 +5,13 @@
 - Prefers outputs (summaries, key results, and copy-paste prompts) delivered in chat, not only saved to files (asked to "tell me in chat" and "will copy from chat"). Confidence: 0.8
 - Prefers status/comparison answers presented as tables rather than prose — corrects long narrative summaries with terse format requests ("tell in table", "make in table and show"; repeated again in this session). Confidence: 0.75
 - Prefers incremental extension of an existing codebase over rewrites: inspect and reuse existing architecture, never duplicate functionality, preserve working features. Confidence: 0.9
-- Expects honest reporting — never mark incomplete features as completed; verify functionality in the actual code before claiming it exists or is missing, and make no status claims without evidence. Confidence: 0.85
+- Expects honest reporting — never mark incomplete features as completed; verify functionality in the actual code before claiming it exists or is missing, and make no status claims without evidence. Also expects the weak spots surfaced proactively and unprompted, rather than only after he challenges a status claim ("we are weak or behind ... did you not know still yet"). Confidence: 0.9
 - Prefers large jobs split up and delegated to parallel subagents rather than worked serially in one thread ("use sub agent to work"). Confidence: 0.65
 - Expects exhaustive completion of the whole scope, not a representative subset — repeatedly asks for "all platforms" / "A to Z" coverage and keeps pushing ("continue", "do 100 percent") until every item on the list is done or explicitly justified as blocked. Confidence: 0.8
 - Prefers actual implementation over analysis-only recommendations: expects working code and tests, not plans, mockups, or documentation alone. Confidence: 0.9
 - Does not want CLAUDE.md or Claude-specific architecture in this project; use AGENTS.md/HARNESS.md and per-entity Markdown context files. Confidence: 0.9
+- Requires LLM provider and model to be user-selectable config (base_url + api_key_env + model), never hardcoded to a single provider or model; API keys belong in $VIKRAM_HOME/.env and never in repo files or Markdown. Confidence: 0.85
+- Expects interactive UI controls to actually perform their action rather than being informational, and the current state (active provider/model) to be visible without extra keystrokes — corrects pickers that "nothing happens" when chosen and status readouts that hide which model is in use. Confidence: 0.7
+- Prefers no decorative placeholder rows in the TUI transcript: a live turn that hasn't produced a token yet should show only its header/clock, not a "Waiting for the model"-style filler line ("rem this"). Confidence: 0.6
 - Treats Hive as a group collaboration space rather than an AI entity; messages and actions must be attributed to real member identities. Confidence: 0.85
 

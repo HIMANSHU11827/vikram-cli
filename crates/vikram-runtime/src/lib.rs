@@ -6,8 +6,8 @@
 //!
 //! Nothing here formats terminal output. The TUI is one subscriber among possible others.
 
-pub mod agents;
 pub mod anthropic;
+pub mod bots;
 pub mod browser;
 pub mod bus;
 pub mod compaction;
@@ -32,11 +32,11 @@ pub mod pty;
 pub mod rules;
 pub mod runtime;
 pub use vikram_sandbox as sandbox;
+pub mod hive_roster;
 pub mod search;
 pub mod session;
 pub mod skills;
 pub mod spill;
-pub mod teams;
 pub mod tickets;
 pub mod titling;
 pub mod tools;
@@ -45,7 +45,7 @@ pub mod types;
 pub mod verification;
 pub mod workspace;
 
-pub use agents::{AgentManager, ManagedAgent, TaskManager};
+pub use bots::{BotManager, ManagedBot, TaskManager};
 pub use bus::EventBus;
 pub use compaction::{
     COMPACTION_FOLDED_KEY, COMPACTION_SUMMARY_KEY, COMPACTION_THROUGH_KEY, CompactionPolicy,
@@ -60,6 +60,7 @@ pub use context_engine::*;
 pub use dialectic::{DialecticConfig, DialecticEngine, Insight, InsightKind};
 pub use error::{Result, RuntimeError};
 pub use hive_chat::HiveManager;
+pub use hive_roster::{HiveRoster, HiveRosterManager};
 pub use learning::{LearningAuditEntry, LearningManager, LearningPolicy, LearningProposal};
 pub use lsp::{LspClient, LspError, LspPool, ServerCommand};
 pub use mcp::McpRegistry;
@@ -68,10 +69,9 @@ pub use memory_provider::{BuiltInMemoryProvider, MemoryProvider, MemoryProviderM
 pub use plugins::PluginRegistry;
 pub use provider::{CompletionRequest, Provider, ProviderEvent, ProviderStream, ToolSpec};
 pub use rules::RuleBook;
-pub use runtime::{AgentControl, Runtime, RuntimeHandle};
+pub use runtime::{BotControl, PendingMessage, Runtime, RuntimeHandle};
 pub use session::SessionRuntime;
 pub use skills::{Skill, SkillRegistry};
-pub use teams::{Team, TeamManager};
 pub use tickets::TicketManager;
 pub use tools::{Tool, ToolContext, ToolOutput, ToolRegistry};
 pub use types::*;

@@ -116,6 +116,8 @@ pub enum SkillsAction {
     },
     /// Report where skills live and whether the catalog is healthy.
     Doctor,
+    /// Re-scan the skill directories.
+    Reload,
 }
 
 #[derive(Debug, Subcommand)]
@@ -250,6 +252,7 @@ pub fn run(action: SkillsAction, config: &Config) -> Result<(), String> {
         SkillsAction::History { name } => history(&name, config),
         SkillsAction::Rollback { name, yes } => rollback(&name, yes, config),
         SkillsAction::Doctor => doctor(config),
+        SkillsAction::Reload => reload(config),
     }
 }
 
@@ -723,6 +726,13 @@ fn doctor(config: &Config) -> Result<(), String> {
     } else {
         Err(problems.join("; "))
     }
+}
+
+fn reload(config: &Config) -> Result<(), String> {
+    let catalog = Catalog::discover(&discovery_options(config));
+    let count = catalog.list().len();
+    println!("reloaded {count} skills");
+    Ok(())
 }
 
 fn discovery_options(config: &Config) -> DiscoveryOptions {

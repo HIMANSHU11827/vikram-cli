@@ -75,7 +75,15 @@ impl Tool for ListDir {
         let mut entries: Vec<String> = Vec::new();
         match std::fs::read_dir(&path) {
             Ok(iter) => {
-                for entry in iter.flatten() {
+                for entry in iter {
+                    // A directory entry is still reported even when its OS-level
+                    // metadata read fails or its name is not valid UTF-8: convert
+                    // the name lossily (replacement chars mark the invalid bytes)
+                    // instead of panicking on `.unwrap()` or silently skipping.
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(_) => continue,
+                    };
                     let name = entry.file_name().to_string_lossy().into_owned();
                     if name == ".git" || name == "target" {
                         continue;

@@ -1,7 +1,7 @@
 //! Durable state.
 //!
 //! Two tables carry the runtime: `journal` is the append-only execution substrate, and `sessions`
-//! / `agents` are the metadata an interface lists. Journal appends and their idempotency marker are
+//! / `bots` are the metadata an interface lists. Journal appends and their idempotency marker are
 //! written in one transaction, which is what makes crash recovery safe.
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use vikram_contracts::error::{Result as ContractResult, VikramError};
 use vikram_contracts::{
-    AgentId, Appended, AssignmentId, ContractDecl, EffectId, EntityId, HiveId, HiveMessageId,
-    JournalRecord, JournalSink, NewRecord, ProfileId, ProjectId, RecordKind, SessionId, TeamId,
-    TicketEventId, TicketId, TicketMessageId, UserId,
+    Appended, AssignmentId, BotId, ContractDecl, EffectId, EntityId, HiveId, HiveMessageId,
+    HiveRosterId, JournalRecord, JournalSink, NewRecord, ProfileId, ProjectId, RecordKind,
+    SessionId, TicketEventId, TicketId, TicketMessageId, UserId,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -35,7 +35,7 @@ pub struct SessionRow {
     pub title: String,
     pub cwd: PathBuf,
     pub model: Option<String>,
-    pub agent: Option<AgentId>,
+    pub bot: Option<BotId>,
     pub created_ms: u64,
     pub updated_ms: u64,
     /// `active` or `archived`. Archived sessions are kept, hidden from default listings.
@@ -71,7 +71,7 @@ pub const TITLE_FAILED: &str = "failed";
 
 /// The projection every session read uses. Appending a column here keeps the six `SELECT` sites
 /// and [`map_session_row`] in step; the positional reader below depends on this exact order.
-const SESSION_COLS: &str = "id, title, cwd, model, agent_id, created_ms, updated_ms, status, \
+const SESSION_COLS: &str = "id, title, cwd, model, bot_id, created_ms, updated_ms, status, \
                             project_id, title_source, title_status, parent_session, forked_from";
 
 /// How a session's conversation is exported. `Json` is the machine-readable transcript;
@@ -167,7 +167,7 @@ pub struct ArtifactRow {
     pub id: String,
     pub session: SessionId,
     pub project_id: Option<ProjectId>,
-    pub agent: Option<AgentId>,
+    pub bot: Option<BotId>,
     pub name: String,
     pub path: PathBuf,
     /// `source` | `image` | `pdf` | `document` | `data` | `other`.
@@ -186,7 +186,7 @@ pub struct ArtifactRow {
 pub struct FileChangeRow {
     pub id: String,
     pub session: SessionId,
-    pub agent: Option<AgentId>,
+    pub bot: Option<BotId>,
     pub path: PathBuf,
     /// `create` | `modify` | `delete`.
     pub operation: String,
@@ -223,8 +223,8 @@ pub struct UsageTotals {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentRow {
-    pub id: AgentId,
+pub struct BotRow {
+    pub id: BotId,
     pub name: String,
     pub role: String,
     pub description: String,
@@ -234,8 +234,8 @@ pub struct AgentRow {
 
 /// A HIVE team: a user-named group of saved agent profiles sharing one dedicated conversation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TeamRow {
-    pub id: TeamId,
+pub struct HiveRosterRow {
+    pub id: HiveRosterId,
     pub name: String,
     pub session_id: Option<SessionId>,
     pub created_ms: u64,
@@ -481,6 +481,10 @@ impl Store {
 
     fn from_connection(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL").ok();
+        // Two vikram processes share this file: a TUI left open in one terminal and a command in
+        // another. WAL lets them read together, but a write still needs the lock, and the default
+        // zero timeout turns that into an instant SQLITE_BUSY — which looks like a frozen turn.
+        conn.pragma_update(None, "busy_timeout", 5_000).ok();
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         migrate(&conn)?;
@@ -526,7 +530,7 @@ impl Store {
             title: title.to_owned(),
             cwd: cwd.to_path_buf(),
             model: model.map(str::to_owned),
-            agent: None,
+            bot: None,
             created_ms: now_ms,
             updated_ms: now_ms,
             status: "active".to_owned(),
@@ -537,14 +541,14 @@ impl Store {
             forked_from: None,
         };
         self.lock().execute(
-            "INSERT INTO sessions (id, title, cwd, model, agent_id, created_ms, updated_ms, status, project_id, title_source, title_status)
+            "INSERT INTO sessions (id, title, cwd, model, bot_id, created_ms, updated_ms, status, project_id, title_source, title_status)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', NULL, ?8, ?9)",
             params![
                 row.id.as_str(),
                 row.title,
                 row.cwd.to_string_lossy(),
                 row.model,
-                row.agent.as_ref().map(|a| a.as_str().to_owned()),
+                row.bot.as_ref().map(|b| b.as_str().to_owned()),
                 row.created_ms as i64,
                 row.updated_ms as i64,
                 row.title_source,
@@ -724,7 +728,7 @@ impl Store {
     pub fn search_session_text_filtered(
         &self,
         query: &str,
-        agent_filter: Option<&AgentId>,
+        bot_filter: Option<&BotId>,
         project_filter: Option<&ProjectId>,
         since_ms: u64,
         limit: usize,
@@ -734,11 +738,11 @@ impl Store {
         let sql = "SELECT session_fts.session, snippet(session_fts, 1, '[', ']', '…', 12) \
                    FROM session_fts JOIN sessions s ON s.id = session_fts.session \
                    WHERE session_fts MATCH ?1 \
-                     AND (?2 IS NULL OR s.agent_id = ?2) \
+                     AND (?2 IS NULL OR s.bot_id = ?2) \
                      AND (?3 IS NULL OR s.project_id = ?3) \
                      AND (?4 = 0 OR s.updated_ms >= ?4) \
                    ORDER BY rank LIMIT ?5";
-        let agent = agent_filter.map(|a| a.as_str().to_owned());
+        let agent = bot_filter.map(|a| a.as_str().to_owned());
         let project = project_filter.map(|p| p.as_str().to_owned());
         if let Ok(mut stmt) = conn.prepare(sql)
             && let Ok(rows) = stmt.query_map(
@@ -822,7 +826,7 @@ impl Store {
             title: format!("{} (copy)", src.title),
             cwd: src.cwd.clone(),
             model: src.model.clone(),
-            agent: src.agent.clone(),
+            bot: src.bot.clone(),
             created_ms: now_ms,
             updated_ms: now_ms,
             status: "active".to_owned(),
@@ -835,14 +839,14 @@ impl Store {
             forked_from: src.forked_from.clone(),
         };
         self.lock().execute(
-            "INSERT INTO sessions (id, title, cwd, model, agent_id, created_ms, updated_ms, status, project_id, title_source, title_status, parent_session, forked_from)
+            "INSERT INTO sessions (id, title, cwd, model, bot_id, created_ms, updated_ms, status, project_id, title_source, title_status, parent_session, forked_from)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10, ?11, ?12)",
             params![
                 copy.id.as_str(),
                 copy.title,
                 copy.cwd.to_string_lossy(),
                 copy.model,
-                copy.agent.as_ref().map(|a| a.as_str().to_owned()),
+                copy.bot.as_ref().map(|b| b.as_str().to_owned()),
                 copy.created_ms as i64,
                 copy.updated_ms as i64,
                 copy.project_id.as_ref().map(|p| p.as_str().to_owned()),
@@ -869,7 +873,7 @@ impl Store {
             title: format!("{} (fork)", src.title),
             cwd: src.cwd.clone(),
             model: src.model.clone(),
-            agent: src.agent.clone(),
+            bot: src.bot.clone(),
             created_ms: now_ms,
             updated_ms: now_ms,
             status: "active".to_owned(),
@@ -882,14 +886,14 @@ impl Store {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO sessions (id, title, cwd, model, agent_id, created_ms, updated_ms, status, project_id, title_source, title_status, parent_session, forked_from)
+            "INSERT INTO sessions (id, title, cwd, model, bot_id, created_ms, updated_ms, status, project_id, title_source, title_status, parent_session, forked_from)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10, ?11, ?12)",
             params![
                 fork.id.as_str(),
                 fork.title,
                 fork.cwd.to_string_lossy(),
                 fork.model,
-                fork.agent.as_ref().map(|a| a.as_str().to_owned()),
+                fork.bot.as_ref().map(|b| b.as_str().to_owned()),
                 fork.created_ms as i64,
                 fork.updated_ms as i64,
                 fork.project_id.as_ref().map(|p| p.as_str().to_owned()),
@@ -1130,17 +1134,12 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_session_agent(
-        &self,
-        id: &SessionId,
-        agent: Option<&AgentId>,
-        now_ms: u64,
-    ) -> Result<()> {
+    pub fn set_session_bot(&self, id: &SessionId, bot: Option<&BotId>, now_ms: u64) -> Result<()> {
         self.lock().execute(
-            "UPDATE sessions SET agent_id = ?2, updated_ms = ?3 WHERE id = ?1",
+            "UPDATE sessions SET bot_id = ?2, updated_ms = ?3 WHERE id = ?1",
             params![
                 id.as_str(),
-                agent.map(|a| a.as_str().to_owned()),
+                bot.map(|b| b.as_str().to_owned()),
                 now_ms as i64
             ],
         )?;
@@ -1163,7 +1162,7 @@ impl Store {
             params![id.as_str()],
         )?;
         tx.execute(
-            "UPDATE teams SET session_id = NULL WHERE session_id = ?1",
+            "UPDATE hive_rosters SET session_id = NULL WHERE session_id = ?1",
             params![id.as_str()],
         )?;
         tx.execute(
@@ -1364,7 +1363,7 @@ impl Store {
 
     pub fn register_artifact(&self, row: &ArtifactRow) -> Result<()> {
         self.lock().execute(
-            "INSERT INTO artifacts (id, session, project_id, agent_id, name, path, kind, mime, size, checksum, source, created_ms, updated_ms)
+            "INSERT INTO artifacts (id, session, project_id, bot_id, name, path, kind, mime, size, checksum, source, created_ms, updated_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(path) DO UPDATE SET session = excluded.session, name = excluded.name,
                kind = excluded.kind, mime = excluded.mime, size = excluded.size,
@@ -1373,7 +1372,7 @@ impl Store {
                 row.id,
                 row.session.as_str(),
                 row.project_id.as_ref().map(|p| p.as_str().to_owned()),
-                row.agent.as_ref().map(|a| a.as_str().to_owned()),
+                row.bot.as_ref().map(|b| b.as_str().to_owned()),
                 row.name,
                 row.path.to_string_lossy(),
                 row.kind,
@@ -1393,12 +1392,12 @@ impl Store {
         let conn = self.lock();
         let (sql, args): (&str, Vec<String>) = match session {
             Some(s) => (
-                "SELECT id, session, project_id, agent_id, name, path, kind, mime, size, checksum, source, created_ms, updated_ms
+                "SELECT id, session, project_id, bot_id, name, path, kind, mime, size, checksum, source, created_ms, updated_ms
                  FROM artifacts WHERE session = ?1 ORDER BY created_ms DESC",
                 vec![s.as_str().to_owned()],
             ),
             None => (
-                "SELECT id, session, project_id, agent_id, name, path, kind, mime, size, checksum, source, created_ms, updated_ms
+                "SELECT id, session, project_id, bot_id, name, path, kind, mime, size, checksum, source, created_ms, updated_ms
                  FROM artifacts ORDER BY created_ms DESC",
                 vec![],
             ),
@@ -1424,12 +1423,12 @@ impl Store {
 
     pub fn record_file_change(&self, row: &FileChangeRow) -> Result<()> {
         self.lock().execute(
-            "INSERT INTO file_changes (id, session, agent_id, path, operation, checksum_before, checksum_after, size, checkpoint_path, ts_ms)
+            "INSERT INTO file_changes (id, session, bot_id, path, operation, checksum_before, checksum_after, size, checkpoint_path, ts_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 row.id,
                 row.session.as_str(),
-                row.agent.as_ref().map(|a| a.as_str().to_owned()),
+                row.bot.as_ref().map(|b| b.as_str().to_owned()),
                 row.path.to_string_lossy(),
                 row.operation,
                 row.checksum_before,
@@ -1445,7 +1444,7 @@ impl Store {
     pub fn list_file_changes(&self, session: &SessionId) -> Result<Vec<FileChangeRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, session, agent_id, path, operation, checksum_before, checksum_after, size, checkpoint_path, ts_ms
+            "SELECT id, session, bot_id, path, operation, checksum_before, checksum_after, size, checkpoint_path, ts_ms
              FROM file_changes WHERE session = ?1 ORDER BY ts_ms ASC",
         )?;
         let rows = stmt
@@ -1453,7 +1452,7 @@ impl Store {
                 Ok(FileChangeRow {
                     id: r.get(0)?,
                     session: SessionId::new(r.get::<_, String>(1)?),
-                    agent: r.get::<_, Option<String>>(2)?.map(AgentId::new),
+                    bot: r.get::<_, Option<String>>(2)?.map(BotId::new),
                     path: PathBuf::from(r.get::<_, String>(3)?),
                     operation: r.get(4)?,
                     checksum_before: r.get(5)?,
@@ -1572,11 +1571,11 @@ impl Store {
         Ok(())
     }
 
-    // ---- agents ---------------------------------------------------------
+    // ---- bots ----------------------------------------------------------
 
-    pub fn save_agent(&self, row: &AgentRow) -> Result<()> {
+    pub fn save_bot(&self, row: &BotRow) -> Result<()> {
         self.lock().execute(
-            "INSERT INTO agents (id, name, role, description, icon, created_ms)
+            "INSERT INTO bots (id, name, role, description, icon, created_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(id) DO UPDATE SET
                name = excluded.name, role = excluded.role,
@@ -1593,15 +1592,15 @@ impl Store {
         Ok(())
     }
 
-    pub fn list_agents(&self) -> Result<Vec<AgentRow>> {
+    pub fn list_bots(&self) -> Result<Vec<BotRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, name, role, description, icon, created_ms FROM agents ORDER BY created_ms ASC",
+            "SELECT id, name, role, description, icon, created_ms FROM bots ORDER BY created_ms ASC",
         )?;
         let rows = stmt
             .query_map([], |row| {
-                Ok(AgentRow {
-                    id: AgentId::new(row.get::<_, String>(0)?),
+                Ok(BotRow {
+                    id: BotId::new(row.get::<_, String>(0)?),
                     name: row.get(1)?,
                     role: row.get(2)?,
                     description: row.get(3)?,
@@ -1613,24 +1612,24 @@ impl Store {
         Ok(rows)
     }
 
-    pub fn delete_agent(&self, id: &AgentId) -> Result<()> {
+    pub fn delete_bot(&self, id: &BotId) -> Result<()> {
         self.lock()
-            .execute("DELETE FROM agents WHERE id = ?1", params![id.as_str()])?;
+            .execute("DELETE FROM bots WHERE id = ?1", params![id.as_str()])?;
         Ok(())
     }
 
     // ---- teams ----------------------------------------------------------
 
-    pub fn create_team(&self, name: &str, now_ms: u64) -> Result<TeamRow> {
-        let row = TeamRow {
-            id: TeamId::generate(),
+    pub fn create_hive_roster(&self, name: &str, now_ms: u64) -> Result<HiveRosterRow> {
+        let row = HiveRosterRow {
+            id: HiveRosterId::generate(),
             name: name.to_owned(),
             session_id: None,
             created_ms: now_ms,
             updated_ms: now_ms,
         };
         self.lock().execute(
-            "INSERT INTO teams (id, name, session_id, created_ms, updated_ms)
+            "INSERT INTO hive_rosters (id, name, session_id, created_ms, updated_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 row.id.as_str(),
@@ -1643,15 +1642,15 @@ impl Store {
         Ok(row)
     }
 
-    pub fn list_teams(&self) -> Result<Vec<TeamRow>> {
+    pub fn list_hive_rosters(&self) -> Result<Vec<HiveRosterRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, name, session_id, created_ms, updated_ms FROM teams ORDER BY created_ms ASC",
+            "SELECT id, name, session_id, created_ms, updated_ms FROM hive_rosters ORDER BY created_ms ASC",
         )?;
         let rows = stmt
             .query_map([], |row| {
-                Ok(TeamRow {
-                    id: TeamId::new(row.get::<_, String>(0)?),
+                Ok(HiveRosterRow {
+                    id: HiveRosterId::new(row.get::<_, String>(0)?),
                     name: row.get(1)?,
                     session_id: row.get::<_, Option<String>>(2)?.map(SessionId::new),
                     created_ms: row.get::<_, i64>(3)? as u64,
@@ -1662,22 +1661,22 @@ impl Store {
         Ok(rows)
     }
 
-    pub fn rename_team(&self, id: &TeamId, name: &str, now_ms: u64) -> Result<()> {
+    pub fn rename_hive_roster(&self, id: &HiveRosterId, name: &str, now_ms: u64) -> Result<()> {
         self.lock().execute(
-            "UPDATE teams SET name = ?2, updated_ms = ?3 WHERE id = ?1",
+            "UPDATE hive_rosters SET name = ?2, updated_ms = ?3 WHERE id = ?1",
             params![id.as_str(), name, now_ms as i64],
         )?;
         Ok(())
     }
 
-    pub fn set_team_session(
+    pub fn set_hive_roster_session(
         &self,
-        id: &TeamId,
+        id: &HiveRosterId,
         session: Option<&SessionId>,
         now_ms: u64,
     ) -> Result<()> {
         self.lock().execute(
-            "UPDATE teams SET session_id = ?2, updated_ms = ?3 WHERE id = ?1",
+            "UPDATE hive_rosters SET session_id = ?2, updated_ms = ?3 WHERE id = ?1",
             params![
                 id.as_str(),
                 session.map(|s| s.as_str().to_owned()),
@@ -1687,59 +1686,62 @@ impl Store {
         Ok(())
     }
 
-    pub fn delete_team(&self, id: &TeamId) -> Result<()> {
+    pub fn delete_hive_roster(&self, id: &HiveRosterId) -> Result<()> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         tx.execute(
-            "DELETE FROM team_members WHERE team = ?1",
+            "DELETE FROM hive_roster_members WHERE roster = ?1",
             params![id.as_str()],
         )?;
-        tx.execute("DELETE FROM teams WHERE id = ?1", params![id.as_str()])?;
+        tx.execute(
+            "DELETE FROM hive_rosters WHERE id = ?1",
+            params![id.as_str()],
+        )?;
         tx.commit()?;
         Ok(())
     }
 
-    pub fn add_team_member(&self, team: &TeamId, agent: &AgentId) -> Result<()> {
+    pub fn add_hive_roster_member(&self, roster: &HiveRosterId, bot: &BotId) -> Result<()> {
         self.lock().execute(
-            "INSERT OR IGNORE INTO team_members (team, agent) VALUES (?1, ?2)",
-            params![team.as_str(), agent.as_str()],
+            "INSERT OR IGNORE INTO hive_roster_members (roster, bot) VALUES (?1, ?2)",
+            params![roster.as_str(), bot.as_str()],
         )?;
         Ok(())
     }
 
-    pub fn remove_team_member(&self, team: &TeamId, agent: &AgentId) -> Result<()> {
+    pub fn remove_hive_roster_member(&self, roster: &HiveRosterId, bot: &BotId) -> Result<()> {
         self.lock().execute(
-            "DELETE FROM team_members WHERE team = ?1 AND agent = ?2",
-            params![team.as_str(), agent.as_str()],
+            "DELETE FROM hive_roster_members WHERE roster = ?1 AND bot = ?2",
+            params![roster.as_str(), bot.as_str()],
         )?;
         Ok(())
     }
 
-    pub fn list_team_members(&self, team: &TeamId) -> Result<Vec<AgentId>> {
+    pub fn list_hive_roster_members(&self, roster: &HiveRosterId) -> Result<Vec<BotId>> {
         let conn = self.lock();
         let mut stmt =
-            conn.prepare("SELECT agent FROM team_members WHERE team = ?1 ORDER BY agent ASC")?;
+            conn.prepare("SELECT bot FROM hive_roster_members WHERE roster = ?1 ORDER BY bot ASC")?;
         let rows = stmt
-            .query_map(params![team.as_str()], |row| {
-                Ok(AgentId::new(row.get::<_, String>(0)?))
+            .query_map(params![roster.as_str()], |row| {
+                Ok(BotId::new(row.get::<_, String>(0)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     /// Drop an agent from every team that references it, so membership never outlives a profile.
-    pub fn remove_agent_from_teams(&self, agent: &AgentId) -> Result<Vec<TeamId>> {
+    pub fn remove_bot_from_hive_rosters(&self, bot: &BotId) -> Result<Vec<HiveRosterId>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare("SELECT team FROM team_members WHERE agent = ?1")?;
-        let teams: Vec<TeamId> = stmt
-            .query_map(params![agent.as_str()], |row| {
-                Ok(TeamId::new(row.get::<_, String>(0)?))
+        let mut stmt = conn.prepare("SELECT roster FROM hive_roster_members WHERE bot = ?1")?;
+        let teams: Vec<HiveRosterId> = stmt
+            .query_map(params![bot.as_str()], |row| {
+                Ok(HiveRosterId::new(row.get::<_, String>(0)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if !teams.is_empty() {
             conn.execute(
-                "DELETE FROM team_members WHERE agent = ?1",
-                params![agent.as_str()],
+                "DELETE FROM hive_roster_members WHERE bot = ?1",
+                params![bot.as_str()],
             )?;
         }
         Ok(teams)
@@ -1830,7 +1832,7 @@ impl Store {
             for sid in &prof_session_ids {
                 tx.execute("DELETE FROM journal WHERE session = ?1", params![sid])?;
                 tx.execute(
-                    "UPDATE teams SET session_id = NULL WHERE session_id = ?1",
+                    "UPDATE hive_rosters SET session_id = NULL WHERE session_id = ?1",
                     params![sid],
                 )?;
                 tx.execute(
@@ -1896,7 +1898,7 @@ impl Store {
         for sid in &session_ids {
             tx.execute("DELETE FROM journal WHERE session = ?1", params![sid])?;
             tx.execute(
-                "UPDATE teams SET session_id = NULL WHERE session_id = ?1",
+                "UPDATE hive_rosters SET session_id = NULL WHERE session_id = ?1",
                 params![sid],
             )?;
             tx.execute(
@@ -2026,7 +2028,7 @@ impl Store {
         for sid in &session_ids {
             tx.execute("DELETE FROM journal WHERE session = ?1", params![sid])?;
             tx.execute(
-                "UPDATE teams SET session_id = NULL WHERE session_id = ?1",
+                "UPDATE hive_rosters SET session_id = NULL WHERE session_id = ?1",
                 params![sid],
             )?;
             tx.execute(
@@ -3143,6 +3145,64 @@ fn kind_to_str(kind: RecordKind) -> &'static str {
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
+    // The agent-profile table was renamed to `bots` (AgentId -> BotId). Existing databases
+    // still carry `agents`; move it once, before the CREATE TABLE IF NOT EXISTS batch runs.
+    let table_exists = |name: &str| -> Result<bool> {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .map_err(StoreError::from)
+    };
+    if table_exists("agents")? && !table_exists("bots")? {
+        conn.execute("ALTER TABLE agents RENAME TO bots", [])?;
+    }
+    // Same rename for the roster tables (teams -> hive_rosters, team_members -> hive_roster_members).
+    if table_exists("teams")? && !table_exists("hive_rosters")? {
+        conn.execute("ALTER TABLE teams RENAME TO hive_rosters", [])?;
+    }
+    if table_exists("team_members")? && !table_exists("hive_roster_members")? {
+        conn.execute("ALTER TABLE team_members RENAME TO hive_roster_members", [])?;
+        conn.execute(
+            "ALTER TABLE hive_roster_members RENAME COLUMN team TO roster",
+            [],
+        )?;
+    }
+    // agent_id -> bot_id columns (they store BotId values now).
+    for table in ["sessions", "artifacts", "file_changes"] {
+        let has_old: bool = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = 'agent_id'"
+                ),
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+            .unwrap_or(false);
+        if has_old {
+            conn.execute(
+                &format!("ALTER TABLE {table} RENAME COLUMN agent_id TO bot_id"),
+                [],
+            )?;
+        }
+    }
+    let member_agent_col: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('hive_roster_members') WHERE name = 'agent'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if member_agent_col {
+        conn.execute(
+            "ALTER TABLE hive_roster_members RENAME COLUMN agent TO bot",
+            [],
+        )?;
+    }
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS sessions (
@@ -3150,14 +3210,14 @@ fn migrate(conn: &Connection) -> Result<()> {
             title       TEXT NOT NULL,
             cwd         TEXT NOT NULL,
             model       TEXT,
-            agent_id    TEXT,
+            bot_id    TEXT,
             created_ms  INTEGER NOT NULL,
             updated_ms  INTEGER NOT NULL,
             title_source TEXT NOT NULL DEFAULT 'manual',
             title_status TEXT NOT NULL DEFAULT 'ready'
         );
 
-        CREATE TABLE IF NOT EXISTS agents (
+        CREATE TABLE IF NOT EXISTS bots (
             id          TEXT PRIMARY KEY,
             name        TEXT NOT NULL,
             role        TEXT NOT NULL,
@@ -3166,7 +3226,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             created_ms  INTEGER NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS teams (
+        CREATE TABLE IF NOT EXISTS hive_rosters (
             id          TEXT PRIMARY KEY,
             name        TEXT NOT NULL,
             session_id  TEXT,
@@ -3174,10 +3234,10 @@ fn migrate(conn: &Connection) -> Result<()> {
             updated_ms  INTEGER NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS team_members (
-            team  TEXT NOT NULL,
-            agent TEXT NOT NULL,
-            PRIMARY KEY (team, agent)
+        CREATE TABLE IF NOT EXISTS hive_roster_members (
+            roster TEXT NOT NULL,
+            bot    TEXT NOT NULL,
+            PRIMARY KEY (roster, bot)
         );
 
         CREATE TABLE IF NOT EXISTS journal (
@@ -3315,7 +3375,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             id          TEXT PRIMARY KEY,
             session     TEXT NOT NULL,
             project_id  TEXT,
-            agent_id    TEXT,
+            bot_id    TEXT,
             name        TEXT NOT NULL,
             path        TEXT NOT NULL,
             kind        TEXT NOT NULL DEFAULT 'other',
@@ -3332,7 +3392,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS file_changes (
             id               TEXT PRIMARY KEY,
             session          TEXT NOT NULL,
-            agent_id         TEXT,
+            bot_id         TEXT,
             path             TEXT NOT NULL,
             operation        TEXT NOT NULL,
             checksum_before  TEXT,
@@ -3678,7 +3738,7 @@ fn map_session_row(row: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
         title: row.get(1)?,
         cwd: PathBuf::from(row.get::<_, String>(2)?),
         model: row.get(3)?,
-        agent: row.get::<_, Option<String>>(4)?.map(AgentId::new),
+        bot: row.get::<_, Option<String>>(4)?.map(BotId::new),
         created_ms: row.get::<_, i64>(5)? as u64,
         updated_ms: row.get::<_, i64>(6)? as u64,
         status: row.get(7)?,
@@ -3695,7 +3755,7 @@ fn map_artifact(row: &rusqlite::Row) -> rusqlite::Result<ArtifactRow> {
         id: row.get(0)?,
         session: SessionId::new(row.get::<_, String>(1)?),
         project_id: row.get::<_, Option<String>>(2)?.map(ProjectId::new),
-        agent: row.get::<_, Option<String>>(3)?.map(AgentId::new),
+        bot: row.get::<_, Option<String>>(3)?.map(BotId::new),
         name: row.get(4)?,
         path: PathBuf::from(row.get::<_, String>(5)?),
         kind: row.get(6)?,
@@ -3848,12 +3908,15 @@ mod tests {
             .unwrap();
         {
             let conn = store.lock();
-            conn.execute("DROP TABLE teams", []).unwrap();
+            conn.execute("DROP TABLE hive_rosters", []).unwrap();
         }
         let err = store
             .delete_session(&row.id)
             .expect_err("a failed cascade must not be swallowed and committed");
-        assert!(err.to_string().contains("teams"), "names the table: {err}");
+        assert!(
+            err.to_string().contains("hive_rosters"),
+            "names the table: {err}"
+        );
         assert!(
             store
                 .list_sessions()
@@ -3972,18 +4035,18 @@ mod tests {
     #[test]
     fn agent_profiles_persist_and_update_in_place() {
         let store = Store::open_in_memory().unwrap();
-        let mut row = AgentRow {
-            id: AgentId::generate(),
+        let mut row = BotRow {
+            id: BotId::generate(),
             name: "Rudra".into(),
             role: "Implementer".into(),
             description: "builds".into(),
             icon: None,
             created_ms: 1,
         };
-        store.save_agent(&row).unwrap();
+        store.save_bot(&row).unwrap();
         row.description = "builds carefully".into();
-        store.save_agent(&row).unwrap();
-        let listed = store.list_agents().unwrap();
+        store.save_bot(&row).unwrap();
+        let listed = store.list_bots().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].description, "builds carefully");
     }
@@ -3992,72 +4055,77 @@ mod tests {
     fn teams_round_trip_with_members_and_session_link() {
         let store = Store::open_in_memory().unwrap();
         let now = 100;
-        let team = store.create_team("Forge", now).unwrap();
+        let team = store.create_hive_roster("Forge", now).unwrap();
         assert_eq!(team.name, "Forge");
         assert_eq!(team.session_id, None);
 
-        let agent = AgentId::generate();
-        store.add_team_member(&team.id, &agent).unwrap();
-        store.add_team_member(&team.id, &agent).unwrap(); // idempotent
+        let agent = BotId::generate();
+        store.add_hive_roster_member(&team.id, &agent).unwrap();
+        store.add_hive_roster_member(&team.id, &agent).unwrap(); // idempotent
         let session = store
             .create_session("Forge", Path::new("/work"), None, now + 1)
             .unwrap();
         store
-            .set_team_session(&team.id, Some(&session.id), now + 2)
+            .set_hive_roster_session(&team.id, Some(&session.id), now + 2)
             .unwrap();
 
-        let listed = store.list_teams().unwrap();
+        let listed = store.list_hive_rosters().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, "Forge");
         assert_eq!(listed[0].session_id.as_ref(), Some(&session.id));
         assert_eq!(
-            store.list_team_members(&team.id).unwrap(),
+            store.list_hive_roster_members(&team.id).unwrap(),
             vec![agent.clone()]
         );
 
         store
-            .rename_team(&team.id, "Project Orion", now + 3)
+            .rename_hive_roster(&team.id, "Project Orion", now + 3)
             .unwrap();
-        assert_eq!(store.list_teams().unwrap()[0].name, "Project Orion");
+        assert_eq!(store.list_hive_rosters().unwrap()[0].name, "Project Orion");
 
-        store.remove_team_member(&team.id, &agent).unwrap();
-        assert!(store.list_team_members(&team.id).unwrap().is_empty());
+        store.remove_hive_roster_member(&team.id, &agent).unwrap();
+        assert!(store.list_hive_roster_members(&team.id).unwrap().is_empty());
     }
 
     #[test]
     fn deleting_a_team_cascades_to_membership() {
         let store = Store::open_in_memory().unwrap();
-        let team = store.create_team("Nexus", 1).unwrap();
+        let team = store.create_hive_roster("Nexus", 1).unwrap();
         store
-            .add_team_member(&team.id, &AgentId::generate())
+            .add_hive_roster_member(&team.id, &BotId::generate())
             .unwrap();
-        store.delete_team(&team.id).unwrap();
-        assert!(store.list_teams().unwrap().is_empty());
-        assert!(store.list_team_members(&team.id).unwrap().is_empty());
+        store.delete_hive_roster(&team.id).unwrap();
+        assert!(store.list_hive_rosters().unwrap().is_empty());
+        assert!(store.list_hive_roster_members(&team.id).unwrap().is_empty());
     }
 
     #[test]
     fn removing_an_agent_drops_it_from_every_team() {
         let store = Store::open_in_memory().unwrap();
-        let agent = AgentId::generate();
-        let a = store.create_team("A", 1).unwrap();
-        let b = store.create_team("B", 2).unwrap();
-        store.add_team_member(&a.id, &agent).unwrap();
-        store.add_team_member(&b.id, &agent).unwrap();
+        let agent = BotId::generate();
+        let a = store.create_hive_roster("A", 1).unwrap();
+        let b = store.create_hive_roster("B", 2).unwrap();
+        store.add_hive_roster_member(&a.id, &agent).unwrap();
+        store.add_hive_roster_member(&b.id, &agent).unwrap();
 
-        let affected = store.remove_agent_from_teams(&agent).unwrap();
+        let affected = store.remove_bot_from_hive_rosters(&agent).unwrap();
         assert_eq!(affected.len(), 2);
-        assert!(store.list_team_members(&a.id).unwrap().is_empty());
-        assert!(store.list_team_members(&b.id).unwrap().is_empty());
+        assert!(store.list_hive_roster_members(&a.id).unwrap().is_empty());
+        assert!(store.list_hive_roster_members(&b.id).unwrap().is_empty());
         // Second call is a no-op with no teams affected.
-        assert!(store.remove_agent_from_teams(&agent).unwrap().is_empty());
+        assert!(
+            store
+                .remove_bot_from_hive_rosters(&agent)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn team_names_support_arbitrary_unicode() {
         let store = Store::open_in_memory().unwrap();
-        let team = store.create_team("研究小组 🐝", 1).unwrap();
-        assert_eq!(store.list_teams().unwrap()[0].name, "研究小组 🐝");
+        let team = store.create_hive_roster("研究小组 🐝", 1).unwrap();
+        assert_eq!(store.list_hive_rosters().unwrap()[0].name, "研究小组 🐝");
         assert_eq!(team.name, "研究小组 🐝");
     }
 

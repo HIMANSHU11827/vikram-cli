@@ -568,7 +568,7 @@ impl Daemon {
     }
 }
 
-/// Answer, for one running team, whether the operator has stopped a member. The request travels
+/// Answer, for one running hive, whether the operator has stopped a member. The request travels
 /// through the scheduler database because the CLI and the daemon are different processes.
 fn member_probe(store: ScheduleStore, run: &str) -> runner::StopProbe {
     let run = run.to_string();
@@ -624,28 +624,29 @@ fn work_for(job: &Job, timeout: Millis, stop: Option<runner::StopProbe>) -> Work
                 };
                 runner::run_delegate(config, request, limit).await
             }
-            // A team job names a saved team; its members each get their own delegated turn.
+            // A hive job names a saved hive; its members each get their own delegated turn.
             JobMode::Workflow => {
                 if job.agent.trim().is_empty() {
                     return RunOutcome::failed(
-                        "a workflow job needs a team: set --agent <team>".to_string(),
+                        "a workflow job needs a hive: set --agent <hive>".to_string(),
                     );
                 }
                 let config = match vikram_runtime::config::Config::load() {
                     Ok(config) => config,
                     Err(err) => return RunOutcome::failed(format!("config: {err}")),
                 };
-                let request = runner::TeamRequest::new(job.agent.clone(), job.payload.clone())
-                    .title(runner::title_from(&job.payload))
-                    .in_order(runner::TeamOrder::parse(&job.order).unwrap_or_default())
-                    // A member stopped from the CLI is asked about between events, so the rest of
-                    // the team keeps working instead of being cancelled with it.
-                    .stopping_when(stop);
+                let request =
+                    runner::HiveRosterRequest::new(job.agent.clone(), job.payload.clone())
+                        .title(runner::title_from(&job.payload))
+                        .in_order(runner::HiveRosterOrder::parse(&job.order).unwrap_or_default())
+                        // A member stopped from the CLI is asked about between events, so the rest of
+                        // the hive keeps working instead of being cancelled with it.
+                        .stopping_when(stop);
                 let request = match job.target.strip_prefix("model:") {
                     Some(model) => request.model(model.to_string()),
                     None => request,
                 };
-                runner::run_team(config, request, limit).await
+                runner::run_hive_roster(config, request, limit).await
             }
         }
     })

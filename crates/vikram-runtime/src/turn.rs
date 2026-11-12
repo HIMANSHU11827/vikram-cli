@@ -16,14 +16,14 @@ use vikram_contracts::{
     ToolCall, ToolCallId, Trust, TurnId,
 };
 
-use crate::agents::ManagedAgent;
+use crate::bots::ManagedBot;
 use crate::learning::TurnGrowth;
 use crate::provider::{CompletionRequest, ProviderEvent};
 use crate::runtime::{PendingApproval, RuntimeInner};
 use crate::session::SessionRuntime;
 use crate::skills::SkillRegistry;
 use crate::types::{
-    AgentState, ApprovalPrompt, ContextMeter, ContextPart, NoticeLevel, RuntimeEvent, TaskState,
+    ApprovalPrompt, BotState, ContextMeter, ContextPart, NoticeLevel, RuntimeEvent, TaskState,
     TurnState, now_ms,
 };
 
@@ -33,7 +33,7 @@ const LIVE_METRIC_INTERVAL: std::time::Duration = std::time::Duration::from_mill
 
 /// An agent turn carries the task record it must close when it finishes.
 pub struct AgentRun {
-    pub agent: Arc<ManagedAgent>,
+    pub agent: Arc<ManagedBot>,
     pub task_id: String,
 }
 
@@ -141,8 +141,8 @@ pub(crate) async fn run_turn(
         turn: turn.clone(),
     });
     if let Some(run) = &agent {
-        run.agent.set_state(AgentState::Thinking);
-        inner.publish_agent(&run.agent);
+        run.agent.set_state(BotState::Thinking);
+        inner.publish_bot(&run.agent);
     }
     inner.emit(RuntimeEvent::Status(inner.status()));
     inner.publish_metrics();
@@ -153,12 +153,18 @@ pub(crate) async fn run_turn(
     let mut reported_input: Option<u64> = None;
     let mut last_estimated_input = 0u64;
     let mut over_limit_retries = 0u32;
-    let max_steps = u64::from(inner.config.max_steps);
+    let max_steps = u64::from(
+        inner
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .max_steps,
+    );
     let mut steps_used = 0u64;
-    // Guards the two ways a turn spends a minute in silence: the model retrying a tool that has
-    // already failed, and the model keeping busy past the point where the operator is still
-    // waiting for words.
-    let mut guard = RepeatGuard::new(started);
+    // Watches the run of failures so the model can be handed a different plan. It never blocks a
+    // call: a ✗ is information, and a turn that runs out of permitted attempts answers in promises.
+    let mut guard = RepeatGuard::new();
+    let mut step_notice_sent = false;
     let mut live_metrics = Instant::now();
 
     let Some(provider) = inner.provider.read().expect("provider lock").clone() else {
@@ -252,7 +258,14 @@ pub(crate) async fn run_turn(
         {
             let q = codeindex_query(&request_text);
             if !q.is_empty() {
-                let ctx = crate::tools::codeindex::codeindex_context(&inner.workspace_root, &q);
+                // The fallback scan reads files, so it runs on the blocking pool: even bounded,
+                // it must not hold an executor thread the stream loop and tools share.
+                let root = inner.workspace_root.clone();
+                let ctx = tokio::task::spawn_blocking(move || {
+                    crate::tools::codeindex::codeindex_context(&root, &q)
+                })
+                .await
+                .unwrap_or_default();
                 if !ctx.trim().is_empty() {
                     // Only inject when something useful was found (index hits or grep hits).
                     if ctx.contains("no index") {
@@ -328,7 +341,11 @@ pub(crate) async fn run_turn(
             model: inner.model(),
             messages: request_messages,
             tools: inner.tools.specs(),
-            max_output_tokens: inner.config.max_output_tokens,
+            max_output_tokens: inner
+                .config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .max_output_tokens,
         };
 
         let mut stream = provider.stream(request);
@@ -337,25 +354,92 @@ pub(crate) async fn run_turn(
         let mut reasoning_buffer = String::new();
         let mut calls: Vec<ToolCall> = Vec::new();
         let mut stream_failed = false;
+        // Silence is measured from the last *event that produced something visible*, not from a
+        // one-shot "did anything ever arrive" flag. A model can emit one token and then go quiet
+        // while it streams a long tool-call argument block (which the provider buffers without
+        // emitting), and the old one-shot guard switched itself off after the first event — so the
+        // turn sat on the client's whole timeout with a frozen clock and a blank screen. The idle
+        // measure keeps the watchdog armed for the whole stream, however late the stall begins.
+        let stream_started = Instant::now();
+        let mut last_progress = stream_started;
+        let silence_cap = std::time::Duration::from_secs(
+            inner
+                .config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .stream_silence_secs,
+        );
 
         loop {
-            // A provider that thinks for ten seconds before the first token would otherwise freeze
-            // the clock and the rate. On a quiet window, republish what is known so far.
             let item = match tokio::time::timeout(LIVE_METRIC_INTERVAL, stream.next()).await {
-                Ok(Some(item)) => item,
+                Ok(Some(item)) => Some(item),
                 Ok(None) => break,
-                Err(_) => {
-                    live_metrics = Instant::now();
-                    inner.note_stream_progress(started.elapsed(), output_tokens);
-                    continue;
-                }
+                Err(_) => None,
             };
+            // Checked on every pass, not only when a quiet window closes empty. A provider that
+            // drips keep-alives, empty deltas or usage chunks never misses a 250ms timeout, so a
+            // watchdog that only runs inside the timeout arm can be postponed forever: the pane
+            // stays blank, the clock keeps climbing, and nothing ever aborts the turn.
+            if last_progress.elapsed() >= silence_cap {
+                let partial = if text_buffer.is_empty() && reasoning_buffer.is_empty() {
+                    String::new()
+                } else {
+                    " The part it had already written is kept.".to_owned()
+                };
+                inner.emit(RuntimeEvent::Error {
+                    text: format!(
+                        "the model sent nothing for {}s, so the stream was abandoned.{} \
+                         Send again, or switch model with `vikram config set model <name>`. \
+                         Raise the wait with `vikram config set stream_silence_secs <n>` if \
+                         this model is genuinely that slow.",
+                        last_progress.elapsed().as_secs(),
+                        partial
+                    ),
+                });
+                stream_failed = true;
+                break;
+            }
+            // Publishes on a timer rather than on a timeout, so the elapsed time and the rate keep
+            // moving even while the endpoint is dribbling events that render nothing.
+            if live_metrics.elapsed() >= LIVE_METRIC_INTERVAL {
+                live_metrics = Instant::now();
+                inner.note_stream_progress(started.elapsed(), output_tokens);
+            }
+            // Cancellation is checked on every pass, including the passes where the endpoint said
+            // nothing. This used to sit below the `continue`, so it only ran when a delta arrived:
+            // a free or reasoning endpoint sitting on its first token for twenty seconds answered
+            // the operator's stop with silence until that token finally came.
             if cancel.is_cancelled() {
                 break;
             }
+            let Some(item) = item else { continue };
             match item {
+                Ok(ProviderEvent::Retrying {
+                    attempt,
+                    of,
+                    wait_ms,
+                    status,
+                }) => {
+                    // The wait counts as progress: it is the endpoint working through its own
+                    // limit, not a model that has gone quiet, and the silence watchdog must not
+                    // abandon a turn that is legitimately backing off.
+                    last_progress = Instant::now();
+                    let cause = if status == 0 {
+                        "the connection failed".to_owned()
+                    } else {
+                        format!("the endpoint answered {status}")
+                    };
+                    inner.emit(RuntimeEvent::Notice {
+                        level: NoticeLevel::Warn,
+                        text: format!(
+                            "{cause} — retrying in {:.1}s (attempt {attempt} of {of})",
+                            wait_ms as f64 / 1000.0
+                        ),
+                    });
+                }
                 Ok(ProviderEvent::TextDelta(delta)) => {
                     if !delta.is_empty() {
+                        last_progress = Instant::now();
                         output_tokens += vikram_contracts::TokenMeter::estimate(&delta);
                         text_buffer.push_str(&delta);
                         inner.emit(RuntimeEvent::StreamDelta {
@@ -368,15 +452,16 @@ pub(crate) async fn run_turn(
                             inner.note_stream_progress(started.elapsed(), output_tokens);
                         }
                         if let Some(run) = &agent
-                            && run.agent.state() != AgentState::Running
+                            && run.agent.state() != BotState::Running
                         {
-                            run.agent.set_state(AgentState::Running);
-                            inner.publish_agent(&run.agent);
+                            run.agent.set_state(BotState::Running);
+                            inner.publish_bot(&run.agent);
                         }
                     }
                 }
                 Ok(ProviderEvent::ThinkingDelta(delta)) => {
                     if !delta.is_empty() {
+                        last_progress = Instant::now();
                         reasoning_buffer.push_str(&delta);
                         inner.emit(RuntimeEvent::StreamThinkingDelta {
                             session: session.id.clone(),
@@ -389,7 +474,10 @@ pub(crate) async fn run_turn(
                         }
                     }
                 }
-                Ok(ProviderEvent::ToolCall(call)) => calls.push(call),
+                Ok(ProviderEvent::ToolCall(call)) => {
+                    last_progress = Instant::now();
+                    calls.push(call);
+                }
                 Ok(ProviderEvent::Finished {
                     input_tokens,
                     output_tokens: out,
@@ -466,109 +554,84 @@ pub(crate) async fn run_turn(
         }
 
         let mut results: Vec<(ToolCallId, String, bool)> = Vec::new();
-        let mut cancelled_mid_tools = false;
 
-        // A batch of read-only calls has no ordering constraint: none of them can observe another's
-        // effect, none can ask for approval, and the model already asked for all of them at once.
-        // Run those together so a turn that inspects five files costs one round-trip, not five.
-        // Anything with a side effect, a missing tool, or a disabled tool stays on the sequential
-        // path, where cancellation and the step budget are enforced per call.
-        let parallel_safe = calls.len() > 1
-            && steps_used + calls.len() as u64 <= max_steps
-            && calls.iter().all(|call| {
-                inner.tools.get(&call.name).is_some_and(|tool| {
-                    inner.tools.is_enabled(&call.name)
-                        && tool
-                            .permission(&call.arguments)
-                            .map(|request| request.action == ActionKind::Read)
-                            .unwrap_or(false)
-                })
+        // The model asked for the whole batch at once, so calls run together unless they share
+        // a resource: reads, writes to different files, commands on different terminal or
+        // browser sessions and different tools all proceed side by side, while calls that
+        // could observe or overwrite each other keep their order inside one lane.
+        steps_used += calls.len() as u64;
+        if steps_used >= max_steps && !step_notice_sent {
+            // A budget, not a wall. The operator can see the count and stop the turn
+            // themselves; ending it here would throw away a turn that is still finding
+            // its way, which is the one thing an autonomous agent must never do.
+            step_notice_sent = true;
+            inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!(
+                    "step budget reached ({steps_used} steps) — still working; Esc stops the turn"
+                ),
             });
+        }
 
-        if parallel_safe {
-            steps_used += calls.len() as u64;
-            // Refusals are settled before the batch runs so the guard sees one consistent view,
-            // and every call the model asked for still gets an answer in the transcript.
-            let mut batch_calls: Vec<&ToolCall> = Vec::new();
-            let mut batch_results: Vec<(ToolCallId, String, bool)> = Vec::new();
-            for call in &calls {
-                match guard.refusal(call) {
-                    Some(text) => batch_results.push((call.id.clone(), text, false)),
-                    None => batch_calls.push(call),
-                }
-            }
-            let batch = futures_util::future::join_all(
-                batch_calls
-                    .iter()
-                    .map(|call| run_tool(&inner, &session, call, &cancel, &agent, Origin::Model)),
-            )
-            .await;
-            for (call, (content, ok)) in batch_calls.iter().zip(batch) {
-                guard.record(call, ok);
-                growth.record_call(&call.name);
-                if !ok {
-                    growth.record_failure(&call.name, &content);
-                }
-                batch_results.push((call.id.clone(), content, ok));
-            }
-            if let Some(refusals) = guard.take_announcement() {
-                inner.emit(RuntimeEvent::Notice {
-                    level: NoticeLevel::Warn,
-                    text: format!(
-                        "repeat guard: {refusals} tool call(s) refused — the model was retrying calls that already failed this turn"
-                    ),
-                });
-            }
-            results.extend(batch_results);
-            if cancel.is_cancelled() {
-                cancelled_mid_tools = true;
-            }
-        } else {
-            for (index, call) in calls.iter().enumerate() {
-                if cancel.is_cancelled() {
-                    cancelled_mid_tools = true;
-                    results.extend(answer_unrun(&calls[index..], Abandoned::Cancelled));
-                    break;
-                }
-                if steps_used >= max_steps {
-                    inner.emit(RuntimeEvent::Error {
-                        text: format!("step budget exhausted after {} steps", steps_used),
-                    });
-                    outcome = TurnState::Failed;
-                    cancelled_mid_tools = true;
-                    results.extend(answer_unrun(&calls[index..], Abandoned::OutOfSteps));
-                    break;
-                }
-                // A refused call still costs a step: it costs a model round-trip, and charging it
-                // is what stops a model that keeps re-asking from looping forever.
-                steps_used += 1;
-                if let Some(text) = guard.refusal(call) {
-                    if let Some(refusals) = guard.take_announcement() {
-                        inner.emit(RuntimeEvent::Notice {
-                            level: NoticeLevel::Warn,
-                            text: format!(
-                                "repeat guard: {refusals} tool call(s) refused — the model was retrying calls that already failed this turn"
-                            ),
-                        });
+        let mut lanes: Vec<Vec<usize>> = Vec::new();
+        let mut lane_for: HashMap<String, usize> = HashMap::new();
+        for (index, call) in calls.iter().enumerate() {
+            match conflict_key(&inner, call) {
+                Some(key) => match lane_for.get(&key) {
+                    Some(&lane) => lanes[lane].push(index),
+                    None => {
+                        lane_for.insert(key, lanes.len());
+                        lanes.push(vec![index]);
                     }
-                    results.push((call.id.clone(), text, false));
-                    continue;
-                }
-                let (content, ok) =
-                    run_tool(&inner, &session, call, &cancel, &agent, Origin::Model).await;
-                guard.record(call, ok);
-                growth.record_call(&call.name);
-                if !ok {
-                    growth.record_failure(&call.name, &content);
-                }
-                results.push((call.id.clone(), content, ok));
-                if cancel.is_cancelled() {
-                    cancelled_mid_tools = true;
-                    results.extend(answer_unrun(&calls[index + 1..], Abandoned::Cancelled));
-                    break;
-                }
+                },
+                None => lanes.push(vec![index]),
             }
         }
+
+        let calls_ref = &calls;
+        let inner_ref = &inner;
+        let session_ref = &session;
+        let cancel_ref = &cancel;
+        let agent_ref = &agent;
+        let lane_results = futures_util::future::join_all(lanes.iter().map(|lane| async move {
+            let mut out: Vec<(usize, String, bool)> = Vec::with_capacity(lane.len());
+            for &index in lane {
+                if cancel_ref.is_cancelled() {
+                    out.push((index, "cancelled before completion".to_owned(), false));
+                    continue;
+                }
+                let (content, ok) = run_tool(
+                    inner_ref,
+                    session_ref,
+                    &calls_ref[index],
+                    cancel_ref,
+                    agent_ref,
+                    Origin::Model,
+                )
+                .await;
+                out.push((index, content, ok));
+            }
+            out
+        }))
+        .await;
+
+        let mut by_index: Vec<Option<(String, bool)>> = (0..calls.len()).map(|_| None).collect();
+        for lane in lane_results {
+            for (index, content, ok) in lane {
+                by_index[index] = Some((content, ok));
+            }
+        }
+        for (call, slot) in calls.iter().zip(by_index) {
+            let (content, ok) =
+                slot.unwrap_or_else(|| ("cancelled before completion".to_owned(), false));
+            guard.record(call, ok);
+            growth.record_call(&call.name);
+            if !ok {
+                growth.record_failure(&call.name, &content);
+            }
+            results.push((call.id.clone(), content, ok));
+        }
+        let cancelled_mid_tools = cancel.is_cancelled();
 
         for (call_id, content, ok) in results {
             let result = Message::tool_result(call_id, content, ok);
@@ -581,6 +644,37 @@ pub(crate) async fn run_turn(
             inner.emit(RuntimeEvent::MessageCommitted {
                 session: session.id.clone(),
                 message: result,
+            });
+        }
+
+        // The guards above only see repetition. A model that rewords its query and rotates its
+        // tools never repeats itself, so they cannot see a turn that is failing in fresh ways.
+        // Consecutive failures are that signal. They do not end the turn — an agent that keeps
+        // trying is doing its job — they buy it a different plan and let it keep working.
+        if guard.needs_advice() {
+            let repeated = guard
+                .worst_tool()
+                .map(|(name, failures)| format!(" ({name} has failed {failures} times)"))
+                .unwrap_or_default();
+            inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!(
+                    "{} tool calls in a row failed{repeated}. Changing the approach, still working.",
+                    RepeatGuard::ADVICE_AFTER
+                ),
+            });
+            let msg = Message::system(
+                "Your last tool calls all failed. Do not repeat a call that already failed: it will fail the same way. Change the approach instead — a different tool for the same goal (web.search failed: try browser.fetch or browser.open on a real URL, then browser.text or browser.links; or http against a site's own endpoint, or search.text for the local machine), a different source or site, a narrower query, or one specific question to the operator. Keep working until you have the result, or until you can say precisely what is blocking you.",
+            );
+            session.push_message(msg.clone(), now_ms());
+            inner.journal(
+                &session.id,
+                RecordKind::Message,
+                serde_json::json!({"message": msg}),
+            );
+            inner.emit(RuntimeEvent::MessageCommitted {
+                session: session.id.clone(),
+                message: msg,
             });
         }
 
@@ -647,140 +741,111 @@ pub(crate) async fn run_turn(
     );
 }
 
-/// Why a batch of tool calls stopped before all of them ran.
-enum Abandoned {
-    Cancelled,
-    OutOfSteps,
+/// The resource a call touches, when two calls touching the same one must keep their order.
+/// `None` means the call shares nothing with any sibling and may run beside all of them.
+fn conflict_key(inner: &Arc<RuntimeInner>, call: &ToolCall) -> Option<String> {
+    let tool = inner.tools.get(&call.name)?;
+    let action = tool.permission(&call.arguments).ok()?.action;
+    match action {
+        ActionKind::Read => None,
+        ActionKind::Write => {
+            for key in ["path", "file", "file_path", "target", "resource"] {
+                if let Some(raw) = call.arguments.get(key).and_then(|v| v.as_str()) {
+                    let resolved = crate::config::resolve_within(
+                        &inner.workspace_root,
+                        std::path::Path::new(raw),
+                    )
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| raw.to_owned());
+                    return Some(format!("path:{resolved}"));
+                }
+            }
+            Some(format!("write:{}", call.name))
+        }
+        _ => {
+            // Session-scoped tools (terminal, browser.*, …) name the session they drive; calls
+            // on different sessions are independent and run together.
+            for key in ["session", "id", "name"] {
+                if let Some(value) = call.arguments.get(key).and_then(|v| v.as_str()) {
+                    return Some(format!("{}:{value}", call.name));
+                }
+            }
+            // A terminal `open` without a name starts a fresh PTY every time, so each one is
+            // independent; everything else of its kind shares the tool's own lane.
+            if call.name == "terminal"
+                && call.arguments.get("action").and_then(|v| v.as_str()) == Some("open")
+            {
+                return Some(format!("pty-open:{}", call.id.as_str()));
+            }
+            Some(format!("exec:{}", call.name))
+        }
+    }
 }
 
-/// Answer the calls a batch never reached. The model asked for them, so the transcript the next turn
-/// reads has to say what happened to each one: silence is what makes a resumed conversation
-/// unreadable, and the honest line differs depending on whether a person stopped the turn or the
-/// step budget did.
-/// Repeated-call and wall-clock breaker for the tool phase of a turn.
+/// The turn's memory of what has been failing.
 ///
-/// Two things turn a turn into a minute of silence instead of an answer: a model that re-asks for
-/// a tool that has already failed (the step budget converts that into pure waiting), and a model
-/// that keeps working long past the point where the operator is still watching. Both are bounded
-/// here, because only the turn loop can see them.
+/// It never blocks a call. A failed tool is one ✗ in a list: the agent's job is to read it and try
+/// something else, and every attempt it is forbidden from making is an attempt it spends writing a
+/// promise instead. All this does is notice a run of failures and hand the model a better plan,
+/// periodically, for as long as it keeps working.
 struct RepeatGuard {
-    /// Exact call (name + canonical arguments) -> failures this turn.
-    by_call: HashMap<String, u32>,
-    /// Tool name -> failures this turn, across every set of arguments.
+    /// Tool name -> failures this turn, across every set of arguments. Read only by the advice, so
+    /// it can name the tool that keeps failing instead of describing it.
     by_tool: HashMap<String, u32>,
-    /// When the tool phase stops being worth continuing.
-    deadline: Instant,
-    refusals: u32,
-    announced: bool,
+    /// Failures since the last successful call, regardless of which tool produced them.
+    failures_in_row: u32,
+    /// The streak length the turn was last advised at, so one streak produces one nudge.
+    advised_at: u32,
 }
 
 impl RepeatGuard {
-    /// The same exact call may fail this many times before it is refused.
-    const CALL_FAILURES: u32 = 2;
-    /// Any single tool may fail this many times per turn before every further call to it is refused.
-    const TOOL_FAILURES: u32 = 4;
-    /// The tool phase gets this long before the model is told to answer in words. Generous enough
-    /// for real multi-step work, short enough that a runaway turn cannot sit silent for minutes.
-    const TOOL_PHASE: std::time::Duration = std::time::Duration::from_secs(120);
+    /// Failures in a row — across every tool and every set of arguments — before the turn is
+    /// handed a different plan. Guidance, not a wall: an agent that keeps trying is doing its job,
+    /// it just needs to stop trying the same way.
+    const ADVICE_AFTER: u32 = 3;
 
-    fn new(started: Instant) -> Self {
+    fn new() -> Self {
         Self {
-            by_call: HashMap::new(),
             by_tool: HashMap::new(),
-            deadline: started + Self::TOOL_PHASE,
-            refusals: 0,
-            announced: false,
+            failures_in_row: 0,
+            advised_at: 0,
         }
-    }
-
-    /// Why this call must not run, or `None` when it may.
-    fn refusal(&mut self, call: &ToolCall) -> Option<String> {
-        let text = if Instant::now() >= self.deadline {
-            format!(
-                "refused: this turn has spent {}s in tool calls. Answer now, in words, with what you already have. Do not call another tool.",
-                Self::TOOL_PHASE.as_secs()
-            )
-        } else if self
-            .by_call
-            .get(&Self::key(call))
-            .is_some_and(|failures| *failures >= Self::CALL_FAILURES)
-        {
-            format!(
-                "refused: {} was already called with these exact arguments and failed {} times this turn. It will fail the same way again. Change the approach, or answer with what you have.",
-                call.name,
-                Self::CALL_FAILURES
-            )
-        } else if self
-            .by_tool
-            .get(&call.name)
-            .is_some_and(|failures| *failures >= Self::TOOL_FAILURES)
-        {
-            format!(
-                "refused: {} has failed {} times this turn. Stop using it: answer with what you have, or use a different tool.",
-                call.name,
-                Self::TOOL_FAILURES
-            )
-        } else {
-            return None;
-        };
-        self.refusals += 1;
-        Some(text)
     }
 
     /// Records the outcome of a call that actually ran.
     fn record(&mut self, call: &ToolCall, ok: bool) {
         if ok {
+            // One success is enough to say the turn is still working on something it can reach.
+            self.failures_in_row = 0;
+            self.advised_at = 0;
             return;
         }
-        *self.by_call.entry(Self::key(call)).or_insert(0) += 1;
+        self.failures_in_row += 1;
         *self.by_tool.entry(call.name.clone()).or_insert(0) += 1;
     }
 
-    /// The refusal count, returned exactly once per turn so the operator learns why the model
-    /// suddenly stopped using tools.
-    fn take_announcement(&mut self) -> Option<u32> {
-        if self.refusals > 0 && !self.announced {
-            self.announced = true;
-            return Some(self.refusals);
-        }
-        None
+    /// The tool that has failed most this turn, or `None` before anything has failed.
+    fn worst_tool(&self) -> Option<(&str, u32)> {
+        self.by_tool
+            .iter()
+            .max_by_key(|(_, failures)| **failures)
+            .map(|(name, failures)| (name.as_str(), *failures))
     }
 
-    /// Identity of a call: its name plus arguments with object keys sorted, so a model that
-    /// reorders the same arguments is still recognised as repeating itself.
-    fn key(call: &ToolCall) -> String {
-        format!("{}\u{1f}{}", call.name, canonical_json(&call.arguments))
-    }
-}
-
-fn canonical_json(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            let body: Vec<String> = keys
-                .into_iter()
-                .map(|key| format!("{key}:{}", canonical_json(&map[key])))
-                .collect();
-            format!("{{{}}}", body.join(","))
+    /// Whether the turn has failed enough times in a row that it should be handed a different
+    /// plan. Counted across tools and arguments, because a change of wording is not a change of
+    /// outcome. Returns true once per streak length, so a long run of failures is nudged
+    /// periodically rather than nagged on every step.
+    fn needs_advice(&mut self) -> bool {
+        if self.failures_in_row < Self::ADVICE_AFTER
+            || !self.failures_in_row.is_multiple_of(Self::ADVICE_AFTER)
+            || self.advised_at == self.failures_in_row
+        {
+            return false;
         }
-        serde_json::Value::Array(items) => {
-            let body: Vec<String> = items.iter().map(canonical_json).collect();
-            format!("[{}]", body.join(","))
-        }
-        other => other.to_string(),
+        self.advised_at = self.failures_in_row;
+        true
     }
-}
-
-fn answer_unrun(calls: &[ToolCall], why: Abandoned) -> Vec<(ToolCallId, String, bool)> {
-    let text = match why {
-        Abandoned::Cancelled => "cancelled before completion",
-        Abandoned::OutOfSteps => "not run: the step budget was exhausted first",
-    };
-    calls
-        .iter()
-        .map(|call| (call.id.clone(), text.to_owned(), false))
-        .collect()
 }
 
 fn commit_assistant_text(
@@ -876,13 +941,13 @@ fn finish(
 
     if let Some(run) = agent {
         let (state, task_state) = match outcome {
-            TurnState::Cancelled => (AgentState::Stopped, TaskState::Cancelled),
-            TurnState::Failed => (AgentState::Failed, TaskState::Failed),
-            _ => (AgentState::Completed, TaskState::Completed),
+            TurnState::Cancelled => (BotState::Stopped, TaskState::Cancelled),
+            TurnState::Failed => (BotState::Failed, TaskState::Failed),
+            _ => (BotState::Completed, TaskState::Completed),
         };
         run.agent.set_state(state);
         run.agent.set_task(None);
-        inner.publish_agent(&run.agent);
+        inner.publish_bot(&run.agent);
         if let Some(task) = inner.tasks.finish(&run.task_id, task_state) {
             inner.task_snapshot(&task);
         }
@@ -904,9 +969,9 @@ fn finish(
         // background task id so progress and completion are tracked rather than
         // being silently dropped (the previous `String::new()` lost the task).
         let queued_agent = agent.as_ref().map(|run| {
-            run.agent.set_state(AgentState::Thinking);
+            run.agent.set_state(BotState::Thinking);
             run.agent.set_task(Some(next.clone()));
-            inner.publish_agent(&run.agent);
+            inner.publish_bot(&run.agent);
             let bg = inner.tasks.start(
                 format!("agent: {}", run.agent.profile.name),
                 session.id.clone(),
@@ -957,7 +1022,65 @@ pub(crate) async fn run_operator_tool(
     run_tool(inner, session, call, &cancel, &None, Origin::Operator).await
 }
 
+/// Faults worth another attempt: the call never completed. A tool that answered — even with
+/// "0 results" or a 404 — is not retried, because the second answer would be the same and the model
+/// can re-plan faster than the clock can be wasted.
+const TRANSIENT_ATTEMPTS: usize = 3;
+
+/// Whether a failure is the transport's fault rather than the tool's answer.
+fn is_transient(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    [
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection refused",
+        "connection closed",
+        "error sending request",
+        "failed to connect",
+        "temporarily unavailable",
+        "rate limit",
+        "too many requests",
+        "status 429",
+        "status 502",
+        "status 503",
+        "status 504",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// Run one call, giving a request that never completed up to three attempts. The retry lives here
+/// rather than in the turn loop so the model is never handed a failure that was only the network
+/// hiccuping — it would answer that with a promise instead of a result.
 async fn run_tool(
+    inner: &Arc<RuntimeInner>,
+    session: &Arc<SessionRuntime>,
+    call: &ToolCall,
+    cancel: &vikram_contracts::CancellationToken,
+    agent: &Option<AgentRun>,
+    origin: Origin,
+) -> (String, bool) {
+    let mut attempt = 1;
+    loop {
+        let (content, ok) = run_tool_once(inner, session, call, cancel, agent, origin).await;
+        if ok || attempt >= TRANSIENT_ATTEMPTS || !is_transient(&content) || cancel.is_cancelled() {
+            return (content, ok);
+        }
+        attempt += 1;
+        inner.emit(RuntimeEvent::Notice {
+            level: NoticeLevel::Warn,
+            text: format!(
+                "{} failed: {}. Retrying — attempt {attempt} of {TRANSIENT_ATTEMPTS}.",
+                call.name,
+                truncate(&content, 80)
+            ),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(250 * attempt as u64)).await;
+    }
+}
+
+async fn run_tool_once(
     inner: &Arc<RuntimeInner>,
     session: &Arc<SessionRuntime>,
     call: &ToolCall,
@@ -1096,8 +1219,8 @@ async fn run_tool(
                 session.set_turn(TurnState::WaitingApproval);
             }
             if let Some(run) = agent {
-                run.agent.set_state(AgentState::Waiting);
-                inner.publish_agent(&run.agent);
+                run.agent.set_state(BotState::Waiting);
+                inner.publish_bot(&run.agent);
             }
             inner.emit(RuntimeEvent::ApprovalRequested(prompt));
             inner.emit(RuntimeEvent::ToolStarted {
@@ -1155,8 +1278,8 @@ async fn run_tool(
                 session.set_turn(TurnState::Tooling);
             }
             if let Some(run) = agent {
-                run.agent.set_state(AgentState::Running);
-                inner.publish_agent(&run.agent);
+                run.agent.set_state(BotState::Running);
+                inner.publish_bot(&run.agent);
             }
         }
         Decision::Allow => {}
@@ -1182,8 +1305,8 @@ async fn run_tool(
         session.set_turn(TurnState::Tooling);
     }
     if let Some(run) = agent {
-        run.agent.set_state(AgentState::Running);
-        inner.publish_agent(&run.agent);
+        run.agent.set_state(BotState::Running);
+        inner.publish_bot(&run.agent);
     }
 
     let mut context = inner.tool_context_for(&session.id);
@@ -1240,8 +1363,8 @@ async fn run_tool(
             request_id: request_id.clone(),
         });
         if let Some(run) = agent {
-            run.agent.set_state(AgentState::Waiting);
-            inner.publish_agent(&run.agent);
+            run.agent.set_state(BotState::Waiting);
+            inner.publish_bot(&run.agent);
         }
         match wait_for_answer(receiver, cancel).await {
             Some(answer) => content = format!("{content}\nUser answered: {answer}"),
@@ -1411,95 +1534,96 @@ mod tests {
     }
 
     #[test]
-    fn a_call_that_keeps_failing_is_refused_once_it_has_failed_twice() {
-        let mut guard = RepeatGuard::new(Instant::now());
-        let failing = call(
-            "browser.fetch",
-            serde_json::json!({"url": "https://a.example"}),
+    fn advice_arrives_once_per_streak_of_three() {
+        let mut guard = RepeatGuard::new();
+
+        // The loop from the bug report: a new query and a new tool each time. Nothing is refused,
+        // so the only help the turn gets is the plan that arrives with the third failure.
+        for (index, name) in ["web.search", "web.search", "browser.dom"]
+            .iter()
+            .enumerate()
+        {
+            guard.record(&call(name, serde_json::json!({"query": index})), false);
+            if index < 2 {
+                assert!(!guard.needs_advice(), "attempt {index} is not a streak yet");
+            }
+        }
+
+        assert!(
+            guard.needs_advice(),
+            "three in a row earns a different plan"
         );
-
-        assert!(guard.refusal(&failing).is_none());
-        guard.record(&failing, false);
-        assert!(guard.refusal(&failing).is_none());
-        guard.record(&failing, false);
-
-        let refusal = guard.refusal(&failing).expect("third attempt is refused");
-        assert!(refusal.contains("browser.fetch"));
-        assert!(refusal.contains("failed 2 times"));
-        assert_eq!(guard.take_announcement(), Some(1));
-        assert_eq!(guard.take_announcement(), None, "announced once per turn");
+        assert!(
+            !guard.needs_advice(),
+            "the same streak is not nudged twice in a row"
+        );
     }
 
     #[test]
-    fn reordered_arguments_still_identify_the_same_call() {
-        let mut guard = RepeatGuard::new(Instant::now());
-        let first = call(
-            "web.search",
-            serde_json::json!({"query": "ai news", "count": 5}),
-        );
-        let reordered = call(
-            "web.search",
-            serde_json::json!({"count": 5, "query": "ai news"}),
+    fn the_worst_tool_is_the_one_the_advice_names() {
+        let mut guard = RepeatGuard::new();
+        for attempt in 0..3 {
+            guard.record(
+                &call("browser.dom", serde_json::json!({"url": attempt})),
+                false,
+            );
+        }
+        guard.record(
+            &call("web.search", serde_json::json!({"query": "x"})),
+            false,
         );
 
-        guard.record(&first, false);
-        guard.record(&reordered, false);
-
-        assert!(guard.refusal(&first).is_some());
-        assert!(guard.refusal(&reordered).is_some());
+        let (name, failures) = guard.worst_tool().expect("a failure was recorded");
+        assert_eq!(name, "browser.dom");
+        assert_eq!(failures, 3);
     }
 
     #[test]
-    fn a_tool_is_refused_by_name_after_four_failures_even_with_new_arguments() {
-        let mut guard = RepeatGuard::new(Instant::now());
-        for url in [
-            "https://a.example",
-            "https://b.example",
-            "https://c.example",
+    fn a_success_resets_the_failure_streak() {
+        let mut guard = RepeatGuard::new();
+        guard.record(
+            &call("web.search", serde_json::json!({"query": "a"})),
+            false,
+        );
+        guard.record(
+            &call("web.search", serde_json::json!({"query": "b"})),
+            false,
+        );
+        guard.record(&call("fs.read", serde_json::json!({"path": "x"})), true);
+
+        guard.record(&call("fs.read", serde_json::json!({"path": "y"})), false);
+        assert!(
+            !guard.needs_advice(),
+            "the turn made progress, so the streak starts over"
+        );
+    }
+
+    #[test]
+    fn a_request_that_never_completed_is_worth_another_attempt() {
+        // The transport's fault: this has to be retried, because the model would answer it with a
+        // promise instead of a result.
+        for content in [
+            "error sending request: connection reset by peer",
+            "browser.fetch timed out after 15000ms",
+            "http answered with status 503",
+            "rate limit reached, too many requests",
         ] {
-            let call = call("browser.fetch", serde_json::json!({"url": url}));
-            assert!(guard.refusal(&call).is_none());
-            guard.record(&call, false);
-        }
-        let fourth = call(
-            "browser.fetch",
-            serde_json::json!({"url": "https://d.example"}),
-        );
-        assert!(guard.refusal(&fourth).is_none());
-        guard.record(&fourth, false);
-
-        let fresh_url = call(
-            "browser.fetch",
-            serde_json::json!({"url": "https://e.example"}),
-        );
-        let refusal = guard.refusal(&fresh_url).expect("fifth attempt is refused");
-        assert!(refusal.contains("has failed 4 times"));
-    }
-
-    #[test]
-    fn a_call_that_worked_is_never_refused() {
-        let mut guard = RepeatGuard::new(Instant::now());
-        let ok = call("file.read", serde_json::json!({"path": "README.md"}));
-        for _ in 0..10 {
-            guard.record(&ok, true);
-            assert!(guard.refusal(&ok).is_none());
+            assert!(is_transient(content), "should be retried: {content}");
         }
     }
 
     #[test]
-    fn the_tool_phase_deadline_refuses_every_call() {
-        let started = Instant::now()
-            .checked_sub(RepeatGuard::TOOL_PHASE + std::time::Duration::from_secs(5))
-            .expect("earlier instant");
-        let mut guard = RepeatGuard::new(started);
-
-        let refusal = guard
-            .refusal(&call(
-                "web.search",
-                serde_json::json!({"query": "anything"}),
-            ))
-            .expect("refused on time");
-        assert!(refusal.contains("Answer now, in words"));
+    fn a_tool_that_answered_is_never_retried() {
+        // The tool's answer, however unhelpful. A second attempt returns the same nothing, and the
+        // model can re-plan faster than the clock can be wasted.
+        for content in [
+            "web search failed: the backend answered with zero results",
+            "browser.fetch: 404 not found",
+            "read 0 files: no match for *.rs in /tmp",
+            "ok",
+        ] {
+            assert!(!is_transient(content), "should not be retried: {content}");
+        }
     }
 
     #[test]
@@ -1590,6 +1714,58 @@ mod tests {
             Box::pin(futures_util::stream::iter(
                 batch.into_iter().map(Ok::<_, VikramError>),
             ))
+        }
+    }
+
+    /// A provider that accepts the request and then says nothing at all. Not an error and not a
+    /// close: the connection is open and silent, which is exactly how a stalled endpoint behaves.
+    struct SilentProvider;
+
+    impl Provider for SilentProvider {
+        fn name(&self) -> &str {
+            "silent"
+        }
+
+        fn model(&self) -> &str {
+            "test-model"
+        }
+
+        fn context_window(&self) -> Option<u64> {
+            Some(8192)
+        }
+
+        fn stream(&self, _request: CompletionRequest) -> ProviderStream {
+            Box::pin(futures_util::stream::pending::<
+                Result<ProviderEvent, VikramError>,
+            >())
+        }
+    }
+
+    /// A provider that says one word and then holds the stream open forever. This is the shape a
+    /// model takes when it starts an answer and then stalls, or streams a long tool-call argument
+    /// block that the provider buffers without emitting. The turn must not wait on it forever just
+    /// because the first event already arrived.
+    struct StallingAfterFirstTokenProvider;
+
+    impl Provider for StallingAfterFirstTokenProvider {
+        fn name(&self) -> &str {
+            "stalling-after-first-token"
+        }
+
+        fn model(&self) -> &str {
+            "test-model"
+        }
+
+        fn context_window(&self) -> Option<u64> {
+            Some(8192)
+        }
+
+        fn stream(&self, _request: CompletionRequest) -> ProviderStream {
+            use futures_util::StreamExt;
+            let first =
+                futures_util::stream::iter(vec![Ok(ProviderEvent::TextDelta("thinking".into()))]);
+            let rest = futures_util::stream::pending::<Result<ProviderEvent, VikramError>>();
+            Box::pin(first.chain(rest))
         }
     }
 
@@ -1773,6 +1949,85 @@ mod tests {
             .expect("the session survives the turn")
             .messages();
         (seen, messages)
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_never_answers_is_abandoned_instead_of_freezing_the_turn() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let mut config = config_for(dir.path());
+        // One second of patience: the watchdog is checked on every pass now, so it would fire on
+        // the first iteration with zero and prove nothing about a real quiet window.
+        config.stream_silence_secs = 1;
+        let runtime = Runtime::start_with_provider(config, Arc::new(SilentProvider))
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "tell me the news".into())
+            .expect("the turn is accepted");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut complaint = None;
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Ok(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), events.recv()).await
+            else {
+                continue;
+            };
+            match event {
+                RuntimeEvent::Error { text } => complaint = Some(text),
+                RuntimeEvent::TurnFinished { .. } => break,
+                _ => {}
+            }
+        }
+
+        let text = complaint.expect("the operator is told the endpoint went silent");
+        assert!(text.contains("sent nothing for"), "unexpected text: {text}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_stalls_after_its_first_token_is_abandoned() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let mut config = config_for(dir.path());
+        // One second, not zero: the check runs before any item is read, so a zero cap would abort
+        // before the first token and never exercise the "stall after output" case.
+        config.stream_silence_secs = 1;
+        let runtime =
+            Runtime::start_with_provider(config, Arc::new(StallingAfterFirstTokenProvider))
+                .await
+                .expect("runtime starts");
+        let handle = runtime.handle();
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "tell me the news".into())
+            .expect("the turn is accepted");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut complaint = None;
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Ok(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), events.recv()).await
+            else {
+                continue;
+            };
+            match event {
+                RuntimeEvent::Error { text } => complaint = Some(text),
+                RuntimeEvent::TurnFinished { .. } => break,
+                _ => {}
+            }
+        }
+
+        let text = complaint.expect("a stall after the first token must still be reported");
+        assert!(text.contains("sent nothing for"), "unexpected text: {text}");
+        assert!(
+            text.contains("already written is kept"),
+            "partial work should be acknowledged: {text}"
+        );
     }
 
     #[tokio::test]
@@ -2084,7 +2339,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_model_repeating_a_failing_call_is_cut_off_instead_of_burning_the_step_budget() {
+    async fn a_model_repeating_a_failing_call_keeps_working_instead_of_being_cut_off() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let dir = tempfile::tempdir().expect("temp dir");
         let _home = isolated_home(dir.path());
@@ -2118,8 +2373,8 @@ mod tests {
 
         assert_eq!(
             runs.load(Ordering::SeqCst),
-            2,
-            "the tool runs twice; every later identical call is refused without running"
+            8,
+            "every call the model asked for runs, however many have failed before it"
         );
         let messages = handle
             .inner
@@ -2130,11 +2385,140 @@ mod tests {
             .iter()
             .filter(|message| message.role == Role::Tool && message.text_body().contains("refused"))
             .count();
-        assert!(refusals > 0, "the model is told why the call was refused");
+        assert_eq!(refusals, 0, "nothing is refused on a counter");
         assert_eq!(
             messages.iter().filter(|m| m.role == Role::Tool).count(),
             8,
             "every call the model asked for still gets an answer"
+        );
+    }
+
+    /// The loop from the bug report: every attempt used a new query or a new tool, so the
+    /// repetition guards (exact call, then tool name) never fired and the turn spent the whole
+    /// step budget saying "let me try" in different words. Three failures in a row is the signal
+    /// the guards cannot see, so the turn is told to answer instead of buying a fourth attempt.
+    #[tokio::test]
+    async fn a_turn_that_fails_in_new_ways_answers_instead_of_retrying_forever() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        // Three failing attempts, then the model answers. The remaining batches are spare: the turn
+        // should never reach them.
+        let mut script: Vec<Vec<ProviderEvent>> = (0..3)
+            .map(|attempt| {
+                vec![
+                    ProviderEvent::ToolCall(ToolCall::new(
+                        "flaky",
+                        serde_json::json!({"query": format!("today news {attempt}")}),
+                    )),
+                    finished(),
+                ]
+            })
+            .collect();
+        script.push(vec![
+            ProviderEvent::TextDelta("I could not reach the news: search returned nothing.".into()),
+            finished(),
+        ]);
+        script.extend((3..8).map(|attempt| {
+            vec![
+                ProviderEvent::ToolCall(ToolCall::new(
+                    "flaky",
+                    serde_json::json!({"query": format!("today news {attempt}")}),
+                )),
+                finished(),
+            ]
+        }));
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::new(ScriptedProvider::new(script)),
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        let runs = Arc::new(AtomicUsize::new(0));
+        handle.inner.tools.register(Box::new(AlwaysFailsTool {
+            runs: Arc::clone(&runs),
+        }));
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "tell me today's news".into())
+            .expect("the turn is accepted");
+        run_to_end(&mut events).await;
+
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            3,
+            "three attempts, then the model was handed a new plan and answered instead of retrying"
+        );
+        let messages = handle
+            .inner
+            .session(&session)
+            .expect("session survives the turn")
+            .messages();
+        assert!(
+            messages.iter().any(|m| m.role == Role::System
+                && m.text_body()
+                    .contains("Do not repeat a call that already failed")),
+            "the model is handed a different plan in the transcript"
+        );
+        assert!(
+            messages.iter().any(|m| m.role == Role::Assistant
+                && m.text_body().contains("I could not reach the news")),
+            "the operator still gets the honest answer when the work runs out"
+        );
+    }
+
+    /// Failures never take the tools away: the model keeps its whole toolbox for the whole turn.
+    #[tokio::test]
+    async fn a_model_that_keeps_reaching_for_tools_is_never_stopped_by_the_count() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let script: Vec<Vec<ProviderEvent>> = (0..8)
+            .map(|attempt| {
+                vec![
+                    ProviderEvent::ToolCall(ToolCall::new(
+                        "flaky",
+                        serde_json::json!({"url": format!("https://example.com/{attempt}")}),
+                    )),
+                    finished(),
+                ]
+            })
+            .collect();
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::new(ScriptedProvider::new(script)),
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        let runs = Arc::new(AtomicUsize::new(0));
+        handle.inner.tools.register(Box::new(AlwaysFailsTool {
+            runs: Arc::clone(&runs),
+        }));
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "tell me today's news".into())
+            .expect("the turn is accepted");
+        run_to_end(&mut events).await;
+
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            8,
+            "eight distinct attempts all reach the tool, because none of them repeated"
+        );
+        let messages = handle
+            .inner
+            .session(&session)
+            .expect("session survives the turn")
+            .messages();
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.role == Role::Tool && m.text_body().contains("refused")),
+            "nothing was refused: a new attempt is not a repetition"
         );
     }
 
@@ -2585,9 +2969,9 @@ mod tests {
             parent.push_message(message, now_ms());
         }
 
-        let profile = vikram_contracts::AgentId::new("delegatee");
-        handle.inner.agents.add(Arc::new(ManagedAgent::from_profile(
-            crate::types::AgentProfile {
+        let profile = vikram_contracts::BotId::new("delegatee");
+        handle.inner.bots.add(Arc::new(ManagedBot::from_profile(
+            crate::types::BotProfile {
                 id: profile.clone(),
                 name: "Rudra".into(),
                 role: "reviewer".into(),
@@ -2672,7 +3056,7 @@ mod tests {
         // A chain deeper than the floor is refused, not silently allowed to nest.
         child.set_depth(handle.inner.policy().max_delegation_depth());
         let refused = handle.spawn_agent(
-            vikram_contracts::AgentId::new("delegatee"),
+            vikram_contracts::BotId::new("delegatee"),
             "deeper".into(),
             child_id.clone(),
         );
@@ -2743,7 +3127,7 @@ mod tests {
 
         fn permission(&self, _args: &serde_json::Value) -> Result<PermissionRequest, VikramError> {
             Ok(PermissionRequest::new(
-                ActionKind::Read,
+                ActionKind::Write,
                 "probe.run",
                 "stop-turn",
                 SideEffect::None,
@@ -2781,11 +3165,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_stop_key_ends_a_turn_that_has_not_produced_a_token_yet() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let runtime =
+            Runtime::start_with_provider(config_for(dir.path()), Arc::new(SilentProvider))
+                .await
+                .expect("runtime starts");
+        let handle = runtime.handle();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "say something".into())
+            .expect("the turn is accepted");
+        // Long enough for the turn to be waiting on a stream that will never speak.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        handle.cancel(&session).expect("the stop is accepted");
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while handle
+            .inner
+            .session(&session)
+            .expect("the session survives")
+            .is_busy()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "a stop must not wait for a token that is not coming"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
     async fn a_cancelled_batch_still_answers_the_call_that_never_ran() {
         let dir = tempfile::tempdir().expect("temp dir");
         let _home = isolated_home(dir.path());
         let stop = ToolCall::new("stop-turn", serde_json::json!({}));
-        let unrun = ToolCall::new("probe-read", serde_json::json!({}));
+        // Same tool, so both calls share one lane: the second is still queued when the first
+        // cancels the turn, which is the only way a call can genuinely never run.
+        let unrun = ToolCall::new("stop-turn", serde_json::json!({}));
         let unrun_id = unrun.id.clone();
         let provider = Arc::new(ScriptedProvider::new(vec![vec![
             ProviderEvent::ToolCall(stop),

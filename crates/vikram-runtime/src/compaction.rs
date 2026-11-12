@@ -301,8 +301,14 @@ pub fn prune_transcript(
                 }
             }
         }
-        let Some((index, _)) = worst else { break };
-        current[index] = digest_blocks(estimator, &current[index], ceiling);
+        let Some((index, len)) = worst else { break };
+        let digested = digest_blocks(estimator, &current[index], ceiling);
+        // A digest that does not shrink the largest result would be offered again on the next
+        // pass, so the loop would pick it forever. Stop instead of spinning.
+        if largest_result(&digested) >= len {
+            break;
+        }
+        current[index] = digested;
         replaced += 1;
         total = estimator.estimate_messages(&current) + budget.overhead;
         if total <= usable {
@@ -317,6 +323,20 @@ pub fn prune_transcript(
         }
     }
     Some((current, replaced))
+}
+
+/// The longest tool result in a message, in characters. Pruning is driven by this number, so the
+/// loop can tell a digest that helped from one that changed nothing.
+fn largest_result(message: &Message) -> usize {
+    message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            Block::ToolResult { content, .. } => Some(content.chars().count()),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Apply the digest to every oversized tool result on one message.
@@ -342,12 +362,20 @@ pub fn digest_tool_output(content: &str, ceiling: usize) -> String {
     if chars.len() <= ceiling {
         return content.to_string();
     }
-    let head_len = ceiling / 2;
-    let tail_len = ceiling - head_len;
+    let omitted = chars.len() - ceiling;
+    let marker = format!("\n\n<elided {omitted} characters to hold context>\n\n");
+    // The marker is paid for out of the ceiling rather than added on top of it. A digest that is
+    // still larger than the ceiling is not a digest: pruning would keep choosing the same result
+    // and never finish.
+    let keep = ceiling.saturating_sub(marker.chars().count());
+    if keep <= 2 {
+        return chars[..ceiling].iter().collect();
+    }
+    let head_len = keep / 2;
+    let tail_len = keep - head_len;
     let head: String = chars[..head_len].iter().collect();
     let tail: String = chars[chars.len() - tail_len..].iter().collect();
-    let omitted = chars.len() - ceiling;
-    format!("{head}\n\n<elided {omitted} characters to hold context>\n\n{tail}")
+    format!("{head}{marker}{tail}")
 }
 
 /// The bounded brief a delegated agent starts with: the parent's live instruction verbatim, plus
@@ -1246,5 +1274,45 @@ mod tests {
         };
         let answered = Message::tool_result(id2, "output".to_string(), true);
         assert!(pairing_is_consistent(&[with_call, answered]));
+    }
+
+    #[test]
+    fn a_digest_never_grows_past_its_ceiling() {
+        // The marker is charged to the ceiling. A digest that overshoots is still oversized, so
+        // pruning would choose it again and never finish.
+        let content = "x".repeat(40_000);
+        for ceiling in [64usize, 200, 6_000] {
+            let digested = digest_tool_output(&content, ceiling);
+            assert!(
+                digested.chars().count() <= ceiling,
+                "ceiling {ceiling} produced {} chars",
+                digested.chars().count()
+            );
+            assert!(digested.chars().count() < content.len());
+        }
+    }
+
+    #[test]
+    fn pruning_one_oversized_result_terminates() {
+        // The regression this guards: a single huge tool result that the digest could not shrink
+        // was chosen again on every pass, spinning a worker thread forever before the request
+        // ever reached the provider.
+        let estimator = TokenEstimator::default();
+        let budget = budget();
+        let ceiling = 120;
+        let messages = exchange("y".repeat(30_000), true);
+
+        let started = std::time::Instant::now();
+        let (pruned, replaced) = prune_transcript(&estimator, &budget, &messages, ceiling)
+            .expect("an oversized result is pruned");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(replaced, 1);
+        assert_eq!(pruned.len(), messages.len());
+        let content = match &pruned[1].blocks[0] {
+            Block::ToolResult { content, .. } => content.clone(),
+            other => panic!("unexpected block: {other:?}"),
+        };
+        assert!(content.chars().count() <= ceiling);
+        assert!(content.contains("elided"));
     }
 }

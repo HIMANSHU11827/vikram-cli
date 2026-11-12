@@ -211,9 +211,15 @@ impl ToolRegistry {
         registry.register(Box::new(GitStatus));
         registry.register(Box::new(GitDiff));
         registry.register(Box::new(GitLog));
+        registry.register(Box::new(GitCommit));
+        registry.register(Box::new(GitBranch));
+        registry.register(Box::new(GitStash));
         registry.register(Box::new(GitStatusTool));
         registry.register(Box::new(GitDiffTool));
         registry.register(Box::new(GitLogTool));
+        registry.register(Box::new(GitCommitTool));
+        registry.register(Box::new(GitBranchTool));
+        registry.register(Box::new(GitStashTool));
         registry.register(Box::new(BuildRun));
         registry.register(Box::new(TestRun));
         registry.register(Box::new(VerifyRun));
@@ -227,9 +233,6 @@ impl ToolRegistry {
         registry.register(Box::new(MemoryConsolidate));
         registry.register(Box::new(SessionSearch));
         registry.register(Box::new(WebSearch));
-        registry.register(Box::new(TeamCreate));
-        registry.register(Box::new(TeamList));
-        registry.register(Box::new(TeamDelegate));
         registry.register(Box::new(HiveCreate));
         registry.register(Box::new(HiveList));
         registry.register(Box::new(HiveShow));
@@ -268,6 +271,7 @@ impl ToolRegistry {
         registry.register(Box::new(LspSymbols));
         registry.register(Box::new(LspDiagnostics));
         registry.register(Box::new(CodeIndexTool));
+        registry.register(Box::new(CodeSearch));
         registry.register(Box::new(PluginExecute));
         registry.register(Box::new(PluginList));
         registry.register(Box::new(PluginInstall));

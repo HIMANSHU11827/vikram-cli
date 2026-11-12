@@ -348,11 +348,63 @@ fn conversation_lines_with_hits(
         // the clock, and a second "Working" at the foot of the screen reads as a second turn.
     }
 
+    // Follow-ups waiting behind the running turn. A queued text is not a message yet — the runtime
+    // commits it only when its turn starts — so without this row the operator types, presses Tab,
+    // and the words leave the screen entirely.
+    let queue_marker = if theme.ascii { ">" } else { "⏸" };
+    let steer_marker = if theme.ascii { ">>" } else { "⇢" };
+    let holding = session.queue.len();
+    for (position, waiting) in session.queue.iter().enumerate() {
+        let badge = if holding > 1 {
+            format!("{}/{} queued", position + 1, holding)
+        } else {
+            "queued".to_owned()
+        };
+        push_waiting(&mut lines, queue_marker, badge, waiting, width, theme);
+    }
+    // A steer is held the same way, for a shorter and less visible wait: it is injected at the next
+    // safe point, which can be several tool calls away, and until then it is written down nowhere.
+    if let Some(steering) = &session.steer_text {
+        push_waiting(
+            &mut lines,
+            steer_marker,
+            "steering".to_owned(),
+            steering,
+            width,
+            theme,
+        );
+    }
+
     if let Some(pending) = &app.pending_question {
         push_question_prompt(&mut lines, pending, width, theme);
     }
 
     (lines, marks)
+}
+
+/// A message the runtime is holding on the operator's behalf — a queued follow-up or a steer — drawn
+/// at the foot of the transcript so the words that left the input box are still readable while they
+/// wait.
+fn push_waiting(
+    lines: &mut Vec<Line<'static>>,
+    marker: &str,
+    badge: String,
+    text: &str,
+    width: usize,
+    theme: &Theme,
+) {
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(format!("{} {marker} User", theme.prompt()), theme.muted()),
+        Span::styled(format!("  {badge}"), Style::default().fg(theme.accent_dim)),
+    ]));
+    push_message_body(
+        lines,
+        text,
+        width,
+        theme,
+        Some(Style::default().fg(theme.dim)),
+    );
 }
 
 /// A pending `ask_user` question, drawn at the foot of the transcript because the runtime is
@@ -654,6 +706,10 @@ fn push_turn(
         }
         _ => turn_clock(app, ctx.session, ctx.theme),
     };
+    // An empty buffer counts as no buffer. `StreamStarted` gives every turn a streaming buffer
+    // before the model has produced a single token, so requiring `is_none()` here meant this row
+    // could never be drawn at all. Nothing is drawn for that state: the header's clock is the only
+    // thing a turn shows before its first token, and a placeholder row under it is noise.
     let folded = push_turn_header(
         lines,
         marks,
@@ -779,6 +835,8 @@ fn push_turn(
             ctx.session.selected_activity,
         );
     }
+    // A live turn that has said nothing yet keeps its header and nothing else. The clock there is
+    // the receipt that the request is in flight.
     true
 }
 
@@ -1042,13 +1100,6 @@ fn push_tool_row(
         ),
     };
     let label = tool_label(call, theme);
-    let head = format!("{glyph} {}", label.name);
-    marks.push((
-        lines.len(),
-        (indent::row(indent::TURN) + head.width()) as u16,
-        key,
-        true,
-    ));
 
     let mut spans = vec![
         Span::raw(indent::row_prefix(indent::TURN)),
@@ -1057,6 +1108,18 @@ fn push_tool_row(
     ];
     if let Some(detail) = label.detail {
         spans.push(Span::styled(format!("  {detail}"), theme.muted()));
+    }
+    if let Some((content, ok)) = outcome
+        && let Some(receipt) = payload::outcome_receipt(payload::kind_of(&call.name), content, ok)
+    {
+        spans.push(Span::styled(
+            format!("  {receipt}"),
+            if ok {
+                Style::default().fg(theme.faint)
+            } else {
+                Style::default().fg(theme.error)
+            },
+        ));
     }
     if outcome.is_some() {
         spans.push(Span::styled(
@@ -1068,6 +1131,15 @@ fn push_tool_row(
             Style::default().fg(theme.faint),
         ));
     }
+    // The whole row folds, not just its first few characters. The row ends by telling the operator
+    // to click, so a click that lands on that very word has to work; marking only the label made
+    // the affordance a lie down the whole right-hand side of the line.
+    let row_width = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>()
+        .min(width);
+    marks.push((lines.len(), row_width as u16, key, true));
     lines.push(Line::from(spans));
 
     if expanded && let Some((content, ok)) = outcome {
@@ -1108,13 +1180,6 @@ fn push_activity_tool_row(
         ),
     };
     let label = tool_label_from_text(&activity.text, theme);
-    let head = format!("{glyph} {}", label.name);
-    marks.push((
-        lines.len(),
-        (indent::row(indent::TURN) + head.width()) as u16,
-        key,
-        true,
-    ));
     let mut spans = vec![
         Span::raw(indent::row_prefix(indent::TURN)),
         Span::styled(format!("{glyph} "), style),
@@ -1122,6 +1187,20 @@ fn push_activity_tool_row(
     ];
     if let Some(detail) = label.detail {
         spans.push(Span::styled(format!("  {detail}"), theme.muted()));
+    }
+    if let Some(receipt) = payload::outcome_receipt(
+        payload::kind_of(activity_first_word(&activity.text)),
+        content,
+        ok,
+    ) {
+        spans.push(Span::styled(
+            format!("  {receipt}"),
+            if ok {
+                Style::default().fg(theme.faint)
+            } else {
+                Style::default().fg(theme.error)
+            },
+        ));
     }
     spans.push(Span::styled(
         if expanded {
@@ -1131,6 +1210,14 @@ fn push_activity_tool_row(
         },
         Style::default().fg(theme.faint),
     ));
+    // The whole row folds, not only its label: the row invites a click at its right-hand end, so
+    // that is where the click has to be recognised.
+    let row_width = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>()
+        .min(width);
+    marks.push((lines.len(), row_width as u16, key, true));
     lines.push(Line::from(spans));
     if expanded {
         push_tool_payload(
@@ -1787,13 +1874,71 @@ mod tests {
             tokens: Default::default(),
             created_ms: 0,
             updated_ms: 0,
-            agent: None,
+            bot: None,
             queued: 0,
+            queue: Vec::new(),
+            steer_text: None,
+            queue_text: None,
             project_id: None,
             status: "active".to_owned(),
             title_source: "generic".to_owned(),
             title_status: "pending".to_owned(),
         })
+    }
+
+    #[test]
+    fn a_queued_follow_up_is_visible_before_its_turn_starts() {
+        let app = App::new(false);
+        let theme = Theme::new(false);
+        let mut session = sample_session();
+        session.queue = vec!["build me a cli that tails logs".into()];
+        let lines = conversation_lines_with_hits(&app, &session, 76, &theme).0;
+        let rendered = lines.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        assert!(
+            rendered.contains("build me a cli that tails logs"),
+            "the queued words must stay on screen: {rendered}"
+        );
+        assert!(rendered.contains("queued"), "got {rendered}");
+    }
+
+    #[test]
+    fn several_queued_follow_ups_are_numbered_in_run_order() {
+        let app = App::new(false);
+        let theme = Theme::new(false);
+        let mut session = sample_session();
+        session.queue = vec!["first wait".into(), "second wait".into()];
+        let lines = conversation_lines_with_hits(&app, &session, 76, &theme).0;
+        let rendered = lines.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        let first = rendered.find("first wait").expect("first queued row");
+        let second = rendered.find("second wait").expect("second queued row");
+        assert!(first < second, "run order is the queue order: {rendered}");
+        assert!(rendered.contains("1/2 queued"), "got {rendered}");
+        assert!(rendered.contains("2/2 queued"), "got {rendered}");
+    }
+
+    #[test]
+    fn an_empty_queue_adds_no_row() {
+        let app = App::new(false);
+        let theme = Theme::new(false);
+        let session = sample_session();
+        let lines = conversation_lines_with_hits(&app, &session, 76, &theme).0;
+        let rendered = lines.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        assert!(!rendered.contains("queued"), "got {rendered}");
+    }
+
+    #[test]
+    fn a_steer_instruction_stays_visible_until_it_is_injected() {
+        let app = App::new(false);
+        let theme = Theme::new(false);
+        let mut session = sample_session();
+        session.steer_text = Some("stop refactoring and fix the failing test".into());
+        let lines = conversation_lines_with_hits(&app, &session, 76, &theme).0;
+        let rendered = lines.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        assert!(
+            rendered.contains("stop refactoring and fix the failing test"),
+            "the steered words must stay on screen: {rendered}"
+        );
+        assert!(rendered.contains("steering"), "got {rendered}");
     }
 
     fn text_of(line: &Line<'_>) -> String {
@@ -2044,6 +2189,42 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_row_says_why_on_the_row_itself() {
+        let app = App::new(false);
+        let mut session = turn_session("what is the news");
+        let call = ToolCallId::generate();
+        session.payloads.insert(
+            call.clone(),
+            crate::app::Payload {
+                name: "web.search".to_owned(),
+                resource: "today news".to_owned(),
+                arguments: serde_json::json!({"query": "today news"}).to_string(),
+                content: "web search failed: the backend answered with zero results".to_owned(),
+                cwd: "/work".to_owned(),
+                duration_ms: 1_200,
+            },
+        );
+        session.activity.push(Activity {
+            kind: ActivityKind::Tool,
+            text: "web.search · today news".to_owned(),
+            call: Some(call),
+            ok: Some(false),
+            expanded: false,
+        });
+
+        let theme = Theme::new(false);
+        let rows = transcript(&shown(&app, &mut session, 78, &theme));
+        let head = rows
+            .iter()
+            .position(|row| row.contains("today news"))
+            .unwrap_or_else(|| panic!("the row is drawn: {rows:#?}"));
+
+        // A turn that only failed has to look like it failed, without opening anything.
+        assert!(rows[head].contains("1.2s"), "duration missing: {rows:#?}");
+        assert!(rows[head].contains("0 results"), "count missing: {rows:#?}");
+    }
+
+    #[test]
     fn expanding_a_plain_tool_activity_reveals_more_lines() {
         let theme = Theme::new(false);
         let long = "shell · ls -la /very/long/path/that/wraps/to/two/lines/and/beyond";
@@ -2093,6 +2274,69 @@ mod tests {
         let mut session = sample_session();
         session.messages.push(Message::user(request));
         session
+    }
+
+    #[test]
+    fn a_live_turn_with_nothing_to_show_draws_only_its_header() {
+        let app = App::new(false);
+        let mut session = turn_session("tell me todays news");
+        session.turn = TurnState::Streaming;
+
+        let theme = Theme::new(false);
+        let rows = transcript(&shown(&app, &mut session, 78, &theme));
+        let all = rows.join("\n");
+
+        assert!(
+            all.contains("Working"),
+            "the header still reports the clock: {all}"
+        );
+        assert!(
+            !all.contains("Waiting for the model"),
+            "the wait belongs to the header's clock, not to a placeholder row: {all}"
+        );
+    }
+
+    #[test]
+    fn a_turn_waiting_on_its_first_token_draws_no_placeholder() {
+        let app = App::new(false);
+        let mut session = turn_session("tell me todays news");
+        session.turn = TurnState::Streaming;
+        // The real sequence: the runtime announces the turn before the model has said anything,
+        // which gives the view an empty buffer.
+        session.streaming = Some(crate::app::Streaming {
+            turn: TurnId::generate(),
+            text: String::new(),
+        });
+        session.streaming_thought = Some(String::new());
+
+        let theme = Theme::new(false);
+        let rows = transcript(&shown(&app, &mut session, 78, &theme));
+        let all = rows.join("\n");
+
+        assert!(
+            !all.contains("Waiting for the model"),
+            "an empty buffer draws nothing but the header: {all}"
+        );
+    }
+
+    #[test]
+    fn a_turn_with_its_first_token_draws_the_token() {
+        let app = App::new(false);
+        let mut session = turn_session("tell me todays news");
+        session.turn = TurnState::Streaming;
+        session.streaming = Some(crate::app::Streaming {
+            turn: TurnId::generate(),
+            text: "Here are today's headlines".to_owned(),
+        });
+
+        let theme = Theme::new(false);
+        let rows = transcript(&shown(&app, &mut session, 78, &theme));
+        let all = rows.join("\n");
+
+        assert!(
+            all.contains("Here are today's headlines"),
+            "the text is drawn: {all}"
+        );
     }
 
     #[test]

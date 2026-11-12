@@ -191,7 +191,10 @@ pub(crate) fn shell_cmd(command: &str) -> Command {
     }
 }
 
-pub(crate) fn wait_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process::Output> {
+pub(crate) fn wait_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> Option<std::process::Output> {
     use std::io::Read;
     let mut child = cmd
         .stdout(std::process::Stdio::piped())

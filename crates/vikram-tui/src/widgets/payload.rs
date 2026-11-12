@@ -78,6 +78,57 @@ pub fn kind_of(name: &str) -> Kind {
     }
 }
 
+/// How long a call took, when the runtime timed it. A call that reported no duration says nothing
+/// rather than claiming `0.0s`, which would read as instant.
+pub fn duration_text(ms: u64) -> Option<String> {
+    (ms > 0).then(|| format!("{:.1}s", ms as f64 / 1000.0))
+}
+
+/// What a finished call amounts to, in the words that fit on its own row.
+///
+/// A row that failed has to say so where the operator is already reading. A failure that hides
+/// behind a click is a failure found a turn too late, after the answer above it has been believed.
+pub fn outcome_receipt(kind: Kind, content: &str, ok: bool) -> Option<String> {
+    match kind {
+        Kind::Search => return Some(results_word(parse_search(content).len())),
+        Kind::Ran | Kind::Terminal => {
+            if let Some(exit) = parse_shell(content).exit {
+                return Some(format!("exit {exit}"));
+            }
+        }
+        _ => {}
+    }
+    if !ok {
+        return Some(match first_line(content) {
+            Some(reason) => format!("failed: {reason}"),
+            None => "failed".to_owned(),
+        });
+    }
+    content.trim().is_empty().then(|| "no output".to_owned())
+}
+
+fn results_word(count: usize) -> String {
+    match count {
+        0 => "0 results".to_owned(),
+        1 => "1 result".to_owned(),
+        count => format!("{count} results"),
+    }
+}
+
+/// The first line of a failure, without the runtime's own prefix and clipped to what a row holds.
+/// A failure is usually one sentence; the rest is detail the opened row already has.
+fn first_line(content: &str) -> Option<String> {
+    let line = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let line = line
+        .strip_prefix("error: ")
+        .or_else(|| line.strip_prefix("failed: "))
+        .unwrap_or(line);
+    Some(clip(line, 40))
+}
+
 /// Draw one row, shut or open.
 pub fn push_row(lines: &mut Vec<Line<'static>>, marks: &mut Vec<Mark>, row: Row<'_>) {
     let theme = row.theme;
@@ -160,7 +211,7 @@ fn draw_head(
             Style::default().fg(theme.text),
         ),
     ];
-    let mut used = lead + UnicodeWidthStr::width(head);
+    let labelled = lead + UnicodeWidthStr::width(head);
     if let Some(detail) = detail
         && !detail.is_empty()
     {
@@ -168,18 +219,47 @@ fn draw_head(
         spans.push(Span::styled(
             truncate(
                 &redact(detail),
-                row.width.saturating_sub(used).saturating_sub(4),
+                row.width.saturating_sub(labelled).saturating_sub(4),
             ),
             theme.muted(),
         ));
-        used += 2 + UnicodeWidthStr::width(detail);
+    }
+    // The receipt rides on the row, not in the body: how long the call took and what came back.
+    // Opening a row is for detail; whether it worked is not detail.
+    if let Some(ok) = row.ok {
+        let mut receipt: Vec<String> = Vec::new();
+        if let Some(duration) = duration_text(row.payload.duration_ms) {
+            receipt.push(duration);
+        }
+        if let Some(outcome) = outcome_receipt(kind_of(&row.payload.name), &row.payload.content, ok)
+        {
+            receipt.push(outcome);
+        }
+        if !receipt.is_empty() {
+            let text = receipt.join(" · ");
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                text,
+                if ok {
+                    Style::default().fg(theme.faint)
+                } else {
+                    Style::default().fg(theme.error)
+                },
+            ));
+        }
     }
     // The arrow sits right after the label instead of being pushed to the right edge: a right-aligned
     // arrow has to be measured against the drawable width, and one column of error clips it.
     spans.push(Span::raw("  "));
     spans.push(Span::styled(arrow, theme.muted()));
 
-    let mark_width = (used + 2 + UnicodeWidthStr::width(arrow)) as u16;
+    let mark_width = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>()
+        .min(row.width) as u16;
+    // The clickable mark covers the whole row because the row ends by inviting a click. Marking
+    // only the label left every character to the right of it dead, including the words `· click`.
     marks.push((lines.len(), mark_width, row.key, true));
     lines.push(Line::from(spans));
 }
@@ -852,6 +932,47 @@ fn is_secret(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_search_row_says_how_many_results_came_back() {
+        // The row has to answer "did this do anything" without being opened.
+        assert_eq!(
+            outcome_receipt(Kind::Search, "", false).as_deref(),
+            Some("0 results")
+        );
+        assert_eq!(
+            outcome_receipt(Kind::Search, "1. A headline\n2. Another headline\n", true).as_deref(),
+            Some("2 results")
+        );
+    }
+
+    #[test]
+    fn a_failure_carries_its_reason_and_a_success_stays_quiet() {
+        assert_eq!(
+            outcome_receipt(Kind::Read, "error: no such file: notes.md", false).as_deref(),
+            Some("failed: no such file: notes.md")
+        );
+        // Success with content has nothing to add; the row already shows the call.
+        assert_eq!(outcome_receipt(Kind::Read, "some file body", true), None);
+        assert_eq!(
+            outcome_receipt(Kind::Read, "   ", true).as_deref(),
+            Some("no output")
+        );
+    }
+
+    #[test]
+    fn a_run_row_reports_its_exit_code() {
+        assert_eq!(
+            outcome_receipt(Kind::Ran, "all good\n[exit 2]", true).as_deref(),
+            Some("exit 2")
+        );
+    }
+
+    #[test]
+    fn an_untimed_call_invents_no_duration() {
+        assert_eq!(duration_text(0), None);
+        assert_eq!(duration_text(1_900).as_deref(), Some("1.9s"));
+    }
 
     #[test]
     fn a_keyed_secret_loses_its_value_but_keeps_its_name() {

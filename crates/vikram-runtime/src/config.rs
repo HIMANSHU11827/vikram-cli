@@ -38,6 +38,11 @@ pub struct Config {
     pub max_steps: u32,
     /// Cap on generated tokens per completion request.
     pub max_output_tokens: Option<u32>,
+    /// How long a provider may stay completely silent before the turn abandons the request. The
+    /// HTTP client tolerates ten minutes, which is longer than anyone should watch a frozen clock
+    /// and get no answer. Defaults to 60.
+    #[serde(default = "default_stream_silence_secs")]
+    pub stream_silence_secs: u64,
     /// Every Nth tool-bearing turn gets a background model review of its transcript, which spends
     /// tokens. `0` — the default — never asks a model to review; the free experience pipeline runs
     /// regardless.
@@ -61,6 +66,16 @@ pub struct Config {
     /// Settings from the layer that decides which postures may be turned on at all.
     #[serde(default)]
     pub security: SecurityConfig,
+    /// Colours the terminal interface draws with. The shipped values are the charcoal window and
+    /// the orange accent; they live in the config file so an operator can change the look without
+    /// a rebuild.
+    #[serde(default)]
+    pub theme: ThemeConfig,
+    /// Per-tool permission overrides: tool name -> "allow"/"deny"/"ask". Checked before the
+    /// ordinary rules when evaluating a tool call. Empty by default. (May also be set under
+    /// `security.tool_permissions`; both are honoured.)
+    #[serde(default)]
+    pub tool_permissions: std::collections::HashMap<String, String>,
 }
 
 /// Restrictions on mode *availability*, as distinct from the mode itself. `mode` says what this
@@ -80,6 +95,10 @@ pub struct SecurityConfig {
     /// OS-level process isolation for shell/build/test tools. On by default.
     #[serde(default)]
     pub sandbox: SandboxSettings,
+    /// Per-tool permission overrides: tool name -> "allow"/"deny"/"ask". Checked before the
+    /// ordinary rules when evaluating a tool call. Empty by default.
+    #[serde(default)]
+    pub tool_permissions: std::collections::HashMap<String, String>,
 }
 
 /// Sandbox configuration. `enabled` defaults to true; the platform decides which mechanism to
@@ -115,6 +134,11 @@ fn default_true() -> bool {
 
 fn default_memory_nudge_interval() -> u64 {
     10
+}
+
+/// A minute of silence from a model endpoint is already the wrong experience; ten is a hang.
+fn default_stream_silence_secs() -> u64 {
+    60
 }
 
 impl SecurityConfig {
@@ -325,6 +349,7 @@ fn env_requirements() -> SecurityConfig {
         disable_always_allow: forbidden("VIKRAM_DISABLE_ALWAYS_ALLOW"),
         allowed_modes: allowed,
         sandbox: SandboxSettings::default(),
+        tool_permissions: std::collections::HashMap::new(),
     }
 }
 
@@ -384,6 +409,26 @@ impl Default for ContextConfig {
     }
 }
 
+/// The two colours an operator is most likely to have an opinion about. The rest of the palette
+/// either derives from these or stays fixed, so the section stays short enough to edit by hand.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemeConfig {
+    /// Window and panel body, six hex digits, no leading `#`.
+    pub background: String,
+    /// Frames, titles and the prompt, six hex digits.
+    pub accent: String,
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self {
+            background: "232528".into(),
+            accent: "ff8a00".into(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -397,6 +442,7 @@ impl Default for Config {
             workspace_root: None,
             max_steps: 24,
             max_output_tokens: None,
+            stream_silence_secs: 60,
             learning_review_every: 0,
             memory_nudge_interval: 10,
             title_model: String::new(),
@@ -404,6 +450,8 @@ impl Default for Config {
             thinking: false,
             mode: PermissionMode::default(),
             security: SecurityConfig::default(),
+            theme: ThemeConfig::default(),
+            tool_permissions: std::collections::HashMap::new(),
         }
     }
 }
@@ -457,6 +505,13 @@ impl Config {
     /// `$VIKRAM_HOME/.env` — a file the operator owns and we only read.
     pub fn api_key(&self) -> Option<String> {
         self.api_key_with_source().map(|(value, _)| value)
+    }
+
+    /// Whether the variable `env` holds a key, resolved exactly like [`Self::api_key`]. The name is
+    /// given without its `$`, so a chooser can say which endpoints are already usable without
+    /// claiming the key of the endpoint currently in force.
+    pub fn key_present(env: &str) -> bool {
+        key_with_source(env).is_some()
     }
 
     pub fn workspace_root(&self) -> PathBuf {
@@ -585,6 +640,14 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+    /// A disabled server stays in the file but is never spawned: `into_specs` filters it out, so
+    /// the runtime, doctor and `mcp status` all agree it is off.
+    #[serde(default = "mcp_server_enabled_default")]
+    pub enabled: bool,
+}
+
+fn mcp_server_enabled_default() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -602,17 +665,50 @@ pub struct McpConfig {
 
 impl McpConfig {
     pub fn load() -> Self {
-        let path = mcp_config_path();
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default()
+        Self::load_result().unwrap_or_default()
     }
 
-    /// The same servers in the wire-level shape the `vikram-mcp` client consumes.
+    /// `load`, but a missing file is empty while an unreadable or unparseable one is an error —
+    /// the difference between "nothing configured" and "configuration is broken".
+    pub fn load_result() -> Result<Self, RuntimeError> {
+        let path = mcp_config_path();
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(err) => {
+                return Err(RuntimeError::Config {
+                    path,
+                    reason: err.to_string(),
+                });
+            }
+        };
+        serde_json::from_str(&raw).map_err(|err| RuntimeError::Config {
+            path,
+            reason: err.to_string(),
+        })
+    }
+
+    pub fn save(&self) -> Result<(), RuntimeError> {
+        let path = mcp_config_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| RuntimeError::Config {
+                path: parent.to_path_buf(),
+                reason: err.to_string(),
+            })?;
+        }
+        let body = serde_json::to_string_pretty(self).expect("mcp config is serializable");
+        std::fs::write(&path, body).map_err(|err| RuntimeError::Config {
+            path,
+            reason: err.to_string(),
+        })
+    }
+
+    /// The same servers in the wire-level shape the `vikram-mcp` client consumes. Disabled servers
+    /// are left out here so every consumer agrees they are off.
     pub fn into_specs(self) -> Vec<vikram_mcp::ServerSpec> {
         self.servers
             .into_iter()
+            .filter(|server| server.enabled)
             .map(|server| vikram_mcp::ServerSpec {
                 name: server.name,
                 command: server.command,
@@ -804,6 +900,13 @@ mod tests {
     #[test]
     fn the_memory_nudge_interval_defaults_to_ten() {
         assert_eq!(Config::default().memory_nudge_interval, 10);
+    }
+
+    #[test]
+    fn tool_permissions_default_to_empty() {
+        assert!(Config::default().security.tool_permissions.is_empty());
+        assert!(Config::default().tool_permissions.is_empty());
+        assert!(SecurityConfig::default().tool_permissions.is_empty());
     }
 
     #[test]

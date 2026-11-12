@@ -558,7 +558,11 @@ pub(crate) fn on_turn_end(
     if review_is_due(
         turns,
         growth.had_tools(),
-        inner.config.learning_review_every,
+        inner
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .learning_review_every,
         policies_enabled,
     ) || (policies_enabled && nudge_due)
     {
@@ -580,7 +584,7 @@ fn record_and_reflect(
         id: String::new(),
         timestamp_ms: 0,
         agent_id: session
-            .agent()
+            .bot()
             .map(|id| id.to_string())
             .unwrap_or_else(|| "main".to_owned()),
         project_id: session.project_id().map(|id| id.to_string()),

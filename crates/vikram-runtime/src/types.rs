@@ -8,7 +8,8 @@ use serde_json::Value;
 use std::path::PathBuf;
 use vikram_contracts::TokenMeter;
 use vikram_contracts::{
-    AgentId, ApprovalId, Message, PermissionMode, ProjectId, SessionId, TeamId, ToolCallId, TurnId,
+    ApprovalId, BotId, HiveRosterId, Message, PermissionMode, ProjectId, SessionId, ToolCallId,
+    TurnId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,7 +64,7 @@ pub struct Metrics {
     pub mcp_configured: usize,
     pub plugins_loaded: usize,
     pub plugins_installed: usize,
-    pub subagents_active: usize,
+    pub bots_active: usize,
     /// Skills discovered from the configured roots (metadata only, bodies loaded on demand).
     #[serde(default)]
     pub skills_discovered: usize,
@@ -119,7 +120,7 @@ pub struct ContextMeter {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AgentState {
+pub enum BotState {
     Idle,
     Running,
     Thinking,
@@ -130,7 +131,7 @@ pub enum AgentState {
     Stopped,
 }
 
-impl AgentState {
+impl BotState {
     pub fn label(self) -> &'static str {
         match self {
             Self::Idle => "Idle",
@@ -148,7 +149,7 @@ impl AgentState {
         matches!(self, Self::Running | Self::Thinking | Self::Waiting)
     }
 
-    /// Filled dot for active agents, hollow for the rest. Rendering picks the glyph for the
+    /// Filled dot for active bots, hollow for the rest. Rendering picks the glyph for the
     /// terminal's Unicode support separately.
     pub fn is_filled(self) -> bool {
         self.is_active()
@@ -156,8 +157,8 @@ impl AgentState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentProfile {
-    pub id: AgentId,
+pub struct BotProfile {
+    pub id: BotId,
     pub name: String,
     pub role: String,
     pub description: String,
@@ -166,9 +167,9 @@ pub struct AgentProfile {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct AgentSnapshot {
-    pub profile: AgentProfile,
-    pub state: AgentState,
+pub struct BotSnapshot {
+    pub profile: BotProfile,
+    pub state: BotState,
     pub current_task: Option<String>,
     /// Only ever set when the runtime genuinely tracks progress.
     pub progress: Option<f32>,
@@ -176,14 +177,14 @@ pub struct AgentSnapshot {
     pub unread: usize,
 }
 
-/// A HIVE team as the runtime knows it: a user-named group of saved agent profiles sharing one
+/// A HIVE roster as the runtime knows it: a user-named group of saved agent profiles sharing one
 /// dedicated conversation. `working` is derived from that conversation's live turn state, and
 /// `paused` is an explicit operator request that overrides it. Neither is ever guessed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TeamSnapshot {
-    pub id: TeamId,
+pub struct HiveRosterSnapshot {
+    pub id: HiveRosterId,
     pub name: String,
-    pub members: Vec<AgentId>,
+    pub members: Vec<BotId>,
     pub session: Option<SessionId>,
     pub paused: bool,
     pub working: bool,
@@ -227,8 +228,16 @@ pub struct SessionSnapshot {
     pub tokens: TokenMeter,
     pub created_ms: u64,
     pub updated_ms: u64,
-    pub agent: Option<AgentId>,
+    pub bot: Option<BotId>,
     pub queued: usize,
+    /// Every follow-up waiting behind the running turn, in the order it will run. A queued text is
+    /// not a message yet — the runtime only commits it when its turn starts — so this is the only
+    /// copy an interface can show while it waits.
+    pub queue: Vec<String>,
+    /// The steer instruction waiting to be picked up at the next safe point of the running turn.
+    pub steer_text: Option<String>,
+    /// The most recently queued follow-up, so an interface can preview what runs next.
+    pub queue_text: Option<String>,
     pub project_id: Option<ProjectId>,
     pub status: String,
     /// `generic`, `auto` or `manual` — how this session got its name, so an interface can tell the
@@ -237,6 +246,20 @@ pub struct SessionSnapshot {
     /// `pending`, `ready` or `failed` for automatic naming. `pending` is what a `generic` title
     /// carries before the first meaningful message has been named.
     pub title_status: String,
+}
+
+/// One row of the session catalogue: every session the store knows about, whether or not this process
+/// is holding it live. A tab is a view onto a transcript, so the list has to be built from both the
+/// live set and the store — otherwise closing a tab would look like deleting the conversation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub id: SessionId,
+    pub title: String,
+    pub model: Option<String>,
+    pub messages: usize,
+    /// True while the session is loaded and can be talked to without reopening it.
+    pub open: bool,
+    pub updated_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -261,8 +284,8 @@ pub struct StateSnapshot {
     pub status: RuntimeStatus,
     pub metrics: Metrics,
     pub sessions: Vec<SessionSnapshot>,
-    pub agents: Vec<AgentSnapshot>,
-    pub teams: Vec<TeamSnapshot>,
+    pub bots: Vec<BotSnapshot>,
+    pub rosters: Vec<HiveRosterSnapshot>,
     pub tasks: Vec<BackgroundTask>,
     pub approvals: Vec<ApprovalPrompt>,
     /// Skill names discovered from the configured roots (metadata only).
@@ -312,8 +335,8 @@ impl ActivityKind {
 pub struct ActivityEvent {
     pub id: String,
     pub kind: ActivityKind,
-    pub agent: Option<AgentId>,
-    pub parent_agent: Option<AgentId>,
+    pub bot: Option<BotId>,
+    pub parent_agent: Option<BotId>,
     pub session: SessionId,
     pub turn: Option<TurnId>,
     pub call: Option<ToolCallId>,
@@ -389,10 +412,10 @@ pub enum RuntimeEvent {
         turn: TurnId,
         state: TurnState,
     },
-    AgentChanged(AgentSnapshot),
-    AgentRemoved(AgentId),
-    TeamChanged(TeamSnapshot),
-    TeamRemoved(TeamId),
+    BotChanged(BotSnapshot),
+    AgentRemoved(BotId),
+    HiveRosterChanged(HiveRosterSnapshot),
+    TeamRemoved(HiveRosterId),
     TaskChanged(BackgroundTask),
     ApprovalRequested(ApprovalPrompt),
     /// A posture change, with what it replaced. The rules never changed; only what this runtime does

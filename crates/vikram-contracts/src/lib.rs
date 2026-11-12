@@ -31,9 +31,9 @@ pub use version::{
 };
 
 pub use ids::{
-    AgentId, ApprovalId, AssignmentId, EffectId, EntityId, HiveId, HiveMessageId, ProfileId,
-    ProjectId, SessionId, TeamId, TicketEventId, TicketId, TicketMessageId, ToolCallId, TurnId,
-    UserId, WorkspaceId,
+    AgentId, ApprovalId, AssignmentId, BotId, EffectId, EntityId, HiveId, HiveMessageId,
+    HiveRosterId, ProfileId, ProjectId, SessionId, TicketEventId, TicketId, TicketMessageId,
+    ToolCallId, TurnId, UserId, WorkspaceId,
 };
 pub use ticket::*;
 

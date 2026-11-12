@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use vikram_contracts::{SessionId, TeamId, VikramError};
+use vikram_contracts::{HiveRosterId, SessionId, VikramError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
@@ -25,7 +25,7 @@ pub enum RuntimeError {
     AgentNotFound(String),
 
     #[error("unknown team `{0}`")]
-    TeamNotFound(TeamId),
+    TeamNotFound(HiveRosterId),
 
     #[error("permission denied: {0}")]
     Denied(String),

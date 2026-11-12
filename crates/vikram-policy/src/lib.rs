@@ -9,6 +9,7 @@
 //!    then the runtime's built-in defaults for whatever none of them matched. An allow-list entry
 //!    has to be able to end a prompt, which it could not do as one rule among defaults that ask.
 
+use std::collections::HashMap;
 use std::path::Path;
 use vikram_contracts::POLICY_EVALUATOR;
 use vikram_contracts::policy::{
@@ -364,6 +365,8 @@ pub struct Policy {
     /// The runtime's posture for anything no operator rule matches.
     defaults: Vec<Rule>,
     floor: MandatoryFloor,
+    /// Per-tool permission overrides: tool name -> "allow"/"deny"/"ask". Checked before the rules.
+    pub tool_permissions: HashMap<String, String>,
 }
 
 impl Policy {
@@ -372,6 +375,7 @@ impl Policy {
             rules,
             defaults: Vec::new(),
             floor,
+            tool_permissions: HashMap::new(),
         }
     }
 
@@ -380,6 +384,7 @@ impl Policy {
             rules,
             defaults,
             floor,
+            tool_permissions: HashMap::new(),
         }
     }
 
@@ -388,7 +393,24 @@ impl Policy {
             rules: Vec::new(),
             defaults: Vec::new(),
             floor: MandatoryFloor::default(),
+            tool_permissions: HashMap::new(),
         }
+    }
+
+    /// Attach per-tool permission overrides to this policy.
+    pub fn with_tool_permissions(mut self, overrides: HashMap<String, String>) -> Self {
+        self.tool_permissions = overrides;
+        self
+    }
+
+    /// Alias for [`Self::with_tool_permissions`].
+    pub fn with_overrides(self, overrides: HashMap<String, String>) -> Self {
+        self.with_tool_permissions(overrides)
+    }
+
+    /// Alias for [`Self::with_tool_permissions`].
+    pub fn with_permissions(self, overrides: HashMap<String, String>) -> Self {
+        self.with_tool_permissions(overrides)
     }
 
     pub fn rules(&self) -> &[Rule] {
@@ -414,6 +436,25 @@ impl Policy {
         let req = self.normalize_request(req);
         if let Some(reason) = self.floor.veto(&req, depth) {
             return Decision::Deny { reason };
+        }
+
+        // Per-tool overrides are consulted before any rule: a deny wins over every allow.
+        if let Some(override_value) = self.tool_permissions.get(&req.verb) {
+            match override_value.as_str() {
+                "allow" => return Decision::Allow,
+                "deny" => {
+                    return Decision::Deny {
+                        reason: format!("tool `{}` is denied by config override", req.verb),
+                    };
+                }
+                "ask" => {
+                    return Decision::RequireApproval {
+                        reason: format!("tool `{}` requires approval by config override", req.verb),
+                        amendment: Some(vikram_contracts::amendment_for(&req)),
+                    };
+                }
+                _ => {}
+            }
         }
 
         let decided = Self::scan(&self.rules, &req).or_else(|| Self::scan(&self.defaults, &req));
@@ -495,6 +536,13 @@ impl Policy {
     /// a default that allows is not enough, the human has to have saved the shape.
     pub fn has_allow(&self, req: &PermissionRequest) -> bool {
         let req = self.normalize_request(req);
+        if self
+            .tool_permissions
+            .get(&req.verb)
+            .is_some_and(|v| v == "allow")
+        {
+            return true;
+        }
         self.rules
             .iter()
             .any(|rule| rule.outcome == RuleOutcome::Allow && rule.applies_to(&req))
@@ -1163,6 +1211,78 @@ mod tests {
                 .is_allowed(),
             "relative paths belong inside the workspace"
         );
+    }
+
+    #[test]
+    fn a_tool_permission_override_allow_returns_allow() {
+        let mut overrides = HashMap::new();
+        overrides.insert("shell.run".to_owned(), "allow".to_owned());
+        let policy = Policy::empty().with_tool_permissions(overrides);
+        let req = PermissionRequest::new(
+            ActionKind::Execute,
+            "shell.run",
+            "cargo publish",
+            SideEffect::LocalMutation,
+            Trust::Model,
+        );
+        assert!(policy.evaluate(&req).is_allowed());
+    }
+
+    #[test]
+    fn a_tool_permission_override_deny_wins_over_an_allow_rule() {
+        let mut overrides = HashMap::new();
+        overrides.insert("shell.run".to_owned(), "deny".to_owned());
+        let policy = Policy::with_defaults(
+            vec![Rule::allow(ActionKind::Execute, ResourcePattern::Any)],
+            Vec::new(),
+            MandatoryFloor::default(),
+        )
+        .with_tool_permissions(overrides);
+        let req = PermissionRequest::new(
+            ActionKind::Execute,
+            "shell.run",
+            "cargo test",
+            SideEffect::LocalMutation,
+            Trust::Model,
+        );
+        assert!(matches!(policy.evaluate(&req), Decision::Deny { .. }));
+    }
+
+    #[test]
+    fn a_tool_permission_override_ask_returns_approval() {
+        let mut overrides = HashMap::new();
+        overrides.insert("fs.write".to_owned(), "ask".to_owned());
+        let policy = Policy::empty().with_tool_permissions(overrides);
+        let req = PermissionRequest::new(
+            ActionKind::Write,
+            "fs.write",
+            "/tmp/x",
+            SideEffect::LocalMutation,
+            Trust::Model,
+        );
+        assert!(matches!(
+            policy.evaluate(&req),
+            Decision::RequireApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn a_tool_permission_override_cannot_widen_the_mandatory_floor() {
+        let mut overrides = HashMap::new();
+        overrides.insert("fs.write".to_owned(), "allow".to_owned());
+        let floor = MandatoryFloor {
+            workspace_root: Some("/work/proj".into()),
+            ..Default::default()
+        };
+        let policy = Policy::new(Vec::new(), floor).with_tool_permissions(overrides);
+        let req = PermissionRequest::new(
+            ActionKind::Write,
+            "fs.write",
+            "/home/himanshu/.ssh/authorized_keys",
+            SideEffect::LocalMutation,
+            Trust::Model,
+        );
+        assert!(matches!(policy.evaluate(&req), Decision::Deny { .. }));
     }
 
     #[test]

@@ -5,10 +5,10 @@
 //! a hidden panel) from cancelling runtime work.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use vikram_contracts::AgentId;
+use vikram_contracts::BotId;
 
 use crate::app::{
-    AgentAction, App, Focus, InspectorKind, Overlay, PromptAction, Suggestion, SuggestionPopup,
+    App, BotAction, Focus, InspectorKind, Overlay, PromptAction, Suggestion, SuggestionPopup,
     UiCommand,
 };
 use crate::commands;
@@ -28,8 +28,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if app.suggestions.is_some() && handle_suggestion_key(app, key) {
         return true;
     }
-    if key.code == KeyCode::Esc && app.selected_agent.is_some() {
-        app.selected_agent = None;
+    if key.code == KeyCode::Esc && app.selected_bot.is_some() {
+        app.selected_bot = None;
         app.focus = Focus::Input;
         return true;
     }
@@ -56,6 +56,43 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
+    // Copy the current selection before falling through to stop/quit: a drag on screen is
+    // something the operator wants to keep, not a reason to abandon the turn.
+    if app.overlay.is_none()
+        && ctrl
+        && app.selection.is_some_and(|s| !s.is_click())
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        app.copy_selection();
+        return true;
+    }
+
+    // Copy the last assistant reply on demand, so a finished answer can be grabbed without
+    // dragging over it first.
+    if ctrl
+        && (matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
+            || (key.modifiers.contains(KeyModifiers::SHIFT)
+                && matches!(
+                    key.code,
+                    KeyCode::Char('m')
+                        | KeyCode::Char('M')
+                        | KeyCode::Char('a')
+                        | KeyCode::Char('A')
+                        | KeyCode::Char('l')
+                        | KeyCode::Char('L')
+                )))
+        || matches!(key.code, KeyCode::F(9) | KeyCode::F(10))
+    {
+        app.copy_last_assistant_message();
+        return true;
+    }
+
+    // Paste from the system clipboard into whatever field has focus.
+    if ctrl && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')) {
+        let _ = app.paste_from_clipboard();
+        return true;
+    }
+
     // ---- global shortcuts ------------------------------------------------
     match key.code {
         KeyCode::Char('c') if ctrl => {
@@ -71,6 +108,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 app.commands.push(UiCommand::Quit);
                 app.should_quit = true;
             }
+            return true;
+        }
+        KeyCode::Char('v') if ctrl => {
+            // Consumed above; kept here so the key is never inserted as text.
+            let _ = app.paste_from_clipboard();
             return true;
         }
         KeyCode::Char('n') if ctrl => {
@@ -180,14 +222,14 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             return true;
         }
         KeyCode::Char('a') if ctrl => {
-            if app.agents.is_empty() {
+            if app.bots.is_empty() {
                 app.push_notice(
                     vikram_runtime::types::NoticeLevel::Info,
-                    "no bots exist yet; spawn one with `vikram agents`",
+                    "no bots exist yet; spawn one with `vikram bots`",
                 );
             } else {
-                app.agent_selection = 0;
-                app.overlay = Some(Overlay::AddAgent { selected: 0 });
+                app.bot_selection = 0;
+                app.overlay = Some(Overlay::AddBot { selected: 0 });
             }
             return true;
         }
@@ -227,6 +269,14 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         Focus::Conversation => handle_conversation(app, key),
         Focus::Bots => handle_bots(app, key),
     };
+    // Typing has to reach the draft from wherever focus happens to be. Tab on an empty draft moves
+    // focus to the conversation pane, which used to leave every following keystroke unhandled and
+    // therefore invisible — the operator typed and nothing appeared. A key no pane claims puts the
+    // cursor back in the input and is applied there.
+    if !handled && app.focus != Focus::Input {
+        app.focus = Focus::Input;
+        return handle_input(app, key);
+    }
     if app.focus == Focus::Input && app.pending_question.is_none() {
         refresh_suggestions(app);
     }
@@ -237,6 +287,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
 /// [`App::submit_answer`], and Esc drops the prompt. Every key is consumed here so nothing leaks
 /// into the draft while the runtime is blocked on an answer.
 fn handle_question(app: &mut App, key: KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Esc => {
             app.dismiss_question();
@@ -269,6 +320,10 @@ fn handle_question(app: &mut App, key: KeyEvent) -> bool {
             }
             true
         }
+        KeyCode::Char('v') if ctrl => {
+            let _ = app.paste_from_clipboard();
+            true
+        }
         _ => true,
     }
 }
@@ -284,8 +339,16 @@ fn handle_input(app: &mut App, key: KeyEvent) -> bool {
             }
             true
         }
+        KeyCode::Enter if ctrl => {
+            steer(app);
+            true
+        }
         KeyCode::Enter => {
-            submit(app, false);
+            if app.send_mode == crate::app::SendMode::Steer {
+                steer(app);
+            } else {
+                submit(app, true);
+            }
             true
         }
         KeyCode::Tab => {
@@ -308,17 +371,8 @@ fn handle_input(app: &mut App, key: KeyEvent) -> bool {
                     return true;
                 }
             }
-            let has_text = app
-                .active_session()
-                .map(|s| !s.editor.is_empty())
-                .unwrap_or(false);
-            if has_text {
-                submit(app, true);
-                true
-            } else {
-                app.focus = Focus::Conversation;
-                true
-            }
+            app.send_mode = app.send_mode.other();
+            true
         }
         KeyCode::Backspace => {
             if let Some(session) = app.active_session_mut() {
@@ -473,7 +527,10 @@ fn handle_conversation(app: &mut App, key: KeyEvent) -> bool {
             app.scroll_to_bottom();
             true
         }
-        KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('e') => {
+        // Expanding an activity is a pane action, so it must not eat printable keys: while the
+        // transcript has focus, every character still belongs to the draft. Ctrl+E expands the
+        // selected activity; a plain click on the header does the same.
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(session) = app.active_session_mut()
                 && !session.activity.is_empty()
             {
@@ -506,22 +563,22 @@ fn handle_conversation(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn handle_bots(app: &mut App, key: KeyEvent) -> bool {
-    if app.agents.is_empty() {
+    if app.bots.is_empty() {
         return false;
     }
-    let last = app.agents.len() - 1;
+    let last = app.bots.len() - 1;
     match key.code {
         KeyCode::Up => {
-            app.agent_selection = app.agent_selection.saturating_sub(1);
+            app.bot_selection = app.bot_selection.saturating_sub(1);
             true
         }
         KeyCode::Down => {
-            app.agent_selection = (app.agent_selection + 1).min(last);
+            app.bot_selection = (app.bot_selection + 1).min(last);
             true
         }
         KeyCode::Enter => {
-            if let Some(agent) = app.agents.get(app.agent_selection) {
-                app.selected_agent = Some(agent.profile.id.clone());
+            if let Some(agent) = app.bots.get(app.bot_selection) {
+                app.selected_bot = Some(agent.profile.id.clone());
             }
             app.focus = Focus::Input;
             true
@@ -531,28 +588,28 @@ fn handle_bots(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         KeyCode::Char('p') => {
-            if let Some(agent) = app.agents.get(app.agent_selection) {
-                app.commands.push(UiCommand::AgentControl {
-                    agent: agent.profile.id.clone(),
-                    action: AgentAction::Pause,
+            if let Some(agent) = app.bots.get(app.bot_selection) {
+                app.commands.push(UiCommand::BotControl {
+                    bot: agent.profile.id.clone(),
+                    action: BotAction::Pause,
                 });
             }
             true
         }
         KeyCode::Char('s') => {
-            if let Some(agent) = app.agents.get(app.agent_selection) {
-                app.commands.push(UiCommand::AgentControl {
-                    agent: agent.profile.id.clone(),
-                    action: AgentAction::Stop,
+            if let Some(agent) = app.bots.get(app.bot_selection) {
+                app.commands.push(UiCommand::BotControl {
+                    bot: agent.profile.id.clone(),
+                    action: BotAction::Stop,
                 });
             }
             true
         }
         KeyCode::Char('r') => {
-            if let Some(agent) = app.agents.get(app.agent_selection) {
-                app.commands.push(UiCommand::AgentControl {
-                    agent: agent.profile.id.clone(),
-                    action: AgentAction::Resume,
+            if let Some(agent) = app.bots.get(app.bot_selection) {
+                app.commands.push(UiCommand::BotControl {
+                    bot: agent.profile.id.clone(),
+                    action: BotAction::Resume,
                 });
             }
             true
@@ -736,7 +793,7 @@ fn refresh_suggestions(app: &mut App) {
         }
         PrefixKind::At => {
             // References: bots, then workspace files.
-            for agent in &app.agents {
+            for agent in &app.bots {
                 if query.is_empty() || agent.profile.name.to_lowercase().contains(&query) {
                     items.push(Suggestion {
                         text: agent.profile.name.clone(),
@@ -746,7 +803,7 @@ fn refresh_suggestions(app: &mut App) {
                 }
             }
             for name in [
-                "main", "history", "context", "skills", "team", "mcp", "terminal",
+                "main", "history", "context", "skills", "hive", "mcp", "terminal",
             ] {
                 if query.is_empty() || name.contains(&query) {
                     items.push(Suggestion {
@@ -871,6 +928,26 @@ fn resolve_references(text: &str, cwd: std::path::PathBuf) -> String {
         result = result.replace(&from, &to);
     }
     result
+}
+
+/// Ctrl+Enter: steer the running turn with this text instead of queueing behind it.
+fn steer(app: &mut App) {
+    let Some(session) = app.active_session_mut() else {
+        return;
+    };
+    let text = session.editor.text();
+    if text.trim().is_empty() {
+        return;
+    }
+    let trimmed = text.trim().to_owned();
+    let id = session.id.clone();
+    session.editor.remember(&text);
+    session.editor.clear();
+    let resolved = resolve_references(&trimmed, session.cwd.clone());
+    app.commands.push(UiCommand::Steer {
+        session: id,
+        text: resolved,
+    });
 }
 
 fn submit(app: &mut App, queue: bool) {
@@ -1079,10 +1156,13 @@ fn handle_picker_overlay(app: &mut App, mut picker: Picker, key: KeyEvent) -> bo
 }
 
 /// Hand the row under the cursor to the host with the verb that was pressed. A verb on an empty
-/// list does nothing: there is no row, so there is nothing to act on.
+/// list does nothing unless it names the panel itself: creating the first bot has to work before
+/// one exists, or the panel can never be used to create it.
 fn commit_verb(app: &mut App, picker: &Picker, verb: crate::widgets::Verb) {
-    let Some(value) = picker.selected_item().map(|item| item.value.clone()) else {
-        return;
+    let value = match picker.selected_item() {
+        Some(item) => item.value.clone(),
+        None if picker.kind.panel_verb(verb) => String::new(),
+        None => return,
     };
     let Some(session) = app.active_session() else {
         return;
@@ -1173,21 +1253,21 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
                 _ => true,
             }
         }
-        Overlay::AddAgent { selected } => {
-            let last = app.agents.len().saturating_sub(1);
+        Overlay::AddBot { selected } => {
+            let last = app.bots.len().saturating_sub(1);
             match key.code {
                 KeyCode::Esc => {
                     app.overlay = None;
                     true
                 }
                 KeyCode::Up => {
-                    app.overlay = Some(Overlay::AddAgent {
+                    app.overlay = Some(Overlay::AddBot {
                         selected: selected.saturating_sub(1),
                     });
                     true
                 }
                 KeyCode::Down => {
-                    app.overlay = Some(Overlay::AddAgent {
+                    app.overlay = Some(Overlay::AddBot {
                         selected: (selected + 1).min(last),
                     });
                     true
@@ -1242,6 +1322,7 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
                                 command: "model".to_owned(),
                                 args: text,
                             },
+                            PromptAction::SetEndpoint => UiCommand::SetEndpoint { base_url: text },
                             PromptAction::AddAllowRule => UiCommand::AllowRule {
                                 session,
                                 rule: text,
@@ -1251,6 +1332,49 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
                                 session,
                                 path: text,
                             },
+                            PromptAction::CreateHiveRoster => {
+                                UiCommand::CreateHiveRoster { name: text }
+                            }
+                            PromptAction::EditPending { session: s, target } => {
+                                UiCommand::EditPending {
+                                    session: s,
+                                    target,
+                                    text,
+                                }
+                            }
+                            PromptAction::CreateBot => {
+                                let mut parts = text.splitn(3, ':');
+                                let name = parts.next().unwrap_or("").trim().to_owned();
+                                let role = parts.next().unwrap_or("").trim().to_owned();
+                                let description = parts.next().unwrap_or("").trim().to_owned();
+                                UiCommand::CreateBot {
+                                    name,
+                                    role: if role.is_empty() {
+                                        "assistant".to_owned()
+                                    } else {
+                                        role
+                                    },
+                                    description,
+                                }
+                            }
+                            PromptAction::RenameBot { bot } => UiCommand::RenameBot {
+                                bot,
+                                name: text.trim().to_owned(),
+                            },
+                            PromptAction::RenameSkill { skill } => UiCommand::RenameSkill {
+                                skill,
+                                new_name: text.trim().to_owned(),
+                            },
+                            PromptAction::InstallPlugin => UiCommand::InstallPlugin {
+                                path: text.trim().to_owned(),
+                            },
+                            PromptAction::SaveMemory => {
+                                let (key, value) = text
+                                    .split_once(':')
+                                    .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+                                    .unwrap_or_else(|| (text.trim().to_owned(), String::new()));
+                                UiCommand::SaveMemory { key, value }
+                            }
                         };
                         app.commands.push(command);
                     }
@@ -1466,11 +1590,11 @@ fn answer_approval(app: &mut App, allow: bool, persist: bool) {
 }
 
 fn spawn_agent(app: &mut App, selected: usize) {
-    let Some(agent) = app.agents.get(selected) else {
+    let Some(agent) = app.bots.get(selected) else {
         app.overlay = None;
         return;
     };
-    let profile: AgentId = agent.profile.id.clone();
+    let profile: BotId = agent.profile.id.clone();
     let Some(session) = app.active_session() else {
         app.overlay = None;
         return;
@@ -1601,8 +1725,11 @@ mod tests {
                 tokens: Default::default(),
                 created_ms: 0,
                 updated_ms: 0,
-                agent: None,
+                bot: None,
                 queued: 0,
+                queue: Vec::new(),
+                steer_text: None,
+                queue_text: None,
                 project_id: None,
                 status: "active".to_owned(),
                 title_source: "generic".to_owned(),
@@ -1612,7 +1739,7 @@ mod tests {
     }
 
     #[test]
-    fn typing_edits_the_draft_and_enter_emits_one_submit_command() {
+    fn typing_edits_the_draft_and_enter_emits_one_queue_command() {
         let mut app = app_with_session();
         for ch in "hello".chars() {
             assert!(handle_key(&mut app, key(KeyCode::Char(ch))));
@@ -1621,8 +1748,33 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Enter));
         let commands = app.take_commands();
         assert_eq!(commands.len(), 1);
-        assert!(matches!(commands[0], UiCommand::Submit { .. }));
+        assert!(matches!(commands[0], UiCommand::Queue { .. }));
         assert!(app.active_session().unwrap().editor.is_empty());
+    }
+
+    #[test]
+    fn tab_flips_the_send_mode_and_typing_still_reaches_the_input() {
+        let mut app = app_with_session();
+        assert_eq!(app.send_mode, crate::app::SendMode::Queue);
+        handle_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.send_mode, crate::app::SendMode::Steer);
+        handle_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.send_mode, crate::app::SendMode::Queue);
+
+        for ch in "hi".chars() {
+            handle_key(&mut app, key(KeyCode::Char(ch)));
+        }
+        assert_eq!(app.active_session().unwrap().editor.text(), "hi");
+    }
+
+    #[test]
+    fn enter_sends_steer_when_the_mode_is_armed() {
+        let mut app = app_with_session();
+        app.send_mode = crate::app::SendMode::Steer;
+        handle_key(&mut app, key(KeyCode::Char('x')));
+        handle_key(&mut app, key(KeyCode::Enter));
+        let commands = app.take_commands();
+        assert!(matches!(commands[0], UiCommand::Steer { .. }));
     }
 
     #[test]
@@ -1636,16 +1788,16 @@ mod tests {
     }
 
     #[test]
-    fn tab_with_text_queues_and_tab_without_text_moves_focus() {
+    fn tab_toggles_send_mode_without_sending_the_draft() {
         let mut app = app_with_session();
-        handle_key(&mut app, key(KeyCode::Tab));
-        assert_eq!(app.focus, Focus::Conversation);
-
-        app.focus = Focus::Input;
         handle_key(&mut app, key(KeyCode::Char('x')));
         handle_key(&mut app, key(KeyCode::Tab));
-        let commands = app.take_commands();
-        assert!(matches!(commands[0], UiCommand::Queue { .. }));
+        assert_eq!(app.send_mode, crate::app::SendMode::Steer);
+        assert!(
+            app.take_commands().is_empty(),
+            "Tab arms a mode; it must not send the draft"
+        );
+        assert_eq!(app.active_session().unwrap().editor.text(), "x");
     }
 
     #[test]
@@ -1659,6 +1811,19 @@ mod tests {
         handle_key(&mut app, ctrl(KeyCode::Char('c')));
         assert!(!app.should_quit);
         assert!(matches!(app.take_commands()[0], UiCommand::Cancel { .. }));
+    }
+
+    #[test]
+    fn ctrl_c_with_a_selection_copies_instead_of_quitting() {
+        let mut app = app_with_session();
+        app.screen = vec!["hello world".to_owned()];
+        app.selection = Some(crate::app::Selection {
+            anchor: (6, 0),
+            cursor: (10, 0),
+        });
+        handle_key(&mut app, ctrl(KeyCode::Char('c')));
+        assert!(!app.should_quit);
+        assert_eq!(app.take_clipboard().as_deref(), Some("world"));
     }
 
     #[test]
@@ -2051,6 +2216,9 @@ mod tests {
             (PickerKind::Session, 'r', Verb::Rename),
             (PickerKind::Session, 'x', Verb::Close),
             (PickerKind::Memory, 'd', Verb::Remove),
+            (PickerKind::HiveRoster, 'n', Verb::New),
+            (PickerKind::HiveRoster, 'd', Verb::Remove),
+            (PickerKind::HiveRoster, 'x', Verb::Close),
         ];
         for (kind, key, verb) in cases {
             let mut app = app_with_session();
@@ -2075,6 +2243,15 @@ mod tests {
         };
         assert_eq!(picker.query, "x");
         assert_eq!(PickerKind::Model.primary_verb(), Verb::Choose);
+    }
+
+    #[test]
+    fn the_team_panel_still_opens_its_row_on_enter() {
+        use crate::widgets::Verb;
+        // The new verbs are additions beside Enter, not a replacement for it: the roster's first
+        // key has to stay "open", because Enter is what the operator reaches for before reading
+        // the footer.
+        assert_eq!(PickerKind::HiveRoster.primary_verb(), Verb::Choose);
     }
 
     #[test]

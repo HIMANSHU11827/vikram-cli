@@ -44,8 +44,9 @@ macro_rules! id_type {
 
 id_type!(SessionId, "ses");
 id_type!(TurnId, "turn");
+id_type!(BotId, "bot");
 id_type!(AgentId, "agent");
-id_type!(TeamId, "team");
+id_type!(HiveRosterId, "hrost");
 id_type!(EffectId, "eff");
 id_type!(ToolCallId, "call");
 id_type!(ApprovalId, "apv");

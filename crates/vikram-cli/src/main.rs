@@ -6,6 +6,7 @@
 mod chat;
 mod doctor;
 mod gateway;
+mod plugins;
 mod skills;
 mod terminal;
 mod tools;
@@ -91,8 +92,11 @@ enum Command {
         #[command(subcommand)]
         action: FilesAction,
     },
-    /// List saved agent profiles.
-    Agents,
+    /// List, create, and remove saved bot profiles.
+    Bots {
+        #[command(subcommand)]
+        action: Option<BotsAction>,
+    },
     /// Show or change configuration.
     Config {
         #[command(subcommand)]
@@ -100,6 +104,11 @@ enum Command {
     },
     /// Check the runtime's local prerequisites.
     Doctor,
+    /// Scaffold a new project (AGENTS.md, .vikram/config.json, README.md).
+    Init {
+        /// Directory to initialize (defaults to the current directory).
+        path: Option<PathBuf>,
+    },
     /// Show and edit the durable allow-list: approvals a human chose to keep.
     Allow {
         #[command(subcommand)]
@@ -119,6 +128,11 @@ enum Command {
     Skills {
         #[command(subcommand)]
         action: Option<skills::SkillsAction>,
+    },
+    /// Install, inspect, and toggle plugins.
+    Plugins {
+        #[command(subcommand)]
+        action: Option<plugins::PluginsAction>,
     },
     /// Manage users.
     Users {
@@ -175,11 +189,29 @@ enum Command {
 }
 
 #[derive(Debug, Subcommand)]
+enum BotsAction {
+    /// List bots (default).
+    List,
+    /// Create a bot profile.
+    New {
+        name: String,
+        #[arg(default_value = "")]
+        role: String,
+        #[arg(default_value = "")]
+        description: String,
+    },
+    /// Delete an agent profile.
+    Rm { id: String },
+}
+
+#[derive(Debug, Subcommand)]
 enum UsersAction {
     /// List users.
     List,
     /// Create a user.
     New { name: String },
+    /// Rename a user.
+    Rename { id: String, name: String },
     /// Delete a user and their data.
     Rm { id: String },
 }
@@ -190,6 +222,8 @@ enum ProfilesAction {
     List { user: Option<String> },
     /// Create a profile for a user.
     New { user: String, name: String },
+    /// Rename a profile.
+    Rename { id: String, name: String },
     /// Delete a profile.
     Rm { id: String },
 }
@@ -214,6 +248,10 @@ enum EntitiesAction {
     },
     /// Delete an entity.
     Rm { id: String },
+    /// Enable an entity (status becomes active).
+    Enable { id: String },
+    /// Disable an entity (status becomes inactive; it is kept, not deleted).
+    Disable { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -628,6 +666,8 @@ enum ConfigAction {
     Path,
     /// Validate the configuration loaded from the default path.
     Validate,
+    /// Set a per-tool permission override: allow, deny, or ask.
+    SetToolPermission { tool: String, permission: String },
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -638,6 +678,42 @@ enum McpAction {
     Status,
     /// Start the MCP server (expose approved tools).
     Serve,
+    /// Add a client server to ~/.vikram/mcp.json.
+    Add {
+        /// Unique server name clients will reference.
+        name: String,
+        /// The command used to spawn the server.
+        command: String,
+        /// Extra argument for the command; repeat for more than one.
+        #[arg(long = "arg", allow_hyphen_values = true)]
+        args: Vec<String>,
+        /// Environment for the server as KEY=VALUE; repeat for more than one.
+        #[arg(long = "env", allow_hyphen_values = true)]
+        env: Vec<String>,
+    },
+    /// Rename a configured server.
+    Rename {
+        /// Current name.
+        name: String,
+        /// New name.
+        new_name: String,
+    },
+    /// Remove a configured server from mcp.json.
+    #[command(name = "remove", visible_alias = "delete", visible_alias = "rm")]
+    Remove {
+        /// Server name.
+        name: String,
+    },
+    /// Enable a configured server (it is spawned again on the next connect).
+    Enable {
+        /// Server name.
+        name: String,
+    },
+    /// Disable a configured server without removing it.
+    Disable {
+        /// Server name.
+        name: String,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -646,11 +722,17 @@ fn main() -> std::process::ExitCode {
     // worker all get it from here.
     vikram_daemon::tools::install();
     let cli = Cli::parse();
+    let is_doctor = matches!(cli.command, Some(Command::Doctor));
     let mut config = match Config::load() {
         Ok(config) => config,
         Err(err) => {
-            eprintln!("vikram: {err}");
-            return std::process::ExitCode::FAILURE;
+            if is_doctor {
+                // Let `vikram doctor` report the invalid configuration instead of aborting early.
+                Config::default()
+            } else {
+                eprintln!("vikram: {err}");
+                return std::process::ExitCode::FAILURE;
+            }
         }
     };
     if cli.ascii {
@@ -744,9 +826,10 @@ fn main() -> std::process::ExitCode {
         Command::Project { action } => projects(action),
         Command::Workspace { action } => workspace_cmd(action),
         Command::Files { action } => files(action),
-        Command::Agents => agents(),
+        Command::Bots { action } => bots(action.unwrap_or(BotsAction::List)),
         Command::Config { action } => config_command(action, config),
         Command::Doctor => run_async(doctor::run(config)),
+        Command::Init { path } => init(path),
         Command::Allow { action } => allow_command(action, &config),
         Command::Tools { action } => {
             let action =
@@ -760,6 +843,10 @@ fn main() -> std::process::ExitCode {
         Command::Skills { action } => {
             let action = action.unwrap_or_else(|| skills::SkillsAction::List(Default::default()));
             exit(skills::run(action, &config))
+        }
+        Command::Plugins { action } => {
+            let action = action.unwrap_or(plugins::PluginsAction::List);
+            exit(plugins::run(action))
         }
         Command::Users { action } => users(action),
         Command::Profiles { action } => profiles(action),
@@ -1238,15 +1325,44 @@ fn format_date(ms: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-fn agents() -> std::process::ExitCode {
+fn bots(action: BotsAction) -> std::process::ExitCode {
     let result = (|| -> Result<(), String> {
         let store = open_store()?;
-        let rows = store.list_agents().map_err(|e| e.to_string())?;
-        if rows.is_empty() {
-            println!("no agents configured (they are seeded on first run of `vikram`)");
-        }
-        for row in rows {
-            println!("{:<24} {:<14} {}", row.name, row.role, row.description);
+        match action {
+            BotsAction::List => {
+                let rows = store.list_bots().map_err(|e| e.to_string())?;
+                if rows.is_empty() {
+                    println!("no bots configured (they are seeded on first run of `vikram`)");
+                }
+                for row in rows {
+                    println!("{:<24} {:<14} {}", row.name, row.role, row.description);
+                }
+            }
+            BotsAction::New {
+                name,
+                role,
+                description,
+            } => {
+                if name.trim().is_empty() {
+                    return Err("bot name must not be empty".to_owned());
+                }
+                let now = vikram_runtime::types::now_ms();
+                let row = vikram_store::BotRow {
+                    id: vikram_contracts::BotId::generate(),
+                    name,
+                    role,
+                    description,
+                    icon: None,
+                    created_ms: now,
+                };
+                store.save_bot(&row).map_err(|e| e.to_string())?;
+                println!("{}", row.id);
+            }
+            BotsAction::Rm { id } => {
+                let id = vikram_contracts::BotId::new(id);
+                store.delete_bot(&id).map_err(|e| e.to_string())?;
+                println!("removed {id}");
+            }
         }
         Ok(())
     })();
@@ -1270,6 +1386,14 @@ fn users(action: UsersAction) -> std::process::ExitCode {
                 let now = vikram_runtime::types::now_ms();
                 let row = store.create_user(&name, now).map_err(|e| e.to_string())?;
                 println!("{}", row.id);
+            }
+            UsersAction::Rename { id, name } => {
+                let id = vikram_contracts::UserId::new(id);
+                let now = vikram_runtime::types::now_ms();
+                store
+                    .update_user(&id, &name, now)
+                    .map_err(|e| e.to_string())?;
+                println!("renamed {id} to {name}");
             }
             UsersAction::Rm { id } => {
                 let id = vikram_contracts::UserId::new(id);
@@ -1311,6 +1435,14 @@ fn profiles(action: ProfilesAction) -> std::process::ExitCode {
                     .map_err(|e| e.to_string())?;
                 println!("{}", row.id);
             }
+            ProfilesAction::Rename { id, name } => {
+                let id = vikram_contracts::ProfileId::new(id);
+                let now = vikram_runtime::types::now_ms();
+                store
+                    .update_profile(&id, &name, now)
+                    .map_err(|e| e.to_string())?;
+                println!("renamed {id} to {name}");
+            }
             ProfilesAction::Rm { id } => {
                 let id = vikram_contracts::ProfileId::new(id);
                 store.delete_profile(&id).map_err(|e| e.to_string())?;
@@ -1339,8 +1471,8 @@ fn entities(action: EntitiesAction) -> std::process::ExitCode {
                 }
                 for row in rows {
                     println!(
-                        "{:<24} {:<12} {:<24} {}",
-                        row.id, row.kind, row.slug, row.name
+                        "{:<24} {:<12} {:<10} {:<24} {}",
+                        row.id, row.kind, row.status, row.slug, row.name
                     );
                 }
             }
@@ -1401,10 +1533,33 @@ fn entities(action: EntitiesAction) -> std::process::ExitCode {
                 store.delete_entity(&id).map_err(|e| e.to_string())?;
                 println!("removed {id}");
             }
+            EntitiesAction::Enable { id } => entity_set_status(&store, &id, true)?,
+            EntitiesAction::Disable { id } => entity_set_status(&store, &id, false)?,
         }
         Ok(())
     })();
     exit(result)
+}
+
+fn entity_set_status(store: &Store, id: &str, enabled: bool) -> Result<(), String> {
+    let id = vikram_contracts::EntityId::new(id);
+    let mut row = store
+        .get_entity(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("entity {id} not found"))?;
+    row.status = if enabled {
+        "active".to_owned()
+    } else {
+        "inactive".to_owned()
+    };
+    row.updated_ms = vikram_runtime::types::now_ms();
+    store.save_entity(&row).map_err(|e| e.to_string())?;
+    println!(
+        "{} {id} (status: {})",
+        if enabled { "enabled" } else { "disabled" },
+        row.status
+    );
+    Ok(())
 }
 
 async fn hive(action: HiveAction) -> Result<(), String> {
@@ -1855,13 +2010,20 @@ fn learning(action: LearningAction) -> std::process::ExitCode {
 async fn mcp(action: McpAction) -> Result<(), String> {
     match action {
         McpAction::List => {}
-        McpAction::Status => {
-            println!("MCP Server: not running (use `vikram mcp serve` to start)");
-            return Ok(());
-        }
+        McpAction::Status => return mcp_status(),
         McpAction::Serve => {
             return mcp_serve().await;
         }
+        McpAction::Add {
+            name,
+            command,
+            args,
+            env,
+        } => return mcp_add(&name, &command, &args, &env),
+        McpAction::Rename { name, new_name } => return mcp_rename(&name, &new_name),
+        McpAction::Remove { name } => return mcp_remove(&name),
+        McpAction::Enable { name } => return mcp_set_enabled(&name, true),
+        McpAction::Disable { name } => return mcp_set_enabled(&name, false),
     }
     let config = vikram_runtime::config::McpConfig::load();
     if config.servers.is_empty() {
@@ -1871,11 +2033,137 @@ async fn mcp(action: McpAction) -> Result<(), String> {
         );
         return Ok(());
     }
-    println!("{:<20} COMMAND", "NAME");
+    println!("{:<20} {:<9} COMMAND", "NAME", "STATE");
     for server in config.servers {
-        println!("{:<20} {}", server.name, server.command);
+        let args = if server.args.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", server.args.join(" "))
+        };
+        println!(
+            "{:<20} {:<9} {}{}",
+            server.name,
+            if server.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            server.command,
+            args
+        );
     }
     Ok(())
+}
+
+/// Read-modify-write on mcp.json. `load_result` (not `load`) so a corrupt file is an error the
+/// operator sees instead of silently overwritten with defaults plus their new entry.
+fn mcp_edit(
+    edit: impl FnOnce(&mut vikram_runtime::config::McpConfig) -> Result<String, String>,
+) -> Result<(), String> {
+    let mut config = vikram_runtime::config::McpConfig::load_result().map_err(|err| {
+        format!(
+            "could not read {}: {err}",
+            vikram_runtime::config::mcp_config_path().display()
+        )
+    })?;
+    let message = edit(&mut config)?;
+    config.save().map_err(|err| {
+        format!(
+            "could not write {}: {err}",
+            vikram_runtime::config::mcp_config_path().display()
+        )
+    })?;
+    println!(
+        "{message} ({})",
+        vikram_runtime::config::mcp_config_path().display()
+    );
+    Ok(())
+}
+
+fn mcp_add(name: &str, command: &str, args: &[String], env: &[String]) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("server name must not be empty".to_owned());
+    }
+    if command.trim().is_empty() {
+        return Err("command must not be empty".to_owned());
+    }
+    let mut env_map = std::collections::BTreeMap::new();
+    for pair in env {
+        let Some((key, value)) = pair.split_once('=') else {
+            return Err(format!("--env expects KEY=VALUE, got `{pair}`"));
+        };
+        if key.trim().is_empty() {
+            return Err(format!("--env has an empty key in `{pair}`"));
+        }
+        env_map.insert(key.to_owned(), value.to_owned());
+    }
+    mcp_edit(|config| {
+        if config.servers.iter().any(|server| server.name == name) {
+            return Err(format!("an MCP server named `{name}` already exists"));
+        }
+        config
+            .servers
+            .push(vikram_runtime::config::McpServerConfig {
+                name: name.to_owned(),
+                command: command.to_owned(),
+                args: args.to_vec(),
+                env: env_map,
+                enabled: true,
+            });
+        Ok(format!("added MCP server `{name}`"))
+    })
+}
+
+fn mcp_rename(name: &str, new_name: &str) -> Result<(), String> {
+    if new_name.trim().is_empty() {
+        return Err("new name must not be empty".to_owned());
+    }
+    mcp_edit(|config| {
+        if config.servers.iter().any(|server| server.name == new_name) {
+            return Err(format!("an MCP server named `{new_name}` already exists"));
+        }
+        let server = config
+            .servers
+            .iter_mut()
+            .find(|server| server.name == name)
+            .ok_or_else(|| format!("no MCP server named `{name}` (see `vikram mcp list`)"))?;
+        server.name = new_name.to_owned();
+        Ok(format!("renamed MCP server `{name}` to `{new_name}`"))
+    })
+}
+
+fn mcp_remove(name: &str) -> Result<(), String> {
+    mcp_edit(|config| {
+        let before = config.servers.len();
+        config.servers.retain(|server| server.name != name);
+        if config.servers.len() == before {
+            return Err(format!(
+                "no MCP server named `{name}` (see `vikram mcp list`)"
+            ));
+        }
+        Ok(format!("removed MCP server `{name}`"))
+    })
+}
+
+fn mcp_set_enabled(name: &str, enabled: bool) -> Result<(), String> {
+    mcp_edit(|config| {
+        let server = config
+            .servers
+            .iter_mut()
+            .find(|server| server.name == name)
+            .ok_or_else(|| format!("no MCP server named `{name}` (see `vikram mcp list`)"))?;
+        if server.enabled == enabled {
+            return Ok(format!(
+                "MCP server `{name}` is already {}",
+                if enabled { "enabled" } else { "disabled" }
+            ));
+        }
+        server.enabled = enabled;
+        Ok(format!(
+            "{} MCP server `{name}`",
+            if enabled { "enabled" } else { "disabled" }
+        ))
+    })
 }
 
 struct ServeExecutor {
@@ -1910,7 +2198,7 @@ async fn mcp_serve() -> Result<(), String> {
     let serve_config = vikram_runtime::config::McpConfig::load();
     if serve_config.approved_tools.is_empty() {
         return Err(format!(
-            "no approved tools configured; refusing to expose anything.\nadd `approvedTools` to {}",
+            "no approved tools configured; refusing to expose anything.\nadd `approved_tools` to {}",
             vikram_runtime::config::mcp_config_path().display()
         ));
     }
@@ -1963,7 +2251,230 @@ async fn mcp_serve() -> Result<(), String> {
         "vikram: mcp serve running on stdio with approved tools: {}",
         serve_config.approved_tools.join(", ")
     );
+    // Registered for `vikram mcp status`: the file is removed when stdio closes, and a stale one
+    // is reported as stale rather than counted as a live server.
+    let _pidfile = ServePidfile::register()?;
     server.run_stdio().await
+}
+
+/// `mcp status` reports what is actually true: which serve processes are alive right now, which
+/// client servers are configured, and whether `mcp serve` could start with this configuration.
+fn mcp_status() -> Result<(), String> {
+    let config = vikram_runtime::config::McpConfig::load();
+    // `McpConfig::load` treats an unreadable or unparseable file as "empty"; say so here instead
+    // of letting a corrupt mcp.json look like a clean machine.
+    let mcp_path = vikram_runtime::config::mcp_config_path();
+    let config_problem = if mcp_path.exists() {
+        std::fs::read_to_string(&mcp_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<vikram_runtime::config::McpConfig>(&raw).err())
+            .map(|err| format!("{}: {err}", mcp_path.display()))
+    } else {
+        None
+    };
+
+    let mut pids = registered_serve_pids();
+    for pid in proc_serve_pids() {
+        if !pids.contains(&pid) {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    if pids.is_empty() {
+        println!("MCP server: not running (MCP clients spawn it with `vikram mcp serve`)");
+    } else {
+        for pid in &pids {
+            println!("MCP server: running (pid {pid})");
+        }
+    }
+
+    let enabled = config
+        .servers
+        .iter()
+        .filter(|server| server.enabled)
+        .count();
+    if config.servers.is_empty() {
+        println!("client servers: none configured");
+    } else {
+        println!(
+            "client servers: {} ({} enabled)",
+            config.servers.len(),
+            enabled
+        );
+        for server in &config.servers {
+            println!(
+                "  {}  {}  {}",
+                server.name,
+                if server.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                server.command
+            );
+        }
+    }
+
+    // The same gates `mcp serve` enforces before it binds stdio, so a problem here is a problem
+    // the operator would hit on the next client connect.
+    let mut problems: Vec<String> = Vec::new();
+    if let Some(problem) = config_problem {
+        problems.push(format!("mcp config unreadable: {problem}"));
+    }
+    if config.approved_tools.is_empty() {
+        problems.push("no `approved_tools` configured; serve would expose nothing".to_owned());
+    }
+    let registry = vikram_runtime::tools::ToolRegistry::with_builtins();
+    for name in &config.approved_tools {
+        if registry.get(name).is_none() {
+            problems.push(format!("approved tool `{name}` is not a known tool"));
+        }
+    }
+    let server_cfg = vikram_mcp::ServerConfig {
+        approved_tools: config.approved_tools.clone(),
+        auth_required: config.auth_required,
+        auth_token: config.auth_token.clone(),
+        ..vikram_mcp::ServerConfig::default()
+    };
+    if let Err(err) = server_cfg.validate() {
+        problems.push(format!("server config invalid: {err}"));
+    }
+
+    if problems.is_empty() {
+        println!(
+            "serve: ready ({} approved tool(s))",
+            config.approved_tools.len()
+        );
+        Ok(())
+    } else {
+        for problem in &problems {
+            println!("serve: {problem}");
+        }
+        Err("`vikram mcp serve` cannot start with this configuration".to_owned())
+    }
+}
+
+/// Where `mcp serve` processes register themselves: one file per pid under the runtime home.
+fn mcp_serve_dir() -> PathBuf {
+    vikram_home().join("mcp").join("serve")
+}
+
+/// A live `mcp serve` writes `<pid>.json` here on start and removes it on exit. A file whose pid
+/// is gone is a crash leftover: reported as stale and cleaned up, never counted as running.
+struct ServePidfile {
+    path: PathBuf,
+}
+
+impl ServePidfile {
+    fn register() -> Result<Self, String> {
+        let dir = mcp_serve_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|err| format!("could not create {}: {err}", dir.display()))?;
+        let pid = std::process::id();
+        let path = dir.join(format!("{pid}.json"));
+        let body = serde_json::json!({
+            "pid": pid,
+            "started_ms": vikram_runtime::types::now_ms(),
+            "exe": std::env::current_exe().ok(),
+        });
+        std::fs::write(&path, body.to_string())
+            .map_err(|err| format!("could not write {}: {err}", path.display()))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for ServePidfile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Pids of `mcp serve` processes that are still alive, from the pidfile registry.
+fn registered_serve_pids() -> Vec<u32> {
+    let dir = mcp_serve_dir();
+    let mut pids = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return pids;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(stem) = name.strip_suffix(".json") else {
+            continue;
+        };
+        let Ok(pid) = stem.parse::<u32>() else {
+            continue;
+        };
+        if pid_alive(pid) {
+            pids.push(pid);
+        } else {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    pids
+}
+
+/// On Linux, find `vikram mcp serve` processes directly so a server started before pidfiles
+/// existed is still reported. Other platforms rely on the pidfile registry alone.
+#[cfg(target_os = "linux")]
+fn proc_serve_pids() -> Vec<u32> {
+    let mut pids = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return pids;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if cmdline_is_serve(&cmdline) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+#[cfg(not(target_os = "linux"))]
+fn proc_serve_pids() -> Vec<u32> {
+    Vec::new()
+}
+
+/// `/proc/<pid>/cmdline` is NUL-separated argv. A serve is `vikram mcp serve` — the binary's own
+/// name may be a path, so the check is on the argument tail, not argv[0].
+#[cfg(target_os = "linux")]
+fn cmdline_is_serve(cmdline: &[u8]) -> bool {
+    let args: Vec<&[u8]> = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .collect();
+    args.windows(2)
+        .any(|pair| pair[0] == b"mcp".as_slice() && pair[1] == b"serve".as_slice())
+        && args
+            .first()
+            .is_some_and(|arg| arg.ends_with(b"vikram") || arg.ends_with(b"vikram.exe"))
+}
+
+/// Whether a process exists. `kill(pid, 0)` is the portable unix check; EPERM still means it does.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// No cheap liveness probe off unix; a pidfile is reported as recorded but unverified.
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    true
 }
 
 fn config_command(action: ConfigAction, mut config: Config) -> std::process::ExitCode {
@@ -2011,6 +2522,16 @@ fn config_command(action: ConfigAction, mut config: Config) -> std::process::Exi
                 std::process::ExitCode::FAILURE
             }
         },
+        ConfigAction::SetToolPermission { tool, permission } => {
+            // Same write path as `vikram tools set-permission`; kept here for the old command.
+            match tools::set_permission(&tool, &permission) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("vikram: {err}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        }
         ConfigAction::Set { key, value } => {
             let parsed = match key.as_str() {
                 "model" => {
@@ -2333,6 +2854,72 @@ fn draft_of(
         order: changes.order.clone(),
         enabled,
     }
+}
+
+fn init(path: Option<PathBuf>) -> std::process::ExitCode {
+    let result = (|| -> Result<(), String> {
+        let target =
+            path.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        if target.exists() && !target.is_dir() {
+            return Err(format!("{} is not a directory", target.display()));
+        }
+        std::fs::create_dir_all(&target)
+            .map_err(|e| format!("create {}: {e}", target.display()))?;
+
+        let mut created: Vec<&str> = Vec::new();
+
+        let agents_path = target.join("AGENTS.md");
+        if !agents_path.exists() {
+            let body = "# AGENTS.md — Project Instructions\n\n\
+                        ## Overview\n\n\
+                        Describe this project for AI agents working in the repository.\n\n\
+                        ## Conventions\n\n\
+                        - Use existing patterns and module structure.\n\
+                        - Run `cargo fmt`, `cargo clippy`, and `cargo test` before finishing.\n";
+            std::fs::write(&agents_path, body)
+                .map_err(|e| format!("write {}: {e}", agents_path.display()))?;
+            created.push("AGENTS.md");
+        }
+
+        let vikram_dir = target.join(".vikram");
+        std::fs::create_dir_all(&vikram_dir)
+            .map_err(|e| format!("create {}: {e}", vikram_dir.display()))?;
+        let config_path = vikram_dir.join("config.json");
+        if !config_path.exists() {
+            let cfg = Config {
+                base_url: String::new(),
+                model: String::new(),
+                ..Config::default()
+            };
+            let body =
+                serde_json::to_string_pretty(&cfg).map_err(|e| format!("serialize config: {e}"))?;
+            std::fs::write(&config_path, body)
+                .map_err(|e| format!("write {}: {e}", config_path.display()))?;
+            created.push(".vikram/config.json");
+        }
+
+        let readme_path = target.join("README.md");
+        if !readme_path.exists() {
+            let name = target
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Project");
+            let body = format!("# {name}\n\nProject scaffolded by `vikram init`.\n");
+            std::fs::write(&readme_path, body)
+                .map_err(|e| format!("write {}: {e}", readme_path.display()))?;
+            created.push("README.md");
+        }
+
+        if created.is_empty() {
+            println!("nothing to create (all files already exist)");
+        } else {
+            for file in &created {
+                println!("created {file}");
+            }
+        }
+        Ok(())
+    })();
+    exit(result)
 }
 
 fn exit(result: Result<(), String>) -> std::process::ExitCode {

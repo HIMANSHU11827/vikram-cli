@@ -152,20 +152,98 @@ macro_rules! cmd_check_tool {
     };
 }
 
-cmd_check_tool!(TestRunTool, "test_run", "cargo test", "test_run", "Run a test command.");
-cmd_check_tool!(TestRunner, "test_run", "cargo test", "test_run", "Run a test command.");
-cmd_check_tool!(TestRunCommand, "test_run", "cargo test", "test_run", "Run a test command.");
-cmd_check_tool!(TestCommand, "test_run", "cargo test", "test_run", "Run a test command.");
-cmd_check_tool!(RunTests, "test_run", "cargo test", "test_run", "Run a test command.");
-cmd_check_tool!(RunTest, "test_run", "cargo test", "test_run", "Run a test command.");
+cmd_check_tool!(
+    TestRunTool,
+    "test_run",
+    "cargo test",
+    "test_run",
+    "Run a test command."
+);
+cmd_check_tool!(
+    TestRunner,
+    "test_run",
+    "cargo test",
+    "test_run",
+    "Run a test command."
+);
+cmd_check_tool!(
+    TestRunCommand,
+    "test_run",
+    "cargo test",
+    "test_run",
+    "Run a test command."
+);
+cmd_check_tool!(
+    TestCommand,
+    "test_run",
+    "cargo test",
+    "test_run",
+    "Run a test command."
+);
+cmd_check_tool!(
+    RunTests,
+    "test_run",
+    "cargo test",
+    "test_run",
+    "Run a test command."
+);
+cmd_check_tool!(
+    RunTest,
+    "test_run",
+    "cargo test",
+    "test_run",
+    "Run a test command."
+);
 
-cmd_check_tool!(BuildCheck, "build_check", "cargo build", "build_check", "Run a build command.");
-cmd_check_tool!(BuildCheckTool, "build_check", "cargo build", "build_check", "Run a build command.");
-cmd_check_tool!(BuildChecker, "build_check", "cargo build", "build_check", "Run a build command.");
-cmd_check_tool!(BuildValidation, "build_check", "cargo build", "build_check", "Run a build command.");
-cmd_check_tool!(BuildValidate, "build_check", "cargo build", "build_check", "Run a build command.");
-cmd_check_tool!(CheckBuild, "build_check", "cargo build", "build_check", "Run a build command.");
-cmd_check_tool!(BuildCommand, "build_check", "cargo build", "build_check", "Run a build command.");
+cmd_check_tool!(
+    BuildCheck,
+    "build_check",
+    "cargo build",
+    "build_check",
+    "Run a build command."
+);
+cmd_check_tool!(
+    BuildCheckTool,
+    "build_check",
+    "cargo build",
+    "build_check",
+    "Run a build command."
+);
+cmd_check_tool!(
+    BuildChecker,
+    "build_check",
+    "cargo build",
+    "build_check",
+    "Run a build command."
+);
+cmd_check_tool!(
+    BuildValidation,
+    "build_check",
+    "cargo build",
+    "build_check",
+    "Run a build command."
+);
+cmd_check_tool!(
+    BuildValidate,
+    "build_check",
+    "cargo build",
+    "build_check",
+    "Run a build command."
+);
+cmd_check_tool!(
+    CheckBuild,
+    "build_check",
+    "cargo build",
+    "build_check",
+    "Run a build command."
+);
+cmd_check_tool!(
+    BuildCommand,
+    "build_check",
+    "cargo build",
+    "build_check",
+    "Run a build command."
+);
 
 #[cfg(test)]
 mod cmd_check_tests {
@@ -219,7 +297,10 @@ mod cmd_check_tests {
             cancel: None,
         };
         let out = TestRunTool
-            .run(&json!({"command": "echo hello-test", "timeout_ms": 5000}), &ctx)
+            .run(
+                &json!({"command": "echo hello-test", "timeout_ms": 5000}),
+                &ctx,
+            )
             .unwrap();
         assert!(out.ok, "{}", out.content);
         assert!(out.content.contains("hello-test"), "{}", out.content);
@@ -239,7 +320,10 @@ mod cmd_check_tests {
             cancel: None,
         };
         let out = BuildCheck
-            .run(&json!({"command": "echo hello-build", "timeout_ms": 5000}), &ctx)
+            .run(
+                &json!({"command": "echo hello-build", "timeout_ms": 5000}),
+                &ctx,
+            )
             .unwrap();
         assert!(out.ok, "{}", out.content);
         assert!(out.content.contains("hello-build"), "{}", out.content);

@@ -53,6 +53,9 @@ const MAX_HELPER_OUTPUT: u64 = 8 * 1024 * 1024;
 ///
 /// `tesseract` (OCR) and `ydotool` (Wayland-friendly input) are optional in the same way as the
 /// rest: nothing here installs them, and a missing one is reported as an install hint.
+///
+/// The install commands reported for these helpers are platform-aware: `apt` on Linux, `brew` on
+/// macOS, and `choco`/`scoop` (or manual installation) on Windows. See [`install_hint`].
 pub const HELPERS: [&str; 7] = [
     "xdotool",
     "scrot",
@@ -63,8 +66,37 @@ pub const HELPERS: [&str; 7] = [
     "ydotool",
 ];
 
-/// The package that provides each helper.
-fn install_hint(name: &str) -> &'static str {
+/// The command (or instructions) for installing a helper on the current target platform.
+///
+/// Returns a short, copy-pasteable hint. The package manager is chosen from `target_os`: `apt` on
+/// Linux, `brew` on macOS, and `choco`/`scoop` (or "install manually" where no package exists) on
+/// Windows. Unknown helpers get a generic PATH hint on every platform.
+pub fn install_hint(name: &str) -> &'static str {
+    if cfg!(target_os = "macos") {
+        return match name {
+            "xdotool" => "brew install xdotool",
+            "scrot" => "brew install scrot",
+            "import" => "brew install imagemagick",
+            "grim" => "brew install grim",
+            "wmctrl" => "brew install wmctrl",
+            "tesseract" => "brew install tesseract",
+            "ydotool" => "brew install ydotool",
+            _ => "install it and keep it on PATH",
+        };
+    }
+    if cfg!(target_os = "windows") {
+        return match name {
+            "import" => {
+                "choco install imagemagick (or scoop install imagemagick), or install manually"
+            }
+            "tesseract" => {
+                "choco install tesseract (or scoop install tesseract), or install manually"
+            }
+            "xdotool" | "scrot" | "grim" | "wmctrl" | "ydotool" => "install manually",
+            _ => "install it and keep it on PATH",
+        };
+    }
+    // Linux (and other Unix targets): the apt-based hints this module has always used.
     match name {
         "xdotool" => "apt install xdotool",
         "scrot" => "apt install scrot",
@@ -341,14 +373,20 @@ fn run_stdout_only(program: &str, args: &[&str], timeout: Duration) -> Result<St
 }
 
 fn no_screenshot_helper() -> String {
-    "no screenshot helper found; install one: apt install scrot (X11), apt install grim (Wayland) \
-     or apt install imagemagick"
-        .to_string()
+    format!(
+        "no screenshot helper found; install one: {} (X11), {} (Wayland) or {}",
+        install_hint("scrot"),
+        install_hint("grim"),
+        install_hint("import")
+    )
 }
 
 fn no_window_helper() -> String {
-    "no window listing helper found; install one: apt install wmctrl or apt install xdotool"
-        .to_string()
+    format!(
+        "no window listing helper found; install one: {} or {}",
+        install_hint("wmctrl"),
+        install_hint("xdotool")
+    )
 }
 
 /// Capture the whole screen to `path`.
@@ -557,8 +595,10 @@ pub fn scroll(direction: &str, amount: u32) -> Result<String, String> {
     }
     if which("xdotool").is_none() {
         return Err(if prefer_ydotool() {
-            "scrolling needs xdotool: ydotool has no wheel event; install it: apt install xdotool"
-                .to_string()
+            format!(
+                "scrolling needs xdotool: ydotool has no wheel event; install it: {}",
+                install_hint("xdotool")
+            )
         } else {
             missing_tool_message("xdotool")
         });
@@ -1500,6 +1540,42 @@ mod tests {
         assert!(matches!(err, VikramError::ProviderRejected(_)), "{err:?}");
         // `read_screen` needs no arguments, so its permission shape never rejects.
         assert!(ReadScreen.permission(&json!({})).is_ok());
+    }
+
+    #[test]
+    fn install_hint_is_platform_aware() {
+        // The hint depends on the target OS; on this machine (Linux) it stays apt-based.
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(install_hint("xdotool"), "apt install xdotool");
+            assert_eq!(install_hint("scrot"), "apt install scrot");
+            assert_eq!(install_hint("import"), "apt install imagemagick");
+            assert_eq!(install_hint("grim"), "apt install grim");
+            assert_eq!(install_hint("wmctrl"), "apt install wmctrl");
+            assert_eq!(install_hint("tesseract"), "apt install tesseract-ocr");
+            assert_eq!(install_hint("ydotool"), "apt install ydotool");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(install_hint("xdotool"), "brew install xdotool");
+            assert_eq!(install_hint("scrot"), "brew install scrot");
+            assert_eq!(install_hint("import"), "brew install imagemagick");
+            assert_eq!(install_hint("grim"), "brew install grim");
+            assert_eq!(install_hint("wmctrl"), "brew install wmctrl");
+            assert_eq!(install_hint("tesseract"), "brew install tesseract");
+            assert_eq!(install_hint("ydotool"), "brew install ydotool");
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert!(install_hint("import").contains("choco install imagemagick"));
+            assert!(install_hint("tesseract").contains("choco install tesseract"));
+            for helper in ["xdotool", "scrot", "grim", "wmctrl", "ydotool"] {
+                assert_eq!(install_hint(helper), "install manually");
+            }
+        }
+        // Unknown helpers get the generic PATH hint on every platform.
+        assert_eq!(install_hint("mystery"), "install it and keep it on PATH");
+        assert_eq!(install_hint(""), "install it and keep it on PATH");
     }
 
     #[test]

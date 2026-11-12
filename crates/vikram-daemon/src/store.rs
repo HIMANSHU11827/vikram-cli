@@ -149,7 +149,7 @@ pub struct Job {
     pub timeout_ms: Option<Millis>,
     pub retries: u32,
     pub priority: i64,
-    /// How a team job runs its members: `parallel` or `sequential`.
+    /// How a hive job runs its members: `parallel` or `sequential`.
     pub order: String,
     pub enabled: bool,
     pub created_ms: Millis,
@@ -745,7 +745,7 @@ const JOB_COLUMNS: &str = "id, name, description, schedule, timezone, mode, payl
 /// stable order, or `history` would show a different list every time it was asked.
 const RUN_ORDER: &str = "started_ms DESC, slot_ms DESC, attempt DESC";
 
-/// The state key that asks one member of one running team to stop. It lives in the database
+/// The state key that asks one member of one running hive to stop. It lives in the database
 /// because the CLI that asks and the daemon that honours it are different processes.
 pub fn member_stop_key(run: &str, agent: &str) -> String {
     format!("member.{run}.{agent}")
@@ -851,9 +851,9 @@ mod tests {
     #[test]
     fn the_order_a_team_runs_in_is_kept_with_the_job() {
         let store = store();
-        let mut team = job("deploy", "every 1h");
-        team.order = "sequential".into();
-        store.insert_job(&team).unwrap();
+        let mut hive = job("deploy", "every 1h");
+        hive.order = "sequential".into();
+        store.insert_job(&hive).unwrap();
         assert_eq!(
             store.get_job("job_deploy").unwrap().unwrap().order,
             "sequential"

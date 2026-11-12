@@ -1,4 +1,4 @@
-//! Background activity: agents and the tasks they run.
+//! Background activity: bots and the tasks they run.
 //!
 //! Both are owned by the runtime, never by a view. An interface may hide the panel or switch
 //! sessions; the `CancellationToken` here is only cancelled by an explicit control action.
@@ -7,17 +7,17 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use vikram_contracts::CancellationToken;
-use vikram_contracts::{AgentId, SessionId};
-use vikram_store::AgentRow;
+use vikram_contracts::{BotId, SessionId};
+use vikram_store::BotRow;
 
 use crate::types::{
-    ActivityEvent, AgentProfile, AgentSnapshot, AgentState, BackgroundTask, TaskState, now_ms,
+    ActivityEvent, BackgroundTask, BotProfile, BotSnapshot, BotState, TaskState, now_ms,
 };
 
 #[derive(Debug)]
-pub struct ManagedAgent {
-    pub profile: AgentProfile,
-    pub state: Mutex<AgentState>,
+pub struct ManagedBot {
+    pub profile: BotProfile,
+    pub state: Mutex<BotState>,
     pub current_task: Mutex<Option<String>>,
     pub progress: Mutex<Option<f32>>,
     pub session: Mutex<Option<SessionId>>,
@@ -29,11 +29,11 @@ pub struct ManagedAgent {
     pub activities: Mutex<Vec<ActivityEvent>>,
 }
 
-impl ManagedAgent {
-    pub fn from_profile(profile: AgentProfile) -> Self {
+impl ManagedBot {
+    pub fn from_profile(profile: BotProfile) -> Self {
         Self {
             profile,
-            state: Mutex::new(AgentState::Idle),
+            state: Mutex::new(BotState::Idle),
             current_task: Mutex::new(None),
             progress: Mutex::new(None),
             session: Mutex::new(None),
@@ -44,14 +44,14 @@ impl ManagedAgent {
         }
     }
 
-    pub fn set_state(&self, state: AgentState) {
+    pub fn set_state(&self, state: BotState) {
         *self.state.lock().unwrap_or_else(|e| {
             eprintln!("vikram: agent agent state mutex poisoned; recovering");
             e.into_inner()
         }) = state;
     }
 
-    pub fn state(&self) -> AgentState {
+    pub fn state(&self) -> BotState {
         *self.state.lock().unwrap_or_else(|e| {
             eprintln!("vikram: agent agent state mutex poisoned; recovering");
             e.into_inner()
@@ -89,8 +89,8 @@ impl ManagedAgent {
         })
     }
 
-    pub fn snapshot(&self) -> AgentSnapshot {
-        AgentSnapshot {
+    pub fn snapshot(&self) -> BotSnapshot {
+        BotSnapshot {
             profile: self.profile.clone(),
             state: self.state(),
             current_task: self
@@ -142,58 +142,58 @@ impl ManagedAgent {
 }
 
 #[derive(Debug, Default)]
-pub struct AgentManager {
-    agents: Mutex<Vec<Arc<ManagedAgent>>>,
+pub struct BotManager {
+    bots: Mutex<Vec<Arc<ManagedBot>>>,
 }
 
-impl AgentManager {
+impl BotManager {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn install(&self, agents: Vec<Arc<ManagedAgent>>) {
-        *self.agents.lock().unwrap_or_else(|e| {
-            eprintln!("vikram: agent agents lock mutex poisoned; recovering");
+    pub fn install(&self, bots: Vec<Arc<ManagedBot>>) {
+        *self.bots.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: agent bots lock mutex poisoned; recovering");
             e.into_inner()
-        }) = agents;
+        }) = bots;
     }
 
-    pub fn list(&self) -> Vec<Arc<ManagedAgent>> {
-        self.agents
+    pub fn list(&self) -> Vec<Arc<ManagedBot>> {
+        self.bots
             .lock()
             .unwrap_or_else(|e| {
-                eprintln!("vikram: agent agents lock mutex poisoned; recovering");
+                eprintln!("vikram: agent bots lock mutex poisoned; recovering");
                 e.into_inner()
             })
             .clone()
     }
 
-    pub fn snapshots(&self) -> Vec<AgentSnapshot> {
+    pub fn snapshots(&self) -> Vec<BotSnapshot> {
         self.list().iter().map(|a| a.snapshot()).collect()
     }
 
-    pub fn get(&self, id: &AgentId) -> Option<Arc<ManagedAgent>> {
+    pub fn get(&self, id: &BotId) -> Option<Arc<ManagedBot>> {
         self.list().into_iter().find(|a| a.profile.id == *id)
     }
 
-    pub fn add(&self, agent: Arc<ManagedAgent>) {
-        self.agents
+    pub fn add(&self, agent: Arc<ManagedBot>) {
+        self.bots
             .lock()
             .unwrap_or_else(|e| {
-                eprintln!("vikram: agent agents lock mutex poisoned; recovering");
+                eprintln!("vikram: agent bots lock mutex poisoned; recovering");
                 e.into_inner()
             })
             .push(agent);
     }
 
-    pub fn remove(&self, id: &AgentId) -> bool {
-        let mut agents = self.agents.lock().unwrap_or_else(|e| {
-            eprintln!("vikram: agent agents lock mutex poisoned; recovering");
+    pub fn remove(&self, id: &BotId) -> bool {
+        let mut bots = self.bots.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: agent bots lock mutex poisoned; recovering");
             e.into_inner()
         });
-        let before = agents.len();
-        agents.retain(|a| a.profile.id != *id);
-        agents.len() != before
+        let before = bots.len();
+        bots.retain(|a| a.profile.id != *id);
+        bots.len() != before
     }
 
     pub fn active_count(&self) -> usize {
@@ -201,8 +201,8 @@ impl AgentManager {
     }
 }
 
-impl From<AgentRow> for AgentProfile {
-    fn from(row: AgentRow) -> Self {
+impl From<BotRow> for BotProfile {
+    fn from(row: BotRow) -> Self {
         Self {
             id: row.id,
             name: row.name,
@@ -277,23 +277,23 @@ mod tests {
 
     #[test]
     fn agents_start_idle_and_report_their_own_state() {
-        let agent = ManagedAgent::from_profile(AgentProfile {
-            id: AgentId::generate(),
+        let agent = ManagedBot::from_profile(BotProfile {
+            id: BotId::generate(),
             name: "Rudra".into(),
             role: "Implementer".into(),
             description: String::new(),
             icon: None,
             created_ms: 0,
         });
-        assert_eq!(agent.state(), AgentState::Idle);
-        agent.set_state(AgentState::Running);
-        assert_eq!(agent.snapshot().state, AgentState::Running);
+        assert_eq!(agent.state(), BotState::Idle);
+        agent.set_state(BotState::Running);
+        assert_eq!(agent.snapshot().state, BotState::Running);
     }
 
     #[test]
     fn progress_is_only_present_when_the_runtime_sets_it() {
-        let agent = ManagedAgent::from_profile(AgentProfile {
-            id: AgentId::generate(),
+        let agent = ManagedBot::from_profile(BotProfile {
+            id: BotId::generate(),
             name: "Karma".into(),
             role: "Reviewer".into(),
             description: String::new(),

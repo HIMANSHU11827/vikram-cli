@@ -10,10 +10,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use std::sync::Arc;
-use vikram_contracts::{AgentId, Block, Message, PermissionMode, Role, SessionId};
+use vikram_contracts::{Block, BotId, Message, PermissionMode, Role, SessionId};
 use vikram_runtime::config::Config;
 use vikram_runtime::types::{RuntimeEvent, RuntimeStatus, TurnState};
-use vikram_runtime::{AgentControl, Runtime, RuntimeHandle};
+use vikram_runtime::{BotControl, Runtime, RuntimeHandle};
 
 /// How much of a run's own words are kept. A job that prints a gigabyte must not fill the database.
 const OUTPUT_CAP: usize = 64 * 1024;
@@ -269,19 +269,19 @@ impl DelegateRequest {
     }
 }
 
-/// Asked, between events, whether one member of a running team should be stopped. The daemon
+/// Asked, between events, whether one member of a running hive should be stopped. The daemon
 /// answers from the scheduler database, so the request survives the process boundary that
 /// separates `vikram jobs cancel` from the runtime doing the work.
 pub type StopProbe = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// A job that runs as a team: one delegated turn per member, all at once.
-pub struct TeamRequest {
-    pub team: String,
+pub struct HiveRosterRequest {
+    pub hive: String,
     pub prompt: String,
     pub title: Option<String>,
     pub model: Option<String>,
     pub unattended: bool,
-    pub order: TeamOrder,
+    pub order: HiveRosterOrder,
     pub stop: Option<StopProbe>,
 }
 
@@ -291,44 +291,44 @@ pub struct TeamRequest {
 /// team whose members share something outside vikram — a rate limit, a single test database, a
 /// deploy lock — where two turns at once would interfere.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum TeamOrder {
+pub enum HiveRosterOrder {
     #[default]
     Parallel,
     Sequential,
 }
 
-impl TeamOrder {
+impl HiveRosterOrder {
     pub fn as_str(self) -> &'static str {
         match self {
-            TeamOrder::Parallel => "parallel",
-            TeamOrder::Sequential => "sequential",
+            HiveRosterOrder::Parallel => "parallel",
+            HiveRosterOrder::Sequential => "sequential",
         }
     }
 
     pub fn parse(text: &str) -> Option<Self> {
         match text.trim().to_ascii_lowercase().as_str() {
-            "parallel" | "together" | "at-once" | "all" => Some(TeamOrder::Parallel),
-            "sequential" | "serial" | "one" | "in-order" => Some(TeamOrder::Sequential),
+            "parallel" | "together" | "at-once" | "all" => Some(HiveRosterOrder::Parallel),
+            "sequential" | "serial" | "one" | "in-order" => Some(HiveRosterOrder::Sequential),
             _ => None,
         }
     }
 }
 
-impl std::fmt::Display for TeamOrder {
+impl std::fmt::Display for HiveRosterOrder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-impl TeamRequest {
-    pub fn new(team: impl Into<String>, prompt: impl Into<String>) -> Self {
+impl HiveRosterRequest {
+    pub fn new(hive: impl Into<String>, prompt: impl Into<String>) -> Self {
         Self {
-            team: team.into(),
+            hive: hive.into(),
             prompt: prompt.into(),
             title: None,
             model: None,
             unattended: true,
-            order: TeamOrder::Parallel,
+            order: HiveRosterOrder::Parallel,
             stop: None,
         }
     }
@@ -339,7 +339,7 @@ impl TeamRequest {
         self
     }
 
-    pub fn in_order(mut self, order: TeamOrder) -> Self {
+    pub fn in_order(mut self, order: HiveRosterOrder) -> Self {
         self.order = order;
         self
     }
@@ -362,7 +362,7 @@ impl TeamRequest {
 
 /// How many members one scheduled team run will start. A schedule is unattended: eight parallel
 /// model turns is already a lot of somebody's credit to spend without being asked.
-const MAX_TEAM_MEMBERS: usize = 8;
+const MAX_HIVE_ROSTER_MEMBERS: usize = 8;
 
 /// Run the job as the bot it was assigned to.
 pub async fn run_delegate(
@@ -376,7 +376,7 @@ pub async fn run_delegate(
         .clone()
         .unwrap_or_else(|| title_from(&request.prompt));
     let work = async move {
-        let agent = AgentId::new(&request.agent);
+        let agent = BotId::new(&request.agent);
         let fanout = delegated(
             config,
             vec![agent],
@@ -384,7 +384,7 @@ pub async fn run_delegate(
             title,
             request.model,
             request.unattended,
-            TeamOrder::Parallel,
+            HiveRosterOrder::Parallel,
             None,
         )
         .await;
@@ -406,8 +406,12 @@ pub async fn run_delegate(
 }
 
 /// Run the job as every member of a team, in parallel, and report each one separately.
-pub async fn run_team(config: Config, request: TeamRequest, timeout: Duration) -> RunOutcome {
-    let members = match team_members(&request.team) {
+pub async fn run_hive_roster(
+    config: Config,
+    request: HiveRosterRequest,
+    timeout: Duration,
+) -> RunOutcome {
+    let members = match hive_roster_members(&request.hive) {
         Ok(members) => members,
         Err(err) => return RunOutcome::failed(err),
     };
@@ -427,7 +431,7 @@ pub async fn run_team(config: Config, request: TeamRequest, timeout: Duration) -
             request.stop,
         )
         .await;
-        team_report(fanout)
+        hive_roster_report(fanout)
     };
 
     match tokio::time::timeout(timeout, work).await {
@@ -440,32 +444,35 @@ pub async fn run_team(config: Config, request: TeamRequest, timeout: Duration) -
 }
 
 /// The members of a saved team, or a reason a scheduled run cannot use it.
-fn team_members(name: &str) -> Result<Vec<AgentId>, String> {
-    members_of(&vikram_runtime::teams::TeamManager::load(), name)
+fn hive_roster_members(name: &str) -> Result<Vec<BotId>, String> {
+    members_of(
+        &vikram_runtime::hive_roster::HiveRosterManager::load(),
+        name,
+    )
 }
 
 fn members_of(
-    teams: &vikram_runtime::teams::TeamManager,
+    rosters: &vikram_runtime::hive_roster::HiveRosterManager,
     name: &str,
-) -> Result<Vec<AgentId>, String> {
-    let Some(team) = teams.get(name) else {
-        return Err(format!("no team called `{name}`"));
+) -> Result<Vec<BotId>, String> {
+    let Some(roster) = rosters.get(name) else {
+        return Err(format!("no hive called `{name}`"));
     };
-    if team.members.is_empty() {
-        return Err(format!("team `{name}` has no members"));
+    if roster.members.is_empty() {
+        return Err(format!("hive `{name}` has no members"));
     }
-    if team.members.len() > MAX_TEAM_MEMBERS {
+    if roster.members.len() > MAX_HIVE_ROSTER_MEMBERS {
         return Err(format!(
-            "team `{name}` has {} members; a scheduled team run stops at {MAX_TEAM_MEMBERS}",
-            team.members.len()
+            "hive `{name}` has {} members; a scheduled hive run stops at {MAX_HIVE_ROSTER_MEMBERS}",
+            roster.members.len()
         ));
     }
-    Ok(team.members)
+    Ok(roster.members)
 }
 
 struct Fanout {
     parent: Option<String>,
-    results: Vec<(AgentId, RunOutcome)>,
+    results: Vec<(BotId, RunOutcome)>,
 }
 
 /// Start one delegated turn per agent inside a single runtime and wait for all of them.
@@ -476,12 +483,12 @@ struct Fanout {
 #[allow(clippy::too_many_arguments)]
 async fn delegated(
     config: Config,
-    agents: Vec<AgentId>,
+    agents: Vec<BotId>,
     prompt: String,
     title: String,
     model: Option<String>,
     unattended: bool,
-    order: TeamOrder,
+    order: HiveRosterOrder,
     stop: Option<StopProbe>,
 ) -> Fanout {
     let mut fanout = Fanout {
@@ -554,7 +561,7 @@ async fn delegated(
     let mut events = handle.events();
     let mut denied = 0_usize;
     match order {
-        TeamOrder::Parallel => {
+        HiveRosterOrder::Parallel => {
             let started = spawn_into(&handle, &agents, &prompt, &parent, &mut fanout.results);
             let children = children_of(&handle, &started, &mut fanout.results);
             let (finished, failure, stopped) =
@@ -573,7 +580,7 @@ async fn delegated(
                 fanout.results.push((agent, outcome));
             }
         }
-        TeamOrder::Sequential => {
+        HiveRosterOrder::Sequential => {
             // One member at a time: the next turn does not start until the previous one has
             // finished, so a team sharing a rate limit or a single test database cannot collide.
             // Each member still gets its own session; sequential means ordered, not shared.
@@ -629,11 +636,11 @@ async fn delegated(
 /// Start every named agent on the same request, recording the ones that would not start.
 fn spawn_into(
     handle: &RuntimeHandle,
-    agents: &[AgentId],
+    agents: &[BotId],
     prompt: &str,
     parent: &SessionId,
-    results: &mut Vec<(AgentId, RunOutcome)>,
-) -> Vec<AgentId> {
+    results: &mut Vec<(BotId, RunOutcome)>,
+) -> Vec<BotId> {
     let mut started = Vec::new();
     for agent in agents {
         match handle.spawn_agent(agent.clone(), prompt.to_string(), parent.clone()) {
@@ -652,11 +659,11 @@ fn spawn_into(
 /// rather than silently dropped from the report.
 fn children_of(
     handle: &RuntimeHandle,
-    started: &[AgentId],
-    results: &mut Vec<(AgentId, RunOutcome)>,
-) -> Vec<(SessionId, AgentId)> {
-    let mut children: Vec<(SessionId, AgentId)> = Vec::new();
-    for snapshot in handle.agent_snapshots() {
+    started: &[BotId],
+    results: &mut Vec<(BotId, RunOutcome)>,
+) -> Vec<(SessionId, BotId)> {
+    let mut children: Vec<(SessionId, BotId)> = Vec::new();
+    for snapshot in handle.bot_snapshots() {
         if let (Some(session), true) = (
             snapshot.session.clone(),
             started.contains(&snapshot.profile.id),
@@ -664,7 +671,7 @@ fn children_of(
             children.push((session, snapshot.profile.id.clone()));
         }
     }
-    let missing: Vec<AgentId> = started
+    let missing: Vec<BotId> = started
         .iter()
         .filter(|agent| !children.iter().any(|(_, child)| child == *agent))
         .cloned()
@@ -683,13 +690,13 @@ fn children_of(
 async fn wait_for(
     events: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
     handle: &RuntimeHandle,
-    children: &[(SessionId, AgentId)],
+    children: &[(SessionId, BotId)],
     denied: &mut usize,
     stop: Option<&StopProbe>,
-) -> (Vec<(SessionId, TurnState)>, Option<String>, Vec<AgentId>) {
+) -> (Vec<(SessionId, TurnState)>, Option<String>, Vec<BotId>) {
     let mut finished: Vec<(SessionId, TurnState)> = Vec::new();
     let mut failure: Option<String> = None;
-    let mut stopped: Vec<AgentId> = Vec::new();
+    let mut stopped: Vec<BotId> = Vec::new();
     while finished.len() < children.len() {
         // Wait for an event, but not forever: a stop request arrives through the database, not
         // through the event stream, so the loop has to surface every so often to look.
@@ -703,7 +710,7 @@ async fn wait_for(
                         }
                         // The runtime owns the turn; asking it to stop is the only way to end one
                         // member without ending the team.
-                        let _ = handle.control_agent(agent, AgentControl::Stop);
+                        let _ = handle.control_bot(agent, BotControl::Stop);
                         stopped.push(agent.clone());
                     }
                 }
@@ -788,7 +795,7 @@ fn outcome_of(
 }
 
 /// Join a fan-out into one report a notification can carry.
-fn team_report(fanout: Fanout) -> RunOutcome {
+fn hive_roster_report(fanout: Fanout) -> RunOutcome {
     let parent = fanout.parent.clone();
     let total = fanout.results.len();
     let mut lines = Vec::new();
@@ -1030,72 +1037,87 @@ mod tests {
     #[test]
     fn a_team_is_refused_for_the_reasons_an_unattended_run_cannot_use_it() {
         let dir = tempfile::tempdir().unwrap();
-        let teams = vikram_runtime::teams::TeamManager::with_path(dir.path().join("teams.json"));
-        assert!(members_of(&teams, "ghost").unwrap_err().contains("no team"));
-
-        teams.create("empty").unwrap();
+        let rosters = vikram_runtime::hive_roster::HiveRosterManager::with_path(
+            dir.path().join("hive-roster.json"),
+        );
         assert!(
-            members_of(&teams, "empty")
+            members_of(&rosters, "ghost")
+                .unwrap_err()
+                .contains("no hive")
+        );
+
+        rosters.create("empty").unwrap();
+        assert!(
+            members_of(&rosters, "empty")
                 .unwrap_err()
                 .contains("no members")
         );
 
-        teams.create("crew").unwrap();
-        teams.add_member("crew", AgentId::new("arun")).unwrap();
-        teams.add_member("crew", AgentId::new("mira")).unwrap();
-        assert_eq!(members_of(&teams, "crew").unwrap().len(), 2);
+        rosters.create("crew").unwrap();
+        rosters.add_member("crew", BotId::new("arun")).unwrap();
+        rosters.add_member("crew", BotId::new("mira")).unwrap();
+        assert_eq!(members_of(&rosters, "crew").unwrap().len(), 2);
 
-        teams.create("crowd").unwrap();
-        for index in 0..=MAX_TEAM_MEMBERS {
-            teams
-                .add_member("crowd", AgentId::new(format!("bot{index}")))
+        rosters.create("crowd").unwrap();
+        for index in 0..=MAX_HIVE_ROSTER_MEMBERS {
+            rosters
+                .add_member("crowd", BotId::new(format!("bot{index}")))
                 .unwrap();
         }
         assert!(
-            members_of(&teams, "crowd")
+            members_of(&rosters, "crowd")
                 .unwrap_err()
                 .contains("stops at"),
-            "a schedule must not start eleven model turns because somebody typed a big team"
+            "a schedule must not start eleven model turns because somebody typed a big hive"
         );
     }
 
     #[test]
     fn an_order_is_read_the_way_an_operator_would_write_it() {
-        assert_eq!(TeamOrder::parse("parallel"), Some(TeamOrder::Parallel));
-        assert_eq!(TeamOrder::parse("SEQUENTIAL"), Some(TeamOrder::Sequential));
-        assert_eq!(TeamOrder::parse("one"), Some(TeamOrder::Sequential));
-        assert_eq!(TeamOrder::parse(""), None);
-        assert_eq!(TeamOrder::parse("sideways"), None);
-        assert_eq!(TeamOrder::Sequential.to_string(), "sequential");
-        assert_eq!(TeamOrder::default(), TeamOrder::Parallel);
+        assert_eq!(
+            HiveRosterOrder::parse("parallel"),
+            Some(HiveRosterOrder::Parallel)
+        );
+        assert_eq!(
+            HiveRosterOrder::parse("SEQUENTIAL"),
+            Some(HiveRosterOrder::Sequential)
+        );
+        assert_eq!(
+            HiveRosterOrder::parse("one"),
+            Some(HiveRosterOrder::Sequential)
+        );
+        assert_eq!(HiveRosterOrder::parse(""), None);
+        assert_eq!(HiveRosterOrder::parse("sideways"), None);
+        assert_eq!(HiveRosterOrder::Sequential.to_string(), "sequential");
+        assert_eq!(HiveRosterOrder::default(), HiveRosterOrder::Parallel);
     }
 
     #[test]
-    fn a_team_report_names_who_answered_and_who_did_not() {
+    fn a_hive_roster_report_names_who_answered_and_who_did_not() {
         let finished = Fanout {
             parent: Some("ses_1".to_string()),
             results: vec![
                 (
-                    AgentId::new("arun"),
+                    BotId::new("arun"),
                     RunOutcome::finished("port 80 is up", Some("ses_a".to_string())),
                 ),
                 (
-                    AgentId::new("mira"),
+                    BotId::new("mira"),
                     RunOutcome::failed("timed out after 10m"),
                 ),
             ],
         };
-        let outcome = team_report(finished);
+        let outcome = hive_roster_report(finished);
         assert!(!outcome.ok);
         assert_eq!(outcome.session.as_deref(), Some("ses_1"));
         assert!(outcome.output.contains("arun: port 80 is up"));
         assert!(outcome.output.contains("mira: failed — timed out"));
         assert!(outcome.error.unwrap().contains("mira"));
 
-        let clean = team_report(Fanout {
+        let clean = hive_roster_report(Fanout {
             parent: Some("ses_1".to_string()),
             results: vec![(
-                AgentId::new("arun"),
+                BotId::new("arun"),
                 RunOutcome::finished("all clear", Some("ses_a".to_string())),
             )],
         });

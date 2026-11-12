@@ -5,6 +5,7 @@
 //! session switch can never cancel work the runtime is doing.
 
 pub mod app;
+pub mod clipboard;
 pub mod commands;
 pub mod editor;
 pub mod input;

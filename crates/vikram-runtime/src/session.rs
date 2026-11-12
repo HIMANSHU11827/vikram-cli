@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use vikram_contracts::{AgentId, Message, ProjectId, SessionId};
+use vikram_contracts::{BotId, Message, ProjectId, SessionId};
 use vikram_contracts::{CancellationToken, TokenMeter};
 use vikram_store::{SessionRow, TITLE_MANUAL};
 
@@ -53,7 +53,7 @@ pub struct SessionRuntime {
     pub queue: Mutex<VecDeque<String>>,
     /// A pending steer instruction injected at a safe point during a running turn.
     pub steer: Mutex<Option<String>>,
-    pub agent: Mutex<Option<AgentId>>,
+    pub bot: Mutex<Option<BotId>>,
     pub created_ms: u64,
     pub updated_ms: AtomicU64,
     /// Set when a turn starts; cleared when it finishes. Used for the elapsed-time metric.
@@ -103,7 +103,7 @@ impl SessionRuntime {
             paused: Mutex::new(false),
             queue: Mutex::new(VecDeque::new()),
             steer: Mutex::new(None),
-            agent: Mutex::new(row.agent),
+            bot: Mutex::new(row.bot),
             created_ms: row.created_ms,
             updated_ms: AtomicU64::new(row.updated_ms),
             turn_started_ms: Mutex::new(None),
@@ -539,6 +539,93 @@ impl SessionRuntime {
             .len()
     }
 
+    /// Every queued follow-up in run order, without consuming anything.
+    pub fn queue_items(&self) -> Vec<String> {
+        self.queue
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session queue lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Rewrite one queued follow-up. Returns false when the index is gone.
+    pub fn update_queue(&self, index: usize, text: String) -> bool {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session queue lock mutex poisoned; recovering");
+            e.into_inner()
+        });
+        match queue.get_mut(index) {
+            Some(slot) => {
+                *slot = text;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Drop one queued follow-up and hand it back, if the index was real.
+    pub fn remove_queue(&self, index: usize) -> Option<String> {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session queue lock mutex poisoned; recovering");
+            e.into_inner()
+        });
+        if index < queue.len() {
+            queue.remove(index)
+        } else {
+            None
+        }
+    }
+
+    /// Reposition a queued follow-up. `to` is clamped into range; returns false for a bad `from`.
+    pub fn move_queue(&self, from: usize, to: usize) -> bool {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session queue lock mutex poisoned; recovering");
+            e.into_inner()
+        });
+        if from >= queue.len() {
+            return false;
+        }
+        let to = to.min(queue.len() - 1);
+        if let Some(text) = queue.remove(from) {
+            queue.insert(to, text);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drop a pending steer without running it.
+    pub fn clear_steer(&self) {
+        *self.steer.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session steer lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = None;
+    }
+
+    /// Demote a pending steer to an ordinary queued follow-up.
+    pub fn steer_to_queue(&self) {
+        if let Some(text) = self.take_steer() {
+            self.enqueue(text);
+        }
+    }
+
+    /// Promote one queued follow-up to the pending steer. A steer already waiting drops back into
+    /// the queue so nothing is lost.
+    pub fn queue_to_steer(&self, index: usize) -> bool {
+        let Some(text) = self.remove_queue(index) else {
+            return false;
+        };
+        if let Some(old) = self.take_steer() {
+            self.enqueue(old);
+        }
+        self.steer(text);
+        true
+    }
+
     /// Set a steer instruction to be incorporated at the next safe point.
     pub fn steer(&self, text: String) {
         *self.steer.lock().unwrap_or_else(|e| {
@@ -568,16 +655,39 @@ impl SessionRuntime {
             .is_some()
     }
 
-    pub fn set_agent(&self, agent: Option<AgentId>, now_ms: u64) {
-        *self.agent.lock().unwrap_or_else(|e| {
-            eprintln!("vikram: session agent lock mutex poisoned; recovering");
+    /// The pending steer instruction's text, if one is waiting.
+    pub fn pending_steer(&self) -> Option<String> {
+        self.steer
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session steer lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()
+    }
+
+    /// The newest queued follow-up, without consuming it.
+    pub fn queue_back(&self) -> Option<String> {
+        self.queue
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session queue lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .back()
+            .cloned()
+    }
+
+    pub fn set_bot(&self, bot: Option<BotId>, now_ms: u64) {
+        *self.bot.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session bot lock mutex poisoned; recovering");
             e.into_inner()
-        }) = agent;
+        }) = bot;
         self.updated_ms.store(now_ms, Ordering::Relaxed);
     }
 
-    pub fn agent(&self) -> Option<AgentId> {
-        self.agent
+    pub fn bot(&self) -> Option<BotId> {
+        self.bot
             .lock()
             .unwrap_or_else(|e| {
                 eprintln!("vikram: session agent lock mutex poisoned; recovering");
@@ -612,13 +722,13 @@ impl SessionRuntime {
     }
 
     pub fn begin_turn(&self, now_ms: u64) {
-        let mut cancel = self.cancel.lock().unwrap_or_else(|e| {
+        let cancel = self.cancel.lock().unwrap_or_else(|e| {
             eprintln!("vikram: session cancel lock mutex poisoned; recovering");
             e.into_inner()
         });
-        if cancel.is_cancelled() {
-            *cancel = CancellationToken::new();
-        }
+        // Cleared in place, not replaced: the turn snapshots this token before calling
+        // `begin_turn`, and a fresh token would leave that clone cancelled for the whole turn.
+        cancel.reset();
         *self.turn_started_ms.lock().unwrap_or_else(|e| {
             eprintln!("vikram: session started lock mutex poisoned; recovering");
             e.into_inner()
@@ -653,8 +763,11 @@ impl SessionRuntime {
             tokens: self.token_snapshot(),
             created_ms: self.created_ms,
             updated_ms: self.updated_ms.load(Ordering::Relaxed),
-            agent: self.agent(),
+            bot: self.bot(),
             queued: self.queue_len(),
+            queue: self.queue_items(),
+            steer_text: self.pending_steer(),
+            queue_text: self.queue_back(),
             project_id: self.project_id(),
             status: self.status(),
             title_source: self.title_source(),
@@ -674,7 +787,7 @@ mod tests {
             title: "Session 1".into(),
             cwd: "/work".into(),
             model: None,
-            agent: None,
+            bot: None,
             created_ms: 1,
             updated_ms: 1,
             status: "active".into(),
@@ -706,12 +819,56 @@ mod tests {
     }
 
     #[test]
+    fn pending_messages_edit_delete_move_and_flip() {
+        let s = session();
+        s.enqueue("first".into());
+        s.enqueue("second".into());
+        s.enqueue("third".into());
+        s.steer("now".into());
+
+        assert!(s.update_queue(1, "second!".into()));
+        assert_eq!(s.queue_items(), vec!["first", "second!", "third"]);
+        assert!(!s.update_queue(9, "gone".into()));
+
+        assert!(s.move_queue(2, 0));
+        assert_eq!(s.queue_items(), vec!["third", "first", "second!"]);
+        assert!(!s.move_queue(9, 0));
+
+        assert_eq!(s.pending_steer().as_deref(), Some("now"));
+        s.steer_to_queue();
+        assert!(s.pending_steer().is_none());
+        assert_eq!(s.queue_items().last().map(String::as_str), Some("now"));
+
+        assert!(s.queue_to_steer(0));
+        assert_eq!(s.pending_steer().as_deref(), Some("third"));
+        // Promoting bumped nothing: "now" was already queued, the old steer slot was empty.
+        assert_eq!(s.queue_items(), vec!["first", "second!", "now"]);
+
+        // A second promote swaps: the waiting steer goes back to the queue's end.
+        assert!(s.queue_to_steer(0));
+        assert_eq!(s.pending_steer().as_deref(), Some("first"));
+        assert_eq!(s.queue_items(), vec!["second!", "now", "third"]);
+
+        assert_eq!(s.remove_queue(1).as_deref(), Some("now"));
+        s.clear_steer();
+        assert!(s.pending_steer().is_none());
+        assert_eq!(s.queue_items(), vec!["second!", "third"]);
+    }
+
+    #[test]
     fn cancellation_resets_at_the_start_of_the_next_turn() {
         let s = session();
+        // A turn takes its token *before* `begin_turn` runs, so the clone taken here is the one the
+        // turn would be holding. It has to come back uncancelled, or the next turn dies on arrival.
+        let held_by_the_turn = s.cancel_handle();
         s.cancel_handle().cancel();
-        assert!(s.cancel_handle().is_cancelled());
+        assert!(held_by_the_turn.is_cancelled());
         s.begin_turn(10);
         assert!(!s.cancel_handle().is_cancelled());
+        assert!(
+            !held_by_the_turn.is_cancelled(),
+            "clearing the flag has to reach the clone the turn already holds"
+        );
         assert_eq!(s.turn(), TurnState::Streaming);
     }
 
@@ -734,7 +891,7 @@ mod tests {
             title: "Fork".into(),
             cwd: "/work".into(),
             model: None,
-            agent: None,
+            bot: None,
             created_ms: 1,
             updated_ms: 1,
             status: "active".into(),

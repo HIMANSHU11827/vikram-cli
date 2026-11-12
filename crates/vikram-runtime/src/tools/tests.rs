@@ -92,6 +92,9 @@ fn every_builtin_declares_a_permission_shape() {
             "search.text" => json!({"query": "x"}),
             "shell.run" => json!({"command": "echo hi"}),
             "git" => json!({"subcommand": "status"}),
+            "git_commit" | "git.commit" => json!({"message": "m"}),
+            "git_branch" | "git.branch" => json!({"name": "b"}),
+            "git_stash" | "git.stash" => json!({"action": "push"}),
             "build.run" => json!({}),
             "test.run" => json!({}),
             "memory.save" => json!({"key": "k", "value": "v"}),
@@ -101,13 +104,10 @@ fn every_builtin_declares_a_permission_shape() {
             "memory.note" => json!({"note": "x"}),
             "memory.consolidate" => json!({"action": "run"}),
             "web.search" => json!({"query": "x"}),
-            "team.create" => json!({"name": "t"}),
-            "team.list" => json!({}),
-            "team.delegate" => json!({"team": "t", "task": "x"}),
             "hive.create" => json!({"name": "t"}),
             "hive.list" => json!({}),
             "hive.show" => json!({"name": "t"}),
-            "hive.delegate" => json!({"team": "t", "task": "x"}),
+            "hive.delegate" => json!({"hive": "t", "task": "x"}),
             "hive.delete" => json!({"name": "t"}),
             "bot.list" => json!({}),
             "bot.show" => json!({"name": "t"}),
@@ -1089,7 +1089,7 @@ fn hive_show_declares_read_permission() {
 #[test]
 fn hive_delegate_declares_delegate_permission() {
     let req = HiveDelegate
-        .permission(&json!({"team": "t", "task": "x"}))
+        .permission(&json!({"hive": "t", "task": "x"}))
         .unwrap();
     assert_eq!(req.action, ActionKind::Delegate);
     assert_eq!(req.verb, "hive.delegate");
@@ -1605,6 +1605,37 @@ fn memory_and_tasks_round_trip_through_their_own_store() {
 }
 
 #[test]
+fn code_search_is_registered() {
+    let registry = ToolRegistry::with_builtins();
+    let tool = registry.get("code_search").expect("code_search registered");
+    assert_eq!(tool.spec().name, "code_search");
+    assert_eq!(tool.spec().schema["required"][0], "query");
+}
+
+#[test]
+fn code_search_without_index_returns_helpful_error() {
+    let (_dir, ctx) = ctx();
+    let out = CodeSearch.run(&json!({"query": "foo"}), &ctx).unwrap();
+    assert!(!out.ok, "{}", out.content);
+    assert!(out.content.contains("no index"));
+}
+
+#[test]
+fn code_search_with_index_returns_ranked_context() {
+    let (dir, ctx) = ctx();
+    std::fs::create_dir_all(dir.path().join(".vikram")).unwrap();
+    let db = dir.path().join(".vikram").join("codeindex.db");
+    std::fs::write(dir.path().join("a.rs"), "fn foo() {}\nstruct Bar {}\n").unwrap();
+    let mut idx = vikram_codeindex::CodeIndex::open(dir.path(), &db).unwrap();
+    idx.index(&[]).unwrap();
+    let out = CodeSearch
+        .run(&json!({"query": "foo", "limit": 5}), &ctx)
+        .unwrap();
+    assert!(out.ok, "{}", out.content);
+    assert!(out.content.contains("foo"));
+}
+
+#[test]
 fn the_host_inspection_tools_answer_without_a_model() {
     let (_dir, ctx) = ctx();
     let answers = vec![
@@ -1619,4 +1650,23 @@ fn the_host_inspection_tools_answer_without_a_model() {
         assert!(out.ok, "{name} failed: {}", out.content);
         assert!(!out.content.trim().is_empty(), "{name} answered nothing");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn list_dir_handles_non_utf8_filenames() {
+    use std::os::unix::ffi::OsStringExt;
+    let (dir, ctx) = ctx();
+    let bad = std::ffi::OsString::from_vec(vec![b'n', b'o', b'n', b'u', b't', b'f', 0xff, b'8']);
+    std::fs::write(dir.path().join(&bad), "x").unwrap();
+    let out = ListDir
+        .run(&serde_json::json!({"path": "."}), &ctx)
+        .unwrap();
+    assert!(out.ok, "{}", out.content);
+    let expected = bad.to_string_lossy();
+    assert!(
+        out.content.contains(expected.as_ref()),
+        "expected lossy name in listing: {}",
+        out.content
+    );
 }

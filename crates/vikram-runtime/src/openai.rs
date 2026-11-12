@@ -105,6 +105,9 @@ pub fn model_ids(body: &Value) -> Vec<String> {
 /// being told to wait than watching a silent clock, so nothing is retried.
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(10);
 
+/// How many times one request is put on the wire before the refusal is believed.
+const MAX_ATTEMPTS: u32 = 3;
+
 /// Statuses a model endpoint asks us to try again on, rather than treat as a final refusal. Every
 /// 5xx qualifies, because gateways disagree about which of them are permanent (529 overloaded, for
 /// one) and a single retry costs less than a wrong failure.
@@ -123,6 +126,102 @@ fn retry_after(response: &reqwest::Response) -> Option<Duration> {
     let value = response.headers().get(reqwest::header::RETRY_AFTER)?;
     let seconds = value.to_str().ok()?.trim().parse::<u64>().ok()?;
     Some(Duration::from_secs(seconds.min(300)))
+}
+
+/// The reset time a rate-limit window carries, in either place providers put it: the
+/// `x-ratelimit-reset` header (epoch seconds) or the same key inside the JSON body's metadata.
+///
+/// OpenRouter, for one, sends only the body form — so a decision that read headers alone would see
+/// "no wait named" and retry inside a window that is closed for hours.
+fn rate_limit_reset(header: Option<&str>, body: &str) -> Option<u64> {
+    if let Some(seconds) = header.and_then(|value| value.trim().parse::<u64>().ok()) {
+        return Some(seconds);
+    }
+    let parsed: Value = serde_json::from_str(body).ok()?;
+    let headers = parsed
+        .get("error")?
+        .get("metadata")?
+        .get("headers")?
+        .as_object()?;
+    for (key, value) in headers {
+        if !key.eq_ignore_ascii_case("x-ratelimit-reset") {
+            continue;
+        }
+        if let Some(text) = value.as_str() {
+            return text.trim().parse::<u64>().ok();
+        }
+        return value.as_u64();
+    }
+    None
+}
+
+/// A quota that is spent for a *window* rather than for a moment. Retrying inside one is a lie: the
+/// cap is counted per day (OpenRouter: 50 free requests), so a few seconds of backoff changes
+/// nothing and the operator waits for an answer that cannot come.
+fn quota_window_exhausted(body: &str) -> bool {
+    let body = body.to_lowercase();
+    body.contains("free-models-per-day")
+        || body.contains("per-day")
+        || (body.contains("x-ratelimit-remaining") && body.contains("\"0\""))
+}
+
+/// What a refusal deserves: another attempt after a wait, or an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    /// Try once more after this delay.
+    After(Duration),
+    /// Do not try again; the refusal is already in words.
+    Never,
+}
+
+/// How long until the window the provider named reopens, if it said.
+fn until_reset(reset_epoch_secs: Option<u64>) -> Option<Duration> {
+    let reset = reset_epoch_secs?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(Duration::from_secs(reset.saturating_sub(now)))
+}
+
+/// Spread retries so parallel turns do not hammer a rate-limited endpoint in lockstep. `backoff`
+/// stays a pure function; the wobble is applied where the sleep happens.
+fn jittered(delay: Duration) -> Duration {
+    let millis = delay.as_millis() as u64;
+    let spread = (millis / 5).max(1);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let offset = (nanos % (spread * 2 + 1)) as i64 - spread as i64;
+    Duration::from_millis((millis as i64 + offset).max(1) as u64)
+}
+
+/// Retry, or stop. This is the whole policy in one place so the answer to "why did it try three
+/// times" is readable instead of spread through the loop.
+fn retry_decision(
+    status: reqwest::StatusCode,
+    body: &str,
+    wait: Option<Duration>,
+    attempt: u32,
+) -> Retry {
+    let max_attempts = MAX_ATTEMPTS;
+    if attempt >= max_attempts {
+        return Retry::Never;
+    }
+    if status.as_u16() == 402 || credit_exhausted(body) || quota_window_exhausted(body) {
+        return Retry::Never;
+    }
+    if !retryable_status(status) {
+        return Retry::Never;
+    }
+    let delay = wait.unwrap_or_else(|| backoff(attempt));
+    // A wait the server asks for that is longer than this turn may sit through is a refusal with a
+    // time on it, not a retry.
+    if delay > MAX_RETRY_WAIT {
+        return Retry::Never;
+    }
+    Retry::After(jittered(delay))
 }
 
 /// Bodies that mean "this account cannot pay for a request", whatever status carries them. OpenAI
@@ -173,6 +272,40 @@ fn explain_rejection(status: reqwest::StatusCode, body: &str, endpoint: &str) ->
              the request. Retry in a moment. Provider said: {detail}"
         ),
         _ => format!("{status} from {endpoint}. Provider said: {detail}"),
+    }
+}
+
+/// `explain_rejection` plus the one fact a spent quota carries: when it comes back. Without it the
+/// operator reads "wait for the window to reset" and has no idea whether that is a minute or a day.
+fn explain_rejection_with(
+    status: reqwest::StatusCode,
+    body: &str,
+    endpoint: &str,
+    reset_epoch_secs: Option<u64>,
+) -> String {
+    let base = explain_rejection(status, body, endpoint);
+    let spent = quota_window_exhausted(body) || credit_exhausted(body);
+    if status.as_u16() != 429 || !spent {
+        return base;
+    }
+    match until_reset(reset_epoch_secs) {
+        Some(left) if !left.is_zero() => {
+            format!("{base} The window reopens in {}.", human_gap(left))
+        }
+        _ => base,
+    }
+}
+
+/// A gap in words, the way an operator says it: `3h 12m`, `48s`. No date formatting, so the answer
+/// needs no clock arithmetic the reader has to redo.
+fn human_gap(gap: Duration) -> String {
+    let secs = gap.as_secs();
+    if secs >= 3600 {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
     }
 }
 
@@ -270,7 +403,6 @@ impl Provider for OpenAiProvider {
         let body = build_request_body(&request);
 
         tokio::spawn(async move {
-            const MAX_ATTEMPTS: u32 = 3;
             let mut attempt = 0u32;
             let response = loop {
                 attempt += 1;
@@ -289,42 +421,58 @@ impl Provider for OpenAiProvider {
                         // The body decides between "wait and retry" and "this account cannot pay":
                         // OpenAI folds quota exhaustion into 429, so the status alone lies.
                         let wait = retry_after(&response);
+                        let reset = rate_limit_reset(
+                            response
+                                .headers()
+                                .get("x-ratelimit-reset")
+                                .and_then(|value| value.to_str().ok()),
+                            "",
+                        );
                         let body = response.text().await.unwrap_or_default();
+                        let reset = reset.or_else(|| rate_limit_reset(None, &body));
                         let billing = status.as_u16() == 402 || credit_exhausted(&body);
-                        if !billing && retryable_status(status) && attempt < MAX_ATTEMPTS {
-                            match wait {
-                                Some(delay) if delay > MAX_RETRY_WAIT => {
-                                    let text = format!(
-                                        "{endpoint} asked to wait {}s before retrying ({status}). \
-                                         That would stall the turn, so nothing was retried: wait, \
-                                         then send again.",
-                                        delay.as_secs()
-                                    );
-                                    let _ = tx.send(Err(VikramError::ProviderRejected(text))).await;
-                                    return;
-                                }
-                                other => {
-                                    let delay = other.unwrap_or_else(|| backoff(attempt));
-                                    tokio::time::sleep(delay).await;
-                                    continue;
-                                }
+                        match retry_decision(status, &body, wait, attempt) {
+                            Retry::After(delay) => {
+                                // The wait is the provider's, not the model's, and an interface that
+                                // does not say so shows a frozen clock and an empty pane.
+                                let _ = tx
+                                    .send(Ok(ProviderEvent::Retrying {
+                                        attempt,
+                                        of: MAX_ATTEMPTS,
+                                        wait_ms: delay.as_millis() as u64,
+                                        status: status.as_u16(),
+                                    }))
+                                    .await;
+                                tokio::time::sleep(delay).await;
+                                continue;
+                            }
+                            Retry::Never => {
+                                let text = explain_rejection_with(status, &body, &endpoint, reset);
+                                let _ = tx
+                                    .send(Err(if billing || status.as_u16() == 429 {
+                                        VikramError::ProviderRejected(text)
+                                    } else {
+                                        VikramError::ProviderTransient(text)
+                                    }))
+                                    .await;
+                                return;
                             }
                         }
-                        let text = explain_rejection(status, &body, &endpoint);
-                        let _ = tx
-                            .send(Err(if billing || status.as_u16() == 429 {
-                                VikramError::ProviderRejected(text)
-                            } else {
-                                VikramError::ProviderTransient(text)
-                            }))
-                            .await;
-                        return;
                     }
                     Err(err) => {
                         // A connection that failed before any bytes were sent is safe to retry:
                         // the request never reached the model, so it cannot run twice.
                         if attempt < MAX_ATTEMPTS && retryable_transport(&err) {
-                            tokio::time::sleep(backoff(attempt)).await;
+                            let delay = jittered(backoff(attempt));
+                            let _ = tx
+                                .send(Ok(ProviderEvent::Retrying {
+                                    attempt,
+                                    of: MAX_ATTEMPTS,
+                                    wait_ms: delay.as_millis() as u64,
+                                    status: 0,
+                                }))
+                                .await;
+                            tokio::time::sleep(delay).await;
                             continue;
                         }
                         let text = explain_transport(&err, &endpoint, attempt);
@@ -1172,6 +1320,126 @@ mod tests {
         match &events[0] {
             ProviderEvent::ToolCall(call) => assert_eq!(call.id, ToolCallId::new("abc")),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_spent_daily_quota_is_not_retried() {
+        // The exact body OpenRouter sends once the free-tier day is gone. Backing off for a second
+        // and asking again cannot help: the cap resets on a day boundary.
+        let body = r#"{"error":{"message":"Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day","code":429,"metadata":{"headers":{"X-RateLimit-Limit":"50","X-RateLimit-Remaining":"0","X-RateLimit-Reset":"1794355200"}}}}"#;
+        assert_eq!(
+            retry_decision(reqwest::StatusCode::TOO_MANY_REQUESTS, body, None, 1),
+            Retry::Never
+        );
+        assert!(quota_window_exhausted(body));
+    }
+
+    #[test]
+    fn a_short_rate_limit_is_retried_after_the_wait_the_server_names() {
+        let decision = retry_decision(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"slow down"}}"#,
+            Some(Duration::from_secs(2)),
+            1,
+        );
+        let Retry::After(delay) = decision else {
+            panic!("a two-second rate limit is worth waiting out: {decision:?}");
+        };
+        assert!(
+            delay >= Duration::from_millis(1600) && delay <= Duration::from_millis(2400),
+            "the server's wait is kept, with only a little wobble: {delay:?}"
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_asking_for_longer_than_a_turn_may_wait_is_believed_instead_of_retried() {
+        assert_eq!(
+            retry_decision(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"message":"slow down"}}"#,
+                Some(Duration::from_secs(120)),
+                1
+            ),
+            Retry::Never
+        );
+    }
+
+    #[test]
+    fn server_faults_and_client_faults_are_treated_differently() {
+        let transient = retry_decision(reqwest::StatusCode::BAD_GATEWAY, "upstream died", None, 1);
+        assert!(matches!(transient, Retry::After(_)), "{transient:?}");
+        assert_eq!(
+            retry_decision(reqwest::StatusCode::NOT_FOUND, "no such model", None, 1),
+            Retry::Never
+        );
+        assert_eq!(
+            retry_decision(reqwest::StatusCode::BAD_REQUEST, "bad body", None, 1),
+            Retry::Never
+        );
+    }
+
+    #[test]
+    fn the_attempt_budget_is_finite() {
+        assert_eq!(
+            retry_decision(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "down",
+                None,
+                MAX_ATTEMPTS
+            ),
+            Retry::Never,
+            "the last attempt is the last attempt"
+        );
+    }
+
+    #[test]
+    fn the_reset_time_is_read_from_the_body_when_no_header_carries_it() {
+        let body = r#"{"error":{"message":"Rate limit exceeded: free-models-per-day","metadata":{"headers":{"X-RateLimit-Remaining":"0","X-RateLimit-Reset":"1794355200"}}}}"#;
+        assert_eq!(rate_limit_reset(None, body), Some(1_794_355_200));
+        assert_eq!(
+            rate_limit_reset(Some(" 1794355200 "), ""),
+            Some(1_794_355_200)
+        );
+        assert_eq!(rate_limit_reset(None, "not json"), None);
+    }
+
+    #[test]
+    fn a_spent_quota_says_when_it_comes_back() {
+        let reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs()
+            + 3 * 3600
+            + 12 * 60;
+        let text = explain_rejection_with(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"Rate limit exceeded: free-models-per-day"}}"#,
+            "https://openrouter.ai/api/v1",
+            Some(reset),
+        );
+        assert!(
+            text.contains("reopens in 3h 1"),
+            "the wait has to be a number the operator can act on: {text}"
+        );
+    }
+
+    #[test]
+    fn a_gap_reads_the_way_it_is_spoken() {
+        assert_eq!(human_gap(Duration::from_secs(45)), "45s");
+        assert_eq!(human_gap(Duration::from_secs(125)), "2m 5s");
+        assert_eq!(human_gap(Duration::from_secs(3 * 3600 + 12 * 60)), "3h 12m");
+    }
+
+    #[test]
+    fn retry_wobble_stays_inside_a_fifth_of_the_delay() {
+        let base = Duration::from_secs(2);
+        for _ in 0..20 {
+            let delay = jittered(base);
+            assert!(
+                delay >= Duration::from_millis(1600) && delay <= Duration::from_millis(2400),
+                "jitter must not turn a two-second wait into {delay:?}"
+            );
         }
     }
 }

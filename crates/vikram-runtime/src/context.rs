@@ -22,7 +22,7 @@ pub enum ContextFile {
     User,
     Preferences,
     Hive,
-    Team,
+    HiveRoster,
     Agents,
     Harness,
     Skill,
@@ -38,7 +38,7 @@ impl ContextFile {
             Self::User => "USER.md",
             Self::Preferences => "PREFERENCES.md",
             Self::Hive => "HIVE.md",
-            Self::Team => "TEAM.md",
+            Self::HiveRoster => "TEAM.md",
             Self::Agents => "AGENTS.md",
             Self::Harness => "HARNESS.md",
             Self::Skill => "SKILL.md",
@@ -330,7 +330,7 @@ impl ContextLoader {
             }
         }
         if let Some(d) = hive_dir {
-            self.try_add(&mut bundle, ContextFile::Team, d.join("TEAM.md"));
+            self.try_add(&mut bundle, ContextFile::HiveRoster, d.join("TEAM.md"));
         }
         // Project AGENTS.md
         self.load_project_agents(&mut bundle);

@@ -2,16 +2,17 @@
 //! bar, the shortcut hints, and the modal overlays.
 //!
 //! Every panel is a pure function of [`App`]. None of them reads a clock, emits a command, or
-//! invents state: the BOTS panel lists exactly what `app.agents` already holds, and a panel with
+//! invents state: the BOTS panel lists exactly what `app.bots` already holds, and a panel with
 //! nothing to show says so instead of drawing a plausible placeholder.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
+
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-use vikram_runtime::types::TaskState;
+use vikram_runtime::types::{NoticeLevel, TaskState};
 
 use crate::app::{ActivityKind, App, Focus, InspectorKind, Overlay, Selection, TabHit};
 use crate::theme::{StatusSegment, Theme};
@@ -35,7 +36,7 @@ const HELP_ROWS: [(&str, &str); 19] = [
     ("F2", "background tasks"),
     ("F3", "MCP servers"),
     ("F4", "plugins"),
-    ("F5", "sub-agents"),
+    ("F5", "sub-bots"),
     ("F6", "context usage"),
     ("F7", "model and throughput"),
     ("F8", "skills browser"),
@@ -59,16 +60,29 @@ pub fn session_tabs(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme)
         let label = " no sessions";
         spans.push(Span::styled(label, theme.secondary()));
         x += label.width() as u16;
-        let hint = "   Ctrl+N starts one";
+        let hint = "   Ctrl+N starts one   ";
         spans.push(Span::styled(hint, theme.muted()));
         x += hint.width() as u16;
-        // + New control
-        let new_label = "  + New";
-        app.new_session_x = Some((area.y, x, x + new_label.width() as u16));
-        spans.push(Span::styled(new_label, Style::default().fg(theme.accent)));
+        // + New control, drawn as a control: a bracket pair with the label inside it, so the one
+        // thing on this row you can click looks clickable.
+        let start = x;
+        for (text, style) in [
+            ("[ ", Style::default().fg(theme.border)),
+            ("+ New", Style::default().fg(theme.accent)),
+            (" ]", Style::default().fg(theme.border)),
+        ] {
+            spans.push(Span::styled(text, style));
+            x += text.width() as u16;
+        }
+        app.new_session_x = Some((area.y, start, x));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
         return;
     }
+
+    // Read once, before the loop borrows `app.sessions`: a tab that is working turns the dot into the
+    // same spinner the transcript uses, so the one glyph says which of several sessions is moving
+    // without the operator opening any of them.
+    let spin = app.thinking_frame();
 
     for (index, session) in app.sessions.iter().enumerate() {
         if !spans.is_empty() {
@@ -79,10 +93,17 @@ pub fn session_tabs(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme)
         }
         let tab_start = x;
         let active = index == app.active;
-        let glyph = if session.is_busy() || active {
-            theme.filled_dot()
+        // The tab wears the same asterisks the transcript uses for thinking, so the tab bar and the
+        // conversation are one vocabulary: a filled star is a session that is here, a light one is a
+        // session that is not, and the set cycles while one of them works.
+        let glyph = if session.is_busy() {
+            spin
+        } else if active {
+            if theme.ascii { "*" } else { "✳" }
+        } else if theme.ascii {
+            "+"
         } else {
-            theme.hollow_dot()
+            "✢"
         };
         let style = if active {
             Style::default()
@@ -93,28 +114,39 @@ pub fn session_tabs(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme)
         } else {
             theme.muted()
         };
+        // The open tab carries a band, the way the row under the cursor does in a chooser: the
+        // selected surface is one filled rectangle, not a brighter word. Square corners, no gap
+        // between its parts, so it reads as a tab and not as coloured text.
+        let band = if active { Some(theme.selection) } else { None };
+        let on_band = |s: Style| match band {
+            Some(bg) => s.bg(bg),
+            None => s,
+        };
         let title = clip(&session.title, TAB_TITLE_CAP, theme.ascii);
         let tab_text = format!(" {glyph} {title}");
         let tab_w = tab_text.width() as u16;
-        spans.push(Span::styled(tab_text.clone(), style));
+        spans.push(Span::styled(tab_text.clone(), on_band(style)));
         x += tab_w;
         if session.queued > 0 {
             let q = format!(" +{}", session.queued);
             let qw = q.width() as u16;
-            spans.push(Span::styled(q, Style::default().fg(theme.warn)));
+            spans.push(Span::styled(q, on_band(Style::default().fg(theme.warn))));
             x += qw;
         }
         if session.unread > 0 {
             let u = format!(" ({})", session.unread);
             let uw = u.width() as u16;
-            spans.push(Span::styled(u, Style::default().fg(theme.accent_dim)));
+            spans.push(Span::styled(
+                u,
+                on_band(Style::default().fg(theme.accent_dim)),
+            ));
             x += uw;
         }
         // close button
-        let close_label = " ×";
+        let close_label = " × ";
         let close_w = close_label.width() as u16;
         let close_start = x;
-        spans.push(Span::styled(close_label, theme.muted()));
+        spans.push(Span::styled(close_label, on_band(theme.muted())));
         x += close_w;
         let tab_end = x;
         app.tab_hits.push(TabHit {
@@ -132,10 +164,16 @@ pub fn session_tabs(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme)
     let sw = sep.width() as u16;
     spans.push(Span::styled(sep, theme.frame()));
     x += sw;
-    let new_label = "+ New";
-    let new_w = new_label.width() as u16;
-    app.new_session_x = Some((area.y, x, x + new_w));
-    spans.push(Span::styled(new_label, Style::default().fg(theme.accent)));
+    let start = x;
+    for (text, style) in [
+        ("[ ", Style::default().fg(theme.border)),
+        ("+ New", Style::default().fg(theme.accent)),
+        (" ]", Style::default().fg(theme.border)),
+    ] {
+        spans.push(Span::styled(text, style));
+        x += text.width() as u16;
+    }
+    app.new_session_x = Some((area.y, start, x));
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -164,12 +202,12 @@ pub fn hive_panel(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     }
 
     let mut lines: Vec<Line> = Vec::new();
-    if app.teams.is_empty() {
-        lines.push(Line::styled(" no teams", theme.muted()));
+    if app.rosters.is_empty() {
+        lines.push(Line::styled(" no hives", theme.muted()));
     } else {
-        for team in &app.teams {
+        for roster in &app.rosters {
             let name = clip(
-                &team.name,
+                &roster.name,
                 (inner.width as usize).saturating_sub(12),
                 theme.ascii,
             );
@@ -181,8 +219,8 @@ pub fn hive_panel(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 Span::raw(" "),
                 Span::styled(name, Style::default().fg(theme.text)),
             ];
-            // Independent activity indicator - only when team is working and not paused
-            if team.working && !team.paused {
+            // Independent activity indicator - only when roster is working and not paused
+            if roster.working && !roster.paused {
                 let pulse = if theme.ascii {
                     "*"
                 } else {
@@ -230,12 +268,12 @@ pub fn bots_panel(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     }
 
     let mut lines: Vec<Line> = Vec::new();
-    if app.agents.is_empty() {
+    if app.bots.is_empty() {
         lines.push(Line::styled(" no bots", theme.muted()));
-        lines.push(Line::styled(" `vikram agents` lists them", theme.muted()));
+        lines.push(Line::styled(" `vikram bots` lists them", theme.muted()));
     } else {
-        for (index, agent) in app.agents.iter().enumerate() {
-            let selected = focused && index == app.agent_selection;
+        for (index, agent) in app.bots.iter().enumerate() {
+            let selected = focused && index == app.bot_selection;
             let marker = if selected { theme.chevron() } else { " " };
             let glyph = if agent.state.is_filled() {
                 theme.filled_dot()
@@ -314,6 +352,15 @@ pub fn plasma(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
     let (text, style) = if let Some(tool) = running_tool {
         (tool.text.clone(), Style::default().fg(theme.tool))
+    } else if let Some(notice) = app
+        .notices
+        .back()
+        .filter(|notice| matches!(notice.level, NoticeLevel::Warn | NoticeLevel::Error))
+    {
+        // A warning or an error outranks the stream: "retrying in 2.0s" and "rate limited" are the
+        // answer to why the clock is moving with nothing in the pane, and burying them under
+        // "receiving" leaves the operator with no explanation at all.
+        (notice.text.clone(), theme.notice_style(notice.level))
     } else if app.active_session().is_some_and(|s| s.streaming.is_some()) {
         (
             format!("{} receiving", app.thinking_frame()),
@@ -359,30 +406,21 @@ pub fn status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .clone()
         .or_else(|| app.active_session().and_then(|s| s.model.clone()))
         .unwrap_or_else(|| "unset".to_owned());
+    // The whole identifier is shown wherever it fits: `nvidia/nemotron-3.5` is not the name of
+    // anything, and the vendor prefix is the first thing an operator reads. The line as a whole is
+    // still clipped to the terminal below, so a narrow window drops segments instead of wrapping.
     left.push(Span::styled(
-        format!("{model_glyph} {}", clip(&model, 20, theme.ascii)),
+        format!("{model_glyph} {}", clip(&model, 40, theme.ascii)),
         theme.status_style(StatusSegment::Value),
     ));
 
-    // ctx — a percentage only when the window is a real figure. When no source advertised or
-    // configured one, the denominator would be invented, so the measured cost stands alone.
-    if app.metrics.context_limit_assumed {
-        if app.metrics.context_used > 0 {
-            left.push(Span::raw(sep.to_owned()));
-            left.push(Span::styled(
-                "ctx ",
-                theme.status_style(StatusSegment::Label),
-            ));
-            left.push(Span::styled(
-                format!("{} tok", human(app.metrics.context_used)),
-                theme.status_style(StatusSegment::Value),
-            ));
-        }
-    } else if let Some(ratio) = app.metrics.context_ratio() {
-        let pct = (f64::from(ratio) * 100.0).round() as u64;
+    // ctx — the boxed meter is drawn in every state, because the shape is what an operator reads at
+    // a glance: how full, and how close to full. What changes behind it is the figure. A window the
+    // provider reported gets a percentage; a window nobody reported gets the measured count instead,
+    // since a share of an invented denominator would be a number with no meaning. A tilde says the
+    // count is the estimator's, an asterisk says the window itself was assumed.
+    if let Some(ratio) = app.metrics.context_ratio() {
         let bar = context_bar(ratio, 10, theme);
-        // A tilde says the figure is the estimator's, not the provider's; an asterisk says the
-        // window itself was assumed because nothing advertised it. Both are explained in F6.
         let approx = if app.metrics.context_measured {
             ""
         } else {
@@ -393,36 +431,72 @@ pub fn status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         } else {
             ""
         };
+        let figure = if app.metrics.context_limit_assumed {
+            format!("{}{assumed}", human(app.metrics.context_used))
+        } else {
+            let pct = (f64::from(ratio) * 100.0).round() as u64;
+            format!("{approx}{pct}%{assumed}")
+        };
         left.push(Span::raw(sep.to_owned()));
         left.push(Span::styled(
             "ctx ",
             theme.status_style(StatusSegment::Label),
         ));
         left.push(Span::styled(
-            format!("[{bar}] {approx}{pct}%{assumed}"),
+            format!("[{bar}] {figure}"),
+            theme.status_style(StatusSegment::Value),
+        ));
+    } else if app.metrics.context_used > 0 {
+        // Nothing to fill the box with, not even an assumed window, so it is not drawn: an empty
+        // frame beside a real figure would read as zero usage rather than as an unknown window.
+        left.push(Span::raw(sep.to_owned()));
+        left.push(Span::styled(
+            "ctx ",
+            theme.status_style(StatusSegment::Label),
+        ));
+        left.push(Span::styled(
+            format!("{} tok", human(app.metrics.context_used)),
             theme.status_style(StatusSegment::Value),
         ));
     }
 
-    // ⏱ turn timing — the number an operator actually waits on. Process uptime used to sit beside
-    // it and read as a stalled turn, so it is gone.
-    if let Some(ms) = app.metrics.turn_elapsed_ms {
+    // ◷ the turn timer. It exists only while a turn is running, and that is the point: a second
+    // clock beside it that also ran between turns would make two numbers move at once and neither
+    // would say which question it answers.
+    if let Some(turn) = app.metrics.turn_elapsed_ms {
+        let turn_glyph = if theme.ascii { "o" } else { "◷" };
         left.push(Span::raw(sep.to_owned()));
-        let t_glyph = if theme.ascii { "T" } else { "⏱" };
         left.push(Span::styled(
-            format!("{t_glyph} {:.1}s", ms as f64 / 1000.0),
+            format!("{turn_glyph} {}", duration(turn)),
             theme.status_style(StatusSegment::Value),
         ));
     }
 
-    // ~tok/s
-    if let Some(rate) = app.metrics.tokens_per_sec {
-        left.push(Span::raw(sep.to_owned()));
-        left.push(Span::styled(
-            format!("~{:.0} tok/s", rate),
-            theme.status_style(StatusSegment::Value),
-        ));
-    }
+    // ⏱ the session clock — drawn in every state, because a segment that appears and disappears
+    // makes the whole line jump and an operator cannot tell at a glance whether the machine is idle
+    // or the number is missing. It measures the session, not the turn, so it never resets on send.
+    left.push(Span::raw(sep.to_owned()));
+    let t_glyph = if theme.ascii { "T" } else { "⏱" };
+    left.push(Span::styled(
+        format!("{t_glyph} {}", duration(app.metrics.elapsed_ms)),
+        theme.status_style(StatusSegment::Value),
+    ));
+
+    // ↑ throughput — same rule. Before a turn has produced a rate the segment says so instead of
+    // leaving a gap, so the line keeps its shape and the figure is never invented.
+    left.push(Span::raw(sep.to_owned()));
+    let up_glyph = if theme.ascii { "^" } else { "↑" };
+    let rate = app
+        .metrics
+        .tokens_per_sec
+        .map(|rate| format!("{up_glyph} {rate:.0} t/s"))
+        .unwrap_or_else(|| format!("{up_glyph} -- t/s"));
+    left.push(Span::styled(rate, theme.status_style(StatusSegment::Value)));
+
+    // Everything above this line is the sentence about this session and it is not negotiable: a
+    // clock that vanishes when the terminal narrows is worse than no clock, because the operator
+    // reads its absence as stillness. What gives way is the totals column on the right, which
+    // survives in the status bar's other forms and is the one thing nobody reads mid-turn.
 
     // Right group: system counts.
     let mut right: Vec<Span> = Vec::new();
@@ -446,17 +520,15 @@ pub fn status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     right.push(Span::raw(sep.to_owned()));
     let agent_glyph = if theme.ascii { "*" } else { "◇" };
     right.push(Span::styled(
-        format!("{agent_glyph} Agents {}", app.agents.len()),
+        format!("{agent_glyph} Bots {}", app.bots.len()),
         theme.status_style(StatusSegment::Value),
     ));
 
-    // Status dot + runtime label at the very left.
+    // The line opens with the posture and never with a message. A notice sat here for a while and
+    // every segment after it shifted whenever one arrived — a status line that changes shape is one
+    // the eye has to find again on each frame, and the message outranked the facts the row exists to
+    // report. Notices are still recorded; they are simply not this row's business.
     let mut spans: Vec<Span> = Vec::new();
-    spans.push(Span::styled(
-        format!("{} {}", theme.filled_dot(), app.status.label()),
-        theme.runtime_style(&app.status),
-    ));
-    spans.push(Span::raw(sep.to_owned()));
     // The posture, early in the line so a narrow terminal still shows it: an operator must be able
     // to see that something is approving without asking.
     let shield = if theme.ascii { "!" } else { "⛨" };
@@ -468,11 +540,37 @@ pub fn status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             StatusSegment::Value
         }),
     ));
+    // Counts give way before the sentence does. The column stays when there is room for it, and
+    // when there is not, whole segments drop from the right end rather than letting the sentence
+    // that describes the session be cut in the middle.
+    let fixed_w: usize = spans.iter().map(|span| span.content.width()).sum::<usize>() + sep.width();
+    let left_w: usize = left.iter().map(|span| span.content.width()).sum();
+    while !right.is_empty() {
+        let right_w: usize = right.iter().map(|span| span.content.width()).sum();
+        if fixed_w + left_w + right_w + 3 <= area.width as usize {
+            break;
+        }
+        right.truncate(right.len().saturating_sub(2));
+    }
+    let right_w: usize = right.iter().map(|span| span.content.width()).sum();
+
     spans.push(Span::raw(sep.to_owned()));
     spans.extend(left);
-    // pipe separator between groups
-    spans.push(Span::raw(pipe.to_owned()));
-    spans.extend(right);
+    // The counts belong on the right margin: they are totals, not part of the sentence about what
+    // this session is doing. Pinned to the edge they land in the same place on every frame, so the
+    // eye stops having to hunt for them. When the line is too narrow to give them their own column,
+    // they follow the sentence behind a pipe instead.
+    let lead_w: usize = spans.iter().map(|span| span.content.width()).sum();
+    let pad = (area.width as usize)
+        .saturating_sub(lead_w)
+        .saturating_sub(right_w);
+    if pad >= 3 {
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.extend(right);
+    } else {
+        spans.push(Span::styled(pipe, theme.frame()));
+        spans.extend(right);
+    }
 
     // Clip to width (single logical line).
     let mut used = 0usize;
@@ -506,50 +604,132 @@ pub fn suggestions_popup(frame: &mut Frame, anchor: Rect, app: &App, theme: &The
     let Some(popup) = app.suggestions.as_ref() else {
         return;
     };
-    if popup.items.is_empty() || anchor.width < 12 || anchor.y < 4 {
+    if popup.items.is_empty() || anchor.width < 20 || anchor.y < 5 {
         return;
     }
-    let height = (popup.items.len() as u16 + 2)
+
+    // The list borrows rows from the transcript directly above the input, so it is capped, and it
+    // never opens over the box it is filling in: the input keeps its own rows whatever the list
+    // length. A footer is drawn only when there is a row to spare for it.
+    let space = anchor.y.saturating_sub(1);
+    let wanted = popup.items.len() as u16 + 2;
+    let footer = wanted < 12 && wanted < space;
+    let height = (if footer { wanted + 1 } else { wanted })
         .min(12)
-        .min(anchor.y.saturating_sub(1));
-    if height < 3 {
+        .min(space);
+    if height < 4 {
         return;
     }
-    let width = anchor.width.saturating_sub(2).min(76);
-    let rect = Rect::new(anchor.x + 1, anchor.y.saturating_sub(height), width, height);
+
+    // The list is the width of the box it fills in, so the two edges are the same edge and the eye
+    // reads one surface rather than a small panel hovering over a large one.
+    let width = anchor.width.saturating_sub(2);
+    let rect = Rect::new(anchor.x + 1, anchor.y - height, width, height);
     frame.render_widget(Clear, rect);
+
+    // Same ring, same body and same title-on-the-edge as every other panel, so the list an operator
+    // types into reads as a surface of the interface rather than as a second, thinner vocabulary.
+    let title = match popup.items.first().map(|item| item.category.as_str()) {
+        Some("command") => " commands ",
+        Some("shell") => " shell ",
+        _ => " files ",
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.accent_dim));
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(theme.accent))
+        .style(theme.dialog())
+        .padding(Padding::new(1, 1, 0, 0))
+        .title(Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
-    let mut lines: Vec<Line> = Vec::new();
-    for (index, item) in popup.items.iter().enumerate() {
-        let selected = index == popup.selected;
+    let rows = (if footer {
+        inner.height.saturating_sub(1)
+    } else {
+        inner.height
+    }) as usize;
+    if rows == 0 || inner.width < 8 {
+        return;
+    }
+
+    // The cursor row stays on screen when the list is longer than the popup: the window scrolls
+    // under the selection instead of running off the bottom of it.
+    let offset = popup.selected.saturating_sub(rows.saturating_sub(1));
+    let name_col = (inner.width.saturating_sub(14) as usize).clamp(10, 26);
+
+    for (row, item) in popup.items.iter().skip(offset).take(rows).enumerate() {
+        let selected = offset + row == popup.selected;
         let marker = if selected {
             if theme.ascii { ">" } else { "›" }
         } else {
             " "
         };
-        let name_style = if selected {
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.text)
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {marker} "), theme.muted()),
-            Span::styled(clip(&item.text, 28, theme.ascii), name_style),
+        let name = clip(&item.text, name_col, theme.ascii);
+        let pad = " ".repeat(name_col.saturating_sub(name.width()));
+        let desc_room = (inner.width as usize).saturating_sub(5 + name_col);
+        let line = Line::from(vec![
             Span::styled(
-                format!("  {}", clip(&item.description, 40, theme.ascii)),
+                format!(" {marker} "),
+                if selected {
+                    Style::default().fg(theme.accent)
+                } else {
+                    theme.muted()
+                },
+            ),
+            Span::styled(
+                format!("{name}{pad}"),
+                if selected {
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.text)
+                },
+            ),
+            Span::raw("  "),
+            Span::styled(
+                clip(&item.description, desc_room, theme.ascii),
                 theme.muted(),
             ),
-        ]));
+        ]);
+        let style = if selected {
+            theme.selected()
+        } else {
+            Style::default()
+        };
+        let area = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
+        frame.render_widget(Paragraph::new(line).style(style), area);
     }
-    lines.truncate(inner.height as usize);
-    frame.render_widget(Paragraph::new(lines), inner);
+
+    if footer {
+        let mut spans = vec![Span::raw(" ")];
+        for (index, (key, action)) in [("tab", "fill"), ("↑↓", "move")].iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(
+                    if theme.ascii { "  |  " } else { "  ·  " },
+                    theme.frame(),
+                ));
+            }
+            spans.push(Span::styled(*key, Style::default().fg(theme.text)));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(*action, theme.muted()));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(
+                inner.x,
+                inner.y + inner.height.saturating_sub(1),
+                inner.width,
+                1,
+            ),
+        );
+    }
 }
 
 pub fn shortcuts(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
@@ -557,17 +737,52 @@ pub fn shortcuts(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         return;
     }
 
-    let hints = if app.overlay.is_some() {
-        "Esc close  ·  Enter confirm"
+    // Key and action carry different weights: the key is what the hand has to find, the action is
+    // what the head reads once it has found it. One flat sentence makes the row scannable at neither
+    // speed. Hints drop whole, never clipped mid-word.
+    let hints: &[(&str, &str)] = if app.overlay.is_some() {
+        &[("Esc", "close"), ("Enter", "confirm")]
     } else {
-        "Enter · Send    Tab · Queue    Esc · Interrupt    Ctrl+C · Stop"
+        &[
+            ("Enter", "send"),
+            ("Tab", "queue"),
+            ("Esc", "interrupt"),
+            ("Ctrl+C", "stop"),
+        ]
     };
 
-    let text = clip(hints, area.width.saturating_sub(2) as usize, theme.ascii);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(format!(" {text}"), theme.muted()))),
-        area,
-    );
+    let mut spans: Vec<Span> = vec![Span::raw(" ")];
+    let mut used = 1usize;
+    for (index, (key, action)) in hints.iter().enumerate() {
+        let separator = if index == 0 { 0 } else { 3 };
+        let needs = separator + key.width() + 1 + action.width();
+        if used + needs > area.width as usize {
+            break;
+        }
+        if separator > 0 {
+            spans.push(Span::styled(
+                if theme.ascii { " | " } else { " · " },
+                theme.frame(),
+            ));
+            used += separator;
+        }
+        spans.push(Span::styled(*key, Style::default().fg(theme.text)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(*action, theme.muted()));
+        used += key.width() + 1 + action.width();
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn panel_frame(title: Line<'static>, theme: &Theme) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(theme.accent))
+        .style(theme.dialog())
+        .padding(Padding::new(1, 1, 1, 0))
+        .title(title)
 }
 
 pub fn overlay(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
@@ -576,10 +791,16 @@ pub fn overlay(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     let Some(current) = app.overlay.clone() else {
         app.picker_rows.clear();
         app.picker_x = None;
+        app.picker_verbs.clear();
+        app.overlay_clicks.clear();
+        app.overlay_rect = None;
         return;
     };
     app.picker_rows.clear();
     app.picker_x = None;
+    app.picker_verbs.clear();
+    app.overlay_clicks.clear();
+    app.overlay_rect = None;
 
     if let Overlay::Autocomplete {
         candidates,
@@ -621,62 +842,106 @@ pub fn overlay(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
 
     if let Overlay::Picker(picker) = &current {
         // A chooser gets its own width: a model name and its detail do not fit in a 62-column
-        // dialog, and a clipped row is a row the operator cannot tell apart from another.
-        let lines = crate::widgets::picker_lines(picker, theme);
-        let height = (lines.len() as u16 + 2).min(area.height);
-        let width = DIALOG_WIDTH.max(72).min(area.width);
+        // dialog, and a clipped row is a row the operator cannot tell apart from another. The width
+        // comes from the rows themselves, measured in display columns, then capped by the region.
+        let width = (crate::widgets::wanted_width(picker) + 4)
+            .max(DIALOG_WIDTH.max(72))
+            .min(area.width);
+        let body = crate::widgets::picker_body(picker, theme, width.saturating_sub(4));
+        let height = (body.lines.len() as u16 + 3).min(area.height);
         let rect = docked(area, width, height);
         frame.render_widget(Clear, rect);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.accent))
-            .title(Line::from(Span::styled(
+        let block = panel_frame(
+            Line::from(Span::styled(
                 format!(" {} ", crate::widgets::picker_title(picker)),
                 Style::default()
-                    .fg(theme.accent_dim)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
-            )));
+            )),
+            theme,
+        );
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
-        frame.render_widget(Paragraph::new(lines), inner);
+        frame.render_widget(Paragraph::new(body.lines), inner);
 
-        // The rows, so a click can name one. The filter line is first, then the optional note;
-        // everything after that is a row in the order `window()` returned.
-        let note_rows = usize::from(picker.note.is_some());
-        let (rows, _) = picker.window();
-        for position in 0..rows.len() {
-            let y = inner.y + 1 + note_rows as u16 + position as u16;
+        // The rows, so a click can name one. `first_row` is the only thing that knows where the
+        // header ended, so the hit test asks it instead of counting lines again.
+        for position in 0..body.rows {
+            let y = inner.y + body.first_row as u16 + position as u16;
             app.picker_rows.push((y, position));
         }
         app.picker_x = Some((rect.x, rect.x + rect.width));
+        // The footer buttons, so a press can name one. Coordinates are absolute, because that is
+        // what the mouse reports; the body only knows its columns inside the frame.
+        for chip in &body.verbs {
+            let y = inner.y + chip.line as u16;
+            if y < rect.y + rect.height && y >= rect.y {
+                app.picker_verbs.push((
+                    y,
+                    inner.x + chip.start,
+                    inner.x + chip.end,
+                    chip.verb,
+                ));
+            }
+        }
+        app.overlay_rect = Some((rect.x, rect.y, rect.width, rect.height));
         return;
     }
 
-    let (title, lines) = overlay_content(&*app, &current, theme);
-    let height = (lines.len() as u16 + 2).min(area.height);
-    let width = DIALOG_WIDTH.min(area.width);
+    let (title, lines, clicks) = overlay_content(&*app, &current, theme);
+    // A panel is as wide as the widest line it has to show, up to the region. Sixty-two columns is
+    // the floor, not the ceiling: an inspector or a doctor report that wraps at the floor hides the
+    // one column that explains the row.
+    let widest = lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(0);
+    let width = ((widest as u16).saturating_add(8))
+        .max(DIALOG_WIDTH)
+        .min(area.width);
+    let height = (lines.len() as u16 + 3).min(area.height);
     let rect = docked(area, width, height);
-
     frame.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.accent))
-        .title(Line::from(Span::styled(
+    let block = panel_frame(
+        Line::from(Span::styled(
             format!(" {title} "),
             Style::default()
-                .fg(theme.accent_dim)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
-        )));
+        )),
+        theme,
+    );
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     frame.render_widget(Paragraph::new(lines), inner);
+
+    // The buttons and rows this panel drew, in screen coordinates.
+    for hit in clicks {
+        let y = inner.y + hit.line as u16;
+        if y < rect.y + rect.height && y >= rect.y {
+            let (start, end) = hit.columns.map_or((inner.x, inner.x + inner.width), |(s, e)| {
+                (inner.x + s, inner.x + e)
+            });
+            app.overlay_clicks.push((y, start, end, hit.click));
+        }
+    }
+    app.overlay_rect = Some((rect.x, rect.y, rect.width, rect.height));
 }
 
-fn overlay_content(app: &App, overlay: &Overlay, theme: &Theme) -> (String, Vec<Line<'static>>) {
+fn overlay_content(
+    app: &App,
+    overlay: &Overlay,
+    theme: &Theme,
+) -> (String, Vec<Line<'static>>, Vec<OverlayHit>) {
     match overlay {
-        Overlay::Help => (
-            "Keys".to_owned(),
-            HELP_ROWS
+        Overlay::Help => {
+            let mut lines: Vec<Line<'static>> = HELP_ROWS
                 .iter()
                 .map(|(key, description)| {
                     Line::from(vec![
@@ -684,15 +949,59 @@ fn overlay_content(app: &App, overlay: &Overlay, theme: &Theme) -> (String, Vec<
                         Span::styled((*description).to_owned(), theme.secondary()),
                     ])
                 })
-                .collect(),
-        ),
-        Overlay::Approvals => approval_lines(app, theme),
-        Overlay::Inspector(kind) => (
-            inspector_title(kind).to_owned(),
-            inspector_lines(app, kind, theme),
-        ),
-        Overlay::AddAgent { selected } => add_agent_lines(app, *selected, theme),
-        Overlay::RenameSession { editor } => rename_lines(app, editor, theme),
+                .collect();
+            let clicks = push_chips(&mut lines, theme, &[("esc close", OverlayClick::PromptCancel)]);
+            ("Keys".to_owned(), lines, clicks)
+        }
+        Overlay::Approvals => {
+            let (title, lines, action_rows) = approval_lines(app, theme);
+            let clicks = action_rows
+                .into_iter()
+                .enumerate()
+                .map(|(index, line)| OverlayHit {
+                    line,
+                    columns: None,
+                    click: OverlayClick::ApprovalAction(index),
+                })
+                .collect();
+            (title, lines, clicks)
+        }
+        Overlay::Inspector(kind) => {
+            let mut lines = inspector_lines(app, kind, theme);
+            let clicks = push_chips(&mut lines, theme, &[("esc close", OverlayClick::PromptCancel)]);
+            (inspector_title(kind).to_owned(), lines, clicks)
+        }
+        Overlay::AddBot { selected } => {
+            let (title, mut lines) = add_agent_lines(app, *selected, theme);
+            let mut clicks: Vec<OverlayHit> = (0..app.bots.len())
+                .map(|index| OverlayHit {
+                    line: index * 2,
+                    columns: None,
+                    click: OverlayClick::AddBotRow(index),
+                })
+                .collect();
+            clicks.extend(push_chips(
+                &mut lines,
+                theme,
+                &[
+                    ("enter spawn", OverlayClick::AddBotSpawn),
+                    ("esc close", OverlayClick::PromptCancel),
+                ],
+            ));
+            (title, lines, clicks)
+        }
+        Overlay::RenameSession { editor } => {
+            let (title, mut lines) = rename_lines(app, editor, theme);
+            let clicks = push_chips(
+                &mut lines,
+                theme,
+                &[
+                    ("enter save", OverlayClick::PromptSubmit),
+                    ("esc cancel", OverlayClick::PromptCancel),
+                ],
+            );
+            (title, lines, clicks)
+        }
         Overlay::HistorySearch { query, selected }
         | Overlay::ReverseSearch { query, selected }
         | Overlay::ReverseHistorySearch { query, selected } => {
@@ -723,11 +1032,24 @@ fn overlay_content(app: &App, overlay: &Overlay, theme: &Theme) -> (String, Vec<
                     lines.push(Line::from(Span::styled(format!("  {}", entry), style)));
                 }
             }
-            ("Reverse search".to_owned(), lines)
+            let clicks = push_chips(&mut lines, theme, &[("esc close", OverlayClick::PromptCancel)]);
+            ("Reverse search".to_owned(), lines, clicks)
         }
-        Overlay::Autocomplete { .. } => ("Autocomplete".to_owned(), vec![]),
-        Overlay::Skills => skills_lines(app, theme),
-        Overlay::Info { title, lines } => (title.clone(), info_lines(lines, theme)),
+        Overlay::Autocomplete { .. } => ("Autocomplete".to_owned(), vec![], Vec::new()),
+        Overlay::Skills => {
+            let (title, mut lines) = skills_lines(app, theme);
+            let clicks = push_chips(&mut lines, theme, &[("esc close", OverlayClick::PromptCancel)]);
+            (title, lines, clicks)
+        }
+        Overlay::Info { title, lines } => {
+            let mut rendered = info_lines(lines, theme);
+            let clicks = push_chips(
+                &mut rendered,
+                theme,
+                &[("esc close", OverlayClick::PromptCancel)],
+            );
+            (title.clone(), rendered, clicks)
+        }
         Overlay::Prompt {
             title,
             hint,
@@ -745,19 +1067,50 @@ fn overlay_content(app: &App, overlay: &Overlay, theme: &Theme) -> (String, Vec<
                 ),
                 Span::styled("▌", theme.muted()),
             ]));
-            (title.clone(), lines)
+            let clicks = push_chips(
+                &mut lines,
+                theme,
+                &[
+                    ("enter save", OverlayClick::PromptSubmit),
+                    ("esc cancel", OverlayClick::PromptCancel),
+                ],
+            );
+            (title.clone(), lines, clicks)
         }
         Overlay::Confirm { title, lines, .. } => {
             let mut rendered = info_lines(lines, theme);
-            rendered.push(Line::from(Span::styled(
-                "  enter confirms · esc keeps it as it is",
-                theme.muted(),
-            )));
-            (title.clone(), rendered)
+            let clicks = push_chips(
+                &mut rendered,
+                theme,
+                &[
+                    ("enter confirm", OverlayClick::ConfirmYes),
+                    ("esc keep as is", OverlayClick::ConfirmNo),
+                ],
+            );
+            (title.clone(), rendered, clicks)
         }
         // Drawn by `overlay` before this point; the arm exists so the match stays total.
-        Overlay::Picker(_) => ("Choose".to_owned(), Vec::new()),
+        Overlay::Picker(_) => ("Choose".to_owned(), Vec::new(), Vec::new()),
     }
+}
+
+/// Append a blank separator and a row of buttons, rewriting the line indices into the body.
+fn push_chips(
+    lines: &mut Vec<Line<'static>>,
+    theme: &Theme,
+    chips: &[(&str, OverlayClick)],
+) -> Vec<OverlayHit> {
+    lines.push(Line::from(""));
+    let (row, hits) = chip_row(theme, chips);
+    let line = lines.len();
+    lines.push(row);
+    hits.into_iter()
+        .map(|(start, end, click)| OverlayHit {
+            line,
+            columns: Some((start, end)),
+            click,
+        })
+        .collect()
 }
 
 fn info_lines(lines: &[String], theme: &Theme) -> Vec<Line<'static>> {
@@ -781,17 +1134,75 @@ pub const APPROVAL_ACTIONS: [&str; 4] = [
     "Approve and add to the allow list",
 ];
 
+/// A press target inside a non-picker overlay. Every panel that can be answered is answerable with
+/// the mouse too, so no dialog is keyboard-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlayClick {
+    /// One row of the spawn-a-bot list, by its index in `App::bots`.
+    AddBotRow(usize),
+    /// Spawn the bot the spawn list has selected.
+    AddBotSpawn,
+    /// One of [`APPROVAL_ACTIONS`], by index.
+    ApprovalAction(usize),
+    /// Commit whatever the open text field holds.
+    PromptSubmit,
+    /// Leave the open text field (or the spawn list) as it was.
+    PromptCancel,
+    /// Answer a confirmation with yes.
+    ConfirmYes,
+    /// Answer a confirmation with no.
+    ConfirmNo,
+}
+
+/// One press target in a panel body, before the draw turns its line into a screen row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverlayHit {
+    /// Index into the body's lines.
+    pub line: usize,
+    /// Columns inside the body when the target is one button among several on a shared line.
+    /// `None` means the whole row is the target.
+    pub columns: Option<(u16, u16)>,
+    pub click: OverlayClick,
+}
+
+/// A row of bracketed buttons, with the columns each one occupies. The same shape as the picker's
+/// footer, so a button looks and behaves the same wherever it appears.
+fn chip_row(
+    theme: &Theme,
+    chips: &[(&str, OverlayClick)],
+) -> (Line<'static>, Vec<(u16, u16, OverlayClick)>) {
+    let mut spans: Vec<Span<'static>> = vec![Span::styled("  ".to_owned(), theme.muted())];
+    let mut hits: Vec<(u16, u16, OverlayClick)> = Vec::new();
+    let mut col: u16 = 2;
+    for (label, click) in chips {
+        let text = format!("[{label}]");
+        let width = UnicodeWidthStr::width(text.as_str()) as u16;
+        hits.push((col, col + width, *click));
+        spans.push(Span::styled(
+            text,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(" ".to_owned(), theme.muted()));
+        col += width + 1;
+    }
+    (Line::from(spans), hits)
+}
+
 /// How many rows the approvals panel needs when it is docked under the transcript.
 ///
 /// The caller reserves exactly this many rows so the question never covers the rows it is asking
 /// about: the transcript is laid out above the reserved strip and stays readable behind it.
 pub fn approval_panel_height(app: &App, theme: &Theme) -> u16 {
-    let (_, lines) = approval_lines(app, theme);
+    let (_, lines, _) = approval_lines(app, theme);
     (lines.len() as u16 + 2).clamp(3, 16)
 }
 
-fn approval_lines(app: &App, theme: &Theme) -> (String, Vec<Line<'static>>) {
+/// The panel body plus the line each answer button sits on, so a press can name one.
+fn approval_lines(app: &App, theme: &Theme) -> (String, Vec<Line<'static>>, Vec<usize>) {
     let mut lines: Vec<Line> = Vec::new();
+    let mut action_rows: Vec<usize> = Vec::new();
     if app.approvals.is_empty() {
         lines.push(Line::styled("  nothing is waiting", theme.secondary()));
     } else {
@@ -822,7 +1233,7 @@ fn approval_lines(app: &App, theme: &Theme) -> (String, Vec<Line<'static>>) {
         }
     }
     lines.push(Line::from(""));
-    // Three answers, laid out so the arrow keys can land on any of them.
+    // One button per answer, laid out so the arrow keys and the mouse can land on any of them.
     for (index, label) in APPROVAL_ACTIONS.iter().enumerate() {
         let selected = index == app.approval_action;
         let marker = if selected { theme.chevron() } else { " " };
@@ -833,16 +1244,21 @@ fn approval_lines(app: &App, theme: &Theme) -> (String, Vec<Line<'static>>) {
         } else {
             Style::default().fg(theme.text)
         };
+        action_rows.push(lines.len());
         lines.push(Line::from(vec![
             Span::styled(format!("{marker} "), style),
-            Span::styled((*label).to_owned(), style),
+            Span::styled(format!("[{label}]"), style),
         ]));
     }
     lines.push(Line::styled(
         "  ↑↓ choose · enter confirm · a approve · d deny · p add",
         theme.muted(),
     ));
-    (format!("Permissions {}", app.approvals.len()), lines)
+    (
+        format!("Permissions {}", app.approvals.len()),
+        lines,
+        action_rows,
+    )
 }
 
 fn inspector_title(kind: &InspectorKind) -> &'static str {
@@ -850,7 +1266,7 @@ fn inspector_title(kind: &InspectorKind) -> &'static str {
         InspectorKind::Background => "Background tasks",
         InspectorKind::Mcp => "MCP servers",
         InspectorKind::Plugins => "Plugins",
-        InspectorKind::SubAgents => "Sub-agents",
+        InspectorKind::SubAgents => "Sub-bots",
         InspectorKind::Context => "Context",
         InspectorKind::Model => "Model",
     }
@@ -902,7 +1318,7 @@ fn inspector_lines(app: &App, kind: &InspectorKind, theme: &Theme) -> Vec<Line<'
         }
         InspectorKind::SubAgents => {
             let spawned: Vec<_> = app
-                .agents
+                .bots
                 .iter()
                 .filter(|agent| agent.session.is_some() || agent.state.is_active())
                 .collect();
@@ -1063,10 +1479,10 @@ fn inspector_lines(app: &App, kind: &InspectorKind, theme: &Theme) -> Vec<Line<'
 
 fn add_agent_lines(app: &App, selected: usize, theme: &Theme) -> (String, Vec<Line<'static>>) {
     let mut lines: Vec<Line> = Vec::new();
-    if app.agents.is_empty() {
+    if app.bots.is_empty() {
         lines.push(Line::styled("  no bot profiles", theme.secondary()));
     } else {
-        for (index, agent) in app.agents.iter().enumerate() {
+        for (index, agent) in app.bots.iter().enumerate() {
             let active = index == selected;
             let marker = if active { theme.chevron() } else { " " };
             let style = if active {
@@ -1094,7 +1510,6 @@ fn add_agent_lines(app: &App, selected: usize, theme: &Theme) -> (String, Vec<Li
         }
     }
     lines.push(Line::from(""));
-    lines.push(Line::styled("  Enter spawn · Esc close", theme.muted()));
     ("Spawn a bot".to_owned(), lines)
 }
 
@@ -1139,7 +1554,6 @@ fn rename_lines(
         }
     }
     lines.push(Line::from(""));
-    lines.push(Line::styled("  Enter save · Esc cancel", theme.muted()));
     ("Rename session".to_owned(), lines)
 }
 
@@ -1209,6 +1623,21 @@ fn human(value: u64) -> String {
         return format!("{:.1}k", value as f64 / 1_000.0);
     }
     format!("{:.1}M", value as f64 / 1_000_000.0)
+}
+
+/// A span of time at the resolution a status line can use: seconds under a minute, then minutes
+/// and seconds, then hours and minutes. The unit is always named, because `5` beside a box tells
+/// nobody whether the machine has been up for five seconds or five hours.
+fn duration(ms: u64) -> String {
+    let total = ms / 1000;
+    let (hours, minutes, seconds) = (total / 3600, (total % 3600) / 60, total % 60);
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn clip(text: &str, width: usize, ascii: bool) -> String {
@@ -1306,9 +1735,9 @@ mod tests {
     use crate::app::Activity;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use vikram_contracts::{AgentId, ApprovalId, Message, SessionId};
+    use vikram_contracts::{ApprovalId, BotId, Message, SessionId};
     use vikram_runtime::types::{
-        AgentProfile, AgentSnapshot, AgentState, ApprovalPrompt, BackgroundTask, ContextMeter,
+        ApprovalPrompt, BackgroundTask, BotProfile, BotSnapshot, BotState, ContextMeter,
         ContextPart, Metrics, NoticeLevel, RuntimeStatus, SessionSnapshot, TurnState,
     };
 
@@ -1330,8 +1759,11 @@ mod tests {
             tokens: Default::default(),
             created_ms: 0,
             updated_ms: 0,
-            agent: None,
+            bot: None,
             queued: 0,
+            queue: Vec::new(),
+            steer_text: None,
+            queue_text: None,
             project_id: None,
             status: "active".to_owned(),
             title_source: "generic".to_owned(),
@@ -1339,10 +1771,10 @@ mod tests {
         }
     }
 
-    fn bot(name: &str, role: &str, state: AgentState) -> AgentSnapshot {
-        AgentSnapshot {
-            profile: AgentProfile {
-                id: AgentId::generate(),
+    fn bot(name: &str, role: &str, state: BotState) -> BotSnapshot {
+        BotSnapshot {
+            profile: BotProfile {
+                id: BotId::generate(),
                 name: name.to_owned(),
                 role: role.to_owned(),
                 description: format!("{role} bot"),
@@ -1361,10 +1793,10 @@ mod tests {
         let mut app = App::new(false);
         app.sessions
             .push(crate::app::SessionView::from_snapshot(session("First")));
-        app.agents = vec![
-            bot("Rudra", "Implementer", AgentState::Idle),
-            bot("Karma", "Reviewer", AgentState::Idle),
-            bot("Verifier", "Verifier", AgentState::Idle),
+        app.bots = vec![
+            bot("Rudra", "Implementer", BotState::Idle),
+            bot("Karma", "Reviewer", BotState::Idle),
+            bot("Verifier", "Verifier", BotState::Idle),
         ];
         app
     }
@@ -1386,6 +1818,40 @@ mod tests {
     }
 
     #[test]
+    fn a_working_tab_spins_where_an_idle_tab_shows_the_star() {
+        let mut app = app_with_default_bots();
+        app.sessions[0].turn = vikram_runtime::types::TurnState::Streaming;
+        let busy = draw(40, 1, |frame| {
+            session_tabs(frame, frame.area(), &mut app, &Theme::new(false))
+        });
+        assert!(
+            crate::app::THINKING_FRAMES
+                .iter()
+                .any(|frame| busy.contains(&format!(" {frame} "))),
+            "a working tab shows no spinner: {busy}"
+        );
+        app.tick = app.tick.wrapping_add(2);
+        let busy_next = draw(40, 1, |frame| {
+            session_tabs(frame, frame.area(), &mut app, &Theme::new(false))
+        });
+        assert_ne!(
+            busy, busy_next,
+            "a working tab stopped animating between ticks"
+        );
+
+        app.sessions[0].turn = vikram_runtime::types::TurnState::Idle;
+        let idle = draw(40, 1, |frame| {
+            session_tabs(frame, frame.area(), &mut app, &Theme::new(false))
+        });
+        assert!(idle.contains(" ✳ "), "an idle tab lost its star: {idle}");
+        app.tick = app.tick.wrapping_add(2);
+        let idle_next = draw(40, 1, |frame| {
+            session_tabs(frame, frame.area(), &mut app, &Theme::new(false))
+        });
+        assert_eq!(idle, idle_next, "an idle tab kept animating");
+    }
+
+    #[test]
     fn tabs_are_honest_when_no_session_exists() {
         let mut app = App::new(false);
         let rendered = draw(60, 1, |frame| {
@@ -1398,8 +1864,8 @@ mod tests {
     #[test]
     fn bots_panel_lists_the_profile_names_and_state() {
         let mut app = app_with_default_bots();
-        app.agents[0].state = AgentState::Running;
-        app.agents[0].current_task = Some("porting the store".to_owned());
+        app.bots[0].state = BotState::Running;
+        app.bots[0].current_task = Some("porting the store".to_owned());
 
         let rendered = draw(32, 10, |frame| {
             bots_panel(frame, frame.area(), &app, &Theme::new(false))
@@ -1426,9 +1892,8 @@ mod tests {
     #[test]
     fn bots_panel_never_exceeds_its_area() {
         let mut app = app_with_default_bots();
-        app.agents.extend(
-            (0..12).map(|index| bot(&format!("bot {index}"), "Reviewer", AgentState::Idle)),
-        );
+        app.bots
+            .extend((0..12).map(|index| bot(&format!("bot {index}"), "Reviewer", BotState::Idle)));
         let rendered = draw(30, 5, |frame| {
             bots_panel(frame, frame.area(), &app, &Theme::new(false))
         });
@@ -1501,16 +1966,44 @@ mod tests {
             plugins_installed: 1,
             ..Metrics::default()
         };
-        let rendered = draw(130, 1, |frame| {
+        // 150 columns, not a narrow terminal: the totals column yields to the session sentence when
+        // the line runs out, so a width that cannot hold both would test the yielding rather than
+        // the reporting this test is named for.
+        let rendered = draw(150, 1, |frame| {
             status_bar(frame, frame.area(), &app, &Theme::new(false))
         });
-        assert!(rendered.contains("Runtime active"), "got {rendered}");
+        // The row opens with the posture and carries no runtime label and no notice: a leading
+        // message shifted every segment after it, so the line no longer has one.
+        assert!(
+            rendered.starts_with("⛨ ask"),
+            "the line opens with the posture: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Runtime"),
+            "the runtime label left this row: {rendered}"
+        );
         assert!(rendered.contains("gpt-5-codex"), "got {rendered}");
         assert!(rendered.contains("50%"), "got {rendered}");
         assert!(rendered.contains("Background"), "got {rendered}");
         assert!(rendered.contains("MCP"), "got {rendered}");
         assert!(rendered.contains("Plugins"), "got {rendered}");
-        assert!(rendered.contains("Agents"), "got {rendered}");
+        assert!(rendered.contains("Bots"), "got {rendered}");
+    }
+
+    #[test]
+    fn the_status_bar_names_the_whole_model_identifier_when_it_fits() {
+        let mut app = app_with_default_bots();
+        app.metrics = Metrics {
+            model: Some("nvidia/nemotron-3.5-super-vl:free".to_owned()),
+            ..Metrics::default()
+        };
+        let rendered = draw(160, 1, |frame| {
+            status_bar(frame, frame.area(), &app, &Theme::new(false))
+        });
+        assert!(
+            rendered.contains("nvidia/nemotron-3.5-super-vl:free"),
+            "a clipped model name does not say which model is running: {rendered}"
+        );
     }
 
     #[test]
@@ -1529,15 +2022,71 @@ mod tests {
     }
 
     #[test]
+    fn status_bar_keeps_the_clock_and_throughput_segments_when_idle() {
+        let mut app = app_with_default_bots();
+        app.metrics = Metrics {
+            model: Some("gpt-5-codex".to_owned()),
+            elapsed_ms: 65_000,
+            ..Metrics::default()
+        };
+        let rendered = draw(140, 1, |frame| {
+            status_bar(frame, frame.area(), &app, &Theme::new(false))
+        });
+        assert!(
+            rendered.contains("1m05s"),
+            "the session clock is missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("↑ -- t/s"),
+            "an unmeasured rate has to say so rather than vanish: {rendered}"
+        );
+        assert!(
+            !rendered.contains('◷'),
+            "the turn timer belongs to a running turn only: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_turn_timer_appears_beside_the_session_clock_only_while_a_turn_runs() {
+        let mut app = app_with_default_bots();
+        app.metrics = Metrics {
+            model: Some("gpt-5-codex".to_owned()),
+            elapsed_ms: 65_000,
+            turn_elapsed_ms: Some(9_400),
+            tokens_per_sec: Some(13.0),
+            ..Metrics::default()
+        };
+        let rendered = draw(140, 1, |frame| {
+            status_bar(frame, frame.area(), &app, &Theme::new(false))
+        });
+        assert!(rendered.contains("◷ 9s"), "turn timer missing: {rendered}");
+        assert!(
+            rendered.contains("⏱ 1m05s"),
+            "session clock missing: {rendered}"
+        );
+        assert!(rendered.contains("↑ 13 t/s"), "rate missing: {rendered}");
+    }
+
+    #[test]
+    fn duration_names_its_unit() {
+        assert_eq!(duration(5_000), "5s");
+        assert_eq!(duration(65_000), "1m05s");
+        assert_eq!(duration(3_720_000), "1h02m");
+    }
+
+    #[test]
     fn shortcuts_show_the_approved_line() {
         let app = app_with_default_bots();
         let rendered = draw(80, 1, |frame| {
             shortcuts(frame, frame.area(), &app, &Theme::new(false))
         });
-        assert!(rendered.contains("Enter · Send"), "got {rendered}");
-        assert!(rendered.contains("Tab · Queue"), "got {rendered}");
-        assert!(rendered.contains("Esc · Interrupt"), "got {rendered}");
-        assert!(rendered.contains("Ctrl+C · Stop"), "got {rendered}");
+        // Key and action are drawn as separate spans, so the row reads at two speeds: the key is
+        // what the hand looks for, the action is what the head reads. Lowercase, because the action
+        // continues the key rather than starting a sentence.
+        assert!(rendered.contains("Enter send"), "got {rendered}");
+        assert!(rendered.contains("Tab queue"), "got {rendered}");
+        assert!(rendered.contains("Esc interrupt"), "got {rendered}");
+        assert!(rendered.contains("Ctrl+C stop"), "got {rendered}");
     }
 
     #[test]
@@ -1590,12 +2139,12 @@ mod tests {
         });
         assert!(
             idle.contains("none spawned"),
-            "default bots must not be reported as sub-agents: {idle}"
+            "default bots must not be reported as sub-bots: {idle}"
         );
 
-        app.agents[1].session = Some(app.sessions[0].id.clone());
-        app.agents[1].state = AgentState::Running;
-        app.agents[1].current_task = Some("review the diff".to_owned());
+        app.bots[1].session = Some(app.sessions[0].id.clone());
+        app.bots[1].state = BotState::Running;
+        app.bots[1].current_task = Some("review the diff".to_owned());
         let busy = draw(80, 24, |frame| {
             overlay(frame, frame.area(), &mut app, &Theme::new(false))
         });
@@ -1669,7 +2218,7 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_shows_tokens_when_the_window_is_assumed_and_a_percentage_when_it_is_real() {
+    fn status_bar_draws_the_context_meter_in_every_state() {
         let mut app = app_with_default_bots();
         app.metrics = Metrics {
             context_used: 50_000,
@@ -1681,16 +2230,19 @@ mod tests {
         let assumed = draw(130, 1, |frame| {
             status_bar(frame, frame.area(), &app, &Theme::new(false))
         });
-        // No source knows this model's window, so a percentage would divide by an invented number.
-        assert!(assumed.contains("ctx 50.0k tok"), "got {assumed}");
+        // The box is the signal; only the figure behind it changes. An assumed window keeps its
+        // meter but reports the measured count, because a share of an invented number says nothing.
+        assert!(assumed.contains("ctx ["), "got {assumed}");
+        assert!(assumed.contains("50.0k*"), "got {assumed}");
         assert!(
-            !assumed.contains('%') && !assumed.contains('*'),
+            !assumed.contains('%'),
             "an assumed window carries no percentage: {assumed}"
         );
         app.metrics.context_limit_assumed = false;
         let estimated = draw(130, 1, |frame| {
             status_bar(frame, frame.area(), &app, &Theme::new(false))
         });
+        assert!(estimated.contains("ctx ["), "got {estimated}");
         assert!(estimated.contains("~50%"), "got {estimated}");
         app.metrics.context_measured = true;
         let measured = draw(130, 1, |frame| {
@@ -1709,7 +2261,7 @@ mod tests {
     #[test]
     fn add_agent_overlay_marks_the_selection() {
         let mut app = app_with_default_bots();
-        app.overlay = Some(Overlay::AddAgent { selected: 1 });
+        app.overlay = Some(Overlay::AddBot { selected: 1 });
         let rendered = draw(80, 24, |frame| {
             overlay(frame, frame.area(), &mut app, &Theme::new(false))
         });
@@ -1730,7 +2282,7 @@ mod tests {
         });
         assert!(rendered.contains("now: First"), "got {rendered}");
         assert!(rendered.contains("Renamed"), "got {rendered}");
-        assert!(rendered.contains("Enter save"), "got {rendered}");
+        assert!(rendered.contains("[enter save]"), "got {rendered}");
     }
 
     #[test]
@@ -1835,8 +2387,11 @@ mod picker_panel_tests {
                 tokens: Default::default(),
                 created_ms: 0,
                 updated_ms: 0,
-                agent: None,
+                bot: None,
                 queued: 0,
+                queue: Vec::new(),
+                steer_text: None,
+                queue_text: None,
                 project_id: None,
                 status: "active".to_owned(),
                 title_source: "generic".to_owned(),
@@ -1906,7 +2461,7 @@ mod picker_panel_tests {
             overlay(frame, frame.area(), &mut app, &Theme::new(false))
         });
         assert!(rendered.contains("fs write"), "got {rendered}");
-        assert!(rendered.contains("enter confirms"), "got {rendered}");
-        assert!(rendered.contains("esc keeps"), "got {rendered}");
+        assert!(rendered.contains("[enter confirm]"), "got {rendered}");
+        assert!(rendered.contains("esc keep as is"), "got {rendered}");
     }
 }

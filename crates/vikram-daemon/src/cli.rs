@@ -15,7 +15,7 @@ use crate::daemon::{Daemon, Lock, LockError, owner};
 use crate::heartbeat::{Beat, BeatKind, Heartbeat, Policy};
 use crate::jobs::{JobManager, NewJob};
 use crate::notify;
-use crate::runner::TeamOrder;
+use crate::runner::HiveRosterOrder;
 use crate::service;
 use crate::store::{Delivery, JobMode, Run, RunStatus, ScheduleStore};
 use crate::time::{Zone, format_ms, humanize_ms, now_ms, parse_duration};
@@ -395,7 +395,7 @@ pub struct Draft {
     pub retries: Option<u32>,
     pub timeout: Option<String>,
     pub priority: Option<i64>,
-    /// How a team job runs its members: `parallel` or `sequential`.
+    /// How a hive job runs its members: `parallel` or `sequential`.
     pub order: Option<String>,
     pub enabled: Option<bool>,
 }
@@ -441,7 +441,7 @@ impl Draft {
         if let Some(order) = &self.order {
             // A word the runner cannot read would quietly fall back to parallel, which is the
             // opposite of what somebody asking for sequential wants.
-            TeamOrder::parse(order)
+            HiveRosterOrder::parse(order)
                 .ok_or_else(|| format!("unknown order {order:?}: use parallel or sequential"))?;
             job = job.order(order.clone());
         }
@@ -457,7 +457,7 @@ impl Draft {
             return Err("a delegate job needs a bot: add --bot <agent>".into());
         }
         if job.mode == JobMode::Workflow && job.agent.trim().is_empty() {
-            return Err("a workflow job needs a team: add --agent <team>".into());
+            return Err("a workflow job needs a hive: add --agent <hive>".into());
         }
         Ok(job)
     }
@@ -586,7 +586,7 @@ pub fn cron_edit(needle: &str, draft: &Draft) -> Result<String, String> {
             Some(parse_duration(timeout).ok_or_else(|| format!("unknown duration {timeout:?}"))?);
     }
     if let Some(order) = &draft.order {
-        TeamOrder::parse(order)
+        HiveRosterOrder::parse(order)
             .ok_or_else(|| format!("unknown order {order:?}: use parallel or sequential"))?;
         job.order = order.clone();
     }
@@ -612,7 +612,7 @@ pub fn cron_edit(needle: &str, draft: &Draft) -> Result<String, String> {
         return Err("a delegate job needs a bot: add --bot <agent>".into());
     }
     if job.mode == JobMode::Workflow && job.agent.trim().is_empty() {
-        return Err("a workflow job needs a team: add --agent <team>".into());
+        return Err("a workflow job needs a hive: add --agent <hive>".into());
     }
     store.update_job(&job).map_err(|err| err.to_string())?;
     audit(&home(), &format!("cron edit {} {}", job.id, job.schedule));
@@ -804,9 +804,9 @@ pub fn jobs_cancel(needle: &str) -> Result<String, String> {
     Ok(format!("asked {} to stop", run.id))
 }
 
-/// Ask the daemon to stop one member of a running team, leaving the rest of it working.
+/// Ask the daemon to stop one member of a running hive, leaving the rest of it working.
 ///
-/// A team run has one turn per member; cancelling the whole run throws away the members that are
+/// A hive run has one turn per member; cancelling the whole run throws away the members that are
 /// doing fine. This names one of them and lets the others finish.
 pub fn jobs_cancel_member(needle: &str, agent: &str) -> Result<String, String> {
     let store = store()?;

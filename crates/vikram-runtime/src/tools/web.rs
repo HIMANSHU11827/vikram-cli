@@ -151,7 +151,7 @@ pub(crate) fn search_tool_output(
             ok: true,
         },
         Ok(_) => ToolOutput {
-            content: "web search failed: the backend answered with zero results".into(),
+            content: "web search failed: the backend answered with zero results. Do not repeat this query: try different words, or fetch a real page instead (browser.fetch or browser.open on a news site's URL, then browser.text, browser.links), or call http against a site's own endpoint.".into(),
             ok: false,
         },
         Err(err) => ToolOutput {

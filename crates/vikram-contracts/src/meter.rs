@@ -20,6 +20,13 @@ impl CancellationToken {
         self.cancelled.store(true, Ordering::SeqCst);
     }
 
+    /// Clear the flag in place, so the next turn starts uncancelled **and** every holder of a clone
+    /// sees it. Replacing the token with a new one leaves the running turn holding a clone that is
+    /// still cancelled, which is what made the turn after a stop end before it began.
+    pub fn reset(&self) {
+        self.cancelled.store(false, Ordering::SeqCst);
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }

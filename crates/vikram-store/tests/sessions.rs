@@ -1,5 +1,5 @@
 use std::path::Path;
-use vikram_contracts::{AgentId, JournalSink, NewRecord, ProjectId, RecordKind, SessionId};
+use vikram_contracts::{BotId, JournalSink, NewRecord, ProjectId, RecordKind, SessionId};
 use vikram_store::{ArtifactRow, FileChangeRow, Store};
 
 fn now() -> u64 {
@@ -117,13 +117,13 @@ fn artifacts_index_without_copying() {
     let s = store
         .create_session("s", Path::new("/work"), None, now)
         .unwrap();
-    let agent = AgentId::new("rudra");
+    let agent = BotId::new("rudra");
 
     let art = ArtifactRow {
         id: "art-1".into(),
         session: s.id.clone(),
         project_id: None,
-        agent: Some(agent.clone()),
+        bot: Some(agent.clone()),
         name: "chart.png".into(),
         path: Path::new("/work/out/chart.png").into(),
         kind: "image".into(),
@@ -142,7 +142,7 @@ fn artifacts_index_without_copying() {
     assert_eq!(all.len(), 1);
     let mine = store.list_artifacts(Some(&s.id)).unwrap();
     assert_eq!(mine.len(), 1);
-    assert_eq!(mine[0].agent.as_ref(), Some(&agent));
+    assert_eq!(mine[0].bot.as_ref(), Some(&agent));
 
     assert!(store.remove_artifact("art-1").unwrap());
     assert!(store.list_artifacts(None).unwrap().is_empty());
@@ -162,7 +162,7 @@ fn file_changes_are_recorded_and_scoped_to_session() {
     let change = FileChangeRow {
         id: "chg-1".into(),
         session: s1.id.clone(),
-        agent: None,
+        bot: None,
         path: Path::new("/work/a.rs").into(),
         operation: "modify".into(),
         checksum_before: Some("before".into()),
@@ -198,7 +198,7 @@ fn deleting_a_session_removes_its_metadata_not_projects() {
         .record_file_change(&FileChangeRow {
             id: "chg".into(),
             session: s.id.clone(),
-            agent: None,
+            bot: None,
             path: Path::new("/ws/f.txt").into(),
             operation: "create".into(),
             checksum_before: None,
@@ -424,11 +424,11 @@ fn recent_sessions_are_listed_by_activity_not_by_creation() {
 fn session_fts_filtered_and_browse() {
     let store = Store::open_in_memory().unwrap();
     let now = now();
-    let agent = AgentId::new("rudra");
+    let agent = BotId::new("rudra");
     let s1 = store
         .create_session("Deploy notes", Path::new("/work"), None, now)
         .unwrap();
-    store.set_session_agent(&s1.id, Some(&agent), now).unwrap();
+    store.set_session_bot(&s1.id, Some(&agent), now).unwrap();
     let p = store
         .create_project("website", Path::new("/tmp/website"), now)
         .unwrap();

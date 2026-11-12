@@ -17,12 +17,13 @@ use crossterm::terminal::{
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::style::Color;
 use tokio::sync::broadcast::error::RecvError;
-use vikram_contracts::{AgentId, PermissionMode, SessionId};
+use vikram_contracts::{BotId, PermissionMode, SessionId};
 use vikram_runtime::config::Config;
 use vikram_runtime::types::{NoticeLevel, TurnState};
-use vikram_runtime::{AgentControl, Runtime, RuntimeHandle};
-use vikram_tui::app::{AgentAction, App, Focus, Overlay, UiCommand};
+use vikram_runtime::{BotControl, Runtime, RuntimeHandle};
+use vikram_tui::app::{App, BotAction, Focus, Overlay, UiCommand};
 use vikram_tui::commands::{self, Outcome};
 use vikram_tui::widgets::{Picker, PickerItem, PickerKind, Verb};
 use vikram_tui::{input, ui};
@@ -31,18 +32,35 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 
 pub async fn run(config: Config) -> Result<(), String> {
     let ascii = config.ascii_fallback;
+    let theme_bg = configured_colour(&config.theme.background, "theme.background");
+    let theme_accent = configured_colour(&config.theme.accent, "theme.accent");
     let runtime = Runtime::start(config)
         .await
         .map_err(|err| format!("could not start runtime: {err}"))?;
     let handle = runtime.handle();
 
     let mut app = App::new(ascii);
+    app.theme_bg = theme_bg;
+    app.theme_accent = theme_accent;
     app.sync_snapshot(handle.snapshot());
 
     let mut terminal = setup_terminal()?;
     let outcome = event_loop(&mut terminal, &mut app, &handle).await;
     restore_terminal(&mut terminal);
     outcome
+}
+
+/// Read a `rrggbb` colour out of the config. A value that is not six hex digits is reported and
+/// dropped, so a typo costs the operator the default colour and a sentence saying so, rather than
+/// a window drawn in whatever the parser happened to make of it.
+fn configured_colour(value: &str, field: &str) -> Option<Color> {
+    let hex = value.trim().trim_start_matches('#');
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        eprintln!("config: {field} = {value:?} is not six hex digits (rrggbb); using the default");
+        return None;
+    }
+    let byte = |at: usize| u8::from_str_radix(&hex[at..at + 2], 16).unwrap_or_default();
+    Some(Color::Rgb(byte(0), byte(2), byte(4)))
 }
 
 fn setup_terminal() -> Result<Term, String> {
@@ -289,6 +307,100 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
                 report(app, err);
             }
         }
+        UiCommand::Steer { session, text } => {
+            if let Err(err) = handle.steer(&session, text) {
+                report(app, err);
+            } else {
+                app.push_notice(NoticeLevel::Info, "steered the running turn");
+            }
+        }
+        UiCommand::EditPending {
+            session,
+            target,
+            text,
+        } => {
+            let text = text.trim().to_owned();
+            if text.is_empty() {
+                app.push_notice(NoticeLevel::Warn, "empty edit — nothing changed");
+            } else if let Err(err) = handle.pending_update(&session, &target, text) {
+                report(app, err);
+            }
+        }
+        UiCommand::CreateBot {
+            name,
+            role,
+            description,
+        } => {
+            if name.trim().is_empty() {
+                app.push_notice(NoticeLevel::Warn, "a bot needs a name");
+            } else {
+                match handle.bot_create(name.trim(), &role, &description) {
+                    Ok(id) => {
+                        app.push_notice(NoticeLevel::Info, format!("created bot `{name}` ({id})"))
+                    }
+                    Err(err) => report(app, err),
+                }
+            }
+        }
+        UiCommand::RenameBot { bot, name } => {
+            if name.trim().is_empty() {
+                app.push_notice(NoticeLevel::Warn, "a bot needs a name");
+            } else {
+                match handle.bot_rename(&bot, name.trim()) {
+                    Ok(()) => {
+                        app.push_notice(NoticeLevel::Info, format!("renamed bot to `{name}`"))
+                    }
+                    Err(err) => report(app, err),
+                }
+            }
+        }
+        UiCommand::DeleteBot { bot } => match handle.bot_delete(&bot) {
+            Ok(()) => {
+                app.push_notice(NoticeLevel::Info, "bot deleted");
+                app.sync_snapshot(handle.snapshot());
+            }
+            Err(err) => report(app, err),
+        },
+        UiCommand::RenameSkill { skill, new_name } => {
+            if new_name.trim().is_empty() {
+                app.push_notice(NoticeLevel::Warn, "a skill needs a name");
+            } else {
+                match handle.skill_rename(&skill, new_name.trim()) {
+                    Ok(()) => app.push_notice(
+                        NoticeLevel::Info,
+                        format!("renamed skill `{skill}` to `{new_name}`"),
+                    ),
+                    Err(err) => report(app, err),
+                }
+            }
+        }
+        UiCommand::InstallPlugin { path } => {
+            let path = std::path::PathBuf::from(path.trim());
+            if path.as_os_str().is_empty() {
+                app.push_notice(NoticeLevel::Warn, "a plugin needs a path");
+            } else {
+                match handle.plugin_install(&path) {
+                    Ok(id) => {
+                        app.push_notice(NoticeLevel::Info, format!("installed plugin `{id}`"))
+                    }
+                    Err(err) => report(app, err),
+                }
+            }
+        }
+        UiCommand::UninstallPlugin { id } => match handle.plugin_uninstall(&id) {
+            Ok(()) => app.push_notice(NoticeLevel::Info, format!("uninstalled plugin `{id}`")),
+            Err(err) => report(app, err),
+        },
+        UiCommand::SaveMemory { key, value } => {
+            if key.trim().is_empty() {
+                app.push_notice(NoticeLevel::Warn, "a memory needs a key");
+            } else {
+                match handle.memory_save(key.trim(), value.trim(), "global") {
+                    Ok(()) => app.push_notice(NoticeLevel::Info, format!("remembered `{key}`")),
+                    Err(err) => report(app, err),
+                }
+            }
+        }
         UiCommand::Cancel { session } => {
             if let Err(err) = handle.cancel(&session) {
                 report(app, err);
@@ -302,8 +414,26 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
             Err(err) => report(app, err),
         },
         UiCommand::SwitchSession { session } => {
-            app.selected_agent = None;
-            select(app, &session);
+            app.selected_bot = None;
+            // A closed tab is a view that was closed, not a conversation that ended, so choosing it
+            // from the catalogue loads it again instead of failing. Only when the store has no such
+            // session is there nothing to select.
+            let live = match app.session_index(&session) {
+                Some(_) => true,
+                None => match handle.open_session(&session) {
+                    Ok(_) => {
+                        app.sync_snapshot(handle.snapshot());
+                        true
+                    }
+                    Err(err) => {
+                        report(app, err);
+                        false
+                    }
+                },
+            };
+            if live {
+                select(app, &session);
+            }
         }
         UiCommand::RenameSession { session, title } => {
             if let Err(err) = handle.rename_session(&session, title) {
@@ -312,9 +442,21 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
         }
         UiCommand::CloseSession { session } => {
             let was_active = app.session_index(&session) == Some(app.active);
+            let title = app
+                .sessions
+                .iter()
+                .find(|view| view.id == session)
+                .map(|view| view.title.clone());
             if let Err(err) = handle.close_session(&session) {
                 report(app, err);
             } else {
+                // The tab is gone and the transcript is not: saying so once, here, is what keeps a
+                // close from reading as a delete.
+                let name = title.unwrap_or_else(|| "session".to_owned());
+                app.push_notice(
+                    NoticeLevel::Info,
+                    format!("closed {name} — still in /sessions"),
+                );
                 if app.sessions.is_empty() {
                     match handle.create_session(Some("Session".into())) {
                         Ok(id) => select(app, &id),
@@ -340,6 +482,20 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
             args,
         } => open_command(handle, app, &session, &command, &args),
         UiCommand::RefreshModels => handle.refresh_models(),
+        UiCommand::SetEndpoint { base_url } => {
+            // A custom endpoint keeps the key variable and dialect already configured: the operator
+            // typed where the server lives, not which variable holds its token.
+            let config = handle.config();
+            match handle.set_provider(base_url, config.api_key_env, config.provider) {
+                Ok(()) => {
+                    app.models.clear();
+                    app.models_error = None;
+                    app.models_loading = true;
+                    handle.refresh_models();
+                }
+                Err(err) => report(app, err),
+            }
+        }
         UiCommand::Unallow { index } => match handle.unallow(index) {
             Ok(rule) => app.push_notice(NoticeLevel::Info, format!("forgot {}", rule.describe())),
             Err(err) => report(app, err),
@@ -376,6 +532,10 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
                 NoticeLevel::Info,
                 format!("imported skill from `{}`", path.trim()),
             ),
+            Err(err) => report(app, err),
+        },
+        UiCommand::CreateHiveRoster { name } => match handle.hive_roster_create(name.trim()) {
+            Ok(()) => app.push_notice(NoticeLevel::Info, format!("created hive `{}`", name.trim())),
             Err(err) => report(app, err),
         },
         UiCommand::Act {
@@ -419,13 +579,13 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
                 report(app, err);
             }
         }
-        UiCommand::AgentControl { agent, action } => {
+        UiCommand::BotControl { bot, action } => {
             let control = match action {
-                AgentAction::Pause => AgentControl::Pause,
-                AgentAction::Resume => AgentControl::Resume,
-                AgentAction::Stop => AgentControl::Stop,
+                BotAction::Pause => BotControl::Pause,
+                BotAction::Resume => BotControl::Resume,
+                BotAction::Stop => BotControl::Stop,
             };
-            if let Err(err) = handle.control_agent(&agent, control) {
+            if let Err(err) = handle.control_bot(&bot, control) {
                 report(app, err);
             }
         }
@@ -542,16 +702,14 @@ fn open_command(
     match command.outcome {
         Outcome::Picker(kind) => open_panel(handle, app, kind),
         Outcome::Info => {
-            // Info commands are now handled as pickers - this should not be reached
+            // No command in the table uses this outcome: a read-only answer is a picker too, so the
+            // text reaches the screen. Kept so the match stays exhaustive.
             app.push_notice(
                 NoticeLevel::Warn,
-                format!("`/{}` should be a picker", command.name),
+                format!("`/{}` has no panel", command.name),
             );
         }
-        Outcome::Action => {
-            // Legacy action commands - most are now pickers, but keep for safety
-            run_action(app, session, command.name);
-        }
+        Outcome::Action => run_action(app, session, command.name),
     }
 }
 
@@ -605,41 +763,18 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                     .with_note("ctrl+a saves a rule · enter forgets the one under the cursor"),
             );
         }
-        PickerKind::Bot | PickerKind::Agent => {
+        PickerKind::Bot => {
             let mut items: Vec<PickerItem> = Vec::new();
-            for agent in handle.agent_snapshots() {
+            for agent in handle.bot_snapshots() {
                 items.push(PickerItem::new(
                     agent.profile.name.clone(),
                     format!("{} · {}", agent.profile.role, agent.state.label()),
                     agent.profile.id.to_string(),
                 ));
             }
-            let title = if kind == PickerKind::Bot {
-                "Bots"
-            } else {
-                "Agents"
-            };
-            let picker = Picker::new(kind, title, items);
-            app.open_picker(picker.with_note(if kind == PickerKind::Bot {
-                "enter selects · ctrl+n spawns a new bot"
-            } else {
-                "enter chooses what to do with it"
-            }));
-        }
-        PickerKind::AgentAction => {
-            let subject = app
-                .pending_agent
-                .as_ref()
-                .map(|id| id.to_string())
-                .unwrap_or_default();
-            let items = vec![
-                PickerItem::new("pause", "stop scheduling work", "pause"),
-                PickerItem::new("resume", "continue", "resume"),
-                PickerItem::new("stop", "end the agent", "stop"),
-            ];
-            app.open_picker(
-                Picker::new(kind, "Agent", items).with_note(format!("for `{subject}`")),
-            );
+            app.open_picker(Picker::new(kind, "Bots", items).with_note(
+                "enter selects · ctrl+n spawn · ctrl+c new · ctrl+r rename · ctrl+x delete",
+            ));
         }
         PickerKind::Mcp => {
             let servers = handle.mcp_servers();
@@ -661,23 +796,33 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
             });
         }
         PickerKind::Session => {
-            let items: Vec<PickerItem> = app
-                .sessions
-                .iter()
-                .enumerate()
-                .map(|(index, view)| {
-                    let detail = format!(
-                        "{} · {} message(s){}",
-                        view.model.clone().unwrap_or_else(|| "no model".to_owned()),
-                        view.messages.len(),
-                        if view.unread > 0 {
-                            format!(" · {} unread", view.unread)
-                        } else {
-                            String::new()
-                        }
+            // Built from the catalogue, not from the open tabs: a session whose tab was closed is
+            // still a conversation, and the list that cannot show it is the list that teaches an
+            // operator to stop closing tabs.
+            let active_id = app.sessions.get(app.active).map(|view| view.id.clone());
+            let items: Vec<PickerItem> = handle
+                .session_catalogue()
+                .into_iter()
+                .map(|entry| {
+                    let mut detail = format!(
+                        "{} · {} message(s)",
+                        entry.model.clone().unwrap_or_else(|| "no model".to_owned()),
+                        entry.messages
                     );
-                    let item = PickerItem::new(view.title.clone(), detail, view.id.to_string());
-                    if index == app.active {
+                    let unread = app
+                        .sessions
+                        .iter()
+                        .find(|view| view.id == entry.id)
+                        .map(|view| view.unread)
+                        .unwrap_or(0);
+                    if unread > 0 {
+                        detail.push_str(&format!(" · {unread} unread"));
+                    }
+                    if !entry.open {
+                        detail.push_str(" · closed");
+                    }
+                    let item = PickerItem::new(entry.title, detail, entry.id.to_string());
+                    if active_id.as_ref() == Some(&entry.id) {
                         item.as_current()
                     } else {
                         item
@@ -704,6 +849,48 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
             } else {
                 picker.with_note("enter stops the task")
             });
+        }
+        PickerKind::Pending => {
+            let Some(view) = app.active_session() else {
+                app.push_notice(NoticeLevel::Warn, "no session is active");
+                return;
+            };
+            let session_id = view.id.clone();
+            match handle.pending_list(&session_id) {
+                Ok(items) => {
+                    let picker_items: Vec<PickerItem> = items
+                        .iter()
+                        .map(|m| {
+                            let label: String = m.text.chars().take(60).collect();
+                            let detail = if m.steer {
+                                "steer — injected at the next safe point"
+                            } else {
+                                "queued — runs after the turn"
+                            };
+                            PickerItem::new(
+                                if m.steer {
+                                    format!("» {label}")
+                                } else {
+                                    label
+                                },
+                                detail,
+                                m.target.clone(),
+                            )
+                        })
+                        .collect();
+                    let picker = Picker::new(kind, "Pending messages", picker_items);
+                    app.open_picker(if has_no_rows(&picker) {
+                        picker.with_note(
+                            "nothing waiting — Enter queues while a turn runs, Ctrl+Enter steers",
+                        )
+                    } else {
+                        picker.with_note(
+                            "ctrl+e edit · ctrl+d delete · ctrl+f steer/queue · ctrl+k/j reorder",
+                        )
+                    });
+                }
+                Err(err) => report(app, err),
+            }
         }
         PickerKind::Memory => {
             let entries = match handle.memory_list_all() {
@@ -742,7 +929,7 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                     "ascii",
                 ),
                 PickerItem::new(
-                    "agents pane",
+                    "bots pane",
                     if app.show_bots { "shown" } else { "hidden" },
                     "bots",
                 ),
@@ -752,23 +939,23 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                     .with_note("enter flips the setting; it applies immediately"),
             );
         }
-        PickerKind::Team => {
-            let teams = handle.team_list();
+        PickerKind::HiveRoster => {
+            let rosters = handle.hive_roster_list();
             let mut items = Vec::new();
-            if teams.is_empty() {
+            if rosters.is_empty() {
                 items.push(PickerItem::new(
-                    "no teams yet".to_owned(),
+                    "no hives yet".to_owned(),
                     String::new(),
                     "empty".to_owned(),
                 ));
             }
-            for team in &teams {
+            for roster in &rosters {
                 items.push(PickerItem::new(
-                    team.name.clone(),
-                    format!("{} member(s)", team.members.len()),
-                    team.name.clone(),
+                    roster.name.clone(),
+                    format!("{} member(s)", roster.members.len()),
+                    roster.name.clone(),
                 ));
-                for member in &team.members {
+                for member in &roster.members {
                     items.push(PickerItem::new(
                         format!("  {member}"),
                         String::new(),
@@ -776,7 +963,7 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                     ));
                 }
             }
-            app.open_picker(Picker::new(kind, "HIVE teams", items));
+            app.open_picker(Picker::new(kind, "Hives", items));
         }
         PickerKind::Skill => {
             let snapshot = handle.snapshot();
@@ -821,50 +1008,60 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
         PickerKind::Command => input::open_palette(app),
         PickerKind::Provider => {
             let config = handle.config();
-            let key = if config.api_key().is_some() {
-                "set"
-            } else {
-                "empty or missing"
-            };
-            let mut items = vec![
-                PickerItem::new(
-                    "endpoint",
-                    if config.base_url.trim().is_empty() {
-                        "not set"
+            // One row per endpoint this build knows by name, then the escape hatch. A preset is a
+            // shortcut for three config values, not a second registry: what is written is the same
+            // `base_url`/`api_key_env`/`provider` triple a manual edit would set.
+            let mut items: Vec<PickerItem> = PROVIDERS
+                .iter()
+                .map(|preset| {
+                    // Each row reports its own variable, so "set" beside a row means that endpoint
+                    // is usable — not that the endpoint currently in force happens to have a key.
+                    let key = if vikram_runtime::config::Config::key_present(preset.api_key_env) {
+                        "key set"
                     } else {
-                        config.base_url.as_str()
+                        "no key"
+                    };
+                    let item = PickerItem::new(
+                        preset.name,
+                        // The scheme is dropped from the detail: it is the same for every row and
+                        // costs the columns that the key state needs to stay readable.
+                        format!(
+                            "${env} · {key} · {host}",
+                            env = preset.api_key_env,
+                            host = preset
+                                .base_url
+                                .trim_start_matches("https://")
+                                .trim_start_matches("http://"),
+                        ),
+                        preset.encode(),
+                    );
+                    if config.base_url.trim_end_matches('/') == preset.base_url {
+                        item.as_current()
+                    } else {
+                        item
                     }
-                    .to_owned(),
-                    "endpoint".to_owned(),
-                ),
-                PickerItem::new(
-                    "model",
-                    if config.model.trim().is_empty() {
-                        "not set".to_owned()
-                    } else {
-                        config.model.clone()
-                    },
-                    "model".to_owned(),
-                ),
-                PickerItem::new(
-                    "key",
-                    format!("${} — {key}", config.api_key_env),
-                    "key".to_owned(),
-                ),
-            ];
-            if let Some(window) = config.context_window {
-                items.push(PickerItem::new(
-                    "context window",
-                    format!("{window} tokens"),
-                    "window".to_owned(),
-                ));
-            }
+                })
+                .collect();
             items.push(PickerItem::new(
-                "! one endpoint per process: changing it is a config edit and a restart".to_owned(),
+                "custom endpoint…",
+                format!("keep ${} and type a base URL", config.api_key_env),
+                CUSTOM_PROVIDER.to_owned(),
+            ));
+            items.push(PickerItem::new(
+                "! the key itself is never stored here: it lives in $VIKRAM_HOME/.env",
                 String::new(),
                 "hint".to_owned(),
             ));
-            app.open_picker(Picker::new(kind, "Provider", items));
+            let mut picker = Picker::new(kind, "Provider", items);
+            // Open on the endpoint in force, which is the answer to "where am I pointed?" without
+            // reading every row.
+            if let Some(current) = PROVIDERS
+                .iter()
+                .find(|preset| preset.base_url == config.base_url.trim_end_matches('/'))
+            {
+                picker.select_value(&current.encode());
+            }
+            app.open_picker(picker);
         }
         PickerKind::Permissions => {
             let rules = handle.allow_list();
@@ -903,26 +1100,23 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
             app.open_picker(Picker::new(kind, "Permissions", items));
         }
         PickerKind::Plugins => {
-            let metrics = handle.snapshot().metrics;
-            let items = vec![
-                PickerItem::new(
-                    "installed",
-                    format!("{}", metrics.plugins_installed),
-                    "installed".to_owned(),
-                ),
-                PickerItem::new(
-                    "loaded",
-                    format!("{}", metrics.plugins_loaded),
-                    "loaded".to_owned(),
-                ),
-                PickerItem::new(
-                    "! a plugin declares what it needs; the policy still decides every call"
-                        .to_owned(),
+            let states = handle.plugin_states();
+            let mut items: Vec<PickerItem> = states
+                .iter()
+                .map(|(id, name, state)| {
+                    PickerItem::new(name.clone(), format!("{state} · {id}"), id.clone())
+                })
+                .collect();
+            if items.is_empty() {
+                items.push(PickerItem::new(
+                    "no plugins installed".to_owned(),
                     String::new(),
-                    "hint".to_owned(),
-                ),
-            ];
-            app.open_picker(Picker::new(kind, "Plugins", items));
+                    "empty".to_owned(),
+                ));
+            }
+            app.open_picker(Picker::new(kind, "Plugins", items).with_note(
+                "enter inspects · ctrl+t enable/disable · ctrl+i install · ctrl+x uninstall",
+            ));
         }
         PickerKind::Tools => {
             let names = handle.tools().names();
@@ -1047,9 +1241,9 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                     "sessions".to_owned(),
                 ),
                 PickerItem::new(
-                    "agents",
-                    format!("{}", snapshot.agents.len()),
-                    "agents".to_owned(),
+                    "bots",
+                    format!("{}", snapshot.bots.len()),
+                    "bots".to_owned(),
                 ),
                 PickerItem::new(
                     "background tasks",
@@ -1231,7 +1425,7 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
             app.open_picker(Picker::new(kind, "Context", items));
         }
         PickerKind::Doctor => {
-            let checks = crate::doctor::checks(handle.config());
+            let checks = crate::doctor::checks(&handle.config());
             let mut items: Vec<PickerItem> = checks
                 .iter()
                 .map(|check| {
@@ -1306,7 +1500,7 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                 PickerItem::new("F2", "background tasks", "f2".to_owned()),
                 PickerItem::new("F3", "MCP servers", "f3".to_owned()),
                 PickerItem::new("F4", "plugins", "f4".to_owned()),
-                PickerItem::new("F5", "sub-agents", "f5".to_owned()),
+                PickerItem::new("F5", "sub-bots", "f5".to_owned()),
                 PickerItem::new("F6", "context usage", "f6".to_owned()),
                 PickerItem::new("F7", "model and throughput", "f7".to_owned()),
                 PickerItem::new("F8", "skills browser", "f8".to_owned()),
@@ -1399,18 +1593,96 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
             )];
             app.open_picker(Picker::new(kind, "Close session", items));
         }
-        // Kinds with no source of their own: the table never opens them, and naming them as
-        // unavailable is better than an empty panel that looks like a bug.
-        other => app.push_notice(
-            NoticeLevel::Warn,
-            format!("no panel is wired for `{}` yet", other.as_str()),
-        ),
     }
 }
 
 /// Separates scope from key inside a memory row's value, so one picker row carries both without
 /// hoping neither ever contains a space.
 const MEMORY_SEPARATOR: char = '\u{1f}';
+
+/// Separates the three config values a provider row writes, so one row carries the endpoint, the
+/// variable that holds its key, and the dialect it speaks.
+const PROVIDER_SEPARATOR: char = '\u{1e}';
+
+/// The row that opens a prompt instead of naming a preset.
+const CUSTOM_PROVIDER: &str = "custom";
+
+/// An endpoint this build knows by name.
+///
+/// A preset carries exactly the three things that make an endpoint usable and nothing else. The
+/// config file stays the single source of truth: choosing a row writes those three values, which is
+/// the same edit `vikram config set base_url … && vikram config set api_key_env …` makes.
+struct ProviderPreset {
+    name: &'static str,
+    base_url: &'static str,
+    api_key_env: &'static str,
+    kind: &'static str,
+}
+
+impl ProviderPreset {
+    /// The row value: `kind`, `base_url`, `api_key_env`, in that order, separated by
+    /// [`PROVIDER_SEPARATOR`]. No URL or variable name contains that character, so splitting is
+    /// exact rather than hopeful.
+    fn encode(&self) -> String {
+        format!(
+            "{kind}{PROVIDER_SEPARATOR}{url}{PROVIDER_SEPARATOR}{env}",
+            kind = self.kind,
+            url = self.base_url,
+            env = self.api_key_env
+        )
+    }
+}
+
+const PROVIDERS: &[ProviderPreset] = &[
+    ProviderPreset {
+        name: "OpenRouter",
+        base_url: "https://openrouter.ai/api/v1",
+        api_key_env: "OPENROUTER_API_KEY",
+        kind: "openai",
+    },
+    ProviderPreset {
+        name: "NVIDIA NIM",
+        base_url: "https://integrate.api.nvidia.com/v1",
+        api_key_env: "NVIDIA_API_KEY",
+        kind: "openai",
+    },
+    ProviderPreset {
+        name: "OpenAI",
+        base_url: "https://api.openai.com/v1",
+        api_key_env: "OPENAI_API_KEY",
+        kind: "openai",
+    },
+    ProviderPreset {
+        name: "Anthropic",
+        base_url: "https://api.anthropic.com",
+        api_key_env: "ANTHROPIC_API_KEY",
+        kind: "anthropic",
+    },
+    ProviderPreset {
+        name: "Groq",
+        base_url: "https://api.groq.com/openai/v1",
+        api_key_env: "GROQ_API_KEY",
+        kind: "openai",
+    },
+    ProviderPreset {
+        name: "Together",
+        base_url: "https://api.together.xyz/v1",
+        api_key_env: "TOGETHER_API_KEY",
+        kind: "openai",
+    },
+    ProviderPreset {
+        name: "Ollama (local)",
+        base_url: "http://127.0.0.1:11434/v1",
+        api_key_env: "OLLAMA_API_KEY",
+        kind: "openai",
+    },
+    ProviderPreset {
+        name: "LM Studio (local)",
+        base_url: "http://127.0.0.1:1234/v1",
+        api_key_env: "LMSTUDIO_API_KEY",
+        kind: "openai",
+    },
+];
 
 fn has_no_rows(picker: &Picker) -> bool {
     picker.items.is_empty()
@@ -1471,6 +1743,11 @@ fn apply_act(
                 },
             );
         }
+        (PickerKind::Memory, Verb::Prompt) => app.open_prompt(
+            "Remember something",
+            "key: value — e.g. `editor: I prefer vim`",
+            vikram_tui::app::PromptAction::SaveMemory,
+        ),
         (PickerKind::Memory, Verb::Remove) => {
             if let Some((scope, key)) = value.split_once(MEMORY_SEPARATOR) {
                 app.open_confirm(
@@ -1521,25 +1798,88 @@ fn apply_act(
                 UiCommand::Unallow { index },
             );
         }
-        (PickerKind::Bot, Verb::New) => app.overlay = Some(Overlay::AddAgent { selected: 0 }),
+        (PickerKind::Bot, Verb::New) => app.overlay = Some(Overlay::AddBot { selected: 0 }),
+        (PickerKind::Bot, Verb::Prompt) => app.open_prompt(
+            "New bot",
+            "name: role: description — e.g. `reviewer: code review: reads diffs and reports`",
+            vikram_tui::app::PromptAction::CreateBot,
+        ),
+        (PickerKind::Bot, Verb::Rename) => app.open_prompt(
+            "Rename bot",
+            "the new name, then press Enter",
+            vikram_tui::app::PromptAction::RenameBot {
+                bot: BotId::new(value),
+            },
+        ),
+        (PickerKind::Bot, Verb::Remove) => {
+            let name = app
+                .bots
+                .iter()
+                .find(|b| b.profile.id.to_string() == value)
+                .map(|b| b.profile.name.clone())
+                .unwrap_or_else(|| value.clone());
+            app.open_confirm(
+                "Delete a bot",
+                vec![
+                    name,
+                    "! the profile is removed from the store and cannot be undone".to_owned(),
+                ],
+                UiCommand::DeleteBot {
+                    bot: BotId::new(value),
+                },
+            );
+        }
+        (PickerKind::Bot, Verb::Toggle) => {
+            let action = app
+                .bots
+                .iter()
+                .find(|b| b.profile.id.to_string() == value)
+                .map(|b| {
+                    if matches!(b.state, vikram_runtime::types::BotState::Paused) {
+                        BotAction::Resume
+                    } else {
+                        BotAction::Pause
+                    }
+                });
+            match action {
+                Some(action) => app.commands.push(UiCommand::BotControl {
+                    bot: BotId::new(value),
+                    action,
+                }),
+                None => app.push_notice(NoticeLevel::Warn, "that bot is not running"),
+            }
+        }
         (PickerKind::Bot, Verb::Choose) => {
-            app.selected_agent = Some(AgentId::new(value));
+            app.selected_bot = Some(BotId::new(value));
             app.push_notice(NoticeLevel::Info, "showing that bot's conversation");
         }
-        (PickerKind::Agent, _) => {
-            app.pending_agent = Some(AgentId::new(value));
-            open_panel(handle, app, PickerKind::AgentAction);
+        (PickerKind::Pending, Verb::Prompt) => app.open_prompt(
+            "Edit pending message",
+            "rewrite the message, then press Enter",
+            vikram_tui::app::PromptAction::EditPending {
+                session: session.clone(),
+                target: value,
+            },
+        ),
+        (PickerKind::Pending, Verb::Remove) => {
+            if let Err(err) = handle.pending_remove(session, &value) {
+                report(app, err);
+            }
         }
-        (PickerKind::AgentAction, _) => {
-            let Some(agent) = app.pending_agent.take() else {
-                return;
-            };
-            let action = match value.as_str() {
-                "pause" => AgentAction::Pause,
-                "resume" => AgentAction::Resume,
-                _ => AgentAction::Stop,
-            };
-            app.commands.push(UiCommand::AgentControl { agent, action });
+        (PickerKind::Pending, Verb::Toggle) => {
+            if let Err(err) = handle.pending_flip(session, &value) {
+                report(app, err);
+            }
+        }
+        (PickerKind::Pending, Verb::MoveUp) => {
+            if let Err(err) = handle.pending_move(session, &value, -1) {
+                report(app, err);
+            }
+        }
+        (PickerKind::Pending, Verb::MoveDown) => {
+            if let Err(err) = handle.pending_move(session, &value, 1) {
+                report(app, err);
+            }
         }
         (PickerKind::Mcp, _) => match handle.toggle_mcp_visibility(&value) {
             Ok(state) => app.push_notice(NoticeLevel::Info, format!("{value}: {state}")),
@@ -1553,14 +1893,94 @@ fn apply_act(
         (PickerKind::Session, Verb::New) => {
             app.commands.push(UiCommand::NewSession);
         }
-        (PickerKind::Provider, _) => {
-            // Info panel - just close
+        (PickerKind::Provider, Verb::Choose) => {
+            if value == CUSTOM_PROVIDER {
+                app.open_prompt(
+                    "Endpoint",
+                    "a base URL for an OpenAI-compatible endpoint",
+                    vikram_tui::app::PromptAction::SetEndpoint,
+                );
+                return;
+            }
+            let mut parts = value.split(PROVIDER_SEPARATOR);
+            let (Some(kind), Some(base_url), Some(api_key_env)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                // A hint row is not a choice.
+                return;
+            };
+            match handle.set_provider(base_url.to_owned(), api_key_env.to_owned(), kind.to_owned())
+            {
+                Ok(()) => {
+                    // The list on screen belongs to the endpoint we just left, so it is dropped
+                    // rather than offered: a model id from the old server is not a choice on the
+                    // new one. The fresh read fills the panel in when it lands.
+                    app.models.clear();
+                    app.models_error = None;
+                    app.models_loading = true;
+                    handle.refresh_models();
+                }
+                Err(err) => report(app, err),
+            }
         }
         (PickerKind::Permissions, _) => {
             // Info panel - just close
         }
-        (PickerKind::Plugins, _) => {
-            // Info panel - just close
+        (PickerKind::Plugins, Verb::Choose) => {
+            if value == "empty" {
+                return;
+            }
+            match handle
+                .plugin_states()
+                .into_iter()
+                .find(|(id, _, _)| id == &value)
+            {
+                Some((id, name, state)) => {
+                    app.open_info(
+                        format!("Plugin · {name}"),
+                        vec![
+                            format!("id: {id}"),
+                            format!("state: {state}"),
+                            "! a plugin declares what it needs; the policy still decides every call"
+                                .to_owned(),
+                        ],
+                    );
+                }
+                None => app.push_notice(NoticeLevel::Warn, format!("plugin `{value}` not found")),
+            }
+        }
+        (PickerKind::Plugins, Verb::Toggle) => {
+            let state = handle
+                .plugin_states()
+                .into_iter()
+                .find(|(id, _, _)| id == &value)
+                .map(|(_, _, s)| s);
+            let enabled = !matches!(state.as_deref(), Some("disabled"));
+            match handle.plugin_set_enabled(&value, !enabled) {
+                Ok(()) => app.push_notice(
+                    NoticeLevel::Info,
+                    format!(
+                        "plugin `{value}` {}",
+                        if enabled { "disabled" } else { "enabled" }
+                    ),
+                ),
+                Err(err) => report(app, err),
+            }
+        }
+        (PickerKind::Plugins, Verb::Prompt) => app.open_prompt(
+            "Install plugin",
+            "path to a plugin directory",
+            vikram_tui::app::PromptAction::InstallPlugin,
+        ),
+        (PickerKind::Plugins, Verb::Remove) => {
+            app.open_confirm(
+                "Uninstall a plugin",
+                vec![
+                    value.clone(),
+                    "! the plugin is removed from the registry".to_owned(),
+                ],
+                UiCommand::UninstallPlugin { id: value },
+            );
         }
         (PickerKind::Tools, Verb::Choose) => {
             if let Some(tool) = handle.tools().get(&value) {
@@ -1637,7 +2057,7 @@ fn apply_act(
         (PickerKind::Version, _) => {
             // Info panel - just close
         }
-        (PickerKind::Team, _) => {
+        (PickerKind::HiveRoster, _) => {
             // Info panel - just close
         }
         (PickerKind::Skill, Verb::Choose) => {
@@ -1707,6 +2127,11 @@ fn apply_act(
                 vikram_tui::app::PromptAction::ImportSkill,
             );
         }
+        (PickerKind::Skill, Verb::Rename) => app.open_prompt(
+            "Rename skill",
+            "the new skill name, then press Enter",
+            vikram_tui::app::PromptAction::RenameSkill { skill: value },
+        ),
         (PickerKind::Skill, Verb::Remove) => {
             let desc = handle
                 .skill_get(&value)
@@ -1730,58 +2155,16 @@ fn apply_act(
         (PickerKind::Keys, _) => {
             // Info panel - just close
         }
-        (PickerKind::Diff, _) => confirm_run(app, session, "git diff"),
-        (PickerKind::Test, _) => confirm_run(app, session, "cargo test"),
-        (PickerKind::Build, _) => confirm_run(app, session, "cargo build"),
-        (PickerKind::Clear, _) => {
-            app.open_confirm(
-                "Clear this conversation",
-                vec![
-                    "the transcript in this view goes away".to_owned(),
-                    "! the session itself and its stored history stay".to_owned(),
-                ],
-                UiCommand::Clear {
-                    session: session.clone(),
-                },
-            );
-        }
-        (PickerKind::NewSession, _) => app.commands.push(UiCommand::NewSession),
-        (PickerKind::Exit, _) => {
-            app.commands.push(UiCommand::Quit);
-            app.should_quit = true;
-        }
-        (PickerKind::RenameSession, _) => {
-            let title = app
-                .session_by_id_mut(session)
-                .map(|view| view.title.clone())
-                .unwrap_or_default();
-            let mut editor = vikram_tui::editor::Editor::new();
-            editor.insert_str(&title);
-            app.overlay = Some(Overlay::RenameSession { editor });
-        }
-        (PickerKind::CloseSession, _) => {
-            let title = app
-                .session_by_id_mut(session)
-                .map(|view| view.title.clone())
-                .unwrap_or_default();
-            if app.sessions.len() <= 1 {
-                app.push_notice(
-                    NoticeLevel::Warn,
-                    "this is the only conversation; close it and there is nowhere to type",
-                );
-                return;
-            }
-            app.open_confirm(
-                "Close a conversation",
-                vec![
-                    title,
-                    "! the transcript stays in the store; only this view is closed".to_owned(),
-                ],
-                UiCommand::CloseSession {
-                    session: session.clone(),
-                },
-            );
-        }
+        // These kinds no longer have a panel of their own: the command that used to open one acts
+        // directly now. Routed through `run_action` so there is still exactly one implementation.
+        (PickerKind::Diff, _) => run_action(app, session, "diff"),
+        (PickerKind::Test, _) => run_action(app, session, "test"),
+        (PickerKind::Build, _) => run_action(app, session, "build"),
+        (PickerKind::Clear, _) => run_action(app, session, "clear"),
+        (PickerKind::NewSession, _) => run_action(app, session, "new"),
+        (PickerKind::Exit, _) => run_action(app, session, "exit"),
+        (PickerKind::RenameSession, _) => run_action(app, session, "rename"),
+        (PickerKind::CloseSession, _) => run_action(app, session, "close"),
         (PickerKind::Approvals, _) => app.overlay = Some(Overlay::Approvals),
         (PickerKind::Task, _) => {
             app.open_confirm(
@@ -1840,9 +2223,9 @@ fn apply_act(
                 app.push_notice(
                     NoticeLevel::Info,
                     if app.show_bots {
-                        "agents pane: shown"
+                        "bots pane: shown"
                     } else {
-                        "agents pane: hidden"
+                        "bots pane: hidden"
                     },
                 );
             }
@@ -1868,37 +2251,26 @@ fn apply_act(
     }
 }
 
-/// Ask before running a command that takes time and touches the workspace. The panel shows the
-/// exact line, because "test" is not the instruction — `cargo test` is.
-fn confirm_run(app: &mut App, session: &SessionId, command: &str) {
-    app.open_confirm(
-        "Run a command",
-        vec![
-            command.to_owned(),
-            "! it goes through the same approval gate and journal as a tool call".to_owned(),
-        ],
-        UiCommand::RunShell {
-            session: session.clone(),
-            command: command.to_owned(),
-        },
-    );
-}
-
 /// Commands that do exactly one thing. Each one goes through the same gate, approval and journal as
 /// a model-issued tool call, because an operator typing a build is still a build.
+///
+/// Typing the command *is* the instruction: nothing here opens a panel asking to confirm what was
+/// just asked for. Every one of these leaves a notice behind, so the screen still says what
+/// happened after the transcript has scrolled.
 fn run_action(app: &mut App, session: &SessionId, name: &str) {
     match name {
-        "clear" => app.open_confirm(
-            "Clear this conversation",
-            vec![
-                "the transcript in this view goes away".to_owned(),
-                "! the session itself and its stored history stay".to_owned(),
-            ],
-            UiCommand::Clear {
+        "clear" => {
+            app.commands.push(UiCommand::Clear {
                 session: session.clone(),
-            },
-        ),
-        "new" => app.commands.push(UiCommand::NewSession),
+            });
+            app.push_notice(
+                NoticeLevel::Info,
+                "cleared this view; the stored conversation is untouched — /sessions brings it back",
+            );
+        }
+        "new" => {
+            app.commands.push(UiCommand::NewSession);
+        }
         "rename" => {
             let title = app
                 .session_by_id_mut(session)
@@ -1922,28 +2294,38 @@ fn run_action(app: &mut App, session: &SessionId, name: &str) {
                 );
                 return;
             }
-            app.open_confirm(
-                "Close a conversation",
-                vec![
-                    title,
-                    "! the transcript stays in the store; only this view is closed".to_owned(),
-                ],
-                UiCommand::CloseSession {
-                    session: session.clone(),
-                },
+            app.commands.push(UiCommand::CloseSession {
+                session: session.clone(),
+            });
+            app.push_notice(
+                NoticeLevel::Info,
+                format!("closed {title}; it stays in the store — /sessions reopens it"),
             );
         }
         "keys" => app.overlay = Some(Overlay::Help),
+        "copy" => {
+            app.copy_last_assistant_message();
+        }
         "approvals" => app.overlay = Some(Overlay::Approvals),
         "exit" => {
             app.commands.push(UiCommand::Quit);
             app.should_quit = true;
         }
-        "diff" => confirm_run(app, session, "git diff"),
-        "test" => confirm_run(app, session, "cargo test"),
-        "build" => confirm_run(app, session, "cargo build"),
+        "diff" => run_shell(app, session, "git diff"),
+        "test" => run_shell(app, session, "cargo test"),
+        "build" => run_shell(app, session, "cargo build"),
         other => app.push_notice(NoticeLevel::Warn, format!("`/{other}` has no action")),
     }
+}
+
+/// Run a workspace command on the operator's word. It is queued as a shell call, so it passes the
+/// same approval gate and lands in the same journal as a command the model asked for.
+fn run_shell(app: &mut App, session: &SessionId, command: &str) {
+    app.commands.push(UiCommand::RunShell {
+        session: session.clone(),
+        command: command.to_owned(),
+    });
+    app.push_notice(NoticeLevel::Info, format!("running {command}"));
 }
 
 /// Hand text to the system clipboard. Wayland first, then X11, then the terminal's own OSC 52 —
@@ -2042,8 +2424,11 @@ mod tests {
                 tokens: Default::default(),
                 created_ms: 0,
                 updated_ms: 0,
-                agent: None,
+                bot: None,
                 queued: 0,
+                queue: Vec::new(),
+                steer_text: None,
+                queue_text: None,
                 project_id: None,
                 status: "active".to_owned(),
                 title_source: "generic".to_owned(),
@@ -2058,6 +2443,25 @@ mod tests {
             .draw(|frame| ui::draw(frame, app))
             .expect("the frame draws");
         terminal
+    }
+
+    #[test]
+    fn configured_colour_reads_six_hex_digits_and_rejects_everything_else() {
+        assert_eq!(
+            configured_colour("ff8a00", "theme.accent"),
+            Some(Color::Rgb(255, 138, 0))
+        );
+        assert_eq!(
+            configured_colour(" #4da3ff ", "theme.accent"),
+            Some(Color::Rgb(77, 163, 255))
+        );
+        assert_eq!(
+            configured_colour("232528", "theme.background"),
+            Some(Color::Rgb(35, 37, 40))
+        );
+        assert_eq!(configured_colour("ff8a0", "theme.accent"), None);
+        assert_eq!(configured_colour("zzzzzz", "theme.accent"), None);
+        assert_eq!(configured_colour("", "theme.background"), None);
     }
 
     #[test]
@@ -2085,6 +2489,139 @@ mod tests {
             "clicking the header opens exactly that block"
         );
         assert!(app.selection.is_none(), "a header click is not a drag");
+    }
+
+    /// A session holding one tool row. `live` gives the call a payload, which is how a row that is
+    /// still running draws itself; otherwise the row comes from the result the turn already stored.
+    fn app_with_one_tool_row(live: bool) -> App {
+        use vikram_contracts::ToolCall;
+        use vikram_tui::app::{Activity, ActivityKind, Payload};
+
+        let call = ToolCall::new(
+            "web.search",
+            serde_json::json!({ "query": "today's top news headlines", "limit": 10 }),
+        );
+        let stored = if live {
+            Vec::new()
+        } else {
+            vec![Message::tool_result(
+                call.id.clone(),
+                "1. a headline\n2. another headline",
+                true,
+            )]
+        };
+        let mut session = SessionView::from_snapshot(SessionSnapshot {
+            id: SessionId::generate(),
+            title: "Session 1".to_owned(),
+            cwd: "/work".into(),
+            model: None,
+            messages: stored,
+            turn: TurnState::Idle,
+            tokens: Default::default(),
+            created_ms: 0,
+            updated_ms: 0,
+            bot: None,
+            queued: 0,
+            queue: Vec::new(),
+            steer_text: None,
+            queue_text: None,
+            project_id: None,
+            status: "active".to_owned(),
+            title_source: "generic".to_owned(),
+            title_status: "pending".to_owned(),
+        });
+        if live {
+            session.payloads.insert(
+                call.id.clone(),
+                Payload {
+                    name: "web.search".to_owned(),
+                    resource: "web".to_owned(),
+                    arguments: "{\"query\":\"today's top news headlines\"}".to_owned(),
+                    content: "1. a headline\n2. another headline".to_owned(),
+                    cwd: "/work".to_owned(),
+                    duration_ms: 1400,
+                },
+            );
+        }
+        session.activity.push(Activity {
+            kind: ActivityKind::Tool,
+            text: "web.search query=today's top news headlines".to_owned(),
+            call: Some(call.id.clone()),
+            ok: Some(true),
+            expanded: false,
+        });
+        let mut app = App::new(false);
+        app.sessions.push(session);
+        app
+    }
+
+    /// The last written column of a drawn row: a row that ends by saying `· click` puts the
+    /// invitation there, so that is the column a click has to be understood at.
+    fn end_of_row(terminal: &Terminal<TestBackend>, row: u16) -> u16 {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.width)
+            .rev()
+            .find(|x| !buffer[(*x, row)].symbol().trim().is_empty())
+            .expect("the row has content")
+    }
+
+    fn click(app: &mut App, column: u16, row: u16) {
+        apply_terminal_event(
+            app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            }),
+        );
+    }
+
+    fn tool_row_hit(app: &App) -> vikram_tui::app::ThoughtHit {
+        *app.thought_hits
+            .iter()
+            .find(|hit| hit.tool)
+            .expect("the drawn frame records where the tool row landed")
+    }
+
+    #[test]
+    fn a_click_at_the_end_of_a_running_tool_row_expands_it() {
+        let mut app = app_with_one_tool_row(true);
+        let terminal = draw(&mut app);
+        let hit = tool_row_hit(&app);
+        assert!(
+            !app.sessions[0].tool_expanded(hit.key),
+            "a row starts folded"
+        );
+
+        click(&mut app, end_of_row(&terminal, hit.row), hit.row);
+
+        let session = app.active_session().expect("a session is shown");
+        assert!(
+            session.tool_expanded(hit.key),
+            "the row says `· click` at its right-hand end, so a click there has to open it"
+        );
+        assert!(app.selection.is_none(), "a row click is not a drag");
+    }
+
+    #[test]
+    fn a_click_at_the_end_of_a_stored_tool_row_expands_it() {
+        let mut app = app_with_one_tool_row(false);
+        let terminal = draw(&mut app);
+        let hit = tool_row_hit(&app);
+        assert!(
+            !app.sessions[0].tool_expanded(hit.key),
+            "a row starts folded"
+        );
+
+        click(&mut app, end_of_row(&terminal, hit.row), hit.row);
+
+        let session = app.active_session().expect("a session is shown");
+        assert!(
+            session.tool_expanded(hit.key),
+            "a stored row folds from anywhere the operator can see, not only from its label"
+        );
+        assert!(app.selection.is_none(), "a row click is not a drag");
     }
 
     #[test]

@@ -1,163 +1,19 @@
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
-use vikram_contracts::{ActionKind, AgentId, PermissionRequest, SideEffect, Trust, VikramError};
+use vikram_contracts::{ActionKind, BotId, PermissionRequest, SideEffect, Trust, VikramError};
 
 use crate::config::database_path;
-use crate::teams::TeamManager;
-use vikram_store::{AgentRow, Store};
+use crate::hive_roster::HiveRosterManager;
+use vikram_store::{BotRow, Store};
 
 use crate::tools::*;
-/// A tool wrapper that invokes an MCP server tool.
-pub(crate) struct TeamCreate;
-
-impl Tool for TeamCreate {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "team.create".into(),
-            description: "Create a new team.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {"name": {"type": "string"}},
-                "required": ["name"]
-            }),
-        }
-    }
-
-    fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
-        let name = arg_str(args, "name")?;
-        Ok(PermissionRequest::new(
-            ActionKind::Write,
-            "team.create",
-            name,
-            SideEffect::LocalMutation,
-            Trust::Model,
-        ))
-    }
-
-    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
-        let name = arg_str(args, "name")?;
-        let mgr = TeamManager::load();
-        match mgr.create(&name) {
-            Ok(()) => Ok(ToolOutput {
-                content: format!("created team `{name}`"),
-                ok: true,
-            }),
-            Err(e) => Ok(ToolOutput {
-                content: e,
-                ok: false,
-            }),
-        }
-    }
-}
-
-pub(crate) struct TeamList;
-
-impl Tool for TeamList {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "team.list".into(),
-            description: "List teams and their members.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {}
-            }),
-        }
-    }
-
-    fn permission(&self, _args: &Value) -> Result<PermissionRequest, VikramError> {
-        Ok(PermissionRequest::new(
-            ActionKind::Read,
-            "team.list",
-            "teams",
-            SideEffect::None,
-            Trust::Model,
-        ))
-    }
-
-    fn run(&self, _args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
-        let mgr = TeamManager::load();
-        let teams = mgr.list();
-        if teams.is_empty() {
-            return Ok(ToolOutput {
-                content: "no teams".into(),
-                ok: true,
-            });
-        }
-        let body = teams
-            .iter()
-            .map(|t| {
-                let members = t
-                    .members
-                    .iter()
-                    .map(|m| m.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{}: [{}]", t.name, members)
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        Ok(ToolOutput {
-            content: truncated(body),
-            ok: true,
-        })
-    }
-}
-
-pub(crate) struct TeamDelegate;
-
-impl Tool for TeamDelegate {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "team.delegate".into(),
-            description: "Delegate a task to a team or agent.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "team": {"type": "string"},
-                    "task": {"type": "string"},
-                    "agent": {"type": "string"}
-                },
-                "required": ["team", "task"]
-            }),
-        }
-    }
-
-    fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
-        let team = arg_str(args, "team")?;
-        Ok(PermissionRequest::new(
-            ActionKind::Delegate,
-            "team.delegate",
-            team,
-            SideEffect::LocalMutation,
-            Trust::Model,
-        ))
-    }
-
-    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
-        let team = arg_str(args, "team")?;
-        let task = arg_str(args, "task")?;
-        let agent = args.get("agent").and_then(Value::as_str).map(AgentId::new);
-        let mgr = TeamManager::load();
-        match mgr.delegate_task(&team, &task, agent) {
-            Ok(()) => Ok(ToolOutput {
-                content: format!("delegated task to team `{team}`"),
-                ok: true,
-            }),
-            Err(e) => Ok(ToolOutput {
-                content: e,
-                ok: false,
-            }),
-        }
-    }
-}
-
 pub(crate) struct HiveCreate;
 
 impl Tool for HiveCreate {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "hive.create".into(),
-            description: "Create a new HIVE team.".into(),
+            description: "Create a new hive.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {"name": {"type": "string"}},
@@ -179,10 +35,10 @@ impl Tool for HiveCreate {
 
     fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let name = arg_str(args, "name")?;
-        let mgr = TeamManager::load();
+        let mgr = HiveRosterManager::load();
         match mgr.create(&name) {
             Ok(()) => Ok(ToolOutput {
-                content: format!("created team `{name}`"),
+                content: format!("created hive `{name}`"),
                 ok: true,
             }),
             Err(e) => Ok(ToolOutput {
@@ -199,7 +55,7 @@ impl Tool for HiveList {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "hive.list".into(),
-            description: "List HIVE teams and their members.".into(),
+            description: "List hives and their members.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {}
@@ -211,22 +67,22 @@ impl Tool for HiveList {
         Ok(PermissionRequest::new(
             ActionKind::Read,
             "hive.list",
-            "teams",
+            "rosters",
             SideEffect::None,
             Trust::Model,
         ))
     }
 
     fn run(&self, _args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
-        let mgr = TeamManager::load();
-        let teams = mgr.list();
-        if teams.is_empty() {
+        let mgr = HiveRosterManager::load();
+        let rosters = mgr.list();
+        if rosters.is_empty() {
             return Ok(ToolOutput {
-                content: "no teams".into(),
+                content: "no hives".into(),
                 ok: true,
             });
         }
-        let body = teams
+        let body = rosters
             .iter()
             .map(|t| {
                 let members = t
@@ -252,7 +108,7 @@ impl Tool for HiveShow {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "hive.show".into(),
-            description: "Show details of a HIVE team.".into(),
+            description: "Show details of a hive.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {"name": {"type": "string"}},
@@ -274,19 +130,19 @@ impl Tool for HiveShow {
 
     fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let name = arg_str(args, "name")?;
-        let mgr = TeamManager::load();
+        let mgr = HiveRosterManager::load();
         match mgr.get(&name) {
-            Some(team) => {
-                let members = team
+            Some(roster) => {
+                let members = roster
                     .members
                     .iter()
                     .map(|m| m.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
-                let task = team.task.clone().unwrap_or_else(|| "(none)".to_string());
+                let task = roster.task.clone().unwrap_or_else(|| "(none)".to_string());
                 let content = format!(
                     "name: {}\nmembers: [{}]\ntask: {}\ncreated_ms: {}",
-                    team.name, members, task, team.created_ms
+                    roster.name, members, task, roster.created_ms
                 );
                 Ok(ToolOutput {
                     content: truncated(content),
@@ -294,7 +150,7 @@ impl Tool for HiveShow {
                 })
             }
             None => Ok(ToolOutput {
-                content: format!("team not found: {name}"),
+                content: format!("hive not found: {name}"),
                 ok: false,
             }),
         }
@@ -307,38 +163,38 @@ impl Tool for HiveDelegate {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "hive.delegate".into(),
-            description: "Delegate a task to a HIVE team.".into(),
+            description: "Delegate a task to a hive.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "team": {"type": "string"},
+                    "hive": {"type": "string"},
                     "task": {"type": "string"},
                     "agent": {"type": "string"}
                 },
-                "required": ["team", "task"]
+                "required": ["hive", "task"]
             }),
         }
     }
 
     fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
-        let team = arg_str(args, "team")?;
+        let hive = arg_str(args, "hive")?;
         Ok(PermissionRequest::new(
             ActionKind::Delegate,
             "hive.delegate",
-            team,
+            hive,
             SideEffect::LocalMutation,
             Trust::Model,
         ))
     }
 
     fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
-        let team = arg_str(args, "team")?;
+        let hive = arg_str(args, "hive")?;
         let task = arg_str(args, "task")?;
-        let agent = args.get("agent").and_then(Value::as_str).map(AgentId::new);
-        let mgr = TeamManager::load();
-        match mgr.delegate_task(&team, &task, agent) {
+        let agent = args.get("agent").and_then(Value::as_str).map(BotId::new);
+        let mgr = HiveRosterManager::load();
+        match mgr.delegate_task(&hive, &task, agent) {
             Ok(()) => Ok(ToolOutput {
-                content: format!("delegated task to team `{team}`"),
+                content: format!("delegated task to hive `{hive}`"),
                 ok: true,
             }),
             Err(e) => Ok(ToolOutput {
@@ -355,7 +211,7 @@ impl Tool for HiveDelete {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "hive.delete".into(),
-            description: "Delete a HIVE team.".into(),
+            description: "Delete a hive.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {"name": {"type": "string"}},
@@ -377,10 +233,10 @@ impl Tool for HiveDelete {
 
     fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let name = arg_str(args, "name")?;
-        let mgr = TeamManager::load();
+        let mgr = HiveRosterManager::load();
         match mgr.delete(&name) {
             Ok(()) => Ok(ToolOutput {
-                content: format!("deleted team `{name}`"),
+                content: format!("deleted hive `{name}`"),
                 ok: true,
             }),
             Err(e) => Ok(ToolOutput {
@@ -418,7 +274,7 @@ impl Tool for BotList {
         let store =
             Store::open(&database_path()).map_err(|e| VikramError::Storage(e.to_string()))?;
         let rows = store
-            .list_agents()
+            .list_bots()
             .map_err(|e| VikramError::Storage(e.to_string()))?;
         if rows.is_empty() {
             return Ok(ToolOutput {
@@ -469,7 +325,7 @@ impl Tool for BotShow {
         let store =
             Store::open(&database_path()).map_err(|e| VikramError::Storage(e.to_string()))?;
         let rows = store
-            .list_agents()
+            .list_bots()
             .map_err(|e| VikramError::Storage(e.to_string()))?;
         match rows.into_iter().find(|r| r.name == name) {
             Some(row) => {
@@ -531,8 +387,8 @@ impl Tool for BotCreate {
         let description = arg_str(args, "description")?;
         let store =
             Store::open(&database_path()).map_err(|e| VikramError::Storage(e.to_string()))?;
-        let row = AgentRow {
-            id: AgentId::generate(),
+        let row = BotRow {
+            id: BotId::generate(),
             name: name.clone(),
             role,
             description,
@@ -540,7 +396,7 @@ impl Tool for BotCreate {
             created_ms: crate::types::now_ms(),
         };
         store
-            .save_agent(&row)
+            .save_bot(&row)
             .map_err(|e| VikramError::Storage(e.to_string()))?;
         Ok(ToolOutput {
             content: format!("created bot `{}` (id {})", name, row.id.as_str()),
@@ -576,7 +432,7 @@ impl Tool for AgentList {
         let store =
             Store::open(&database_path()).map_err(|e| VikramError::Storage(e.to_string()))?;
         let rows = store
-            .list_agents()
+            .list_bots()
             .map_err(|e| VikramError::Storage(e.to_string()))?;
         if rows.is_empty() {
             return Ok(ToolOutput {
@@ -627,7 +483,7 @@ impl Tool for AgentShow {
         let store =
             Store::open(&database_path()).map_err(|e| VikramError::Storage(e.to_string()))?;
         let rows = store
-            .list_agents()
+            .list_bots()
             .map_err(|e| VikramError::Storage(e.to_string()))?;
         match rows.into_iter().find(|r| r.name == name) {
             Some(row) => {

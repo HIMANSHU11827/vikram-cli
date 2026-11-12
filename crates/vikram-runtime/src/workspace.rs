@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use vikram_contracts::{AgentId, SessionId};
+use vikram_contracts::{BotId, SessionId};
 use vikram_store::{ArtifactRow, FileChangeRow, ProjectRow, Store};
 
 use crate::error::{Result, RuntimeError};
@@ -196,7 +196,7 @@ impl WorkspaceManager {
     pub fn register_artifact(
         &self,
         session: &SessionId,
-        agent: Option<&AgentId>,
+        agent: Option<&BotId>,
         path: &Path,
         source: Option<&str>,
     ) -> Result<ArtifactRow> {
@@ -215,7 +215,7 @@ impl WorkspaceManager {
             id: format!("art-{now}-{}", short_random()),
             session: session.clone(),
             project_id: self.active_project(session).ok().flatten().map(|p| p.id),
-            agent: agent.cloned(),
+            bot: agent.cloned(),
             name: canon
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -249,7 +249,7 @@ impl WorkspaceManager {
     pub fn record_file_change(
         &self,
         session: &SessionId,
-        agent: Option<&AgentId>,
+        agent: Option<&BotId>,
         path: &Path,
         operation: &str,
         before: Option<&[u8]>,
@@ -283,7 +283,7 @@ impl WorkspaceManager {
         let row = FileChangeRow {
             id: format!("chg-{now}-{}", short_random()),
             session: session.clone(),
-            agent: agent.cloned(),
+            bot: agent.cloned(),
             path: canon.clone(),
             operation: operation.to_string(),
             checksum_before,

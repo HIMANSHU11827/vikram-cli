@@ -15,29 +15,30 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, oneshot};
 use vikram_contracts::journal::JournalSink;
 use vikram_contracts::{
-    ActionKind, AgentId, ApprovalId, Decision, Message, PermissionMode, PermissionRequest, Posture,
+    ActionKind, ApprovalId, BotId, Decision, Message, PermissionMode, PermissionRequest, Posture,
     RecordKind, SessionId,
 };
 use vikram_policy::{MandatoryFloor, Policy, ResourcePattern, Rule};
 use vikram_store::Store;
 
-use crate::agents::{AgentManager, ManagedAgent, TaskManager};
+use crate::bots::{BotManager, ManagedBot, TaskManager};
 use crate::bus::EventBus;
 use crate::config::{Config, McpConfig, ModeAvailability, database_path, ensure_home};
 use crate::error::{Result, RuntimeError};
+use crate::hive_roster::{HiveRoster, HiveRosterManager};
 use crate::mcp::McpRegistry;
 use crate::plugins::PluginRegistry;
 use crate::provider::Provider;
 use crate::rules::RuleBook;
 use crate::session::SessionRuntime;
 use crate::skills::{Skill, SkillRegistry};
-use crate::teams::{Team, TeamManager};
 use crate::tickets::TicketManager;
 use crate::titling;
 use crate::tools::{McpTool, ToolContext, ToolRegistry};
 use crate::types::{
-    AgentSnapshot, AgentState, ApprovalPrompt, BackgroundTask, Metrics, NoticeLevel, RuntimeEvent,
-    RuntimeStatus, SessionSnapshot, StateSnapshot, TaskState, TeamSnapshot, now_ms,
+    ApprovalPrompt, BackgroundTask, BotSnapshot, BotState, HiveRosterSnapshot, Metrics,
+    NoticeLevel, RuntimeEvent, RuntimeStatus, SessionSnapshot, SessionSummary, StateSnapshot,
+    TaskState, now_ms,
 };
 use crate::workspace::WorkspaceManager;
 use vikram_mcp::visibility::VisibilityManager;
@@ -52,10 +53,36 @@ pub(crate) struct PendingApproval {
 pub(crate) type PendingQuestion = oneshot::Sender<String>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AgentControl {
+pub enum BotControl {
     Pause,
     Resume,
     Stop,
+}
+
+/// One message waiting behind a running turn, as [`RuntimeHandle::pending_list`] reports it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingMessage {
+    /// Stable handle for the management calls: `"steer"` or `"q<index>"`.
+    pub target: String,
+    /// True for the steer row, false for a queued follow-up.
+    pub steer: bool,
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingTarget {
+    Steer,
+    Queue(usize),
+}
+
+fn pending_index(target: &str) -> Option<PendingTarget> {
+    if target == "steer" {
+        return Some(PendingTarget::Steer);
+    }
+    target
+        .strip_prefix('q')
+        .and_then(|rest| rest.parse::<usize>().ok())
+        .map(PendingTarget::Queue)
 }
 
 /// Hive group-chat concerns (canonical: `hive_chat::HiveManager` over
@@ -583,7 +610,7 @@ pub(crate) struct LearningState {
 }
 
 pub(crate) struct RuntimeInner {
-    pub config: Config,
+    pub config: std::sync::RwLock<Config>,
     pub store: Store,
     pub memory: crate::MemoryStore,
     pub context: Arc<crate::context::ContextLoader>,
@@ -598,9 +625,9 @@ pub(crate) struct RuntimeInner {
     pub tools: ToolRegistry,
     pub provider: std::sync::RwLock<Option<Arc<dyn Provider>>>,
     pub sessions: Mutex<Vec<Arc<SessionRuntime>>>,
-    pub agents: AgentManager,
+    pub bots: BotManager,
     pub tasks: TaskManager,
-    pub teams: TeamManager,
+    pub rosters: HiveRosterManager,
     // `tickets` field lives above (grouped with hive/learning extraction);
     // removed duplicate declaration here.
     pub mcp: std::sync::Arc<std::sync::Mutex<McpRegistry>>,
@@ -692,8 +719,8 @@ impl RuntimeInner {
         self.emit(RuntimeEvent::SessionUpdated(session.snapshot()));
     }
 
-    pub fn publish_agent(&self, agent: &ManagedAgent) {
-        self.emit(RuntimeEvent::AgentChanged(agent.snapshot()));
+    pub fn publish_bot(&self, bot: &ManagedBot) {
+        self.emit(RuntimeEvent::BotChanged(bot.snapshot()));
     }
 
     pub fn touch(&self, session: &SessionRuntime) {
@@ -705,7 +732,11 @@ impl RuntimeInner {
     /// Whether this session has crossed a memory-nudge boundary: its message count is a positive
     /// multiple of the configured `memory_nudge_interval`. A zero interval never nudges.
     pub fn memory_nudge_due<S: MemoryNudgeSession>(&self, session: &S) -> bool {
-        let interval = self.config.memory_nudge_interval;
+        let interval = self
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .memory_nudge_interval;
         if interval == 0 {
             return false;
         }
@@ -752,7 +783,18 @@ impl RuntimeInner {
                 e.into_inner()
             })
             .snapshot();
-        Policy::with_defaults(saved, defaults, floor)
+        Policy::with_defaults(saved, defaults, floor).with_tool_permissions({
+            let mut merged = std::collections::HashMap::new();
+            if let Ok(cfg) = self.config.read() {
+                for (k, v) in &cfg.tool_permissions {
+                    merged.insert(k.clone(), v.clone());
+                }
+                for (k, v) in &cfg.security.tool_permissions {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+            merged
+        })
     }
 
     pub fn mode(&self) -> PermissionMode {
@@ -846,7 +888,11 @@ impl RuntimeInner {
             .as_ref()
             .is_some_and(|s| s.limits_source == crate::context_engine::LimitsSource::Assumed);
         let compactions: u64 = sessions.iter().map(|s| s.folds()).sum();
-        let context_window = context_window.or(self.config.context_window);
+        let context_window = context_window.or(self
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .context_window);
         let turn_elapsed_ms = sessions
             .iter()
             .filter_map(|s| s.turn_elapsed_ms(now_ms()))
@@ -905,10 +951,14 @@ impl RuntimeInner {
             mcp_configured: mcp.configured_count(),
             plugins_loaded: plugins.loaded(),
             plugins_installed: plugins.installed(),
-            subagents_active: self.agents.active_count(),
+            bots_active: self.bots.active_count(),
             skills_discovered,
             skills_loaded,
-            thinking: self.config.thinking,
+            thinking: self
+                .config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .thinking,
         }
     }
 
@@ -992,7 +1042,13 @@ impl RuntimeInner {
     /// Terms come from the most recent instruction rather than the whole transcript, because the
     /// thing worth remembering is what the agent is being asked about now.
     pub fn retrieved_memory(&self, session: &Arc<SessionRuntime>) -> Option<String> {
-        if !self.config.context.memory_retrieval {
+        if !self
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .context
+            .memory_retrieval
+        {
             return None;
         }
         let transcript = session.messages();
@@ -1041,7 +1097,12 @@ impl RuntimeInner {
         // use all_entries below
         let entries = all_entries;
         let estimator = session.estimator();
-        let budget_tokens = self.config.context.memory_budget_tokens;
+        let budget_tokens = self
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .context
+            .memory_budget_tokens;
         let mut block = String::from(
             "Relevant memory (durable notes from earlier sessions; may be stale, verify before relying on it):\n",
         );
@@ -1121,14 +1182,25 @@ impl RuntimeInner {
             .and_then(|p| p.context_window());
         let limits = crate::context_engine::ModelLimits::resolve_with_margin(
             &self.model(),
-            self.config.context_window,
+            self.config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .context_window,
             advertised,
-            self.config.context.safety_margin_percent,
+            self.config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .context
+                .safety_margin_percent,
         );
         let budget = crate::context_engine::ContextBudget::new(
             limits,
             self.request_overhead(&estimator, prefix),
-            self.config.max_output_tokens.map(u64::from),
+            self.config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .max_output_tokens
+                .map(u64::from),
         );
         match session.anchor() {
             Some(anchor) => budget.with_anchor(anchor),
@@ -1150,11 +1222,22 @@ impl RuntimeInner {
 
         let estimator = session.estimator();
         let budget = self.context_budget(session, prefix);
-        let policy = CompactionPolicy::from_config(&self.config.context);
+        let policy = CompactionPolicy::from_config(
+            &self
+                .config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .context,
+        );
         let mut transcript = session.messages();
         let usable = budget.usable_input();
 
-        if self.config.context.auto_compact
+        if self
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .context
+            .auto_compact
             && should_compact(&estimator, &transcript, &budget, &policy)
             && let Some((folded, _)) =
                 self.fold_once(&session.id, &transcript, &estimator, &budget, &policy)
@@ -1178,7 +1261,14 @@ impl RuntimeInner {
             transcript = pruned;
         }
 
-        if !self.config.context.auto_compact && usable > 0 {
+        if !self
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .context
+            .auto_compact
+            && usable > 0
+        {
             let used = crate::compaction::active_context_tokens(&estimator, &transcript, &budget);
             if used > usable {
                 // Compaction is off, so the only honest move left is to say so rather than send a
@@ -1199,7 +1289,13 @@ impl RuntimeInner {
         let live = self.session(session)?;
         let estimator = live.estimator();
         let budget = self.context_budget(&live, &[]);
-        let policy = crate::compaction::CompactionPolicy::from_config(&self.config.context);
+        let policy = crate::compaction::CompactionPolicy::from_config(
+            &self
+                .config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .context,
+        );
         let transcript = live.messages();
         self.fold_once(session, &transcript, &estimator, &budget, &policy)
             .map(|(_, report)| report)
@@ -1289,7 +1385,15 @@ impl RuntimeInner {
     }
 
     pub fn tool_context(&self) -> ToolContext {
-        ToolContext::new(self.workspace_root.clone(), &self.config.security.sandbox)
+        ToolContext::new(
+            self.workspace_root.clone(),
+            &self
+                .config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .security
+                .sandbox,
+        )
     }
 
     /// A context that can reach this session's spool, so `output.read` resolves the handles the
@@ -1309,7 +1413,12 @@ impl RuntimeInner {
         let Some(parent_session) = self.session(parent) else {
             return;
         };
-        let budget = self.config.context.delegation_budget_tokens;
+        let budget = self
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .context
+            .delegation_budget_tokens;
         let Some(answer) =
             crate::compaction::delegation_answer(&child.estimator(), &child.messages(), budget)
         else {
@@ -1347,7 +1456,12 @@ impl RuntimeInner {
     /// result is too big; the spooled text is what `output.read` serves back.
     pub fn spool_output(&self, session: &SessionId, call: &str, content: String) -> String {
         use crate::compaction::digest_tool_output;
-        let ceiling = self.config.context.tool_output_ceiling as usize;
+        let ceiling = self
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .context
+            .tool_output_ceiling as usize;
         let chars = content.chars().count();
         if chars <= ceiling {
             return content;
@@ -1419,8 +1533,7 @@ impl RuntimeInner {
     }
 
     pub fn status(&self) -> RuntimeStatus {
-        let busy =
-            self.session_list().iter().any(|s| s.is_busy()) || self.agents.active_count() > 0;
+        let busy = self.session_list().iter().any(|s| s.is_busy()) || self.bots.active_count() > 0;
         if self
             .provider
             .read()
@@ -1446,12 +1559,12 @@ impl RuntimeInner {
             status: self.status(),
             metrics: self.metrics(),
             sessions,
-            agents: self.agents.snapshots(),
-            teams: self
-                .teams
+            bots: self.bots.snapshots(),
+            rosters: self
+                .rosters
                 .list()
                 .into_iter()
-                .map(|t| TeamSnapshot {
+                .map(|t| HiveRosterSnapshot {
                     id: t.id.clone(),
                     name: t.name.clone(),
                     members: t.members.clone(),
@@ -1532,7 +1645,11 @@ impl RuntimeInner {
                     snapshot_text
                 ))],
                 tools: Vec::new(),
-                max_output_tokens: inner.config.max_output_tokens,
+                max_output_tokens: inner
+                    .config
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .max_output_tokens,
             };
             use futures_util::StreamExt;
             let mut stream = provider.stream(request);
@@ -1723,8 +1840,21 @@ impl RuntimeInner {
     /// The cheap model used for naming, if one is configured. Naming a session is not worth the
     /// price of the reasoning model the operator is chatting with.
     fn title_model(&self) -> String {
-        if !self.config.title_model.trim().is_empty() {
-            return self.config.title_model.trim().to_owned();
+        if !self
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .title_model
+            .trim()
+            .is_empty()
+        {
+            return self
+                .config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .title_model
+                .trim()
+                .to_owned();
         }
         self.model()
     }
@@ -1774,11 +1904,11 @@ impl Runtime {
             crate::LearningManager::open(Some(crate::config::vikram_home().join("learning.json")));
         let dialectic = crate::dialectic::DialecticEngine::new(config.context.dialectic.clone());
 
-        let agents = AgentManager::new();
-        match store.list_agents() {
+        let bots = BotManager::new();
+        match store.list_bots() {
             Ok(rows) => {
                 for row in rows {
-                    agents.add(Arc::new(ManagedAgent::from_profile(row.into())));
+                    bots.add(Arc::new(ManagedBot::from_profile(row.into())));
                 }
             }
             Err(err) => return Err(RuntimeError::Store(err.to_string())),
@@ -1847,7 +1977,7 @@ impl Runtime {
         let workspace = WorkspaceManager::new(store.clone(), crate::config::vikram_home());
 
         let inner = Arc::new(RuntimeInner {
-            config,
+            config: std::sync::RwLock::new(config),
             store,
             memory,
             context,
@@ -1862,9 +1992,9 @@ impl Runtime {
             tools: ToolRegistry::with_builtins(),
             provider: std::sync::RwLock::new(provider),
             sessions: Mutex::new(Vec::new()),
-            agents,
+            bots,
             tasks: TaskManager::new(),
-            teams: TeamManager::load(),
+            rosters: HiveRosterManager::load(),
             mcp: Arc::new(Mutex::new(mcp)),
             mcp_visibility: Mutex::new(mcp_visibility),
             plugins: Mutex::new(plugins),
@@ -2088,11 +2218,68 @@ impl RuntimeHandle {
         self.inner.tools()
     }
 
-    /// The configuration this process started with. Read-only: a live edit here would change what
-    /// the running provider was built from without rebuilding it, so `set_model` is the one live
-    /// change and everything else needs a restart.
-    pub fn config(&self) -> &Config {
-        &self.inner.config
+    /// The configuration this process is running with. Re-read from disk with [`Self::reload_config`].
+    pub fn config(&self) -> Config {
+        self.inner
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Re-read the configuration from disk and update the running copy. Rebuilds the provider when
+    /// the model, endpoint, key, or provider kind changed.
+    pub fn reload_config(&self) -> Result<()> {
+        let new_config = Config::load()?;
+        let old = self.inner.config.read().unwrap_or_else(|e| e.into_inner());
+        let needs_rebuild = old.model != new_config.model
+            || old.provider != new_config.provider
+            || old.base_url != new_config.base_url
+            || old.api_key_env != new_config.api_key_env
+            || old.context_window != new_config.context_window
+            || old.api_key() != new_config.api_key();
+        // Drop the read guard before taking the write lock.
+        drop(old);
+
+        *self.inner.model.lock().unwrap_or_else(|e| e.into_inner()) = new_config.model.clone();
+        *self.inner.config.write().unwrap_or_else(|e| e.into_inner()) = new_config.clone();
+
+        if needs_rebuild {
+            let mut provider_slot = self.inner.provider.write().unwrap_or_else(|e| {
+                eprintln!("vikram: runtime provider lock rwlock poisoned; recovering");
+                e.into_inner()
+            });
+            let built: Result<Option<Arc<dyn Provider>>> = match new_config.provider.as_str() {
+                "anthropic" => crate::anthropic::AnthropicProvider::from_config(&new_config)
+                    .map(|provider| provider.map(|p| Arc::new(p) as Arc<dyn Provider>)),
+                _ => crate::openai::OpenAiProvider::from_config(&new_config)
+                    .map(|provider| provider.map(|p| Arc::new(p) as Arc<dyn Provider>)),
+            };
+            match built {
+                Ok(Some(provider)) => {
+                    *provider_slot = Some(provider);
+                }
+                _ => {
+                    *provider_slot = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-scan the skill directories and replace the skill registry. Returns the new count.
+    pub fn reload_skills(&self) -> usize {
+        let reg = SkillRegistry::for_workspace(&self.inner.workspace_root);
+        let count = reg.count();
+        *self.inner.skills.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: runtime skills lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = reg;
+        self.inner.emit(RuntimeEvent::SkillsChanged {
+            discovered: count,
+            loaded: 0,
+        });
+        count
     }
 
     /// Flip one MCP server between private and public and return the new state as a label. The
@@ -2379,7 +2566,12 @@ impl RuntimeHandle {
             .set_session_model(&session.id, Some(&model), now)
             .map_err(|err| RuntimeError::Store(err.to_string()))?;
 
-        let mut config = self.inner.config.clone();
+        let mut config = self
+            .inner
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         config.model = model.clone();
         config.save()?;
 
@@ -2433,12 +2625,79 @@ impl RuntimeHandle {
         Ok(())
     }
 
+    /// Point this process at another endpoint, live.
+    ///
+    /// The choice is written to `$VIKRAM_HOME/config.json` and the provider is rebuilt from it, so
+    /// the next turn costs no restart. A key the new endpoint has not been given yet is not a
+    /// failure: the switch is kept and the notice names the variable that is still empty.
+    pub fn set_provider(
+        &self,
+        base_url: String,
+        api_key_env: String,
+        provider: String,
+    ) -> Result<()> {
+        let base_url = base_url.trim().to_owned();
+        if base_url.is_empty() {
+            return Err(RuntimeError::InvalidState(
+                "an endpoint cannot be empty".into(),
+            ));
+        }
+        let api_key_env = api_key_env.trim().to_owned();
+        if api_key_env.is_empty() {
+            return Err(RuntimeError::InvalidState(
+                "a key variable cannot be empty".into(),
+            ));
+        }
+        // Start from the configuration this process is actually running with, the way `set_model`
+        // does: the model may have been chosen live from a config file that does not exist yet, and
+        // saving a fresh read would quietly drop it.
+        let mut config = self.config();
+        config.base_url = base_url.clone();
+        config.api_key_env = api_key_env.clone();
+        config.provider = if provider.trim().is_empty() {
+            "openai".to_owned()
+        } else {
+            provider.trim().to_owned()
+        };
+        config.save()?;
+        self.reload_config()?;
+
+        let key_state = if self.config().api_key().is_some() {
+            format!("${api_key_env} is set")
+        } else {
+            format!("${api_key_env} is empty — add it to $VIKRAM_HOME/.env")
+        };
+        let (level, text) = if self.inner.provider.read().expect("provider lock").is_some() {
+            (
+                NoticeLevel::Info,
+                format!("endpoint now {base_url} ({key_state})"),
+            )
+        } else {
+            (
+                NoticeLevel::Warn,
+                format!("endpoint saved as {base_url}, but no provider could start: {key_state}"),
+            )
+        };
+        self.inner.emit(RuntimeEvent::Notice { level, text });
+        self.inner.publish_metrics();
+        Ok(())
+    }
+
     /// Read the endpoint's own model list without holding up the interface: the answer arrives as
     /// [`RuntimeEvent::ModelsListed`], including when the endpoint refuses or cannot be reached.
     pub fn refresh_models(&self) {
         let inner = Arc::clone(&self.inner);
-        let base_url = inner.config.base_url.clone();
-        let api_key = inner.config.api_key();
+        let base_url = inner
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .base_url
+            .clone();
+        let api_key = inner
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .api_key();
         tokio::spawn(async move {
             let outcome = if base_url.trim().is_empty() {
                 Err("no endpoint is configured (`base_url`)".to_owned())
@@ -2449,9 +2708,27 @@ impl RuntimeHandle {
                     // still what says which key to send.
                     None => Err(format!(
                         "no key found: `${}` is empty",
-                        inner.config.api_key_env
+                        inner
+                            .config
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .api_key_env
                     )),
-                    Some(key) => crate::openai::list_models(&base_url, &key).await,
+                    Some(key) => {
+                        // A listing that fails on the wire is retried once: the first attempt is
+                        // often a cold TLS handshake, and an empty panel is a worse answer than a
+                        // second try that costs a fraction of a second.
+                        let mut attempt = 0u32;
+                        loop {
+                            match crate::openai::list_models(&base_url, &key).await {
+                                Err(err) if attempt == 0 && err.starts_with("could not reach") => {
+                                    attempt += 1;
+                                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                                }
+                                outcome => break outcome,
+                            }
+                        }
+                    }
                 }
             };
             let (models, error) = match outcome {
@@ -2463,16 +2740,11 @@ impl RuntimeHandle {
     }
 
     pub fn queue(&self, session: &SessionId, text: String) -> Result<()> {
-        let Some(session) = self.inner.session(session) else {
-            return Err(RuntimeError::SessionNotFound(session.clone()));
-        };
-        let depth = session.enqueue(text);
-        self.inner.emit(RuntimeEvent::Notice {
-            level: NoticeLevel::Info,
-            text: format!("queued ({depth} waiting)"),
-        });
-        self.inner.publish_session(&session);
-        Ok(())
+        // Submitting is the honest implementation of "send this": it enqueues behind a running turn
+        // and starts one when nothing is running. Enqueueing unconditionally — which is what this
+        // did — stranded the text on an idle session forever, because the queue is only drained at
+        // the end of a turn and no turn was ever going to end.
+        self.submit(session, text)
     }
 
     /// Steer a running turn: inject an instruction at the next safe point (between tool calls).
@@ -2492,6 +2764,120 @@ impl RuntimeHandle {
         } else {
             self.submit(&session.id, text)
         }
+    }
+
+    /// Everything waiting behind the running turn: the pending steer first, then the queue in run
+    /// order. `target` is the stable handle the management calls take — `"steer"` or `"q<index>"`.
+    pub fn pending_list(&self, session: &SessionId) -> Result<Vec<PendingMessage>> {
+        let Some(session) = self.inner.session(session) else {
+            return Err(RuntimeError::SessionNotFound(session.clone()));
+        };
+        let mut items = Vec::new();
+        if let Some(text) = session.pending_steer() {
+            items.push(PendingMessage {
+                target: "steer".into(),
+                steer: true,
+                text,
+            });
+        }
+        for (index, text) in session.queue_items().into_iter().enumerate() {
+            items.push(PendingMessage {
+                target: format!("q{index}"),
+                steer: false,
+                text,
+            });
+        }
+        Ok(items)
+    }
+
+    /// Rewrite a pending message. `target` is `"steer"` or `"q<index>"` from [`Self::pending_list`].
+    pub fn pending_update(&self, session: &SessionId, target: &str, text: String) -> Result<()> {
+        let session = self.pending_session(session)?;
+        let ok = match pending_index(target) {
+            Some(PendingTarget::Steer) => {
+                session.steer(text);
+                true
+            }
+            Some(PendingTarget::Queue(index)) => session.update_queue(index, text),
+            None => false,
+        };
+        if ok {
+            self.inner.publish_session(&session);
+            Ok(())
+        } else {
+            Err(RuntimeError::InvalidState(format!(
+                "no pending message `{target}`"
+            )))
+        }
+    }
+
+    /// Drop a pending message without running it.
+    pub fn pending_remove(&self, session: &SessionId, target: &str) -> Result<()> {
+        let session = self.pending_session(session)?;
+        let ok = match pending_index(target) {
+            Some(PendingTarget::Steer) => {
+                session.clear_steer();
+                true
+            }
+            Some(PendingTarget::Queue(index)) => session.remove_queue(index).is_some(),
+            None => false,
+        };
+        if ok {
+            self.inner.publish_session(&session);
+            Ok(())
+        } else {
+            Err(RuntimeError::InvalidState(format!(
+                "no pending message `{target}`"
+            )))
+        }
+    }
+
+    /// Reorder a queued message by `delta` positions; the steer row does not move.
+    pub fn pending_move(&self, session: &SessionId, target: &str, delta: isize) -> Result<()> {
+        let session = self.pending_session(session)?;
+        let ok = match pending_index(target) {
+            Some(PendingTarget::Queue(index)) => {
+                let to = index as isize + delta;
+                session.move_queue(index, to.max(0) as usize)
+            }
+            _ => false,
+        };
+        if ok {
+            self.inner.publish_session(&session);
+            Ok(())
+        } else {
+            Err(RuntimeError::InvalidState(format!(
+                "cannot move `{target}`"
+            )))
+        }
+    }
+
+    /// Flip a message between steer and queue: the steer demotes to the back of the queue, a queued
+    /// message promotes to steer (any steer already waiting drops back into the queue first).
+    pub fn pending_flip(&self, session: &SessionId, target: &str) -> Result<()> {
+        let session = self.pending_session(session)?;
+        let ok = match pending_index(target) {
+            Some(PendingTarget::Steer) => {
+                session.steer_to_queue();
+                true
+            }
+            Some(PendingTarget::Queue(index)) => session.queue_to_steer(index),
+            None => false,
+        };
+        if ok {
+            self.inner.publish_session(&session);
+            Ok(())
+        } else {
+            Err(RuntimeError::InvalidState(format!(
+                "cannot flip `{target}`"
+            )))
+        }
+    }
+
+    fn pending_session(&self, id: &SessionId) -> Result<Arc<SessionRuntime>> {
+        self.inner
+            .session(id)
+            .ok_or_else(|| RuntimeError::SessionNotFound(id.clone()))
     }
 
     pub fn cancel(&self, session: &SessionId) -> Result<()> {
@@ -2580,15 +2966,15 @@ impl RuntimeHandle {
         Ok(())
     }
 
+    /// Close a tab. The session stops running and leaves the live set, but nothing is deleted: the
+    /// tab was a view onto a transcript, and the transcript lives in the store. A closed session is
+    /// still listed by [`Self::session_catalogue`] and comes back whole through [`Self::open_session`].
+    /// Only [`Self::delete_session`] destroys one.
     pub fn close_session(&self, session: &SessionId) -> Result<()> {
         let Some(session) = self.inner.session(session) else {
             return Err(RuntimeError::SessionNotFound(session.clone()));
         };
         session.cancel_handle().cancel();
-        self.inner
-            .store
-            .delete_session(&session.id)
-            .map_err(|e| RuntimeError::Store(e.to_string()))?;
         self.inner
             .sessions
             .lock()
@@ -2598,6 +2984,100 @@ impl RuntimeHandle {
             .emit(RuntimeEvent::SessionClosed(session.id.clone()));
         self.inner.publish_metrics();
         Ok(())
+    }
+
+    /// Destroy a session and everything journalled against it. Deliberately separate from closing a
+    /// tab, so that the destructive path cannot be reached by clicking the wrong cell.
+    pub fn delete_session(&self, session: &SessionId) -> Result<()> {
+        if let Some(live) = self.inner.session(session) {
+            live.cancel_handle().cancel();
+        }
+        self.inner
+            .store
+            .delete_session(session)
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        self.inner
+            .sessions
+            .lock()
+            .expect("sessions lock")
+            .retain(|s| &s.id != session);
+        self.inner
+            .emit(RuntimeEvent::SessionClosed(session.clone()));
+        self.inner.publish_metrics();
+        Ok(())
+    }
+
+    /// Bring a stored session back into the live set with its transcript replayed. The same work the
+    /// startup pass does for every row, done for one: build the runtime from the row, replay the
+    /// journal, then announce it so any open view can pick it up.
+    pub fn open_session(&self, session: &SessionId) -> Result<SessionId> {
+        if let Some(live) = self.inner.session(session) {
+            return Ok(live.id.clone());
+        }
+        let row = self
+            .inner
+            .store
+            .get_session(session)
+            .map_err(|e| RuntimeError::Store(e.to_string()))?
+            .ok_or_else(|| RuntimeError::SessionNotFound(session.clone()))?;
+        let live = Arc::new(SessionRuntime::from_row(row));
+        if let Ok(Some((parent, depth))) = self.inner.store.session_lineage(&live.id) {
+            live.set_parent(Some(parent));
+            live.set_depth(depth);
+        }
+        if let Ok(records) = self.inner.store.replay_messages(&live.id) {
+            let messages = crate::compaction::project_from_journal(
+                records
+                    .into_iter()
+                    .map(|record| (record.seq, record.kind, record.payload)),
+            );
+            *live.messages.lock().unwrap_or_else(|e| {
+                eprintln!("vikram: runtime messages lock mutex poisoned; recovering");
+                e.into_inner()
+            }) = messages;
+        }
+        self.inner
+            .sessions
+            .lock()
+            .expect("sessions lock")
+            .push(Arc::clone(&live));
+        self.inner
+            .emit(RuntimeEvent::SessionUpdated(live.snapshot()));
+        self.inner.publish_metrics();
+        Ok(live.id.clone())
+    }
+
+    /// Every session the store knows, live ones first. Built from both halves because a closed tab is
+    /// not a deleted session: the live set says what is running, the store says what exists.
+    pub fn session_catalogue(&self) -> Vec<SessionSummary> {
+        let live = self.inner.session_list();
+        let mut rows = Vec::with_capacity(live.len());
+        for session in &live {
+            rows.push(SessionSummary {
+                id: session.id.clone(),
+                title: session.title.lock().map(|t| t.clone()).unwrap_or_default(),
+                model: session.model.lock().ok().and_then(|m| m.clone()),
+                messages: session.messages.lock().map(|m| m.len()).unwrap_or(0),
+                open: true,
+                updated_ms: session.updated_ms.load(Ordering::Relaxed),
+            });
+        }
+        if let Ok(stored) = self.inner.store.browse_sessions() {
+            for (row, count) in stored {
+                if rows.iter().any(|s| s.id == row.id) {
+                    continue;
+                }
+                rows.push(SessionSummary {
+                    id: row.id,
+                    title: row.title,
+                    model: row.model,
+                    messages: count as usize,
+                    open: false,
+                    updated_ms: row.updated_ms,
+                });
+            }
+        }
+        rows
     }
 
     /// Fork a session: a new session that continues from the source's transcript. The journal
@@ -2695,8 +3175,8 @@ impl RuntimeHandle {
         Ok(answered)
     }
 
-    pub fn spawn_agent(&self, profile: AgentId, task: String, session: SessionId) -> Result<()> {
-        let Some(agent) = self.inner.agents.get(&profile) else {
+    pub fn spawn_agent(&self, profile: BotId, task: String, session: SessionId) -> Result<()> {
+        let Some(agent) = self.inner.bots.get(&profile) else {
             return Err(RuntimeError::AgentNotFound(profile.to_string()));
         };
         let Some(parent) = self.inner.session(&session) else {
@@ -2718,13 +3198,13 @@ impl RuntimeHandle {
             .unwrap_or_else(|| titling::clip(&task, 28));
         let title = format!("{} — {}", agent.profile.name, subject);
         let agent_session = self.inner.create_session(Some(title))?;
-        agent_session.set_agent(Some(profile.clone()), now_ms());
+        agent_session.set_bot(Some(profile.clone()), now_ms());
         agent_session.set_parent(Some(parent.id.clone()));
         agent_session.set_depth(depth);
         let _ = self
             .inner
             .store
-            .set_session_agent(&agent_session.id, Some(&profile), now_ms());
+            .set_session_bot(&agent_session.id, Some(&profile), now_ms());
         self.inner
             .store
             .set_session_lineage(&agent_session.id, Some(&parent.id), depth)?;
@@ -2733,7 +3213,12 @@ impl RuntimeHandle {
         let brief = crate::compaction::delegation_brief(
             &agent_session.estimator(),
             &parent.messages(),
-            self.inner.config.context.delegation_budget_tokens,
+            self.inner
+                .config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .context
+                .delegation_budget_tokens,
         );
         if let Some(brief) = brief {
             let message = vikram_contracts::Message::text(
@@ -2749,7 +3234,7 @@ impl RuntimeHandle {
             );
         }
         agent.set_task(Some(task.clone()));
-        agent.set_state(AgentState::Thinking);
+        agent.set_state(BotState::Thinking);
         agent.set_session(Some(agent_session.id.clone()));
         *agent.paused.lock().unwrap_or_else(|e| {
             eprintln!("vikram: runtime pause mutex poisoned; recovering");
@@ -2760,10 +3245,10 @@ impl RuntimeHandle {
             e.into_inner()
         }) = vikram_contracts::CancellationToken::new();
         let bg = self.inner.tasks.start(
-            format!("agent: {}", agent.profile.name),
+            format!("bot: {}", agent.profile.name),
             agent_session.id.clone(),
         );
-        self.inner.publish_agent(&agent);
+        self.inner.publish_bot(&agent);
         self.inner.task_snapshot(&bg);
         self.inner
             .emit(RuntimeEvent::SessionCreated(agent_session.snapshot()));
@@ -2781,41 +3266,41 @@ impl RuntimeHandle {
         Ok(())
     }
 
-    pub fn control_agent(&self, id: &AgentId, control: AgentControl) -> Result<()> {
-        let Some(agent) = self.inner.agents.get(id) else {
+    pub fn control_bot(&self, id: &BotId, control: BotControl) -> Result<()> {
+        let Some(agent) = self.inner.bots.get(id) else {
             return Err(RuntimeError::AgentNotFound(id.to_string()));
         };
         match control {
-            AgentControl::Pause => {
+            BotControl::Pause => {
                 *agent.paused.lock().unwrap_or_else(|e| {
                     eprintln!("vikram: runtime pause mutex poisoned; recovering");
                     e.into_inner()
                 }) = true;
-                agent.set_state(AgentState::Paused);
+                agent.set_state(BotState::Paused);
                 self.inner.emit(RuntimeEvent::Notice {
                     level: NoticeLevel::Info,
                     text: format!("{} paused", agent.profile.name),
                 });
             }
-            AgentControl::Resume => {
+            BotControl::Resume => {
                 *agent.paused.lock().unwrap_or_else(|e| {
                     eprintln!("vikram: runtime pause mutex poisoned; recovering");
                     e.into_inner()
                 }) = false;
-                if agent.state() == AgentState::Paused {
-                    agent.set_state(AgentState::Running);
+                if agent.state() == BotState::Paused {
+                    agent.set_state(BotState::Running);
                 }
             }
-            AgentControl::Stop => {
+            BotControl::Stop => {
                 agent.cancel_handle().cancel();
-                agent.set_state(AgentState::Stopped);
+                agent.set_state(BotState::Stopped);
                 self.inner.emit(RuntimeEvent::Notice {
                     level: NoticeLevel::Warn,
                     text: format!("{} stopped", agent.profile.name),
                 });
             }
         }
-        self.inner.publish_agent(&agent);
+        self.inner.publish_bot(&agent);
         self.inner.publish_metrics();
         Ok(())
     }
@@ -2878,8 +3363,122 @@ impl RuntimeHandle {
         Ok(())
     }
 
-    pub fn agent_snapshots(&self) -> Vec<AgentSnapshot> {
-        self.inner.agents.snapshots()
+    pub fn bot_snapshots(&self) -> Vec<BotSnapshot> {
+        self.inner.bots.snapshots()
+    }
+
+    /// Create a bot profile, persist it, and register it with the manager — the same path the
+    /// store loader takes on startup, so a bot made here survives a restart.
+    pub fn bot_create(&self, name: &str, role: &str, description: &str) -> Result<BotId> {
+        let row = vikram_store::BotRow {
+            id: BotId::generate(),
+            name: name.to_owned(),
+            role: role.to_owned(),
+            description: description.to_owned(),
+            icon: None,
+            created_ms: now_ms(),
+        };
+        self.inner.store.save_bot(&row)?;
+        let bot = Arc::new(ManagedBot::from_profile(row.into()));
+        self.inner.bots.add(bot.clone());
+        self.inner.publish_bot(&bot);
+        Ok(bot.profile.id.clone())
+    }
+
+    /// Rename a bot profile. The store row is the source of truth; the live `ManagedBot` is
+    /// rebuilt from it, which resets transient runtime state (task, progress, unread) — the
+    /// profile itself, including its id, is preserved.
+    pub fn bot_rename(&self, id: &BotId, name: &str) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(RuntimeError::InvalidState("a bot needs a name".into()));
+        }
+        let rows = self.inner.store.list_bots()?;
+        let Some(mut row) = rows.into_iter().find(|row| row.id == *id) else {
+            return Err(RuntimeError::AgentNotFound(id.to_string()));
+        };
+        row.name = name.to_owned();
+        self.inner.store.save_bot(&row)?;
+        self.inner.bots.remove(id);
+        let bot = Arc::new(ManagedBot::from_profile(row.into()));
+        self.inner.bots.add(bot.clone());
+        self.inner.publish_bot(&bot);
+        Ok(())
+    }
+
+    /// Delete a bot profile and drop its managed instance.
+    pub fn bot_delete(&self, id: &BotId) -> Result<()> {
+        self.inner.store.delete_bot(id)?;
+        self.inner.bots.remove(id);
+        Ok(())
+    }
+
+    /// Installed plugins as `(id, name, state)` for pickers. State is `loaded`, `disabled` or
+    /// `error` — the same labels the `vikram plugins` CLI prints.
+    pub fn plugin_states(&self) -> Vec<(String, String, String)> {
+        let registry = self.inner.plugins.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: plugins lock mutex poisoned; recovering");
+            e.into_inner()
+        });
+        registry
+            .plugins()
+            .iter()
+            .map(|plugin| {
+                let state = if let Some(err) = &plugin.error {
+                    format!("error: {err}")
+                } else if plugin.loaded {
+                    "loaded".to_owned()
+                } else {
+                    "disabled".to_owned()
+                };
+                (plugin.id(), plugin.name.clone(), state)
+            })
+            .collect()
+    }
+
+    fn plugin_mutate(
+        &self,
+        op: impl FnOnce(&mut PluginRegistry) -> std::result::Result<(), String>,
+    ) -> Result<()> {
+        let mut registry = self.inner.plugins.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: plugins lock mutex poisoned; recovering");
+            e.into_inner()
+        });
+        op(&mut registry).map_err(RuntimeError::Store)?;
+        let installed = registry.installed();
+        let loaded = registry.plugins().iter().filter(|p| p.loaded).count();
+        drop(registry);
+        self.inner
+            .emit(RuntimeEvent::PluginsChanged { installed, loaded });
+        Ok(())
+    }
+
+    pub fn plugin_install(&self, path: &std::path::Path) -> Result<String> {
+        let registry = self.inner.plugins.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: plugins lock mutex poisoned; recovering");
+            e.into_inner()
+        });
+        let id = registry.install(path).map_err(RuntimeError::Store)?;
+        let installed = registry.installed();
+        let loaded = registry.plugins().iter().filter(|p| p.loaded).count();
+        drop(registry);
+        self.inner
+            .emit(RuntimeEvent::PluginsChanged { installed, loaded });
+        Ok(id)
+    }
+
+    pub fn plugin_uninstall(&self, id: &str) -> Result<()> {
+        self.plugin_mutate(|registry| registry.uninstall(id))
+    }
+
+    pub fn plugin_set_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        self.plugin_mutate(|registry| {
+            if enabled {
+                registry.enable(id)
+            } else {
+                registry.disable(id)
+            }
+        })
     }
 
     pub fn tasks(&self) -> Vec<BackgroundTask> {
@@ -2892,69 +3491,69 @@ impl RuntimeHandle {
         }
     }
 
-    pub fn team_create(&self, name: impl Into<String>) -> crate::error::Result<()> {
+    pub fn hive_roster_create(&self, name: impl Into<String>) -> crate::error::Result<()> {
         self.inner
-            .teams
+            .rosters
             .create(name.into())
             .map_err(RuntimeError::InvalidState)?;
-        let _ = self.inner.teams.save();
+        let _ = self.inner.rosters.save();
         Ok(())
     }
 
-    pub fn team_list(&self) -> Vec<Team> {
-        self.inner.teams.list()
+    pub fn hive_roster_list(&self) -> Vec<HiveRoster> {
+        self.inner.rosters.list()
     }
 
-    pub fn team_get(&self, name: impl Into<String>) -> Option<Team> {
-        self.inner.teams.get(name.into())
+    pub fn hive_roster_get(&self, name: impl Into<String>) -> Option<HiveRoster> {
+        self.inner.rosters.get(name.into())
     }
 
-    pub fn team_add_member(
+    pub fn hive_roster_add_member(
         &self,
-        team: impl Into<String>,
-        agent: AgentId,
+        roster: impl Into<String>,
+        bot: BotId,
     ) -> crate::error::Result<()> {
         self.inner
-            .teams
-            .add_member(team.into(), agent)
+            .rosters
+            .add_member(roster.into(), bot)
             .map_err(RuntimeError::InvalidState)?;
-        let _ = self.inner.teams.save();
+        let _ = self.inner.rosters.save();
         Ok(())
     }
 
-    pub fn team_remove_member(
+    pub fn hive_roster_remove_member(
         &self,
-        team: impl Into<String>,
-        agent: AgentId,
+        roster: impl Into<String>,
+        bot: BotId,
     ) -> crate::error::Result<()> {
         self.inner
-            .teams
-            .remove_member(team.into(), agent)
+            .rosters
+            .remove_member(roster.into(), bot)
             .map_err(RuntimeError::InvalidState)?;
-        let _ = self.inner.teams.save();
+        let _ = self.inner.rosters.save();
         Ok(())
     }
 
-    pub fn team_delete(&self, name: impl Into<String>) -> crate::error::Result<()> {
+    pub fn hive_roster_delete(&self, name: impl Into<String>) -> crate::error::Result<()> {
         self.inner
-            .teams
+            .rosters
             .delete(name.into())
             .map_err(RuntimeError::InvalidState)?;
-        let _ = self.inner.teams.save();
+        let _ = self.inner.rosters.save();
         Ok(())
     }
 
-    pub fn team_delegate(
+    pub fn hive_roster_delegate(
         &self,
-        team: impl Into<String>,
+        roster: impl Into<String>,
         task: impl Into<String>,
-        assigned_to: Option<AgentId>,
+        assigned_to: Option<BotId>,
     ) -> crate::error::Result<()> {
         self.inner
-            .teams
-            .delegate_task(team.into(), task.into(), assigned_to)
+            .rosters
+            .delegate_task(roster.into(), task.into(), assigned_to)
             .map_err(RuntimeError::InvalidState)?;
-        let _ = self.inner.teams.save();
+        let _ = self.inner.rosters.save();
         Ok(())
     }
 
@@ -3470,7 +4069,12 @@ impl RuntimeHandle {
             // A hive turn is shared context, and authorising a share is not the same as emptying
             // the log into the prompt: the participant answers from the most recent exchange that
             // fits its budget, and nothing it was not party to.
-            let budget_tokens = inner.config.context.hive_budget_tokens;
+            let budget_tokens = inner
+                .config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .context
+                .hive_budget_tokens;
             let estimator = crate::context_engine::TokenEstimator::default();
             let mut spent = estimator.estimate_text(&system_text);
             let mut kept: Vec<&vikram_store::HiveMessageRow> = Vec::new();
@@ -3503,7 +4107,11 @@ impl RuntimeHandle {
                 model: model.to_owned(),
                 messages: request_messages,
                 tools: Vec::new(),
-                max_output_tokens: inner.config.max_output_tokens,
+                max_output_tokens: inner
+                    .config
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .max_output_tokens,
             };
             let mut stream = provider.stream(request);
             let mut collected = String::new();
@@ -3699,6 +4307,36 @@ impl RuntimeHandle {
         Ok(())
     }
 
+    /// Rename a skill by copying its directory to the new name and removing the old one, so every
+    /// file the skill ships survives. Re-discovers afterwards.
+    pub fn skill_rename(&self, name: &str, new_name: &str) -> Result<()> {
+        let new_name = new_name.trim();
+        if new_name.is_empty() {
+            return Err(RuntimeError::InvalidState("a skill needs a name".into()));
+        }
+        let dir = {
+            let skills = self.inner.skills.lock().unwrap_or_else(|e| {
+                eprintln!("vikram: runtime skills lock mutex poisoned; recovering");
+                e.into_inner()
+            });
+            skills
+                .get(name)
+                .and_then(|skill| skill.path.parent().map(|p| p.to_path_buf()))
+                .ok_or_else(|| RuntimeError::InvalidState(format!("no skill `{name}`")))?
+        };
+        let mgr = vikram_skills::Manager::new();
+        mgr.create_from(new_name, &dir)
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        mgr.delete(name)
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        self.rescan_skills();
+        self.inner.emit(RuntimeEvent::SkillsChanged {
+            discovered: self.skill_count(),
+            loaded: 0,
+        });
+        Ok(())
+    }
+
     /// Import a skill from a directory path. Re-discovers afterwards.
     pub fn skill_import(&self, path: &str) -> Result<()> {
         let mgr = vikram_skills::Manager::new();
@@ -3726,7 +4364,7 @@ impl RuntimeHandle {
         for session in self.inner.session_list() {
             session.cancel_handle().cancel();
         }
-        for agent in self.inner.agents.list() {
+        for agent in self.inner.bots.list() {
             agent.cancel_handle().cancel();
         }
         self.inner.emit(RuntimeEvent::Shutdown);
@@ -3767,10 +4405,74 @@ mod tests {
         let runtime = Runtime::start(config).await.unwrap();
         let snapshot = runtime.handle().snapshot();
         assert_eq!(snapshot.sessions.len(), 1);
-        assert_eq!(snapshot.agents.len(), 0);
-        assert_eq!(snapshot.metrics.subagents_active, 0);
+        assert_eq!(snapshot.bots.len(), 0);
+        assert_eq!(snapshot.metrics.bots_active, 0);
         assert_eq!(snapshot.metrics.background_tasks, 0);
         assert!(snapshot.metrics.model.is_some());
+    }
+
+    #[tokio::test]
+    async fn queueing_on_an_idle_session_starts_the_turn_instead_of_stranding_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let id = handle.snapshot().sessions[0].id.clone();
+
+        handle
+            .queue(&id, "hello".into())
+            .expect("the text is accepted");
+
+        assert_eq!(
+            handle.snapshot().sessions[0].queued,
+            0,
+            "a queue nothing drains must never be where an idle session's message ends up"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_switch_is_saved_and_keeps_the_model_that_was_chosen() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+
+        handle
+            .set_provider(
+                "https://openrouter.ai/api/v1".into(),
+                "VIKRAM_TEST_OPENROUTER_KEY".into(),
+                "openai".into(),
+            )
+            .expect("a new endpoint is a config edit, not a refusal");
+
+        let saved = Config::load().unwrap();
+        assert_eq!(saved.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(saved.api_key_env, "VIKRAM_TEST_OPENROUTER_KEY");
+        assert_eq!(
+            handle.config().model,
+            "test-model",
+            "changing where the requests go must not change which model they name"
+        );
+        assert!(
+            handle.config().api_key().is_none(),
+            "the switch is kept even when the new variable holds no key yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_endpoint_is_refused_rather_than_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let before = handle.config().base_url;
+
+        assert!(
+            handle
+                .set_provider("   ".into(), "SOME_KEY".into(), "openai".into())
+                .is_err()
+        );
+        assert_eq!(handle.config().base_url, before);
     }
 
     #[tokio::test]
@@ -3790,6 +4492,44 @@ mod tests {
         );
         handle.close_session(&id).unwrap();
         assert!(!handle.snapshot().sessions.iter().any(|s| s.id == id));
+    }
+
+    #[tokio::test]
+    async fn a_closed_tab_keeps_its_transcript_and_reopens_from_the_catalogue() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let (runtime, _) = named_runtime(dir.path(), "Rust JWT Authentication").await;
+        let handle = runtime.handle();
+        let id = handle.create_session(Some("Closed work".into())).unwrap();
+
+        handle.close_session(&id).unwrap();
+
+        // The tab is gone, the conversation is not.
+        assert!(!handle.snapshot().sessions.iter().any(|s| s.id == id));
+        let closed = handle
+            .session_catalogue()
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .expect("a closed session stays in the catalogue");
+        assert!(!closed.open, "a closed session must not claim to be open");
+
+        handle.open_session(&id).unwrap();
+        let reopened = handle
+            .session_catalogue()
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .expect("the reopened session is catalogued");
+        assert!(reopened.open, "the reopened session must be open");
+        assert!(handle.snapshot().sessions.iter().any(|s| s.id == id));
+
+        handle.delete_session(&id).unwrap();
+        assert!(
+            !handle
+                .session_catalogue()
+                .iter()
+                .any(|entry| entry.id == id),
+            "delete is the one path that removes the record"
+        );
     }
 
     #[tokio::test]
@@ -4924,9 +5664,7 @@ mod tests {
         let (runtime, _) = named_runtime(dir.path(), "General Chat").await;
         let handle = runtime.handle();
         let id = handle.create_session(None).unwrap();
-        handle
-            .submit(&id, "compare AI coding agents".into())
-            .unwrap();
+        handle.submit(&id, "compare AI coding bots".into()).unwrap();
         settle(&handle, &id, 1).await;
         let (title, _, status) = title_of(&handle, &id);
         assert_ne!(title, "General Chat", "a forbidden title is refused");
@@ -5018,5 +5756,54 @@ mod tests {
             .unwrap();
         settle(&handle, &manual, 1).await;
         assert_eq!(title_of(&handle, &manual).0, "Quarterly review");
+    }
+
+    #[tokio::test]
+    async fn reload_config_picks_up_a_changed_model_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(Config {
+            workspace_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let handle = runtime.handle();
+
+        let cfg = Config {
+            model: "reloaded-model".into(),
+            workspace_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+        cfg.save().unwrap();
+
+        handle.reload_config().unwrap();
+        assert_eq!(handle.config().model, "reloaded-model");
+    }
+
+    #[tokio::test]
+    async fn reload_skills_rescans_and_reports_the_new_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(Config {
+            workspace_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let handle = runtime.handle();
+
+        let skill_dir = dir.path().join("skills").join("alpha");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: alpha\ndescription: desc\n---\nbody",
+        )
+        .unwrap();
+
+        let before = handle.skill_count();
+        let reloaded = handle.reload_skills();
+        assert!(reloaded > before, "reloaded={reloaded} before={before}");
+        assert!(handle.skill_list().iter().any(|s| s.name == "alpha"));
     }
 }

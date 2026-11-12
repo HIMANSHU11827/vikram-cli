@@ -42,6 +42,15 @@ pub enum ProviderEvent {
     ThinkingDelta(String),
     /// A complete tool call, emitted by the provider once its arguments are fully streamed.
     ToolCall(ToolCall),
+    /// The endpoint refused the request and it is being sent again. `status` is the HTTP code that
+    /// caused it, or `0` when the connection never got that far. Reported so an interface can say
+    /// why the clock is moving: without it, a backoff is indistinguishable from a hung turn.
+    Retrying {
+        attempt: u32,
+        of: u32,
+        wait_ms: u64,
+        status: u16,
+    },
     Finished {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,

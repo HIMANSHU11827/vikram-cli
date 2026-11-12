@@ -15,6 +15,41 @@ fn open_existing(root: &Path) -> Option<CodeIndex> {
     CodeIndex::open(root, &db_path).ok()
 }
 
+/// Upper bounds for the no-index fallback scan. The workspace root can be an entire home
+/// directory, and an unbounded read of every file under it stalls the turn for minutes before
+/// the model is ever asked anything — with nothing on screen to say why.
+const GREP_MAX_FILES: usize = 20_000;
+const GREP_MAX_ELAPSED: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Progress of one fallback scan, shared across the recursion so every branch sees the same
+/// deadline and file count.
+struct GrepScan {
+    files: usize,
+    started: std::time::Instant,
+    truncated: bool,
+}
+
+impl Default for GrepScan {
+    fn default() -> Self {
+        Self {
+            files: 0,
+            started: std::time::Instant::now(),
+            truncated: false,
+        }
+    }
+}
+
+impl GrepScan {
+    fn exhausted(&mut self) -> bool {
+        if !self.truncated
+            && (self.files >= GREP_MAX_FILES || self.started.elapsed() >= GREP_MAX_ELAPSED)
+        {
+            self.truncated = true;
+        }
+        self.truncated
+    }
+}
+
 /// Plain-text fallback when no index exists: bounded line search over source files,
 /// same cap as `search.text` so it cannot hang a turn.
 fn grep_fallback(root: &Path, query: &str) -> String {
@@ -22,40 +57,54 @@ fn grep_fallback(root: &Path, query: &str) -> String {
         return "[codeindex] no index at `.vikram/codeindex.db`; run codeindex index first (grep fallback has no query)".to_string();
     }
     let mut hits: Vec<String> = Vec::new();
-    grep_walk(root, query, &mut hits, 0);
+    let mut scan = GrepScan::default();
+    grep_walk(root, query, &mut hits, 0, &mut scan);
+    let note = if scan.truncated {
+        " (scan truncated: workspace too large)"
+    } else {
+        ""
+    };
     if hits.is_empty() {
         format!(
-            "[codeindex] no index at `.vikram/codeindex.db`; grep fallback found no matches for `{query}`"
+            "[codeindex] no index at `.vikram/codeindex.db`; grep fallback found no matches for `{query}`{note}"
         )
     } else {
         format!(
-            "[codeindex] no index at `.vikram/codeindex.db`; grep fallback:\n{}",
+            "[codeindex] no index at `.vikram/codeindex.db`; grep fallback{note}:\n{}",
             hits.join("\n")
         )
     }
 }
 
-fn grep_walk(dir: &Path, query: &str, hits: &mut Vec<String>, depth: usize) {
-    if depth > 12 || hits.len() >= 100 {
+fn grep_walk(dir: &Path, query: &str, hits: &mut Vec<String>, depth: usize, scan: &mut GrepScan) {
+    if depth > 12 || hits.len() >= 100 || scan.exhausted() {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
+        if scan.exhausted() {
+            return;
+        }
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == ".git" || name == "target" || name == "node_modules" || name == ".vikram" {
+        // Hidden entries are skipped the way ripgrep skips them: VCS internals, tool state and
+        // cache directories are never the code a query is about, and on a home-directory
+        // workspace they are most of the tree.
+        if name.starts_with('.') || name == "target" || name == "node_modules" || name == ".vikram"
+        {
             continue;
         }
         if path.is_dir() {
-            grep_walk(&path, query, hits, depth + 1);
+            grep_walk(&path, query, hits, depth + 1, scan);
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
         if meta.len() > 1_000_000 {
             continue;
         }
+        scan.files += 1;
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -334,6 +383,74 @@ impl Tool for CodeIndexTool {
             }
             other => Ok(ToolOutput {
                 content: format!("unknown action: {other}"),
+                ok: false,
+            }),
+        }
+    }
+}
+
+/// Expose the codeindex's `ranked_context` as a first-class tool.
+pub(crate) struct CodeSearch;
+
+impl Tool for CodeSearch {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "code_search".into(),
+            description: "Ranked code context from the repository index for a query.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "search query"},
+                    "limit": {"type": "integer", "description": "maximum number of results", "default": 20}
+                },
+                "required": ["query"]
+            }),
+        }
+    }
+
+    fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        Ok(PermissionRequest::new(
+            ActionKind::Read,
+            "code_search",
+            query,
+            SideEffect::None,
+            Trust::Model,
+        ))
+    }
+
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+        let query = arg_str(args, "query")?;
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(20);
+        match open_existing(&ctx.workspace_root) {
+            Some(idx) => match idx.ranked_context(&query, limit) {
+                Ok(text) if !text.trim().is_empty() => Ok(ToolOutput {
+                    content: truncated(text),
+                    ok: true,
+                }),
+                Ok(_) => Ok(ToolOutput {
+                    content:
+                        "[codeindex] index is empty or has no matches; run codeindex index first"
+                            .to_owned(),
+                    ok: false,
+                }),
+                Err(e) => Ok(ToolOutput {
+                    content: format!("[codeindex] ranked_context failed: {e}"),
+                    ok: false,
+                }),
+            },
+            None => Ok(ToolOutput {
+                content:
+                    "[codeindex] no index at `.vikram/codeindex.db`; run codeindex index first"
+                        .to_owned(),
                 ok: false,
             }),
         }

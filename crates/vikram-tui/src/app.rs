@@ -5,15 +5,16 @@
 //! applies to the runtime; runtime observations arrive as [`RuntimeEvent`]s and are folded in here.
 
 use crate::editor::Editor;
+use ratatui::style::Color;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use vikram_contracts::TokenMeter;
 use vikram_contracts::{
-    AgentId, ApprovalId, Block, Message, PermissionMode, Role, SessionId, ToolCallId, TurnId,
+    ApprovalId, Block, BotId, Message, PermissionMode, Role, SessionId, ToolCallId, TurnId,
 };
 use vikram_runtime::types::{
-    AgentSnapshot, AgentState, ApprovalPrompt, BackgroundTask, ContextMeter, Metrics, NoticeLevel,
-    RuntimeEvent, RuntimeStatus, SessionSnapshot, StateSnapshot, TaskState, TeamSnapshot,
+    ApprovalPrompt, BackgroundTask, BotSnapshot, BotState, ContextMeter, HiveRosterSnapshot,
+    Metrics, NoticeLevel, RuntimeEvent, RuntimeStatus, SessionSnapshot, StateSnapshot, TaskState,
     TurnState, now_ms,
 };
 
@@ -126,6 +127,30 @@ pub enum Focus {
     Bots,
 }
 
+/// Where Enter sends the draft: `Queue` waits for the running turn to finish, `Steer` injects it
+/// at the next safe point. Tab flips between them; the input box title shows the armed mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendMode {
+    Queue,
+    Steer,
+}
+
+impl SendMode {
+    pub fn other(self) -> Self {
+        match self {
+            Self::Queue => Self::Steer,
+            Self::Steer => Self::Queue,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::Steer => "steer",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActivityKind {
     Tool,
@@ -196,7 +221,7 @@ pub enum Overlay {
     Help,
     Approvals,
     Inspector(InspectorKind),
-    AddAgent {
+    AddBot {
         selected: usize,
     },
     RenameSession {
@@ -250,20 +275,36 @@ pub enum Overlay {
 
 /// What a text panel's Enter means. A closed set, so a prompt can never submit something the host
 /// has no path for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PromptAction {
     /// The typed text is a model id; the host applies it with the same call the picker uses.
     SetModel,
+    /// The typed text is a base URL for an endpoint no preset names.
+    SetEndpoint,
     /// The typed text is an allow-list rule to save.
     AddAllowRule,
     /// The typed text is "name: description" for a new skill.
     CreateSkill,
     /// The typed text is a path to a skill directory to import.
     ImportSkill,
+    /// The typed text is the name of the roster to create.
+    CreateHiveRoster,
+    /// The typed text rewrites one pending steer/queue message.
+    EditPending { session: SessionId, target: String },
+    /// The typed text is "name: role: description" for a new bot profile.
+    CreateBot,
+    /// The typed text is the new name for the bot named by `bot`.
+    RenameBot { bot: BotId },
+    /// The typed text is the new name for the skill named by `skill`.
+    RenameSkill { skill: String },
+    /// The typed text is a path to a plugin directory to install.
+    InstallPlugin,
+    /// The typed text is "key: value" to remember under the global scope.
+    SaveMemory,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AgentAction {
+pub enum BotAction {
     Pause,
     Resume,
     Stop,
@@ -279,6 +320,44 @@ pub enum UiCommand {
         session: SessionId,
         text: String,
     },
+    /// Inject into the running turn now instead of waiting in the queue.
+    Steer {
+        session: SessionId,
+        text: String,
+    },
+    /// Rewrite a pending steer/queue message chosen in the pending picker.
+    EditPending {
+        session: SessionId,
+        target: String,
+        text: String,
+    },
+    /// Create a bot profile from "name: role: description".
+    CreateBot {
+        name: String,
+        role: String,
+        description: String,
+    },
+    RenameBot {
+        bot: BotId,
+        name: String,
+    },
+    DeleteBot {
+        bot: BotId,
+    },
+    RenameSkill {
+        skill: String,
+        new_name: String,
+    },
+    InstallPlugin {
+        path: String,
+    },
+    SaveMemory {
+        key: String,
+        value: String,
+    },
+    UninstallPlugin {
+        id: String,
+    },
     RunShell {
         session: SessionId,
         command: String,
@@ -287,6 +366,10 @@ pub enum UiCommand {
         session: SessionId,
         command: String,
         args: String,
+    },
+    /// Point this process at another endpoint, keeping the key variable and dialect already set.
+    SetEndpoint {
+        base_url: String,
     },
     Cancel {
         session: SessionId,
@@ -308,13 +391,13 @@ pub enum UiCommand {
         persist: bool,
     },
     SpawnAgent {
-        profile: AgentId,
+        profile: BotId,
         task: String,
         session: SessionId,
     },
-    AgentControl {
-        agent: AgentId,
-        action: AgentAction,
+    BotControl {
+        bot: BotId,
+        action: BotAction,
     },
     /// The operator used a verb on a row. The kind and verb together say what to do — a model to
     /// switch to, a session to close, an MCP server to flip — so the host acts instead of the
@@ -344,6 +427,10 @@ pub enum UiCommand {
     ImportSkill {
         session: SessionId,
         path: String,
+    },
+    /// Create a roster by name from the `/roster` panel, which is the only place the roster can grow.
+    CreateHiveRoster {
+        name: String,
     },
     /// Save one allow-list rule the operator typed, bypassing the removed /allow command.
     AllowRule {
@@ -456,11 +543,17 @@ pub struct SessionView {
     pub updated_ms: u64,
     /// `generic`, `auto` or `manual` — how this session got its name.
     pub title_source: String,
-    pub agent: Option<AgentId>,
+    pub bot: Option<BotId>,
     pub editor: Editor,
     pub scroll: usize,
     pub follow: bool,
     pub queued: usize,
+    /// Every follow-up waiting behind the running turn, in the order it will run.
+    pub queue: Vec<String>,
+    /// A steer instruction is pending pickup by the running turn.
+    pub steer_text: Option<String>,
+    /// The newest queued follow-up, previewed by the input box title.
+    pub queue_text: Option<String>,
     pub activity: Vec<Activity>,
     pub expanded_activities: std::collections::HashSet<usize>,
     pub selected_activity: Option<usize>,
@@ -503,11 +596,14 @@ impl SessionView {
             created_ms: snapshot.created_ms,
             updated_ms: snapshot.updated_ms,
             title_source: snapshot.title_source,
-            agent: snapshot.agent,
+            bot: snapshot.bot,
             editor: Editor::new(),
             scroll: 0,
             follow: true,
             queued: snapshot.queued,
+            queue: snapshot.queue,
+            steer_text: snapshot.steer_text,
+            queue_text: snapshot.queue_text,
             activity,
             expanded_activities: std::collections::HashSet::new(),
             selected_activity: None,
@@ -670,8 +766,11 @@ impl SessionView {
         self.tokens = snapshot.tokens;
         self.updated_ms = snapshot.updated_ms;
         self.title_source = snapshot.title_source;
-        self.agent = snapshot.agent;
+        self.bot = snapshot.bot;
         self.queued = snapshot.queued;
+        self.queue = snapshot.queue;
+        self.steer_text = snapshot.steer_text;
+        self.queue_text = snapshot.queue_text;
         // The turn state is the only authority on whether work is happening. Reading it after the
         // copy makes both transitions fire exactly once: `mark_working` is a no-op when a start is
         // already recorded, and `mark_settled` is a no-op when nothing is being timed.
@@ -688,9 +787,9 @@ impl SessionView {
 pub struct App {
     pub sessions: Vec<SessionView>,
     pub active: usize,
-    pub agents: Vec<AgentSnapshot>,
-    pub teams: Vec<TeamSnapshot>,
-    pub selected_agent: Option<AgentId>,
+    pub bots: Vec<BotSnapshot>,
+    pub rosters: Vec<HiveRosterSnapshot>,
+    pub selected_bot: Option<BotId>,
     pub tasks: Vec<BackgroundTask>,
     pub approvals: Vec<ApprovalPrompt>,
     pub status: RuntimeStatus,
@@ -700,7 +799,13 @@ pub struct App {
     pub notices: VecDeque<Notice>,
     pub overlay: Option<Overlay>,
     pub focus: Focus,
+    /// Queue or steer — what Enter does with the draft. Tab flips it.
+    pub send_mode: SendMode,
     pub ascii: bool,
+    /// The operator's window colour, when the config names one.
+    pub theme_bg: Option<Color>,
+    /// The operator's accent colour, when the config names one.
+    pub theme_accent: Option<Color>,
     pub tick: u64,
     pub show_bots: bool,
     pub should_quit: bool,
@@ -718,7 +823,7 @@ pub struct App {
     pub approval_selection: usize,
     /// Which of the three answers the approval panel has highlighted: allow once, deny, keep.
     pub approval_action: usize,
-    pub agent_selection: usize,
+    pub bot_selection: usize,
     /// The question the runtime is currently blocked on, if any.
     pub pending_question: Option<PendingQuestion>,
     /// Answers typed here and not yet handed to the runtime, as `(request_id, answer)`.
@@ -731,11 +836,19 @@ pub struct App {
     pub models_loading: bool,
     /// The agent chosen in the agent panel, waiting for the verb panel to say what to do with it.
     /// Two panels, one subject: the second panel cannot be answered without the first.
-    pub pending_agent: Option<AgentId>,
+    pub pending_bot: Option<BotId>,
     /// Where each picker row was drawn, as `(y, visible position)`, and the panel's x range. The
     /// draw writes it and the mouse reads it, which is the only way a click can name a row.
     pub picker_rows: Vec<(u16, usize)>,
     pub picker_x: Option<(u16, u16)>,
+    /// Where each footer button of the open chooser was drawn, as `(y, x_start, x_end, verb)`.
+    pub picker_verbs: Vec<(u16, u16, u16, crate::widgets::Verb)>,
+    /// Where each pressable row or button of the open panel was drawn, as
+    /// `(y, x_start, x_end, target)`.
+    pub overlay_clicks: Vec<(u16, u16, u16, crate::widgets::OverlayClick)>,
+    /// The rectangle the open panel occupies, as `(x, y, width, height)`. A press outside a
+    /// read-only panel dismisses it, which is what every dialog on a desktop does.
+    pub overlay_rect: Option<(u16, u16, u16, u16)>,
     /// Where each thinking block's header was drawn, recomputed each draw. Cleared with the rest of
     /// the hit regions so a stale row can never fold the wrong block.
     pub thought_hits: Vec<ThoughtHit>,
@@ -753,9 +866,9 @@ impl App {
         Self {
             sessions: Vec::new(),
             active: 0,
-            agents: Vec::new(),
-            teams: Vec::new(),
-            selected_agent: None,
+            bots: Vec::new(),
+            rosters: Vec::new(),
+            selected_bot: None,
             tasks: Vec::new(),
             approvals: Vec::new(),
             status: RuntimeStatus::Initializing,
@@ -764,7 +877,10 @@ impl App {
             notices: VecDeque::new(),
             overlay: None,
             focus: Focus::Input,
+            send_mode: SendMode::Queue,
             ascii,
+            theme_bg: None,
+            theme_accent: None,
             tick: 0,
             show_bots: true,
             should_quit: false,
@@ -775,16 +891,19 @@ impl App {
             mode: PermissionMode::default(),
             approval_selection: 0,
             approval_action: 0,
-            agent_selection: 0,
+            bot_selection: 0,
             pending_question: None,
             pending_answers: Vec::new(),
             commands: Vec::new(),
             models: Vec::new(),
             models_error: None,
             models_loading: false,
-            pending_agent: None,
+            pending_bot: None,
             picker_rows: Vec::new(),
             picker_x: None,
+            picker_verbs: Vec::new(),
+            overlay_clicks: Vec::new(),
+            overlay_rect: None,
             thought_hits: Vec::new(),
             selection: None,
             screen: Vec::new(),
@@ -840,13 +959,70 @@ impl App {
         }
     }
 
-    /// Ask the host to copy the selection. The interface never touches the clipboard itself.
+    /// Ask the host to copy the selection. The interface also hands the text to the system clipboard
+    /// directly when one is reachable, so a copy works even without the host's clipboard helpers.
     pub fn copy_selection(&mut self) {
         if let Some(text) = self.selection_text() {
             let chars = text.chars().count();
-            self.clipboard = Some(text);
+            self.clipboard = Some(text.clone());
+            crate::clipboard::copy(&text);
             self.push_notice(NoticeLevel::Info, format!("copied {chars} chars"));
         }
+    }
+
+    /// Copy the last assistant message in the active session to the clipboard. Returns `true` when
+    /// there was something to copy.
+    pub fn copy_last_assistant_message(&mut self) -> bool {
+        let text = self
+            .active_session()
+            .and_then(|session| {
+                session
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == vikram_contracts::Role::Assistant)
+                    .map(vikram_contracts::Message::text_body)
+            })
+            .unwrap_or_default();
+        if text.trim().is_empty() {
+            self.push_notice(
+                vikram_runtime::types::NoticeLevel::Info,
+                "no assistant message to copy",
+            );
+            return false;
+        }
+        let chars = text.chars().count();
+        self.clipboard = Some(text.clone());
+        crate::clipboard::copy(&text);
+        self.push_notice(
+            vikram_runtime::types::NoticeLevel::Info,
+            format!("copied {chars} chars"),
+        );
+        true
+    }
+
+    /// Alias kept for callers that name the action after its subject.
+    pub fn copy_last_assistant(&mut self) -> bool {
+        self.copy_last_assistant_message()
+    }
+
+    /// Alias kept for callers that name the action after the reply.
+    pub fn copy_last_response(&mut self) -> bool {
+        self.copy_last_assistant_message()
+    }
+
+    /// Read the system clipboard and fold its text into the view, mirroring `handle_paste`. Returns
+    /// `true` when clipboard text was available.
+    pub fn paste_from_clipboard(&mut self) -> bool {
+        let Some(text) = crate::clipboard::paste() else {
+            return false;
+        };
+        crate::input::handle_paste(self, &text)
+    }
+
+    /// Alias kept for callers that name the action after its subject.
+    pub fn paste_clipboard(&mut self) -> bool {
+        self.paste_from_clipboard()
     }
 
     pub fn take_clipboard(&mut self) -> Option<String> {
@@ -888,6 +1064,63 @@ impl App {
         self.overlay = Some(Overlay::Picker(picker));
     }
 
+    /// Put a chooser's cursor on a row the operator pressed. Only the cursor moves; what choosing
+    /// it means is still the key handler's business, so a press and a keystroke stay one path.
+    pub fn select_picker_position(&mut self, position: usize) -> bool {
+        match self.overlay.as_mut() {
+            Some(Overlay::Picker(picker)) => picker.select_position(position),
+            _ => false,
+        }
+    }
+
+    /// Put the spawn list on the row a press named.
+    pub fn select_add_bot(&mut self, index: usize) -> bool {
+        let len = self.bots.len();
+        match self.overlay.as_mut() {
+            Some(Overlay::AddBot { selected }) if index < len => {
+                *selected = index;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Put the approval panel's cursor on the answer button a press named.
+    pub fn select_approval_action(&mut self, index: usize) -> bool {
+        if index < crate::widgets::APPROVAL_ACTIONS.len()
+            && matches!(self.overlay, Some(Overlay::Approvals))
+        {
+            self.approval_action = index;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The chord the panel's footer button stands for, so the host can run the same code path a
+    /// keystroke runs. `None` when the panel is gone or no longer declares that verb.
+    pub fn picker_verb_key(&self, verb: crate::widgets::Verb) -> Option<char> {
+        match &self.overlay {
+            Some(Overlay::Picker(picker)) => picker
+                .kind
+                .verbs()
+                .iter()
+                .find(|(declared, _, _)| *declared == verb)
+                .map(|(_, key, _)| *key),
+            _ => None,
+        }
+    }
+
+    /// Whether a press outside the open panel should dismiss it. Read-only panels close on an
+    /// outside press; anything with a pending answer keeps it, so a stray click cannot commit or
+    /// discard an edit.
+    pub fn dismissable_from_outside(&self) -> bool {
+        matches!(
+            self.overlay,
+            Some(Overlay::Help | Overlay::Info { .. } | Overlay::Inspector(_) | Overlay::Skills)
+        )
+    }
+
     pub fn open_info(&mut self, title: impl Into<String>, lines: Vec<String>) {
         self.overlay = Some(Overlay::Info {
             title: title.into(),
@@ -923,7 +1156,13 @@ impl App {
                 }
             })
             .collect();
-        let picker = crate::widgets::Picker::new(crate::widgets::PickerKind::Model, "Model", items);
+        let mut picker =
+            crate::widgets::Picker::new(crate::widgets::PickerKind::Model, "Model", items);
+        // Open on the model in force. Landing on row one of four hundred is a list; landing on the
+        // current row is a chooser that answers "which model am I on?" without a keystroke.
+        if let Some(model) = current.as_deref() {
+            picker.select_value(model);
+        }
         match (&self.models_error, self.models_loading, current) {
             (Some(error), _, _) => picker.with_note(error.clone()),
             (None, true, _) => picker.with_note("reading the endpoint's model list…"),
@@ -1010,8 +1249,8 @@ impl App {
     pub fn sync_snapshot(&mut self, snapshot: StateSnapshot) {
         self.status = snapshot.status;
         self.metrics = snapshot.metrics;
-        self.agents = snapshot.agents;
-        self.teams = snapshot.teams;
+        self.bots = snapshot.bots;
+        self.rosters = snapshot.rosters;
         self.workspace_root = snapshot.workspace_root;
         self.mode = snapshot.mode;
         self.tasks = snapshot.tasks;
@@ -1226,20 +1465,20 @@ impl App {
                     view.mark_settled();
                 }
             }
-            RuntimeEvent::AgentChanged(agent) => {
+            RuntimeEvent::BotChanged(agent) => {
                 match self
-                    .agents
+                    .bots
                     .iter_mut()
                     .find(|a| a.profile.id == agent.profile.id)
                 {
                     Some(existing) => *existing = agent,
-                    None => self.agents.push(agent),
+                    None => self.bots.push(agent),
                 }
             }
             RuntimeEvent::AgentRemoved(id) => {
-                self.agents.retain(|a| a.profile.id != id);
-                if self.selected_agent.as_ref() == Some(&id) {
-                    self.selected_agent = None;
+                self.bots.retain(|a| a.profile.id != id);
+                if self.selected_bot.as_ref() == Some(&id) {
+                    self.selected_bot = None;
                 }
             }
             RuntimeEvent::TaskChanged(task) => {
@@ -1320,8 +1559,13 @@ impl App {
             }
             RuntimeEvent::ModelsListed { models, error } => {
                 self.models_loading = false;
+                // A refused or unreachable read must not erase a list that was already read: the
+                // rows stay, and the error is reported beside them. Only a successful read replaces
+                // the list, so a flaky network cannot empty a panel the operator was using.
+                if error.is_none() {
+                    self.models = models;
+                }
                 self.models_error = error;
-                self.models = models;
                 // A chooser that was opened while the listing was in flight is filled here, once.
                 // It is the only place the two halves meet, which is why "still reading" cannot
                 // be mistaken for "this endpoint serves nothing".
@@ -1331,7 +1575,16 @@ impl App {
                         if picker.kind == crate::widgets::PickerKind::Model
                 );
                 if showing_models {
-                    let picker = self.model_picker();
+                    let query = match &self.overlay {
+                        Some(Overlay::Picker(picker)) => picker.query.clone(),
+                        _ => String::new(),
+                    };
+                    let mut picker = self.model_picker();
+                    // Whatever the operator typed survives the listing arriving; the cursor is
+                    // re-seated only when there is no filter, because a filter has its own order.
+                    if !query.is_empty() {
+                        picker.type_str(&query);
+                    }
                     self.overlay = Some(Overlay::Picker(picker));
                 }
             }
@@ -1386,14 +1639,14 @@ impl App {
                 }
                 self.push_notice(NoticeLevel::Info, format!("Answered: {answer}"));
             }
-            RuntimeEvent::TeamChanged(team) => {
-                match self.teams.iter_mut().find(|t| t.id == team.id) {
-                    Some(existing) => *existing = team,
-                    None => self.teams.push(team),
+            RuntimeEvent::HiveRosterChanged(roster) => {
+                match self.rosters.iter_mut().find(|t| t.id == roster.id) {
+                    Some(existing) => *existing = roster,
+                    None => self.rosters.push(roster),
                 }
             }
             RuntimeEvent::TeamRemoved(id) => {
-                self.teams.retain(|t| t.id != id);
+                self.rosters.retain(|t| t.id != id);
             }
         }
     }
@@ -1424,20 +1677,20 @@ impl App {
     }
 
     pub fn active_agent_count(&self) -> usize {
-        self.agents.iter().filter(|a| a.state.is_active()).count()
+        self.bots.iter().filter(|a| a.state.is_active()).count()
     }
 
-    pub fn selected_agent_snapshot(&self) -> Option<&AgentSnapshot> {
-        self.selected_agent
+    pub fn selected_agent_snapshot(&self) -> Option<&BotSnapshot> {
+        self.selected_bot
             .as_ref()
-            .and_then(|id| self.agents.iter().find(|a| a.profile.id == *id))
+            .and_then(|id| self.bots.iter().find(|a| a.profile.id == *id))
     }
 
-    pub fn agent_state_label(&self, state: AgentState) -> &'static str {
+    pub fn agent_state_label(&self, state: BotState) -> &'static str {
         match state {
-            AgentState::Paused => "Paused",
-            AgentState::Completed => "Finished",
-            AgentState::Failed | AgentState::Stopped => "Paused",
+            BotState::Paused => "Paused",
+            BotState::Completed => "Finished",
+            BotState::Failed | BotState::Stopped => "Paused",
             _ => {
                 if self.metrics.thinking {
                     "Thinking"
@@ -1547,8 +1800,11 @@ mod tests {
                 tokens: Default::default(),
                 created_ms: 0,
                 updated_ms: 0,
-                agent: None,
+                bot: None,
                 queued: 0,
+                queue: Vec::new(),
+                steer_text: None,
+                queue_text: None,
                 project_id: None,
                 status: "active".to_owned(),
                 title_source: "generic".to_owned(),
@@ -1605,6 +1861,46 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_read_keeps_the_list_it_already_had() {
+        let mut app = app_on(Some("qwen3-coder"));
+        app.on_event(RuntimeEvent::ModelsListed {
+            models: vec!["gpt-5.2".to_owned(), "qwen3-coder".to_owned()],
+            error: None,
+        });
+        app.on_event(RuntimeEvent::ModelsListed {
+            models: Vec::new(),
+            error: Some("could not reach https://openrouter.ai/api/v1/models".to_owned()),
+        });
+        assert_eq!(
+            app.models,
+            vec!["gpt-5.2".to_owned(), "qwen3-coder".to_owned()],
+            "a flaky read must not erase a list the operator was already choosing from"
+        );
+        assert_eq!(
+            app.models_error.as_deref(),
+            Some("could not reach https://openrouter.ai/api/v1/models")
+        );
+    }
+
+    #[test]
+    fn the_model_panel_opens_on_the_model_in_force() {
+        let mut app = app_on(Some("qwen3-coder"));
+        app.on_event(RuntimeEvent::ModelsListed {
+            models: vec!["gpt-5.2".to_owned(), "qwen3-coder".to_owned()],
+            error: None,
+        });
+        app.open_picker(app.model_picker());
+        let Some(Overlay::Picker(picker)) = app.overlay.as_ref() else {
+            panic!("the model panel has to be open");
+        };
+        assert_eq!(
+            picker.selected_item().map(|item| item.value.as_str()),
+            Some("qwen3-coder"),
+            "opening /model has to answer which model is in use"
+        );
+    }
+
+    #[test]
     fn a_listing_that_arrives_when_no_panel_is_open_changes_nothing_visible() {
         let mut app = app_on(Some("qwen3-coder"));
         app.on_event(RuntimeEvent::ModelsListed {
@@ -1613,6 +1909,25 @@ mod tests {
         });
         assert!(app.overlay.is_none());
         assert_eq!(app.models, vec!["gpt-5.2".to_owned()]);
+    }
+
+    #[test]
+    fn copying_the_last_assistant_message_puts_its_text_on_the_clipboard() {
+        let mut app = app_on(None);
+        app.sessions[0].messages.push(Message::text(
+            Role::Assistant,
+            "the answer is 42",
+            vikram_contracts::Trust::Model,
+        ));
+        assert!(app.copy_last_assistant_message());
+        assert_eq!(app.take_clipboard().as_deref(), Some("the answer is 42"));
+    }
+
+    #[test]
+    fn copying_the_last_assistant_message_does_nothing_when_there_is_none() {
+        let mut app = app_on(None);
+        assert!(!app.copy_last_assistant_message());
+        assert!(app.take_clipboard().is_none());
     }
 }
 
@@ -1706,8 +2021,11 @@ mod selection_and_folds {
             tokens: Default::default(),
             created_ms: 0,
             updated_ms: 0,
-            agent: None,
+            bot: None,
             queued: 0,
+            queue: Vec::new(),
+            steer_text: None,
+            queue_text: None,
             project_id: None,
             status: "active".to_owned(),
             title_source: "generic".to_owned(),
