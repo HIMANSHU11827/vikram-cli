@@ -19,6 +19,7 @@
 - [What is VIKRAM](#what-is-vikram)
 - [Features](#features)
 - [Quick Start](#quick-start)
+- [Terminal Interface](#terminal-interface)
 - [Architecture](#architecture)
 - [Permission Model](#permission-model)
 - [Unified Ticket System](#unified-ticket-system)
@@ -102,6 +103,53 @@ vikram hive list
 vikram tickets list
 vikram config show
 ```
+
+---
+
+## Terminal Interface
+
+`vikram` with no arguments opens the TUI: session tabs, conversation transcript, optional HIVE and
+BOTS panes, a one-line notice row, the composer and a shortcut row that changes with focus.
+
+**The composer has two send modes.** `Tab` flips it and the border title always says which is armed:
+
+```
+┏❯ queue …        Enter sends, the turn starts now
+┏❯ steer …        Ctrl+Enter steers the running turn
+┏❯ steer <text> … the pending steer is shown in the title
+```
+
+**Every notice is visible.** An action with nothing to act on answers in the notice row instead of
+returning silently — an empty `/allow` pressed with Enter says ``` `allow` has nothing to forget yet ```.
+Notices age out after 8 seconds (errors after 24) so the row goes back to the conversation.
+
+**35 slash commands**, one table behind the popup, `/help`, the palette and the dispatcher:
+
+| Group | Commands |
+|---|---|
+| Model & endpoint | `/model` `/provider` `/settings` |
+| Permission | `/permissions` `/allow` `/approvals` |
+| Conversation | `/sessions` `/rename` `/close` `/new` `/clear` `/compact` `/queue` |
+| Work | `/tasks` `/schedule` `/diff` `/test` `/build` `/doctor` |
+| Team | `/bot` `/hive` `/skills` `/tools` `/plugins` `/mcp` `/files` `/memory` |
+| Info | `/status` `/usage` `/context` `/version` `/keys` `/help` `/copy` `/exit` |
+
+Near misses resolve, so `/session` finds `/sessions`. `!` runs a shell command, `@` completes a
+workspace path. Read-only panels (`/status`, `/usage`, `/context`, `/doctor`, `/version`) show no
+action verbs, because offering an action over data the panel cannot change is a lie the operator
+only discovers by pressing it.
+
+**Mouse and keyboard are the same path.** Every chip, footer verb, session tab, bot row and
+foldable activity row records its rectangle while drawing, and a press answers through exactly the
+same handler the chord does. Anything the mouse can do, a key can do. Scroll wheel scrolls the
+transcript, or the picker when one is open.
+
+Key highlights: `Ctrl+C` cancel/quit · `Ctrl+N` new session · `Ctrl+Tab` cycle sessions ·
+`Ctrl+B` bots pane · `Ctrl+O` approvals · `Ctrl+R` reverse search · `Ctrl+T` thinking ·
+`Ctrl+A` open a bot · `F1`–`F8` help, background, MCP, plugins, sub-agents, context, model, skills ·
+`Esc` leaves a pane before it cancels anything.
+
+Full command table, key map and hit-region contract: [docs/tui.md](docs/tui.md).
 
 ---
 
