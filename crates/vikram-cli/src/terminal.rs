@@ -194,8 +194,35 @@ fn apply_terminal_event(app: &mut App, event: Event) {
             }
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                 let x = mouse.column;
-                // A click inside a panel selects the row it landed on. The draw wrote those rows
-                // down, so the click names a real row rather than a guess at the geometry.
+                // A chip drawn inside a dialog is a real button. The overlay wrote its rectangle
+                // down while drawing, so a press inside that rectangle answers exactly the way the
+                // key does — this is checked first because a dialog is modal.
+                for (row, start, end, click) in app.overlay_clicks.clone() {
+                    if mouse.row == row && x >= start && x < end {
+                        vikram_tui::input::run_overlay_click(app, click);
+                        return;
+                    }
+                }
+                // A press outside a read-only panel dismisses it, which is what the panel's own
+                // contract says. A panel holding a pending answer keeps it, so a stray click can
+                // never commit or discard an edit. Without this the press fell through to the
+                // selection code below and started a drag that looked like nothing happening.
+                if app.dismissable_from_outside()
+                    && let Some((left, top, width, height)) = app.overlay_rect
+                    && (!(mouse.row >= top && mouse.row < top + height)
+                        || !(x >= left && x < left + width))
+                {
+                    app.overlay = None;
+                    return;
+                }
+                // A chooser's footer buttons are buttons too: a press answers the verb printed on
+                // the chip, through the same `commit_verb` the chords use.
+                for (row, start, end, verb) in app.picker_verbs.clone() {
+                    if mouse.row == row && x >= start && x < end {
+                        vikram_tui::input::run_picker_verb(app, verb);
+                        return;
+                    }
+                }
                 if let Some((left, right)) = app.picker_x
                     && x >= left
                     && x < right
@@ -213,6 +240,12 @@ fn apply_terminal_event(app: &mut App, event: Event) {
                 // The tab strip and `+ New` live on one row. Matching on the column alone would
                 // swallow every press below them, so the row is part of the hit.
                 if app.overlay.is_none() {
+                    for (row, start, end, click) in app.bot_hits.clone() {
+                        if mouse.row == row && x >= start && x < end {
+                            vikram_tui::input::run_bot_click(app, click);
+                            return;
+                        }
+                    }
                     if let Some((row, start, end)) = app.new_session_x
                         && mouse.row == row
                         && x >= start
@@ -302,6 +335,7 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
                 view.follow = true;
             }
         }
+        UiCommand::OpenPicker { kind } => open_panel(handle, app, kind),
         UiCommand::Queue { session, text } => {
             if let Err(err) = handle.queue(&session, text) {
                 report(app, err);
@@ -342,6 +376,26 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
                 }
             }
         }
+        UiCommand::SetBotRole { bot, role } => match handle.bot_set_role(&bot, &role) {
+            Ok(()) => {
+                if role.trim().is_empty() {
+                    app.push_notice(NoticeLevel::Info, "bot tag removed");
+                } else {
+                    app.push_notice(NoticeLevel::Info, format!("bot tag is now `{role}`"));
+                }
+            }
+            Err(err) => report(app, err),
+        },
+        UiCommand::SetBotSoul { bot, soul } => match handle.bot_set_soul(&bot, &soul) {
+            Ok(()) => {
+                if soul.trim().is_empty() {
+                    app.push_notice(NoticeLevel::Info, "bot soul cleared");
+                } else {
+                    app.push_notice(NoticeLevel::Info, "bot soul saved");
+                }
+            }
+            Err(err) => report(app, err),
+        },
         UiCommand::RenameBot { bot, name } => {
             if name.trim().is_empty() {
                 app.push_notice(NoticeLevel::Warn, "a bot needs a name");
@@ -406,10 +460,45 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
                 report(app, err);
             }
         }
-        UiCommand::NewSession => match handle.create_session(None) {
-            Ok(id) => {
-                app.sync_snapshot(handle.snapshot());
-                select(app, &id);
+        UiCommand::NewSession => {
+            // A new tab opened while a bot's chat is in front stays that bot's tab. Ctrl+N used to
+            // drop the operator into a plain session without a word, which read as the bot
+            // forgetting who it was — the opposite of what a new tab next to a bot should do.
+            let bot = app.active_session().and_then(|view| {
+                app.bots
+                    .iter()
+                    .find(|bot| bot.session.as_ref() == Some(&view.id))
+                    .map(|bot| bot.profile.id.clone())
+            });
+            let created = match bot {
+                Some(bot) => handle.bot_new_chat(&bot),
+                None => handle.create_session(None),
+            };
+            match created {
+                Ok(id) => {
+                    app.sync_snapshot(handle.snapshot());
+                    select(app, &id);
+                }
+                Err(err) => report(app, err),
+            }
+        }
+        UiCommand::OpenBotChat { bot } => match handle.bot_chat(&bot) {
+            Ok(session) => {
+                // The chat may be a row the store held but this view never loaded, so the snapshot
+                // is refreshed before selecting — otherwise there is no tab to move to.
+                if app.session_index(&session).is_none() {
+                    app.sync_snapshot(handle.snapshot());
+                }
+                select(app, &session);
+            }
+            Err(err) => report(app, err),
+        },
+        UiCommand::NewBotChat { bot } => match handle.bot_new_chat(&bot) {
+            Ok(session) => {
+                if app.session_index(&session).is_none() {
+                    app.sync_snapshot(handle.snapshot());
+                }
+                select(app, &session);
             }
             Err(err) => report(app, err),
         },
@@ -450,12 +539,13 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
             if let Err(err) = handle.close_session(&session) {
                 report(app, err);
             } else {
-                // The tab is gone and the transcript is not: saying so once, here, is what keeps a
-                // close from reading as a delete.
+                // The tab is gone, and it stays gone: the transcript is kept in the store and the
+                // next launch no longer reopens it. Saying so once, here, keeps a close from
+                // reading as a delete.
                 let name = title.unwrap_or_else(|| "session".to_owned());
                 app.push_notice(
                     NoticeLevel::Info,
-                    format!("closed {name} — still in /sessions"),
+                    format!("closed {name} — it will not reopen on the next launch"),
                 );
                 if app.sessions.is_empty() {
                     match handle.create_session(Some("Session".into())) {
@@ -772,9 +862,9 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                     agent.profile.id.to_string(),
                 ));
             }
-            app.open_picker(Picker::new(kind, "Bots", items).with_note(
-                "enter selects · ctrl+n spawn · ctrl+c new · ctrl+r rename · ctrl+x delete",
-            ));
+            // No note: the footer buttons already print every chord, and a legend above the list
+            // that repeats them is the clutter this chooser was rebuilt to lose.
+            app.open_picker(Picker::new(kind, "Bots", items));
         }
         PickerKind::Mcp => {
             let servers = handle.mcp_servers();
@@ -1923,9 +2013,12 @@ fn apply_act(
                 Err(err) => report(app, err),
             }
         }
-        (PickerKind::Permissions, _) => {
-            // Info panel - just close
-        }
+        (PickerKind::Permissions, Verb::Choose) => open_panel(handle, app, PickerKind::Mode),
+        (PickerKind::Permissions, Verb::Prompt) => app.open_prompt(
+            "Save a rule",
+            "a rule this runtime may act on without asking, then press Enter",
+            vikram_tui::app::PromptAction::AddAllowRule,
+        ),
         (PickerKind::Plugins, Verb::Choose) => {
             if value == "empty" {
                 return;
@@ -2042,23 +2135,83 @@ fn apply_act(
             }
             open_panel(handle, app, PickerKind::Background);
         }
-        (PickerKind::Status, _) => {
-            // Info panel - just close
+        // These five are panels you read. They declare no verbs, so nothing can land here; the
+        // arms are gone on purpose so that if a verb is ever added the catch-all says so loudly
+        // instead of the click dying in silence.
+        (PickerKind::HiveRoster, Verb::New) => {
+            // The prompt and everything behind it already existed; nothing opened it. This is the
+            // front door that was missing.
+            app.open_prompt(
+                "New hive",
+                "a name for the group, then Enter",
+                vikram_tui::app::PromptAction::CreateHiveRoster,
+            );
         }
-        (PickerKind::Usage, _) => {
-            // Info panel - just close
+        (PickerKind::HiveRoster, Verb::Choose) => match handle.hive_roster_get(value.clone()) {
+            Some(roster) => {
+                let name = roster.name.clone();
+                // A roster has no conversation of its own; what it has is its members and the task
+                // it was last handed. Showing exactly that is the honest answer to `open` —
+                // nothing is invented to fill the panel.
+                let mut lines = vec![format!("{} member(s)", roster.members.len())];
+                for member in &roster.members {
+                    lines.push(format!("  {member}"));
+                }
+                if let Some(task) = roster.task.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                    lines.push(format!("task: {task}"));
+                }
+                app.open_info(format!("Hive · {name}"), lines);
+                app.push_notice(NoticeLevel::Info, format!("hive `{name}`"));
+            }
+            None => app.push_notice(
+                NoticeLevel::Warn,
+                "pick a hive row first — the `new hive` band makes one".to_owned(),
+            ),
+        },
+        (PickerKind::HiveRoster, Verb::Remove) => {
+            // Member rows carry `member_<bot id>`, so the roster to edit is the one holding that
+            // bot. A row that is not a member says so instead of failing quietly.
+            let bot = value.strip_prefix("member_").map(str::to_owned);
+            let roster = bot.as_deref().and_then(|bot| {
+                handle
+                    .hive_roster_list()
+                    .into_iter()
+                    .find(|roster| roster.members.iter().any(|member| member.as_str() == bot))
+                    .map(|roster| roster.name)
+            });
+            match (bot, roster) {
+                (Some(bot), Some(roster)) => {
+                    match handle.hive_roster_remove_member(roster.clone(), BotId::new(bot.clone()))
+                    {
+                        Ok(()) => app.push_notice(
+                            NoticeLevel::Info,
+                            format!("removed `{bot}` from `{roster}`"),
+                        ),
+                        Err(err) => report(app, err),
+                    }
+                    open_panel(handle, app, PickerKind::HiveRoster);
+                }
+                _ => app.push_notice(
+                    NoticeLevel::Warn,
+                    "select a member row to remove it".to_owned(),
+                ),
+            }
         }
-        (PickerKind::Context, _) => {
-            // Info panel - just close
-        }
-        (PickerKind::Doctor, _) => {
-            // Info panel - just close
-        }
-        (PickerKind::Version, _) => {
-            // Info panel - just close
-        }
-        (PickerKind::HiveRoster, _) => {
-            // Info panel - just close
+        (PickerKind::HiveRoster, Verb::Close) => {
+            if value.is_empty() || value.starts_with("member_") {
+                app.push_notice(
+                    NoticeLevel::Warn,
+                    "select a hive row to delete it".to_owned(),
+                );
+            } else {
+                match handle.hive_roster_delete(value.clone()) {
+                    Ok(()) => {
+                        app.push_notice(NoticeLevel::Info, format!("hive `{value}` deleted"));
+                        open_panel(handle, app, PickerKind::HiveRoster);
+                    }
+                    Err(err) => report(app, err),
+                }
+            }
         }
         (PickerKind::Skill, Verb::Choose) => {
             if let Some(skill) = handle.skill_get(&value) {
@@ -2152,9 +2305,7 @@ fn apply_act(
                 },
             );
         }
-        (PickerKind::Keys, _) => {
-            // Info panel - just close
-        }
+        (PickerKind::Keys, _) => run_action(app, session, "keys"),
         // These kinds no longer have a panel of their own: the command that used to open one acts
         // directly now. Routed through `run_action` so there is still exactly one implementation.
         (PickerKind::Diff, _) => run_action(app, session, "diff"),
@@ -2299,7 +2450,7 @@ fn run_action(app: &mut App, session: &SessionId, name: &str) {
             });
             app.push_notice(
                 NoticeLevel::Info,
-                format!("closed {title}; it stays in the store — /sessions reopens it"),
+                format!("closed {title}; it stays in the store and will not reopen on its own"),
             );
         }
         "keys" => app.overlay = Some(Overlay::Help),

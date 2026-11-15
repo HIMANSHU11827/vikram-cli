@@ -164,6 +164,9 @@ pub struct BotProfile {
     pub description: String,
     pub icon: Option<String>,
     pub created_ms: u64,
+    /// The operator's standing instructions for this bot — the body of its `soul.md`. Empty means
+    /// none were given, and nothing is invented on the bot's behalf.
+    pub soul: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]

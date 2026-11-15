@@ -363,7 +363,8 @@ impl Tool for BotCreate {
                 "properties": {
                     "name": {"type": "string"},
                     "role": {"type": "string"},
-                    "description": {"type": "string"}
+                    "description": {"type": "string"},
+                    "soul": {"type": "string", "description": "Standing instructions the bot follows every turn. Optional."}
                 },
                 "required": ["name", "role", "description"]
             }),
@@ -394,6 +395,14 @@ impl Tool for BotCreate {
             description,
             icon: None,
             created_ms: crate::types::now_ms(),
+            // A bot made by a model may still be handed its own standing instructions; if none were
+            // given, it starts with none rather than an invented paragraph.
+            soul: args
+                .get("soul")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
         };
         store
             .save_bot(&row)

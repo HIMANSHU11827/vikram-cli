@@ -31,6 +31,9 @@ pub struct ToolContext {
     pub session: Option<vikram_contracts::SessionId>,
     /// The agent identity the call runs as, when the turn belongs to a background agent.
     pub agent: Option<String>,
+    /// The bot whose session this call comes from, when it comes from one. A bot keeps its notes in
+    /// its own memory scope, so knowing which bot is speaking is what stops two bots sharing a brain.
+    pub bot: Option<String>,
     /// Cancellation handle for the turn. Blocking tools that honor it can stop early;
     /// the host still enforces cancellation by aborting the spawn_blocking task.
     pub cancel: Option<vikram_contracts::CancellationToken>,
@@ -45,6 +48,7 @@ impl Default for ToolContext {
             runtime: None,
             session: None,
             agent: None,
+            bot: None,
             cancel: None,
         }
     }
@@ -60,6 +64,7 @@ impl std::fmt::Debug for ToolContext {
             .field("runtime", &self.runtime.as_ref().map(|_| "runtime"))
             .field("session", &self.session)
             .field("agent", &self.agent)
+            .field("bot", &self.bot)
             .field("cancel", &self.cancel.as_ref().map(|_| "token"))
             .finish()
     }
@@ -84,6 +89,7 @@ impl ToolContext {
             runtime: None,
             session: None,
             agent: None,
+            bot: None,
             cancel: None,
         }
     }

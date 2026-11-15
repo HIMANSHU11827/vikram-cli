@@ -1354,6 +1354,7 @@ fn bots(action: BotsAction) -> std::process::ExitCode {
                     description,
                     icon: None,
                     created_ms: now,
+                    soul: String::new(),
                 };
                 store.save_bot(&row).map_err(|e| e.to_string())?;
                 println!("{}", row.id);

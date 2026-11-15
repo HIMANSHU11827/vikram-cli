@@ -210,6 +210,7 @@ impl From<BotRow> for BotProfile {
             description: row.description,
             icon: row.icon,
             created_ms: row.created_ms,
+            soul: row.soul,
         }
     }
 }
@@ -279,11 +280,12 @@ mod tests {
     fn agents_start_idle_and_report_their_own_state() {
         let agent = ManagedBot::from_profile(BotProfile {
             id: BotId::generate(),
-            name: "Rudra".into(),
-            role: "Implementer".into(),
+            name: "Bot One".into(),
+            role: "tag-one".into(),
             description: String::new(),
             icon: None,
             created_ms: 0,
+            soul: String::new(),
         });
         assert_eq!(agent.state(), BotState::Idle);
         agent.set_state(BotState::Running);
@@ -294,11 +296,12 @@ mod tests {
     fn progress_is_only_present_when_the_runtime_sets_it() {
         let agent = ManagedBot::from_profile(BotProfile {
             id: BotId::generate(),
-            name: "Karma".into(),
-            role: "Reviewer".into(),
+            name: "Bot Two".into(),
+            role: "tag-two".into(),
             description: String::new(),
             icon: None,
             created_ms: 0,
+            soul: String::new(),
         });
         assert!(agent.snapshot().progress.is_none());
         *agent.progress.lock().unwrap() = Some(0.42);

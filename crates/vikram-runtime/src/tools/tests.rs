@@ -15,6 +15,7 @@ fn ctx() -> (tempfile::TempDir, ToolContext) {
         runtime: None,
         session: None,
         agent: None,
+        bot: None,
         cancel: None,
     };
     (dir, ctx)
@@ -1568,6 +1569,7 @@ fn memory_and_tasks_round_trip_through_their_own_store() {
         runtime: None,
         session: None,
         agent: None,
+        bot: None,
         cancel: None,
     };
 

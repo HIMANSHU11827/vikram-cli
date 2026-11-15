@@ -35,7 +35,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .active_session()
         .map(|s| s.editor.line_count())
         .unwrap_or(1);
-    let regions = layout::layout(area, show_hive, show_bots, input_lines);
+    // A notice is feedback the operator asked for by pressing something. It gets a row of its own
+    // directly above the input so it can never be confused with the transcript or the status line.
+    let show_notice = app.live_notice().is_some();
+    let regions = layout::layout(area, show_hive, show_bots, input_lines, show_notice);
 
     widgets::session_tabs(frame, regions.tabs, app, &theme);
 
@@ -83,6 +86,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some(bots_area) = regions.bots {
         widgets::bots_panel(frame, bots_area, app, &theme);
+    }
+
+    if let Some(notice_area) = regions.notice {
+        widgets::plasma(frame, notice_area, app, &theme);
     }
 
     render_input(frame, regions.input, app, &theme);
@@ -189,7 +196,14 @@ fn preview(text: &str) -> String {
 
 fn render_input(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let focused = app.focus == Focus::Input;
-    let border = if focused { theme.accent } else { theme.border };
+    // The composer keeps an accent-tinted frame whenever the keyboard can still land in it. Dropping
+    // to the plain border the moment a panel took focus made the box read as disabled — a dead grey
+    // control the operator is told not to type into, when typing there still works.
+    let border = match app.focus {
+        Focus::Input => theme.accent,
+        Focus::Bots => theme.accent_dim,
+        _ => theme.border,
+    };
     let session = app.active_session();
     let title = session.map_or_else(String::new, |s| {
         if let Some(text) = &s.steer_text {

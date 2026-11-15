@@ -104,6 +104,15 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
+    /// The one button look: the same filled band the open tab wears. Every control in the
+    /// interface is drawn through this, so a thing you can press looks the same wherever it is.
+    pub fn button(&self) -> Style {
+        Style::default()
+            .bg(self.selection)
+            .fg(self.accent)
+            .add_modifier(Modifier::BOLD)
+    }
+
     pub fn status_style(&self, segment: StatusSegment) -> Style {
         match segment {
             StatusSegment::Accent => Style::default().fg(self.accent),

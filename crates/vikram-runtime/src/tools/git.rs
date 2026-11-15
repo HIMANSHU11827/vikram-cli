@@ -454,6 +454,7 @@ mod tests {
             runtime: None,
             session: None,
             agent: None,
+            bot: None,
             cancel: None,
         }
     }

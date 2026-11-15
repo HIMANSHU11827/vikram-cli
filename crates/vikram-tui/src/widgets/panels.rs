@@ -12,15 +12,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-use vikram_runtime::types::{NoticeLevel, TaskState};
+use vikram_runtime::types::{BotState, NoticeLevel, TaskState};
 
-use crate::app::{ActivityKind, App, Focus, InspectorKind, Overlay, Selection, TabHit};
+use crate::app::{ActivityKind, App, BotClick, Focus, InspectorKind, Overlay, Selection, TabHit};
 use crate::theme::{StatusSegment, Theme};
 
 /// A tab is a reminder of what exists, not a synopsis of the session.
 const TAB_TITLE_CAP: usize = 22;
 const AGENT_NAME_CAP: usize = 14;
-const AGENT_LINE_CAP: usize = 34;
 const DIALOG_WIDTH: u16 = 62;
 
 const HELP_ROWS: [(&str, &str); 19] = [
@@ -63,17 +62,12 @@ pub fn session_tabs(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme)
         let hint = "   Ctrl+N starts one   ";
         spans.push(Span::styled(hint, theme.muted()));
         x += hint.width() as u16;
-        // + New control, drawn as a control: a bracket pair with the label inside it, so the one
-        // thing on this row you can click looks clickable.
+        // + New control, drawn as a control: one filled band, the same block the open tab wears, so
+        // the one thing on this row you can click looks clickable.
         let start = x;
-        for (text, style) in [
-            ("[ ", Style::default().fg(theme.border)),
-            ("+ New", Style::default().fg(theme.accent)),
-            (" ]", Style::default().fg(theme.border)),
-        ] {
-            spans.push(Span::styled(text, style));
-            x += text.width() as u16;
-        }
+        let text = " + New ";
+        spans.push(Span::styled(text.to_owned(), theme.button()));
+        x += text.width() as u16;
         app.new_session_x = Some((area.y, start, x));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
         return;
@@ -165,14 +159,9 @@ pub fn session_tabs(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme)
     spans.push(Span::styled(sep, theme.frame()));
     x += sw;
     let start = x;
-    for (text, style) in [
-        ("[ ", Style::default().fg(theme.border)),
-        ("+ New", Style::default().fg(theme.accent)),
-        (" ]", Style::default().fg(theme.border)),
-    ] {
-        spans.push(Span::styled(text, style));
-        x += text.width() as u16;
-    }
+    let text = " + New ";
+    spans.push(Span::styled(text.to_owned(), theme.button()));
+    x += text.width() as u16;
     app.new_session_x = Some((area.y, start, x));
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -244,23 +233,23 @@ pub fn hive_panel(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-pub fn bots_panel(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+pub fn bots_panel(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
+    app.bot_hits.clear();
     if area.width < 6 || area.height < 3 {
         return;
     }
 
     let focused = app.focus == Focus::Bots;
-    let border = if focused { theme.accent } else { theme.border };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border))
-        .title(Line::from(Span::styled(
-            " BOTS ",
-            Style::default()
-                .fg(theme.accent_dim)
-                .add_modifier(Modifier::BOLD),
-        )));
+    let title = Line::from(Span::styled(
+        if focused { " BOTS · focused " } else { " BOTS " },
+        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+    ));
+    let block = panel_frame(title, theme);
     let inner = block.inner(area);
+    // Paint the whole rect first. A block only styles the cells it draws, so any cell a previous
+    // frame filled — a selection band, a row that used to be wider — survives the diff and shows up
+    // as a lighter slab inside an otherwise dark panel.
+    frame.buffer_mut().set_style(area, theme.dialog());
     frame.render_widget(block, area);
 
     if inner.height == 0 || inner.width == 0 {
@@ -268,6 +257,8 @@ pub fn bots_panel(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     }
 
     let mut lines: Vec<Line> = Vec::new();
+    // Which line belongs to which agent, so a click on either row of a bot opens that bot.
+    let mut row_lines: Vec<(u16, usize)> = Vec::new();
     if app.bots.is_empty() {
         lines.push(Line::styled(" no bots", theme.muted()));
         lines.push(Line::styled(" `vikram bots` lists them", theme.muted()));
@@ -275,10 +266,14 @@ pub fn bots_panel(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         for (index, agent) in app.bots.iter().enumerate() {
             let selected = focused && index == app.bot_selection;
             let marker = if selected { theme.chevron() } else { " " };
-            let glyph = if agent.state.is_filled() {
-                theme.filled_dot()
+            // Only a working bot turns. The mark itself is the app's own — never a borrowed dot — so
+            // it stays the same shape when the bot is idle, parked on the set's first glyph, and it
+            // is drawn in the accent so the row is identifiable at a glance. State still colours the
+            // status line underneath.
+            let glyph = if agent.state.is_active() {
+                app.bot_frame()
             } else {
-                theme.hollow_dot()
+                app.bot_mark()
             };
             let name_style = if selected {
                 Style::default()
@@ -287,41 +282,181 @@ pub fn bots_panel(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             } else {
                 Style::default().fg(theme.text)
             };
-            let task_desc = agent
-                .current_task
-                .as_deref()
-                .unwrap_or(agent.profile.role.as_str());
-            // Line 1: ● AgentName — Current task description
-            let header = vec![
-                Span::styled(format!("{marker}{glyph} "), theme.agent_style(agent.state)),
+            let task_desc = agent.current_task.as_deref().unwrap_or("");
+            // Line 1: marker, name, tags, then the work.
+            //
+            // Widths are tracked while the spans are built so the task text is clipped to what is
+            // actually left of the row. Clipping it to a fixed cap let it run past the panel edge and
+            // be cut mid-word — a 44-column sidebar read `— porting the sto`.
+            let mut header = vec![
+                Span::styled(
+                    format!("{marker}{glyph} "),
+                    Style::default().fg(theme.accent),
+                ),
                 Span::styled(
                     clip(&agent.profile.name, AGENT_NAME_CAP, theme.ascii),
                     name_style,
                 ),
-                Span::styled(
-                    format!(" — {}", clip(task_desc, AGENT_LINE_CAP, theme.ascii)),
-                    theme.secondary(),
-                ),
             ];
+            let mut used: u16 = header
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()) as u16)
+                .sum();
+            // Tags next: they are the words the operator gave this bot, written the way the panel
+            // reads a row — `name — tag, tag`. A bot with no tag prints nothing at all, so a
+            // resting row never shows a dangling separator, and the list is clipped because the
+            // operator may type as many tags as they like.
+            let tags: Vec<&str> = agent
+                .profile
+                .role
+                .split(',')
+                .map(str::trim)
+                .filter(|tag| !tag.is_empty())
+                .collect();
+            if !tags.is_empty() {
+                let text = format!(
+                    " — {}",
+                    clip(&tags.join(", "), AGENT_NAME_CAP * 2, theme.ascii)
+                );
+                used += UnicodeWidthStr::width(text.as_str()) as u16;
+                header.push(Span::styled(text, Style::default().fg(theme.dim)));
+            }
+            if !task_desc.is_empty() && used + 3 < inner.width {
+                let room = inner.width.saturating_sub(used + 3) as usize;
+                let text = clip(task_desc, room, theme.ascii);
+                header.push(Span::styled(format!(" — {text}"), theme.secondary()));
+            }
+            // The state rides on the same line as the name. A second line under every bot put a gap
+            // between neighbours — two resting bots still read as pairs — and a panel this narrow
+            // needs one line per bot so the list itself stays scannable. A resting bot prints
+            // nothing, the marker already says it exists; a working one appends its state where the
+            // row still has room.
+            if agent.state != BotState::Idle {
+                let status = app.agent_state_label(agent.state);
+                let spinner = if agent.state.is_active() {
+                    format!("{} ", app.thinking_frame())
+                } else {
+                    String::new()
+                };
+                let text = format!("  {spinner}· {status}");
+                let fits = UnicodeWidthStr::width(text.as_str()) as u16;
+                if used + fits + 2 < inner.width {
+                    header.push(Span::styled(text, theme.agent_style(agent.state)));
+                }
+            }
             lines.push(Line::from(header));
+            row_lines.push(((lines.len() - 1) as u16, index));
+        }
+    }
 
-            // Line 2:    — Status
-            let status = app.agent_state_label(agent.state);
-            let spinner = if agent.state.is_active() {
-                format!("{} ", app.thinking_frame())
-            } else {
-                String::new()
-            };
-            lines.push(Line::styled(
-                format!("   {spinner}— {status}"),
-                theme.agent_style(agent.state),
+    // The last rows belong to the actions. Without them this panel is a list an operator can only
+    // use by remembering ctrl+n / ctrl+c / ctrl+r — commands written down instead of buttons.
+    let chips: [(&str, BotClick); 11] = [
+        ("+ agent", BotClick::Spawn),
+        ("new bot", BotClick::NewBot),
+        ("rename", BotClick::Rename),
+        ("tag", BotClick::Tag),
+        ("soul", BotClick::Soul),
+        ("new chat", BotClick::NewChat),
+        ("pause", BotClick::Pause),
+        ("resume", BotClick::Resume),
+        ("stop", BotClick::Stop),
+        ("remove", BotClick::Remove),
+        ("mode", BotClick::Mode),
+    ];
+    // Wrapped, not dropped. A control the operator cannot see is a control they cannot press, and a
+    // narrow panel used to lose `remove` and `mode` outright. Two rows at most: the list is what
+    // this panel is for and the buttons are only the way into it.
+    let chip_width =
+        |label: &str| UnicodeWidthStr::width(format!(" {label} ").as_str()) as u16 + 1;
+    let chips_total: u16 = chips.iter().map(|(label, _)| chip_width(label)).sum();
+    // Pack the chips into as many rows as they actually need, up to the room the panel has. The
+    // fixed one-or-two choice silently dropped the tail on a narrow sidebar — `[mode]` was never
+    // drawn, so it could not be pressed at all.
+    let chip_rows = if chips_total <= inner.width || inner.height < 4 {
+        1
+    } else {
+        let mut rows = 1u16;
+        let mut packed = 0u16;
+        for (label, _) in chips.iter() {
+            let width = chip_width(label);
+            if packed > 0 && packed + width > inner.width {
+                rows += 1;
+                packed = 0;
+            }
+            packed += width;
+        }
+        rows.min(inner.height.saturating_sub(1)).max(1)
+    };
+    let action_row = inner.height.saturating_sub(chip_rows);
+    let body_height = action_row as usize;
+
+    for (line, index) in row_lines {
+        if line < action_row {
+            app.bot_hits.push((
+                inner.y + line,
+                inner.x,
+                inner.x + inner.width,
+                BotClick::Row(index),
             ));
         }
     }
 
-    let visible = inner.height as usize;
-    lines.truncate(visible);
-    frame.render_widget(Paragraph::new(lines), inner);
+    lines.truncate(body_height);
+    let body = Rect {
+        height: body_height as u16,
+        ..inner
+    };
+    frame.render_widget(Paragraph::new(lines), body);
+
+    let mut row = 0u16;
+    let mut x = inner.x;
+    let limit = inner.x + inner.width;
+    let mut spans: Vec<Span> = Vec::new();
+    for (label, click) in chips {
+        let text = format!(" {label} ");
+        let span_width = UnicodeWidthStr::width(text.as_str()) as u16;
+        if x + span_width > limit {
+            if row + 1 >= chip_rows {
+                break;
+            }
+            frame.render_widget(
+                Paragraph::new(Line::from(std::mem::take(&mut spans))),
+                Rect {
+                    y: inner.y + action_row + row,
+                    height: 1,
+                    ..inner
+                },
+            );
+            row += 1;
+            x = inner.x;
+        }
+        app.bot_hits.push((
+            inner.y + action_row + row,
+            x,
+            x + span_width,
+            click,
+        ));
+        // The same band the open tab wears: one filled rectangle, square corners, no brackets. A
+        // bracketed label reads as text that happens to be clickable; a lit block reads as a button.
+        spans.push(Span::styled(
+            text,
+            Style::default()
+                .bg(theme.selection)
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+        x += span_width + 1;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect {
+            y: inner.y + action_row + row,
+            height: 1,
+            ..inner
+        },
+    );
 }
 
 pub fn plasma(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
@@ -353,8 +488,7 @@ pub fn plasma(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let (text, style) = if let Some(tool) = running_tool {
         (tool.text.clone(), Style::default().fg(theme.tool))
     } else if let Some(notice) = app
-        .notices
-        .back()
+        .live_notice()
         .filter(|notice| matches!(notice.level, NoticeLevel::Warn | NoticeLevel::Error))
     {
         // A warning or an error outranks the stream: "retrying in 2.0s" and "rate limited" are the
@@ -366,7 +500,7 @@ pub fn plasma(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             format!("{} receiving", app.thinking_frame()),
             Style::default().fg(theme.accent),
         )
-    } else if let Some(notice) = app.notices.back() {
+    } else if let Some(notice) = app.live_notice() {
         (notice.text.clone(), theme.notice_style(notice.level))
     } else {
         ("ready".to_owned(), theme.muted())
@@ -518,7 +652,10 @@ pub fn status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         theme.status_style(StatusSegment::Value),
     ));
     right.push(Span::raw(sep.to_owned()));
-    let agent_glyph = if theme.ascii { "*" } else { "◇" };
+    // The bot count wears the same marker the panel does. `◇` was a borrowed diamond: it said
+    // nothing about bots, and it changed shape the moment one existed versus none. The turning set
+    // is the mark this app uses for its own work, so the status bar and the panel agree.
+    let agent_glyph = app.bot_mark();
     right.push(Span::styled(
         format!("{agent_glyph} Bots {}", app.bots.len()),
         theme.status_style(StatusSegment::Value),
@@ -755,7 +892,10 @@ pub fn shortcuts(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let mut used = 1usize;
     for (index, (key, action)) in hints.iter().enumerate() {
         let separator = if index == 0 { 0 } else { 3 };
-        let needs = separator + key.width() + 1 + action.width();
+        // The key is a band, the same block every other control wears, so this row reads as the
+        // controls it is describing instead of as a line of small print.
+        let label = format!(" {key} ");
+        let needs = separator + label.width() + 1 + action.width();
         if used + needs > area.width as usize {
             break;
         }
@@ -766,10 +906,10 @@ pub fn shortcuts(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             ));
             used += separator;
         }
-        spans.push(Span::styled(*key, Style::default().fg(theme.text)));
+        spans.push(Span::styled(label.clone(), theme.button()));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(*action, theme.muted()));
-        used += key.width() + 1 + action.width();
+        used += label.width() + 1 + action.width();
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -845,7 +985,7 @@ pub fn overlay(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         // dialog, and a clipped row is a row the operator cannot tell apart from another. The width
         // comes from the rows themselves, measured in display columns, then capped by the region.
         let width = (crate::widgets::wanted_width(picker) + 4)
-            .max(DIALOG_WIDTH.max(72))
+            .max(DIALOG_WIDTH.max(112))
             .min(area.width);
         let body = crate::widgets::picker_body(picker, theme, width.saturating_sub(4));
         let height = (body.lines.len() as u16 + 3).min(area.height);
@@ -984,7 +1124,7 @@ fn overlay_content(
                 &mut lines,
                 theme,
                 &[
-                    ("enter spawn", OverlayClick::AddBotSpawn),
+                    ("enter chat", OverlayClick::AddBotSpawn),
                     ("esc close", OverlayClick::PromptCancel),
                 ],
             ));
@@ -1175,15 +1315,10 @@ fn chip_row(
     let mut hits: Vec<(u16, u16, OverlayClick)> = Vec::new();
     let mut col: u16 = 2;
     for (label, click) in chips {
-        let text = format!("[{label}]");
+        let text = format!(" {label} ");
         let width = UnicodeWidthStr::width(text.as_str()) as u16;
         hits.push((col, col + width, *click));
-        spans.push(Span::styled(
-            text,
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ));
+        spans.push(Span::styled(text, theme.button()));
         spans.push(Span::styled(" ".to_owned(), theme.muted()));
         col += width + 1;
     }
@@ -1237,17 +1372,24 @@ fn approval_lines(app: &App, theme: &Theme) -> (String, Vec<Line<'static>>, Vec<
     for (index, label) in APPROVAL_ACTIONS.iter().enumerate() {
         let selected = index == app.approval_action;
         let marker = if selected { theme.chevron() } else { " " };
-        let style = if selected {
+        let marker_style = if selected {
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.text)
         };
+        // Every answer is a band, so the row reads as a set of buttons; the chosen one is the lit
+        // band, the rest sit on the panel's raised surface. A bracketed label read as text.
+        let button_style = if selected {
+            theme.button()
+        } else {
+            Style::default().bg(theme.surface).fg(theme.text)
+        };
         action_rows.push(lines.len());
         lines.push(Line::from(vec![
-            Span::styled(format!("{marker} "), style),
-            Span::styled(format!("[{label}]"), style),
+            Span::styled(format!("{marker} "), marker_style),
+            Span::styled(format!(" {label} "), button_style),
         ]));
     }
     lines.push(Line::styled(
@@ -1510,7 +1652,7 @@ fn add_agent_lines(app: &App, selected: usize, theme: &Theme) -> (String, Vec<Li
         }
     }
     lines.push(Line::from(""));
-    ("Spawn a bot".to_owned(), lines)
+    ("Open a bot".to_owned(), lines)
 }
 
 fn rename_lines(
@@ -1780,6 +1922,7 @@ mod tests {
                 description: format!("{role} bot"),
                 icon: None,
                 created_ms: 0,
+                soul: String::new(),
             },
             state,
             current_task: None,
@@ -1794,8 +1937,8 @@ mod tests {
         app.sessions
             .push(crate::app::SessionView::from_snapshot(session("First")));
         app.bots = vec![
-            bot("Rudra", "Implementer", BotState::Idle),
-            bot("Karma", "Reviewer", BotState::Idle),
+            bot("Rudra", "tag-one", BotState::Idle),
+            bot("Karma", "tag-two", BotState::Idle),
             bot("Verifier", "Verifier", BotState::Idle),
         ];
         app
@@ -1867,8 +2010,11 @@ mod tests {
         app.bots[0].state = BotState::Running;
         app.bots[0].current_task = Some("porting the store".to_owned());
 
-        let rendered = draw(32, 10, |frame| {
-            bots_panel(frame, frame.area(), &app, &Theme::new(false))
+        // 64 columns, not 32: nine chips need their own rows, and a tagged bot needs the width to
+        // show a task without clipping it. This test is about the rows the panel lists, not about
+        // how it degrades in a sliver.
+        let rendered = draw(64, 12, |frame| {
+            bots_panel(frame, frame.area(), &mut app, &Theme::new(false))
         });
         for name in ["Rudra", "Karma", "Verifier"] {
             assert!(rendered.contains(name), "{name} missing: {rendered}");
@@ -1881,10 +2027,50 @@ mod tests {
     }
 
     #[test]
+    fn the_bots_panel_writes_a_hit_for_every_row_and_chip() {
+        let mut app = app_with_default_bots();
+        draw(120, 12, |frame| {
+            bots_panel(frame, frame.area(), &mut app, &Theme::new(false))
+        });
+        let rows = app
+            .bot_hits
+            .iter()
+            .filter(|(_, _, _, click)| matches!(click, BotClick::Row(_)))
+            .count();
+        // One hit per drawn line. An idle bot draws only its header — the status line is printed
+        // only when the bot has something to report — so the old `len * 2` was counting a line that
+        // no longer exists.
+        let expected: usize = app
+            .bots
+            .iter()
+            .map(|agent| 1 + usize::from(agent.state != BotState::Idle))
+            .sum();
+        assert_eq!(
+            rows,
+            expected,
+            "every drawn line of a bot must select it: {:?}",
+            app.bot_hits
+        );
+        for expected in [
+            BotClick::Spawn,
+            BotClick::NewBot,
+            BotClick::Rename,
+            BotClick::Pause,
+            BotClick::Mode,
+        ] {
+            assert!(
+                app.bot_hits.iter().any(|(_, _, _, click)| *click == expected),
+                "{expected:?} has no clickable area: {:?}",
+                app.bot_hits
+            );
+        }
+    }
+
+    #[test]
     fn bots_panel_says_so_when_there_are_no_profiles() {
-        let app = App::new(false);
+        let mut app = App::new(false);
         let rendered = draw(32, 10, |frame| {
-            bots_panel(frame, frame.area(), &app, &Theme::new(false))
+            bots_panel(frame, frame.area(), &mut app, &Theme::new(false))
         });
         assert!(rendered.contains("no bots"), "got {rendered}");
     }
@@ -1893,9 +2079,9 @@ mod tests {
     fn bots_panel_never_exceeds_its_area() {
         let mut app = app_with_default_bots();
         app.bots
-            .extend((0..12).map(|index| bot(&format!("bot {index}"), "Reviewer", BotState::Idle)));
+            .extend((0..12).map(|index| bot(&format!("bot {index}"), "tag-two", BotState::Idle)));
         let rendered = draw(30, 5, |frame| {
-            bots_panel(frame, frame.area(), &app, &Theme::new(false))
+            bots_panel(frame, frame.area(), &mut app, &Theme::new(false))
         });
         assert_eq!(rendered.chars().count(), 30 * 5);
     }
@@ -2080,13 +2266,19 @@ mod tests {
         let rendered = draw(80, 1, |frame| {
             shortcuts(frame, frame.area(), &app, &Theme::new(false))
         });
-        // Key and action are drawn as separate spans, so the row reads at two speeds: the key is
-        // what the hand looks for, the action is what the head reads. Lowercase, because the action
-        // continues the key rather than starting a sentence.
-        assert!(rendered.contains("Enter send"), "got {rendered}");
-        assert!(rendered.contains("Tab queue"), "got {rendered}");
-        assert!(rendered.contains("Esc interrupt"), "got {rendered}");
-        assert!(rendered.contains("Ctrl+C stop"), "got {rendered}");
+        // The key and the action are separate spans, so the row reads at two speeds: the key is what
+        // the hand looks for, the action is what the head reads. The key sits in a filled band, so
+        // the two are asserted separately rather than as one joined string — the band's padding is
+        // the button, not a space that happens to be there.
+        for (key, action) in [
+            ("Enter", "send"),
+            ("Tab", "queue"),
+            ("Esc", "interrupt"),
+            ("Ctrl+C", "stop"),
+        ] {
+            assert!(rendered.contains(key), "missing `{key}` in {rendered}");
+            assert!(rendered.contains(action), "missing `{action}` in {rendered}");
+        }
     }
 
     #[test]
@@ -2265,7 +2457,7 @@ mod tests {
         let rendered = draw(80, 24, |frame| {
             overlay(frame, frame.area(), &mut app, &Theme::new(false))
         });
-        assert!(rendered.contains("Spawn a bot"), "got {rendered}");
+        assert!(rendered.contains("Open a bot"), "got {rendered}");
         for name in ["Rudra", "Karma", "Verifier"] {
             assert!(rendered.contains(name), "{name} missing: {rendered}");
         }
@@ -2282,14 +2474,16 @@ mod tests {
         });
         assert!(rendered.contains("now: First"), "got {rendered}");
         assert!(rendered.contains("Renamed"), "got {rendered}");
-        assert!(rendered.contains("[enter save]"), "got {rendered}");
+        // The footer verb is a filled band now, so the label is padded instead of bracketed. Assert
+        // the words, not the old bracket dressing.
+        assert!(rendered.contains("enter save"), "got {rendered}");
     }
 
     #[test]
     fn ascii_mode_never_draws_wide_glyphs() {
-        let app = app_with_default_bots();
+        let mut app = app_with_default_bots();
         let theme = Theme::new(true);
-        let rendered = draw(40, 8, |frame| bots_panel(frame, frame.area(), &app, &theme));
+        let rendered = draw(40, 8, |frame| bots_panel(frame, frame.area(), &mut app, &theme));
         for glyph in ['●', '○', '…', '▸', '█', '░'] {
             assert!(
                 !rendered.contains(glyph),
@@ -2424,9 +2618,9 @@ mod picker_panel_tests {
             "the row the runtime acts on has to be readable: {rendered}"
         );
         assert!(rendered.contains("(current)"), "got {rendered}");
-        assert!(rendered.contains("enter choose"), "got {rendered}");
+        assert!(rendered.contains("choose enter"), "got {rendered}");
         assert!(
-            rendered.contains("ctrl+t type a name"),
+            rendered.contains("type a name ctrl+t"),
             "the model panel has to advertise its own verb: {rendered}"
         );
     }
@@ -2461,7 +2655,7 @@ mod picker_panel_tests {
             overlay(frame, frame.area(), &mut app, &Theme::new(false))
         });
         assert!(rendered.contains("fs write"), "got {rendered}");
-        assert!(rendered.contains("[enter confirm]"), "got {rendered}");
+        assert!(rendered.contains("enter confirm"), "got {rendered}");
         assert!(rendered.contains("esc keep as is"), "got {rendered}");
     }
 }

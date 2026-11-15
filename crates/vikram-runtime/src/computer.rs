@@ -1125,6 +1125,7 @@ mod tests {
     fn ctx() -> ToolContext {
         ToolContext {
             agent: None,
+            bot: None,
             cancel: None,
             workspace_root: PathBuf::from("."),
             sandbox: crate::sandbox::Sandbox::disabled("test context"),

@@ -1402,6 +1402,11 @@ impl RuntimeInner {
         let mut context = self.tool_context();
         context.spill = crate::spill::Spill::for_session(self.workspace.home(), session);
         context.session = Some(session.clone());
+        // Which bot is speaking, if any. A bot's notes belong to that bot, and to it alone.
+        context.bot = self
+            .session(session)
+            .and_then(|live| live.bot())
+            .map(|bot| bot.to_string());
         context
     }
 
@@ -2967,9 +2972,8 @@ impl RuntimeHandle {
     }
 
     /// Close a tab. The session stops running and leaves the live set, but nothing is deleted: the
-    /// tab was a view onto a transcript, and the transcript lives in the store. A closed session is
-    /// still listed by [`Self::session_catalogue`] and comes back whole through [`Self::open_session`].
-    /// Only [`Self::delete_session`] destroys one.
+    /// tab was a view onto a transcript, and the transcript lives in the store. A closed session
+    /// comes back whole through [`Self::open_session`]. Only [`Self::delete_session`] destroys one.
     pub fn close_session(&self, session: &SessionId) -> Result<()> {
         let Some(session) = self.inner.session(session) else {
             return Err(RuntimeError::SessionNotFound(session.clone()));
@@ -2980,6 +2984,14 @@ impl RuntimeHandle {
             .lock()
             .expect("sessions lock")
             .retain(|s| s.id != session.id);
+        // The close has to reach the store, or it only lasts until the process exits: startup
+        // rehydrates every row that is still `active`, so a tab the operator dismissed came back on
+        // the next launch. Nothing is deleted here — the row and its transcript stay, and
+        // `open_session` flips it back to `active` when it is reopened.
+        self.inner
+            .store
+            .set_session_status(&session.id, "closed", now_ms())
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
         self.inner
             .emit(RuntimeEvent::SessionClosed(session.id.clone()));
         self.inner.publish_metrics();
@@ -3020,6 +3032,12 @@ impl RuntimeHandle {
             .get_session(session)
             .map_err(|e| RuntimeError::Store(e.to_string()))?
             .ok_or_else(|| RuntimeError::SessionNotFound(session.clone()))?;
+        // Reopening a dismissed tab puts it back on the active list, so the next launch and the CLI
+        // listings see it again instead of treating it as still closed.
+        self.inner
+            .store
+            .set_session_status(&row.id, "active", now_ms())
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
         let live = Arc::new(SessionRuntime::from_row(row));
         if let Ok(Some((parent, depth))) = self.inner.store.session_lineage(&live.id) {
             live.set_parent(Some(parent));
@@ -3377,6 +3395,7 @@ impl RuntimeHandle {
             description: description.to_owned(),
             icon: None,
             created_ms: now_ms(),
+            soul: String::new(),
         };
         self.inner.store.save_bot(&row)?;
         let bot = Arc::new(ManagedBot::from_profile(row.into()));
@@ -3398,6 +3417,128 @@ impl RuntimeHandle {
             return Err(RuntimeError::AgentNotFound(id.to_string()));
         };
         row.name = name.to_owned();
+        self.inner.store.save_bot(&row)?;
+        self.inner.bots.remove(id);
+        let bot = Arc::new(ManagedBot::from_profile(row.into()));
+        self.inner.bots.add(bot.clone());
+        self.inner.publish_bot(&bot);
+        Ok(())
+    }
+
+    /// The conversation a bot owns.
+    ///
+    /// Pressing a bot's row means "talk to it", so the row asks for a chat and gets one: the live
+    /// session when the bot is running, the newest stored session it already worked in, and — for a
+    /// bot that has never run — a fresh session named after it. The old path opened a spawn prompt
+    /// instead, which turned "open my chat" into "answer a question first".
+    pub fn bot_chat(&self, id: &BotId) -> Result<SessionId> {
+        let Some(bot) = self.inner.bots.get(id) else {
+            return Err(RuntimeError::AgentNotFound(id.to_string()));
+        };
+        let name = bot.profile.name.clone();
+        let live = {
+            let guard = bot.session.lock().unwrap_or_else(|e| {
+                eprintln!("vikram: bot session lock mutex poisoned; recovering");
+                e.into_inner()
+            });
+            guard.clone()
+        };
+        if let Some(session) = live {
+            return self.open_session(&session);
+        }
+        if let Some(session) = self
+            .inner
+            .store
+            .session_for_bot(id)
+            .map_err(|e| RuntimeError::Store(e.to_string()))?
+        {
+            let opened = self.open_session(&session)?;
+            *bot.session.lock().unwrap_or_else(|e| {
+                eprintln!("vikram: bot session lock mutex poisoned; recovering");
+                e.into_inner()
+            }) = Some(opened.clone());
+            return Ok(opened);
+        }
+        let session = self.create_session(Some(name))?;
+        self.inner
+            .store
+            .set_session_bot(&session, Some(id), now_ms())
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        if let Some(live) = self.inner.session(&session) {
+            live.set_bot(Some(id.clone()), now_ms());
+        }
+        *bot.session.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: bot session lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = Some(session.clone());
+        Ok(session)
+    }
+
+    /// Start a fresh conversation with a bot, leaving the older ones where they are.
+    ///
+    /// Opening a bot gives back the conversation it already has, because continuity is the point of
+    /// a bot. But a conversation can go stale or start badly, and the operator then needs a clean
+    /// page without deleting history first. This makes one and points the bot at it.
+    pub fn bot_new_chat(&self, id: &BotId) -> Result<SessionId> {
+        let Some(bot) = self.inner.bots.get(id) else {
+            return Err(RuntimeError::AgentNotFound(id.to_string()));
+        };
+        let name = bot.profile.name.clone();
+        let session = self.create_session(Some(name))?;
+        self.inner
+            .store
+            .set_session_bot(&session, Some(id), now_ms())
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        if let Some(live) = self.inner.session(&session) {
+            live.set_bot(Some(id.clone()), now_ms());
+        }
+        *bot.session.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: bot session lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = Some(session.clone());
+        Ok(session)
+    }
+
+    /// Set the tags a bot wears, comma separated, or clear them with an empty string.
+    ///
+    /// Tags are the operator's words for what the bot is, so nothing is invented here: `assistant`
+    /// used to be written into every new profile whether or not anyone asked for it. The list is
+    /// normalised on the way in — split, trimmed, duplicates dropped, joined with `", "` — so the
+    /// store never holds `coder,,coder ` for the panel to render as three chips.
+    pub fn bot_set_role(&self, id: &BotId, role: &str) -> Result<()> {
+        let mut tags: Vec<&str> = Vec::new();
+        for tag in role.split(',') {
+            let tag = tag.trim();
+            if tag.is_empty() || tags.iter().any(|seen| seen.eq_ignore_ascii_case(tag)) {
+                continue;
+            }
+            tags.push(tag);
+        }
+        let role = tags.join(", ");
+        let rows = self.inner.store.list_bots()?;
+        let Some(mut row) = rows.into_iter().find(|row| row.id == *id) else {
+            return Err(RuntimeError::AgentNotFound(id.to_string()));
+        };
+        row.role = role;
+        self.inner.store.save_bot(&row)?;
+        self.inner.bots.remove(id);
+        let bot = Arc::new(ManagedBot::from_profile(row.into()));
+        self.inner.bots.add(bot.clone());
+        self.inner.publish_bot(&bot);
+        Ok(())
+    }
+
+    /// Replace the standing instructions a bot carries — its `soul.md`.
+    ///
+    /// The text is stored verbatim (trimmed) and goes into the bot's system preamble on every turn
+    /// in its own session, so the bot behaves the way the operator asked long after the message that
+    /// asked for it has scrolled away. An empty string clears them: nothing is assumed.
+    pub fn bot_set_soul(&self, id: &BotId, soul: &str) -> Result<()> {
+        let rows = self.inner.store.list_bots()?;
+        let Some(mut row) = rows.into_iter().find(|row| row.id == *id) else {
+            return Err(RuntimeError::AgentNotFound(id.to_string()));
+        };
+        row.soul = soul.trim().to_owned();
         self.inner.store.save_bot(&row)?;
         self.inner.bots.remove(id);
         let bot = Arc::new(ManagedBot::from_profile(row.into()));

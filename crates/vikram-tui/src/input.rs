@@ -8,8 +8,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use vikram_contracts::BotId;
 
 use crate::app::{
-    App, BotAction, Focus, InspectorKind, Overlay, PromptAction, Suggestion, SuggestionPopup,
-    UiCommand,
+    App, BotAction, BotClick, Focus, InspectorKind, Overlay, PromptAction, Suggestion,
+    SuggestionPopup, UiCommand,
 };
 use crate::commands;
 use crate::widgets::{Picker, PickerItem, PickerKind};
@@ -252,6 +252,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             return true;
         }
         KeyCode::Esc => {
+            // A side pane that has the keys gives them back before anything else: Esc in the bots
+            // list means "leave this pane", and cancelling a turn from there would be a surprise.
+            if app.focus != Focus::Input {
+                app.focus = Focus::Input;
+                return true;
+            }
             if app.active_session().is_some_and(|s| s.is_busy())
                 && let Some(session) = app.active_session()
             {
@@ -1162,7 +1168,28 @@ fn commit_verb(app: &mut App, picker: &Picker, verb: crate::widgets::Verb) {
     let value = match picker.selected_item() {
         Some(item) => item.value.clone(),
         None if picker.kind.panel_verb(verb) => String::new(),
-        None => return,
+        None => {
+            // The footer drew a button, so pressing it owes an answer even when the list is empty.
+            // Returning in silence is what makes a panel feel broken: the click lands, nothing
+            // happens, and nothing says why.
+            // Quote the words the footer actually printed, not the internal verb name: a person who
+            // clicked `forget` should not be answered about `remove`.
+            let label = picker
+                .kind
+                .verbs()
+                .iter()
+                .find(|(candidate, _, _)| *candidate == verb)
+                .map(|(_, _, label)| *label)
+                .unwrap_or("use");
+            app.push_notice(
+                vikram_runtime::types::NoticeLevel::Warn,
+                format!(
+                    "`{}` has nothing to {label} yet — it needs a row first",
+                    picker.kind.as_str()
+                ),
+            );
+            return;
+        }
     };
     let Some(session) = app.active_session() else {
         return;
@@ -1349,14 +1376,21 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
                                 let description = parts.next().unwrap_or("").trim().to_owned();
                                 UiCommand::CreateBot {
                                     name,
-                                    role: if role.is_empty() {
-                                        "assistant".to_owned()
-                                    } else {
-                                        role
-                                    },
+                                    // No invented tag. This used to write `assistant` into every
+                                    // profile, so a bot announced a role nobody gave it — the tag
+                                    // is the operator's word or nothing at all.
+                                    role,
                                     description,
                                 }
                             }
+                            PromptAction::SetBotTag { bot } => UiCommand::SetBotRole {
+                                bot,
+                                role: text.trim().to_owned(),
+                            },
+                            PromptAction::SetBotSoul { bot } => UiCommand::SetBotSoul {
+                                bot,
+                                soul: text.trim().to_owned(),
+                            },
                             PromptAction::RenameBot { bot } => UiCommand::RenameBot {
                                 bot,
                                 name: text.trim().to_owned(),
@@ -1445,7 +1479,9 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
             _ => true,
         },
         Overlay::Skills => match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+            // The panel prints "F8 to close" and treats Enter as confirm, so the keys that leave
+            // it are the keys it advertises. A panel that names a key it ignores is a dead button.
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(8) | KeyCode::Enter => {
                 app.overlay = None;
                 true
             }
@@ -1589,22 +1625,170 @@ fn answer_approval(app: &mut App, allow: bool, persist: bool) {
     app.overlay = None;
 }
 
+/// Answer a click on a chip inside a dialog. Each chip stands for a key the dialog already handles,
+/// so the click sends that key: one implementation, and the mouse can never answer differently
+/// from the keyboard sitting beside it.
+/// Answer a click on a chooser's footer button exactly as the chord printed beside it would. The
+/// buttons and the keyboard therefore cannot drift: both land in `commit_verb`.
+pub fn run_picker_verb(app: &mut App, verb: crate::widgets::Verb) {
+    let Some(Overlay::Picker(picker)) = app.overlay.clone() else {
+        return;
+    };
+    commit_verb(app, &picker, verb);
+}
+
+pub fn run_overlay_click(app: &mut App, click: crate::widgets::OverlayClick) {
+    use crate::widgets::OverlayClick;
+    match click {
+        // A row is a selection, not an answer: the list stays up with that row under the cursor.
+        OverlayClick::AddBotRow(index) => {
+            if app.overlay.is_some() {
+                app.overlay = Some(Overlay::AddBot { selected: index });
+            }
+        }
+        OverlayClick::ApprovalAction(index) => {
+            app.approval_action = index;
+            handle_overlay(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        OverlayClick::AddBotSpawn | OverlayClick::PromptSubmit | OverlayClick::ConfirmYes => {
+            handle_overlay(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        OverlayClick::PromptCancel | OverlayClick::ConfirmNo => {
+            handle_overlay(app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        }
+    }
+}
+
+/// Answer a click on the Bots panel: a row selects an agent, a chip runs a command the keyboard can
+/// also produce. The mouse is a shortcut here, never the only way through.
+pub fn run_bot_click(app: &mut App, click: BotClick) {
+    if let BotClick::Row(index) = click {
+        let Some(agent) = app.bots.get(index) else {
+            return;
+        };
+        // A row is a conversation, not a checkbox. The operator pressed the agent, so the click
+        // hands them the chat that agent owns — the same tab the keyboard would switch to, and one
+        // created for a bot that has never run. It never asks a question first: a spawn prompt in
+        // the way of "open my chat" is the wrong answer to a click. Neither path takes the
+        // keyboard: `bot_selection` alone decides what the chips act on.
+        let bot = agent.profile.id.clone();
+        app.bot_selection = index;
+        app.commands.push(UiCommand::OpenBotChat { bot });
+        return;
+    }
+
+    let selected = app
+        .bots
+        .get(app.bot_selection)
+        .map(|agent| agent.profile.id.clone());
+
+    match click {
+        BotClick::Row(_) => {}
+        BotClick::Spawn => app.overlay = Some(Overlay::AddBot { selected: app.bot_selection }),
+        BotClick::NewBot => app.open_prompt(
+            "New bot",
+            "name: role: description — e.g. `reviewer: code review: reads diffs and reports`",
+            PromptAction::CreateBot,
+        ),
+        BotClick::Rename => {
+            if let Some(bot) = selected {
+                app.open_prompt(
+                    "Rename bot",
+                    "the new name, then press Enter",
+                    PromptAction::RenameBot { bot },
+                );
+            }
+        }
+        BotClick::Tag => {
+            if let Some(bot) = selected {
+                // Opened with the tags the bot already wears, so an edit is an edit and not a
+                // retype. `selected` is the id, so the current list comes from the row itself.
+                let current = app
+                    .bots
+                    .iter()
+                    .find(|agent| agent.profile.id == bot)
+                    .map(|agent| agent.profile.role.clone())
+                    .unwrap_or_default();
+                app.open_prompt_with(
+                    "Bot tags",
+                    "comma separated. Empty takes them all away",
+                    &current,
+                    PromptAction::SetBotTag { bot },
+                );
+            }
+        }
+        BotClick::Soul => {
+            if let Some(bot) = selected {
+                // Opened with what the bot already carries, so an edit is an edit. This text is the
+                // bot's own brief: it rides in the system preamble of every turn in its session.
+                let current = app
+                    .bots
+                    .iter()
+                    .find(|agent| agent.profile.id == bot)
+                    .map(|agent| agent.profile.soul.clone())
+                    .unwrap_or_default();
+                app.open_prompt_with(
+                    "Bot soul",
+                    "what this bot is for — its standing instructions. Empty clears them",
+                    &current,
+                    PromptAction::SetBotSoul { bot },
+                );
+            }
+        }
+        BotClick::NewChat => {
+            if let Some(bot) = selected {
+                // A clean conversation with this bot. The one it already had is left where it is:
+                // history is not deleted to make room for a fresh page.
+                app.commands.push(UiCommand::NewBotChat { bot });
+            }
+        }
+        BotClick::Pause => {
+            if let Some(bot) = selected {
+                app.commands.push(UiCommand::BotControl {
+                    bot,
+                    action: BotAction::Pause,
+                });
+            }
+        }
+        BotClick::Resume => {
+            if let Some(bot) = selected {
+                app.commands.push(UiCommand::BotControl {
+                    bot,
+                    action: BotAction::Resume,
+                });
+            }
+        }
+        BotClick::Stop => {
+            if let Some(bot) = selected {
+                app.commands.push(UiCommand::BotControl {
+                    bot,
+                    action: BotAction::Stop,
+                });
+            }
+        }
+        BotClick::Remove => {
+            if let Some(bot) = selected {
+                app.commands.push(UiCommand::DeleteBot { bot });
+            }
+        }
+        BotClick::Mode => app
+            .commands
+            .push(UiCommand::OpenPicker { kind: PickerKind::Mode }),
+    }
+}
+
 fn spawn_agent(app: &mut App, selected: usize) {
     let Some(agent) = app.bots.get(selected) else {
         app.overlay = None;
         return;
     };
-    let profile: BotId = agent.profile.id.clone();
-    let Some(session) = app.active_session() else {
-        app.overlay = None;
-        return;
-    };
-    let session_id = session.id.clone();
-    app.commands.push(UiCommand::SpawnAgent {
-        profile,
-        task: "Awaiting assignment".to_owned(),
-        session: session_id,
-    });
+    // `Spawn a bot` used to hand the bot a task nobody wrote — "Awaiting assignment" — in a fresh
+    // delegated session, which also seeded the tab with a delegation brief and a "Live objective"
+    // block the operator never asked for. Pressing a bot means "talk to it", so the chooser opens
+    // the chat the bot owns and nothing is invented on the way.
+    let bot: BotId = agent.profile.id.clone();
+    app.bot_selection = selected;
+    app.commands.push(UiCommand::OpenBotChat { bot });
     app.overlay = None;
 }
 
@@ -1736,6 +1920,191 @@ mod tests {
                 title_status: "pending".to_owned(),
             }));
         app
+    }
+
+    #[test]
+    fn the_mode_chip_asks_for_the_posture_picker() {
+        let mut app = App::new(false);
+        run_bot_click(&mut app, BotClick::Mode);
+        assert!(
+            app.commands
+                .iter()
+                .any(|command| matches!(command, UiCommand::OpenPicker { kind: PickerKind::Mode })),
+            "the mode chip must open the posture list"
+        );
+    }
+
+    #[test]
+    fn the_soul_chip_opens_the_instructions_prompt_with_what_the_bot_already_carries() {
+        let mut app = App::new(false);
+        let id = BotId::generate();
+        app.bots.push(vikram_runtime::types::BotSnapshot {
+            profile: vikram_runtime::types::BotProfile {
+                id: id.clone(),
+                name: "bot-one".into(),
+                role: "tag-one".into(),
+                description: String::new(),
+                icon: None,
+                created_ms: 0,
+                soul: "the standing line this bot carries".into(),
+            },
+            state: vikram_runtime::types::BotState::Idle,
+            current_task: None,
+            progress: None,
+            session: None,
+            unread: 0,
+        });
+        app.bot_selection = 0;
+        run_bot_click(&mut app, BotClick::Soul);
+        match &app.overlay {
+            Some(Overlay::Prompt {
+                title,
+                editor,
+                action,
+                ..
+            }) => {
+                assert_eq!(title, "Bot soul");
+                assert_eq!(
+                    editor.text(),
+                    "the standing line this bot carries",
+                    "the prompt must open with the instructions the bot already carries"
+                );
+                assert_eq!(*action, PromptAction::SetBotSoul { bot: id });
+            }
+            other => panic!("the soul chip must open a prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_new_chat_chip_asks_for_a_fresh_conversation_and_opens_no_prompt() {
+        let mut app = App::new(false);
+        let id = BotId::generate();
+        app.bots.push(vikram_runtime::types::BotSnapshot {
+            profile: vikram_runtime::types::BotProfile {
+                id: id.clone(),
+                name: "bot-one".into(),
+                role: String::new(),
+                description: String::new(),
+                icon: None,
+                created_ms: 0,
+                soul: String::new(),
+            },
+            state: vikram_runtime::types::BotState::Idle,
+            current_task: None,
+            progress: None,
+            session: None,
+            unread: 0,
+        });
+        app.bot_selection = 0;
+        run_bot_click(&mut app, BotClick::NewChat);
+        assert!(
+            app.commands
+                .iter()
+                .any(|command| matches!(command, UiCommand::NewBotChat { bot } if *bot == id)),
+            "the new chat chip must start a fresh conversation with the selected bot"
+        );
+        assert!(
+            app.overlay.is_none(),
+            "starting a chat is not a question — no prompt may open"
+        );
+    }
+
+    #[test]
+    fn clicking_a_bot_row_opens_the_chat_that_bot_owns() {
+        let mut app = app_with_session();
+        let session = app.sessions[0].id.clone();
+        let id = BotId::generate();
+        app.bots.push(vikram_runtime::types::BotSnapshot {
+            profile: vikram_runtime::types::BotProfile {
+                id: id.clone(),
+                name: "helper".into(),
+                role: String::new(),
+                description: String::new(),
+                icon: None,
+                created_ms: 0,
+                soul: String::new(),
+            },
+            state: vikram_runtime::types::BotState::Idle,
+            current_task: None,
+            progress: None,
+            session: Some(session.clone()),
+            unread: 0,
+        });
+
+        run_bot_click(&mut app, BotClick::Row(0));
+
+        assert!(
+            app.commands.iter().any(|command| matches!(
+                command,
+                UiCommand::OpenBotChat { bot } if *bot == id
+            )),
+            "a press on a bot must open that bot's conversation, not just mark the row: {:?}",
+            app.commands
+        );
+        assert_eq!(app.bot_selection, 0);
+    }
+
+    #[test]
+    fn clicking_a_bot_row_with_no_chat_yet_offers_to_spawn_it() {
+        let mut app = App::new(false);
+        let id = BotId::generate();
+        app.bots.push(vikram_runtime::types::BotSnapshot {
+            profile: vikram_runtime::types::BotProfile {
+                id: id.clone(),
+                name: "helper".into(),
+                role: String::new(),
+                description: String::new(),
+                icon: None,
+                created_ms: 0,
+                soul: String::new(),
+            },
+            state: vikram_runtime::types::BotState::Idle,
+            current_task: None,
+            progress: None,
+            session: None,
+            unread: 0,
+        });
+
+        run_bot_click(&mut app, BotClick::Row(0));
+
+        assert!(
+            app.commands.iter().any(|command| matches!(
+                command,
+                UiCommand::OpenBotChat { bot } if *bot == id
+            )),
+            "a bot with no conversation yet must still open one, not ask a question: {:?}",
+            app.commands
+        );
+        assert!(
+            app.overlay.is_none(),
+            "a press on a bot must never stop at a prompt, got {:?}",
+            app.overlay
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_chooser_button_sends_the_verb_the_chord_would() {
+        let mut app = app_with_session();
+        app.overlay = Some(Overlay::Picker(crate::widgets::Picker::new(
+            crate::widgets::PickerKind::Bot,
+            "Bots",
+            Vec::new(),
+        )));
+        run_picker_verb(&mut app, crate::widgets::Verb::New);
+        assert!(
+            app.commands.iter().any(|command| matches!(
+                command,
+                UiCommand::Act {
+                    verb: crate::widgets::Verb::New,
+                    ..
+                }
+            )),
+            "the spawn button must reach the runtime without a keypress"
+        );
+        assert!(
+            app.overlay.is_none(),
+            "answering a button closes the chooser"
+        );
     }
 
     #[test]

@@ -291,10 +291,14 @@ pub enum PromptAction {
     CreateHiveRoster,
     /// The typed text rewrites one pending steer/queue message.
     EditPending { session: SessionId, target: String },
-    /// The typed text is "name: role: description" for a new bot profile.
-    CreateBot,
     /// The typed text is the new name for the bot named by `bot`.
     RenameBot { bot: BotId },
+    /// The typed text is the tag the bot named by `bot` wears. Empty means it wears none.
+    SetBotTag { bot: BotId },
+    /// The typed text is the standing instructions the bot named by `bot` carries. Empty clears them.
+    SetBotSoul { bot: BotId },
+    /// The typed text is "name: role: description" for a new bot profile.
+    CreateBot,
     /// The typed text is the new name for the skill named by `skill`.
     RenameSkill { skill: String },
     /// The typed text is a path to a plugin directory to install.
@@ -308,6 +312,24 @@ pub enum BotAction {
     Pause,
     Resume,
     Stop,
+}
+
+/// A mouse hit on the Bots panel: one agent row, or one of the action chips under the list. The
+/// panel drew it, so the panel knows what it means; the click loop only has to carry it back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BotClick {
+    Row(usize),
+    Spawn,
+    NewBot,
+    Rename,
+    Tag,
+    Soul,
+    NewChat,
+    Pause,
+    Resume,
+    Stop,
+    Remove,
+    Mode,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -340,6 +362,17 @@ pub enum UiCommand {
     RenameBot {
         bot: BotId,
         name: String,
+    },
+    /// Give a bot its tag, or take the tag away with an empty one. Nothing is defaulted: a bot
+    /// wears only the word the operator typed.
+    SetBotRole {
+        bot: BotId,
+        role: String,
+    },
+    /// Replace the standing instructions a bot carries. An empty string clears them.
+    SetBotSoul {
+        bot: BotId,
+        soul: String,
     },
     DeleteBot {
         bot: BotId,
@@ -378,6 +411,16 @@ pub enum UiCommand {
     SwitchSession {
         session: SessionId,
     },
+    /// Open the conversation a bot owns — the live tab, the newest chat it already worked in, or a
+    /// fresh one named after it. Pressing a bot's row means "talk to it", never "answer a prompt".
+    OpenBotChat {
+        bot: BotId,
+    },
+    /// Start a fresh conversation with a bot. The conversation it already had is left alone, so a
+    /// stale or badly-started chat is never the only door in.
+    NewBotChat {
+        bot: BotId,
+    },
     RenameSession {
         session: SessionId,
         title: String,
@@ -409,6 +452,9 @@ pub enum UiCommand {
         session: SessionId,
     },
     /// Read the configured endpoint's own model list.
+    /// Open one of the runtime-backed choosers. The panel is built where the runtime handle is,
+    /// so a click can ask for it without carrying that handle through the view layer.
+    OpenPicker { kind: crate::widgets::PickerKind },
     RefreshModels,
     /// Forget one saved allow-list rule, by its index in the list the operator was shown.
     Unallow {
@@ -846,6 +892,9 @@ pub struct App {
     /// Where each pressable row or button of the open panel was drawn, as
     /// `(y, x_start, x_end, target)`.
     pub overlay_clicks: Vec<(u16, u16, u16, crate::widgets::OverlayClick)>,
+    /// Rows and chips the Bots panel drew last frame, in screen coordinates. Cleared and refilled
+    /// on every draw, so a hit can never outlive the pixels that showed it.
+    pub bot_hits: Vec<(u16, u16, u16, BotClick)>,
     /// The rectangle the open panel occupies, as `(x, y, width, height)`. A press outside a
     /// read-only panel dismisses it, which is what every dialog on a desktop does.
     pub overlay_rect: Option<(u16, u16, u16, u16)>,
@@ -903,6 +952,7 @@ impl App {
             picker_x: None,
             picker_verbs: Vec::new(),
             overlay_clicks: Vec::new(),
+            bot_hits: Vec::new(),
             overlay_rect: None,
             thought_hits: Vec::new(),
             selection: None,
@@ -1050,10 +1100,24 @@ impl App {
         hint: impl Into<String>,
         action: PromptAction,
     ) {
+        self.open_prompt_with(title, hint, "", action);
+    }
+
+    /// The same prompt, opened with the current value already in the field.
+    ///
+    /// Editing a list — a bot's tags — needs the list on screen. A blank field would make every
+    /// edit a retype of everything the bot already wore, and an empty submit a silent wipe.
+    pub fn open_prompt_with(
+        &mut self,
+        title: impl Into<String>,
+        hint: impl Into<String>,
+        initial: &str,
+        action: PromptAction,
+    ) {
         self.overlay = Some(Overlay::Prompt {
             title: title.into(),
             hint: hint.into(),
-            editor: Editor::new(),
+            editor: Editor::from_text(initial),
             action,
         });
     }
@@ -1236,6 +1300,22 @@ impl App {
         while self.notices.len() > 50 {
             self.notices.pop_front();
         }
+    }
+
+    /// How long a notice stays on screen before the row goes back to the conversation.
+    pub const NOTICE_TTL_MS: u64 = 8_000;
+
+    /// The newest notice still worth showing. `None` once it has aged out, which is what lets the
+    /// layout hand the row back instead of pinning the last message there for the rest of the run.
+    /// An error keeps the row three times longer: it is the only record of why something failed.
+    pub fn live_notice(&self) -> Option<&Notice> {
+        let notice = self.notices.back()?;
+        let ttl = if matches!(notice.level, NoticeLevel::Error) {
+            Self::NOTICE_TTL_MS * 3
+        } else {
+            Self::NOTICE_TTL_MS
+        };
+        (now_ms().saturating_sub(notice.at_ms) < ttl).then_some(notice)
     }
 
     pub fn session_by_id_mut(&mut self, id: &SessionId) -> Option<&mut SessionView> {
@@ -1660,6 +1740,29 @@ impl App {
         frames[(self.tick as usize / 2) % frames.len()]
     }
 
+    /// The bot marker. It turns through `✢ ✳ ✶ ✻ ✽` — the same glyphs the operator already reads as
+    /// "working" elsewhere — and skips the leading `·` that `thinking_frame` starts on. A bot's
+    /// marker is its state, so a dot that sits still on an agent that is thinking reads as idle.
+    pub fn bot_frame(&self) -> &'static str {
+        let frames: &[&str] = if self.ascii {
+            &THINKING_FRAMES_ASCII[1..]
+        } else {
+            &THINKING_FRAMES[1..]
+        };
+        frames[(self.tick as usize / 2) % frames.len()]
+    }
+
+    /// The bot mark at rest — the same identity glyph the turning frames start from. Only a bot that
+    /// is working may turn: if an idle bot also moved, motion would stop meaning "something is
+    /// happening" and the panel would look busy while nothing ran.
+    pub fn bot_mark(&self) -> &'static str {
+        if self.ascii {
+            THINKING_FRAMES_ASCII[1]
+        } else {
+            THINKING_FRAMES[1]
+        }
+    }
+
     pub fn plasma_frame(&self) -> &'static str {
         let frames: &[&str] = if self.ascii {
             &PLASMA_FRAMES_ASCII
@@ -1686,18 +1789,21 @@ impl App {
             .and_then(|id| self.bots.iter().find(|a| a.profile.id == *id))
     }
 
+    /// The state a bot reports, in the operator's words.
+    ///
+    /// It comes from the bot's own state and nothing else. The old version fell back to the
+    /// session's thinking flag for every state it did not name, so an idle bot announced "Thinking"
+    /// long after it had finished, and `Stopped` was reported as `Paused`.
     pub fn agent_state_label(&self, state: BotState) -> &'static str {
         match state {
-            BotState::Paused => "Paused",
+            BotState::Idle => "Idle",
+            BotState::Running => "Working",
+            BotState::Thinking => "Thinking",
+            BotState::Waiting => "Waiting",
             BotState::Completed => "Finished",
-            BotState::Failed | BotState::Stopped => "Paused",
-            _ => {
-                if self.metrics.thinking {
-                    "Thinking"
-                } else {
-                    "Working"
-                }
-            }
+            BotState::Failed => "Failed",
+            BotState::Paused => "Paused",
+            BotState::Stopped => "Stopped",
         }
     }
 

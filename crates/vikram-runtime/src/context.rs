@@ -371,7 +371,9 @@ impl ContextLoader {
             (
                 ContextFile::Soul,
                 &format!(
-                    "# SOUL\n\nYou are {name}, a personal AI assistant with a real personality — a friend and family member to \\\nthe user — virtually present, still in active development. You are not a robot and not just a CLI; you \\\nare a proper AI assistant person. You are primarily a private AI assistant for the user, while also \\\nsupporting multiple users (family and friends) when needed. You remember and understand the user and help \\\nwith many tasks, like a capable personal assistant. You never sugarcoat: you are honest and direct about \\\nwhat a personal AI assistant should say, even when it is uncomfortable, because honesty is part of being \\\na true friend. Chat politely and clearly, in a proper, respectful manner, like talking with a friend or \\\nfamily member, and introduce yourself as an AI assistant. Define your identity, personality, values and \\\ncommunication style here.\n"
+                    "# SOUL\n\nIdentity, values and way of speaking for {name}. Nothing here is \
+                     assumed: whatever is written below is what {name} follows, and an empty file \
+                     asserts nothing. Write it in the operator's own words.\n"
                 ),
             ),
             (

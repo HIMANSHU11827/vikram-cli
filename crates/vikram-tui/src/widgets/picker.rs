@@ -185,13 +185,17 @@ impl PickerKind {
                 (Verb::Remove, 'd', "remove member"),
                 (Verb::Close, 'x', "delete hive"),
             ],
-            Self::Permissions
-            | Self::Status
-            | Self::Usage
-            | Self::Context
-            | Self::Doctor
-            | Self::Version
-            | Self::Approvals
+            // Panels you read, not panels you act in. They used to advertise an `open` band that
+            // did nothing when pressed, which is worse than no button at all: the footer now shows
+            // only the one thing that does work, `esc close`.
+            Self::Status | Self::Usage | Self::Context | Self::Doctor | Self::Version => &[],
+            // The panel's own hint row promises `enter changes the posture` and `ctrl+a saves a
+            // rule`, so those are the two verbs it must actually answer to.
+            Self::Permissions => &[
+                (Verb::Choose, '\n', "change mode"),
+                (Verb::Prompt, 'a', "save a rule"),
+            ],
+            Self::Approvals
             | Self::Keys
             | Self::Diff
             | Self::Test
@@ -233,7 +237,12 @@ impl PickerKind {
     }
 
     pub fn primary_verb(self) -> Verb {
-        self.verbs()[0].0
+        // A panel with no verbs is a panel you only read and close. Falling back instead of
+        // indexing keeps that a decision rather than a panic.
+        self.verbs()
+            .first()
+            .map(|(verb, _, _)| *verb)
+            .unwrap_or(Verb::Choose)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -522,7 +531,6 @@ pub fn picker_body(picker: &Picker, theme: &Theme, width: u16) -> PickerBody {
     let width = (width as usize).max(PAD + MARKER + GAP + 24);
     let cursor = if theme.ascii { ">" } else { "▸" };
     let bullet = if theme.ascii { "*" } else { "•" };
-    let rule_char = if theme.ascii { '-' } else { '─' };
     let caret = if theme.ascii { "_" } else { "▌" };
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -566,7 +574,7 @@ pub fn picker_body(picker: &Picker, theme: &Theme, width: u16) -> PickerBody {
     );
     let typed = format!("{}filter {}", " ".repeat(PAD), picker.query);
     let typed_width = UnicodeWidthStr::width(typed.as_str()) + 1;
-    let gap = width.saturating_sub(typed_width + counter.len()).max(1);
+    let gap = width.saturating_sub(typed_width + counter.len());
     lines.push(Line::from(vec![
         Span::styled(format!("{}filter ", " ".repeat(PAD)), theme.muted()),
         Span::styled(
@@ -580,7 +588,10 @@ pub fn picker_body(picker: &Picker, theme: &Theme, width: u16) -> PickerBody {
         Span::styled(counter, theme.muted()),
     ]));
 
-    if let Some(note) = &picker.note {
+    // One blank line between the search field and the list. A note is drawn only when there is no
+    // row to draw: then it is the reason (`connection refused`, `no model is set`), not a legend.
+    // A legend above a list repeats what the footer buttons already print.
+    if let Some(note) = picker.note.as_ref().filter(|_| picker.items.is_empty()) {
         lines.push(Line::from(vec![
             Span::styled(" ".repeat(PAD), theme.muted()),
             Span::styled(
@@ -588,16 +599,9 @@ pub fn picker_body(picker: &Picker, theme: &Theme, width: u16) -> PickerBody {
                 Style::default().fg(theme.accent_dim),
             ),
         ]));
+    } else {
+        lines.push(Line::from(Span::styled(" ".repeat(PAD), theme.muted())));
     }
-
-    lines.push(Line::from(Span::styled(
-        format!(
-            "{}{}",
-            " ".repeat(PAD),
-            rule_char.to_string().repeat(width.saturating_sub(PAD))
-        ),
-        Style::default().fg(theme.border),
-    )));
 
     // ---- rows ------------------------------------------------------------------------------
     let first_row = lines.len();
@@ -693,74 +697,47 @@ pub fn picker_body(picker: &Picker, theme: &Theme, width: u16) -> PickerBody {
     }
     let rows_drawn = lines.len() - first_row;
 
-    // ---- footer: one button per verb --------------------------------------------------------
-    lines.push(Line::from(Span::styled(
-        format!(
-            "{}{}",
-            " ".repeat(PAD),
-            rule_char.to_string().repeat(width.saturating_sub(PAD))
-        ),
-        Style::default().fg(theme.border),
-    )));
-
-    // Buttons, not a key legend. Each verb is drawn as a bracketed control carrying its chord, and
-    // the columns it occupies are handed back so the mouse can press it. A button that does not fit
-    // the row starts the next one rather than being cut in half: half a button is not clickable.
+    // ---- footer: one line of chords, in the order they are used ------------------------------
+    //
+    // The footer is the legend, so it is the only place a chord is printed — no rule above it and no
+    // second hint line under it. A button that does not fit is dropped rather than wrapped: half a
+    // button is not clickable, and a footer that grows to two rows pushes the list out of the panel.
     let mut verbs: Vec<VerbChip> = Vec::new();
     let mut spans: Vec<Span<'static>> = vec![Span::styled(" ".repeat(PAD), theme.muted())];
     let mut col = PAD;
-    let chip_style = Style::default()
-        .fg(theme.accent)
-        .add_modifier(Modifier::BOLD);
+    let chord_style = theme.button();
     for (verb, key, label) in picker.kind.verbs() {
-        let text = if *key == '\n' {
-            format!("[enter {label}]")
+        // Each verb is a band, the same block the open tab wears: the footer reads as a row of
+        // buttons you can press instead of a legend you have to decode.
+        let chord = if *key == '\n' {
+            "enter".to_owned()
         } else {
-            format!("[ctrl+{key} {label}]")
+            format!("ctrl+{key}")
         };
+        let text = format!(" {label} {chord} ");
         let text_width = UnicodeWidthStr::width(text.as_str());
-        if col > PAD && col + text_width > width {
-            lines.push(Line::from(std::mem::take(&mut spans)));
-            spans.push(Span::styled(" ".repeat(PAD), theme.muted()));
-            col = PAD;
+        let separator = if verbs.is_empty() { 0 } else { 2 };
+        if col + separator + text_width > width {
+            break;
         }
+        if separator > 0 {
+            spans.push(Span::styled(" ".repeat(separator), theme.muted()));
+        }
+        col += separator;
         let start = col;
-        let room = width.saturating_sub(start);
-        let drawn = clip_to(&text, room, theme.ascii);
-        let drawn_width = UnicodeWidthStr::width(drawn.as_str());
-        spans.push(Span::styled(drawn, chip_style));
-        col += drawn_width;
-        // A clipped label is still a button, but a button with nothing drawn is not.
-        if drawn_width > 0 {
-            verbs.push(VerbChip {
-                verb: *verb,
-                line: lines.len(),
-                start: start as u16,
-                end: col as u16,
-            });
-        }
-        spans.push(Span::styled(" ".to_owned(), theme.muted()));
-        col += 1;
+        spans.push(Span::styled(text, chord_style));
+        col += text_width;
+        verbs.push(VerbChip {
+            verb: *verb,
+            line: lines.len(),
+            start: start as u16,
+            end: col as u16,
+        });
+    }
+    if col + 2 + "esc close".len() <= width {
+        spans.push(Span::styled("  esc close", Style::default().fg(theme.faint)));
     }
     lines.push(Line::from(spans));
-
-    // Hints on their own line: a panel that clips its own footer has hidden the one thing the
-    // operator needs to know.
-    lines.push(Line::from(Span::styled(
-        format!(
-            "{}{}",
-            " ".repeat(PAD),
-            clip_to(
-                &format!(
-                    "type to filter  ·  {} move  ·  ctrl+u/d page  ·  esc closes",
-                    if theme.ascii { "up/down" } else { "↑↓" }
-                ),
-                width.saturating_sub(PAD),
-                theme.ascii
-            )
-        ),
-        theme.muted(),
-    )));
 
     PickerBody {
         lines,
@@ -973,7 +950,7 @@ mod tests {
             })
             .collect();
         assert!(text.contains("(current)"), "got {text}");
-        assert!(text.contains("enter choose"), "got {text}");
+        assert!(text.contains("choose enter"), "got {text}");
     }
 
     #[test]

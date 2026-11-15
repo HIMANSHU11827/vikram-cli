@@ -5,6 +5,34 @@ use crate::MemoryStore;
 use crate::config::database_path;
 
 use crate::tools::*;
+
+/// Which scope a memory call lands in.
+///
+/// An explicit `scope` argument always wins — the caller asked for that shelf by name. Otherwise the
+/// call belongs to whoever is speaking: a bot's notes go to that bot's own scope, so two bots never
+/// share a brain and a bot keeps what it learned after its tab is closed, and everything else goes
+/// to `global` exactly as before. The bot key is the bot's id, not its session, precisely so the
+/// memory outlives the conversation.
+fn scope_for(ctx: &ToolContext, asked: Option<&str>) -> String {
+    match asked.map(str::trim) {
+        Some(scope) if !scope.is_empty() => scope.to_owned(),
+        _ => match ctx.bot.as_deref() {
+            Some(bot) if !bot.is_empty() => format!("bot:{bot}"),
+            _ => "global".to_owned(),
+        },
+    }
+}
+
+/// The scopes a lookup may read: the speaker's own first, then the shared `global` shelf. A bot is
+/// allowed to know what the operator told the machine; it is not allowed to know another bot's.
+fn read_scopes(primary: &str) -> Vec<String> {
+    if primary == "global" {
+        vec!["global".to_owned()]
+    } else {
+        vec![primary.to_owned(), "global".to_owned()]
+    }
+}
+
 pub(crate) struct MemorySave;
 
 impl Tool for MemorySave {
@@ -35,17 +63,14 @@ impl Tool for MemorySave {
         ))
     }
 
-    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let key = arg_str(args, "key")?;
         let value = arg_str(args, "value")?;
-        let scope = args
-            .get("scope")
-            .and_then(Value::as_str)
-            .unwrap_or("global");
+        let scope = scope_for(ctx, args.get("scope").and_then(Value::as_str));
         let store =
             MemoryStore::open(database_path()).map_err(|e| VikramError::Storage(e.to_string()))?;
         store
-            .save(&key, &value, scope)
+            .save(&key, &value, &scope)
             .map_err(|e| VikramError::Storage(e.to_string()))?;
         Ok(ToolOutput {
             content: format!("saved memory `{key}` in scope `{scope}`"),
@@ -83,20 +108,28 @@ impl Tool for MemorySearch {
         ))
     }
 
-    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let query = arg_str(args, "query")?;
-        let scope = args
-            .get("scope")
-            .and_then(Value::as_str)
-            .unwrap_or("global");
+        let scope = scope_for(ctx, args.get("scope").and_then(Value::as_str));
+        let scopes = read_scopes(&scope);
         let store =
             MemoryStore::open(database_path()).map_err(|e| VikramError::Storage(e.to_string()))?;
-        let hits = store
-            .search(&query, scope)
-            .map_err(|e| VikramError::Storage(e.to_string()))?;
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for scope in &scopes {
+            let found = store
+                .search(&query, scope)
+                .map_err(|e| VikramError::Storage(e.to_string()))?;
+            for (key, value) in found {
+                if hits.iter().any(|(seen, _)| *seen == key) {
+                    continue;
+                }
+                hits.push((key, value));
+            }
+        }
+        let searched = scopes.join(", ");
         if hits.is_empty() {
             return Ok(ToolOutput {
-                content: format!("no memory matches for `{query}` in scope `{scope}`"),
+                content: format!("no memory matches for `{query}` in scopes `{searched}`"),
                 ok: true,
             });
         }
@@ -106,7 +139,7 @@ impl Tool for MemorySearch {
             .collect::<Vec<_>>()
             .join("\n");
         Ok(ToolOutput {
-            content: truncated(body),
+            content: truncated(format!("searched scopes `{searched}`\n{body}")),
             ok: true,
         })
     }
@@ -142,15 +175,12 @@ impl Tool for MemoryList {
         ))
     }
 
-    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
-        let scope = args
-            .get("scope")
-            .and_then(Value::as_str)
-            .unwrap_or("global");
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+        let scope = scope_for(ctx, args.get("scope").and_then(Value::as_str));
         let store =
             MemoryStore::open(database_path()).map_err(|e| VikramError::Storage(e.to_string()))?;
         let entries = store
-            .list(scope)
+            .list(&scope)
             .map_err(|e| VikramError::Storage(e.to_string()))?;
         if entries.is_empty() {
             return Ok(ToolOutput {
@@ -199,16 +229,13 @@ impl Tool for MemoryDelete {
         ))
     }
 
-    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let key = arg_str(args, "key")?;
-        let scope = args
-            .get("scope")
-            .and_then(Value::as_str)
-            .unwrap_or("global");
+        let scope = scope_for(ctx, args.get("scope").and_then(Value::as_str));
         let store =
             MemoryStore::open(database_path()).map_err(|e| VikramError::Storage(e.to_string()))?;
         let deleted = store
-            .delete(&key, scope)
+            .delete(&key, &scope)
             .map_err(|e| VikramError::Storage(e.to_string()))?;
         Ok(ToolOutput {
             content: if deleted {
@@ -260,13 +287,10 @@ impl Tool for MemoryConsolidate {
         ))
     }
 
-    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         use crate::consolidation::{ConsolidationPolicy, ConsolidationStore, score};
         let action = args.get("action").and_then(Value::as_str).unwrap_or("run");
-        let scope = args
-            .get("scope")
-            .and_then(Value::as_str)
-            .unwrap_or("global");
+        let scope = scope_for(ctx, args.get("scope").and_then(Value::as_str));
         let store = ConsolidationStore::open(crate::config::database_path())
             .map_err(|e| VikramError::Storage(e.to_string()))?;
         let policy = ConsolidationPolicy::default();
@@ -285,7 +309,7 @@ impl Tool for MemoryConsolidate {
                     .and_then(Value::as_f64)
                     .unwrap_or(0.5);
                 let obs = store
-                    .capture(&key, &value, scope, source, confidence, importance)
+                    .capture(&key, &value, &scope, source, confidence, importance)
                     .map_err(|e| VikramError::Storage(e.to_string()))?;
                 Ok(ToolOutput {
                     content: format!(
@@ -297,7 +321,7 @@ impl Tool for MemoryConsolidate {
             }
             "list" => {
                 let observations = store
-                    .load_scope(scope)
+                    .load_scope(&scope)
                     .map_err(|e| VikramError::Storage(e.to_string()))?;
                 let status_filter = args.get("status").and_then(Value::as_str);
                 let filtered: Vec<_> = observations
@@ -328,7 +352,7 @@ impl Tool for MemoryConsolidate {
             }
             "score" => {
                 let observations = store
-                    .load_scope(scope)
+                    .load_scope(&scope)
                     .map_err(|e| VikramError::Storage(e.to_string()))?;
                 let now = crate::types::now_ms();
                 let mut ranked: Vec<_> = observations.iter().collect();
@@ -364,7 +388,7 @@ impl Tool for MemoryConsolidate {
             // "run" and any unknown action fall through to consolidation.
             _ => {
                 let (report, observations) = store
-                    .run_consolidation(Some(scope), &policy)
+                    .run_consolidation(Some(&scope), &policy)
                     .map_err(|e| VikramError::Storage(e.to_string()))?;
                 let mut body = format!(
                     "captured={} deduplicated={} contradictions={} superseded={} expired={} active_after={} staged_after={}",
@@ -449,5 +473,48 @@ impl Tool for MemoryNote {
             content: format!("noted in {target}"),
             ok: true,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context_with_bot(bot: Option<&str>) -> ToolContext {
+        ToolContext {
+            bot: bot.map(str::to_owned),
+            ..ToolContext::default()
+        }
+    }
+
+    #[test]
+    fn an_explicit_scope_wins_over_the_speaker() {
+        let ctx = context_with_bot(Some("b1"));
+        assert_eq!(scope_for(&ctx, Some("scratch")), "scratch");
+        assert_eq!(scope_for(&ctx, Some("  scratch  ")), "scratch");
+    }
+
+    #[test]
+    fn a_bot_saves_into_its_own_scope_not_into_global() {
+        let ctx = context_with_bot(Some("b1"));
+        assert_eq!(scope_for(&ctx, None), "bot:b1");
+    }
+
+    #[test]
+    fn an_empty_scope_falls_through_to_the_speaker() {
+        let ctx = context_with_bot(Some("b1"));
+        assert_eq!(scope_for(&ctx, Some("")), "bot:b1");
+        assert_eq!(scope_for(&ctx, Some("   ")), "bot:b1");
+    }
+
+    #[test]
+    fn a_turn_with_no_bot_still_uses_global() {
+        assert_eq!(scope_for(&context_with_bot(None), None), "global");
+    }
+
+    #[test]
+    fn a_lookup_reads_the_speaker_then_the_shared_shelf() {
+        assert_eq!(read_scopes("bot:b1"), vec!["bot:b1", "global"]);
+        assert_eq!(read_scopes("global"), vec!["global"]);
     }
 }

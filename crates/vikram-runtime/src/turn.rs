@@ -83,6 +83,51 @@ example when one thing finished and another begins. These lines are shown to the
 voice between the tool rows, so each must stand alone. Do not narrate every step, do not repeat a \
 line you already wrote, and never describe your private reasoning.";
 
+/// Said to a bot on every turn in its own session, in place of the app's preamble.
+///
+/// A bot is not the application. It used to be told "You are VIKRAM" on every turn and then
+/// introduced itself to the operator as VIKRAM, in a chat whose title carried the bot's own name —
+/// so the operator was talking to their own bot and being answered by the app. Here it is told its
+/// name, the tags and description the operator gave it, and nothing else about who it is; the app
+/// never speaks through it.
+fn bot_preamble(profile: &crate::types::BotProfile) -> String {
+    let mut text = format!(
+        "You are {}, a bot the operator keeps in VIKRAM. You are not VIKRAM: never introduce \
+         yourself as VIKRAM or as the app, and never speak on the app's behalf. You are you — the \
+         bot named {} — and you say so when a name is needed.",
+        profile.name, profile.name
+    );
+    let tags: Vec<&str> = profile
+        .role
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .collect();
+    if !tags.is_empty() {
+        text.push_str(&format!(" The operator tagged you {}.", tags.join(", ")));
+    }
+    let description = profile.description.trim();
+    if !description.is_empty() {
+        text.push_str(&format!(" About you, in the operator's words: {description}"));
+    }
+    // The operator's standing instructions, if they wrote any. They are given the same weight as the
+    // identity above: they are what the bot is supposed to do, every turn, without being asked again.
+    let soul = profile.soul.trim();
+    if !soul.is_empty() {
+        text.push_str(&format!(
+            " Standing instructions the operator wrote for you — follow them every turn: {soul}"
+        ));
+    }
+    text.push_str(
+        " Alongside your tool calls, write one or two short sentences of progress in the present \
+         tense: what you are about to do and why, naming the file, command or question involved. \
+         Write one before you start a piece of work, and again whenever what you are doing changes. \
+         These lines are shown to the operator as your voice between the tool rows, so each must \
+         stand alone. Do not narrate every step, and never describe your private reasoning.",
+    );
+    text
+}
+
 /// Extract a likely symbol/token query from the user's request for code-index lookup:
 /// the longest word-like token, or "" when nothing looks like an identifier.
 fn codeindex_query(request: &str) -> String {
@@ -221,21 +266,33 @@ pub(crate) async fn run_turn(
             labels.push("project instructions");
             prefix.push(Message::text(Role::System, project_text, Trust::External));
         }
-        // A delegated agent carries its own identity: the profile's name, role and description
-        // become the system identity for its session, so its behaviour follows its configuration.
-        if let Some(run) = &agent {
-            let profile = &run.agent.profile;
-            let identity = format!(
-                "You are {}. Role: {}. {}.",
-                profile.name, profile.role, profile.description
-            );
-            labels.push("agent identity");
-            prefix.push(Message::text(Role::System, identity, Trust::External));
-        }
-        // The operator sees the model's own words between the tool rows, so the model has to be
-        // told that those words exist and what shape they take.
+        // Who is speaking. A bot carries its own identity — the profile's name, tags and
+        // description — and must not be told it is the app. Resolved from the delegated run when
+        // there is one, otherwise from the session's own bot, so an operator typing straight into a
+        // bot's tab is answered by that bot and not by VIKRAM wearing its tab.
+        let profile = agent
+            .as_ref()
+            .map(|run| run.agent.profile.clone())
+            .or_else(|| {
+                session
+                    .bot()
+                    .and_then(|id| inner.bots.get(&id))
+                    .map(|bot| bot.profile.clone())
+            });
         labels.push("turn voice");
-        prefix.push(Message::text(Role::System, PREAMBLE, Trust::External));
+        match profile {
+            Some(profile) => {
+                labels.push("bot identity");
+                prefix.push(Message::text(
+                    Role::System,
+                    bot_preamble(&profile),
+                    Trust::External,
+                ));
+            }
+            // The operator sees the model's own words between the tool rows, so the model has to be
+            // told that those words exist and what shape they take.
+            None => prefix.push(Message::text(Role::System, PREAMBLE, Trust::External)),
+        }
         // Memory and project context are assembled against the budget that is left after the
         // transcript, not on top of it.
         // Two-layer context injection:
@@ -1531,6 +1588,34 @@ mod tests {
 
     fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
         ToolCall::new(name, arguments)
+    }
+
+    #[test]
+    fn a_bot_preambles_itself_with_the_operators_standing_instructions() {
+        let profile = crate::types::BotProfile {
+            id: vikram_contracts::BotId::new("bot-one"),
+            name: "Bot One".into(),
+            role: "tag-one, tag-two".into(),
+            description: "described by the operator".into(),
+            icon: None,
+            created_ms: 0,
+            soul: "the standing line this bot carries".into(),
+        };
+        let preamble = bot_preamble(&profile);
+        assert!(preamble.contains("You are Bot One"));
+        assert!(preamble.contains("never introduce yourself as VIKRAM"));
+        assert!(preamble.contains("tag-one, tag-two"));
+        assert!(
+            preamble.contains("the standing line this bot carries"),
+            "the operator's instructions must reach the model: {preamble}"
+        );
+
+        // An empty soul adds nothing — the prompt never claims instructions nobody wrote.
+        let bare = crate::types::BotProfile {
+            soul: String::new(),
+            ..profile
+        };
+        assert!(!bot_preamble(&bare).contains("Standing instructions"));
     }
 
     #[test]
@@ -2978,6 +3063,7 @@ mod tests {
                 description: "reads code".into(),
                 icon: None,
                 created_ms: now_ms(),
+                soul: String::new(),
             },
         )));
         handle

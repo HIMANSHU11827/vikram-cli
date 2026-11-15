@@ -294,6 +294,7 @@ mod cmd_check_tests {
             runtime: None,
             session: None,
             agent: None,
+            bot: None,
             cancel: None,
         };
         let out = TestRunTool
@@ -317,6 +318,7 @@ mod cmd_check_tests {
             runtime: None,
             session: None,
             agent: None,
+            bot: None,
             cancel: None,
         };
         let out = BuildCheck

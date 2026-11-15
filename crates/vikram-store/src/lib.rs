@@ -230,6 +230,9 @@ pub struct BotRow {
     pub description: String,
     pub icon: Option<String>,
     pub created_ms: u64,
+    /// The operator's standing instructions for this bot — its soul. Kept with the row so the bot
+    /// is still itself after a restart, and handed back for editing from the panel.
+    pub soul: String,
 }
 
 /// A HIVE team: a user-named group of saved agent profiles sharing one dedicated conversation.
@@ -762,11 +765,16 @@ impl Store {
         Ok(out)
     }
 
-    /// Recent sessions (active, by updated_ms) with a count of their indexed FTS rows.
+    /// Recent sessions (by updated_ms) with a count of their indexed FTS rows.
+    ///
+    /// A closed tab is still a session with a transcript: it is what the operator dismissed, not
+    /// what they deleted. So this listing keeps `closed` rows — the catalogue uses it to offer them
+    /// back — and excludes only `archived`, which is the deliberate retirement.
     pub fn browse_sessions(&self) -> Result<Vec<(SessionRow, u64)>> {
         let conn = self.lock();
         let sql = format!(
-            "SELECT {SESSION_COLS} FROM sessions WHERE status = 'active' ORDER BY updated_ms DESC"
+            "SELECT {SESSION_COLS} FROM sessions WHERE status <> 'archived' \
+             ORDER BY updated_ms DESC"
         );
         let sessions: Vec<SessionRow> = {
             let mut stmt = conn.prepare(&sql)?;
@@ -1132,6 +1140,23 @@ impl Store {
             params![id.as_str(), model, now_ms as i64],
         )?;
         Ok(())
+    }
+
+    /// The newest session a bot worked in, if it ever did.
+    ///
+    /// Every session row already carries `bot_id`; this is the read side of it, so pressing a bot
+    /// can land in the conversation it owns instead of asking the operator to spawn it again.
+    pub fn session_for_bot(&self, bot: &BotId) -> Result<Option<SessionId>> {
+        let conn = self.lock();
+        let mut found = None;
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT id FROM sessions WHERE bot_id = ?1 AND status <> 'archived' \
+             ORDER BY updated_ms DESC LIMIT 1",
+        ) && let Ok(id) = stmt.query_row(params![bot.as_str()], |r| r.get::<_, String>(0))
+        {
+            found = Some(SessionId::new(id));
+        }
+        Ok(found)
     }
 
     pub fn set_session_bot(&self, id: &SessionId, bot: Option<&BotId>, now_ms: u64) -> Result<()> {
@@ -1575,18 +1600,20 @@ impl Store {
 
     pub fn save_bot(&self, row: &BotRow) -> Result<()> {
         self.lock().execute(
-            "INSERT INTO bots (id, name, role, description, icon, created_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO bots (id, name, role, description, icon, created_ms, soul)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET
                name = excluded.name, role = excluded.role,
-               description = excluded.description, icon = excluded.icon",
+               description = excluded.description, icon = excluded.icon,
+               soul = excluded.soul",
             params![
                 row.id.as_str(),
                 row.name,
                 row.role,
                 row.description,
                 row.icon,
-                row.created_ms as i64
+                row.created_ms as i64,
+                row.soul
             ],
         )?;
         Ok(())
@@ -1595,7 +1622,8 @@ impl Store {
     pub fn list_bots(&self) -> Result<Vec<BotRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, name, role, description, icon, created_ms FROM bots ORDER BY created_ms ASC",
+            "SELECT id, name, role, description, icon, created_ms, soul FROM bots \
+             ORDER BY created_ms ASC",
         )?;
         let rows = stmt
             .query_map([], |row| {
@@ -1606,6 +1634,7 @@ impl Store {
                     description: row.get(3)?,
                     icon: row.get(4)?,
                     created_ms: row.get::<_, i64>(5)? as u64,
+                    soul: row.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3226,6 +3255,11 @@ fn migrate(conn: &Connection) -> Result<()> {
             created_ms  INTEGER NOT NULL
         );
 
+        -- `assistant` was never a tag anyone chose: the create-bot prompt wrote it into every
+        -- profile that was submitted without one, and the panel then announced it as if the bot had
+        -- picked it. The fallback is gone, and this clears the word it already left behind.
+        UPDATE bots SET role = '' WHERE role = 'assistant';
+
         CREATE TABLE IF NOT EXISTS hive_rosters (
             id          TEXT PRIMARY KEY,
             name        TEXT NOT NULL,
@@ -3504,6 +3538,17 @@ fn migrate(conn: &Connection) -> Result<()> {
     // Fork provenance: which session this one was forked from.
     ensure_column(conn, "sessions", "forked_from", "TEXT")?;
     ensure_column(conn, "entities", "title", "TEXT NOT NULL DEFAULT ''")?;
+    // The words a bot was given. `soul.md` is what the operator calls it; the row keeps the text so
+    // the bot is still itself after a restart and the panel can hand it back for editing.
+    ensure_column(conn, "bots", "soul", "TEXT NOT NULL DEFAULT ''")?;
+    // Bots used to be spawned with a task nobody wrote, and the session took its title from that
+    // task. Those sessions are not conversations anyone had, so they are archived instead of being
+    // reopened every time the operator clicks the bot. Idempotent, and only touches bot sessions.
+    conn.execute(
+        "UPDATE sessions SET status = 'archived' \
+         WHERE bot_id IS NOT NULL AND title LIKE '%Awaiting assign%'",
+        [],
+    )?;
     ensure_column(
         conn,
         "entities",
@@ -4042,6 +4087,7 @@ mod tests {
             description: "builds".into(),
             icon: None,
             created_ms: 1,
+            soul: String::new(),
         };
         store.save_bot(&row).unwrap();
         row.description = "builds carefully".into();
@@ -4049,6 +4095,12 @@ mod tests {
         let listed = store.list_bots().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].description, "builds carefully");
+
+        // The standing instructions ride with the same row, so a bot is still itself after a restart.
+        row.soul = "review every diff before you build".into();
+        store.save_bot(&row).unwrap();
+        let listed = store.list_bots().unwrap();
+        assert_eq!(listed[0].soul, "review every diff before you build");
     }
 
     #[test]
