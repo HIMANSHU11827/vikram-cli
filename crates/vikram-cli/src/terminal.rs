@@ -1139,40 +1139,32 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
         PickerKind::Skill => {
             let snapshot = handle.snapshot();
             let skills = handle.skill_list();
-            let mut items = vec![
-                PickerItem::new(
-                    format!(
-                        "{} discovered · {} loaded this turn",
-                        snapshot.metrics.skills_discovered, snapshot.metrics.skills_loaded
-                    ),
-                    String::new(),
-                    "summary".to_owned(),
-                ),
-                PickerItem::new(
-                    "! bodies are read on demand, never scanned into context".to_owned(),
-                    String::new(),
-                    "hint".to_owned(),
-                ),
-            ];
-            if skills.is_empty() {
-                items.push(PickerItem::new(
-                    "no skill directories found".to_owned(),
-                    String::new(),
-                    "empty".to_owned(),
-                ));
-            } else {
-                for skill in &skills {
-                    let status = if skill.enabled { "on" } else { "off" };
-                    let detail = if skill.description.is_empty() {
-                        format!("{} · {}", skill.scope, status)
-                    } else {
-                        format!("{} · {} · {}", skill.description, skill.scope, status)
-                    };
-                    let item = PickerItem::new(skill.name.clone(), detail, skill.name.clone());
-                    items.push(item);
-                }
+            // The counts and the `read on demand` reassurance are a header, not rows. As rows they
+            // were counted and selectable: an empty panel reported two skills it did not have, and
+            // Enter acted on the pseudo-id `summary`. The note carries them, and says plainly when
+            // no directory held a skill.
+            let mut items = Vec::new();
+            for skill in &skills {
+                let status = if skill.enabled { "on" } else { "off" };
+                let detail = if skill.description.is_empty() {
+                    format!("{} · {}", skill.scope, status)
+                } else {
+                    format!("{} · {} · {}", skill.description, skill.scope, status)
+                };
+                items.push(PickerItem::new(skill.name.clone(), detail, skill.name.clone()));
             }
-            app.open_picker(Picker::new(kind, "Skills", items));
+            let note = if skills.is_empty() {
+                format!(
+                    "no skill directories found · {} discovered · {} loaded this turn",
+                    snapshot.metrics.skills_discovered, snapshot.metrics.skills_loaded
+                )
+            } else {
+                format!(
+                    "{} discovered · {} loaded this turn · bodies are read on demand, never scanned",
+                    snapshot.metrics.skills_discovered, snapshot.metrics.skills_loaded
+                )
+            };
+            app.open_picker(Picker::new(kind, "Skills", items).with_note(note));
         }
         PickerKind::File => input::open_file_picker(app),
         PickerKind::Shell => input::open_shell_picker(app),
@@ -1218,12 +1210,9 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                 format!("keep ${} and type a base URL", config.api_key_env),
                 CUSTOM_PROVIDER.to_owned(),
             ));
-            items.push(PickerItem::new(
-                "! the key itself is never stored here: it lives in $VIKRAM_HOME/.env",
-                String::new(),
-                "hint".to_owned(),
-            ));
-            let mut picker = Picker::new(kind, "Provider", items);
+            // The reassurance was a row, so the panel counted it as a provider you could pick.
+            let mut picker = Picker::new(kind, "Provider", items)
+                .with_note("the key itself is never stored here: it lives in $VIKRAM_HOME/.env");
             // Open on the endpoint in force, which is the answer to "where am I pointed?" without
             // reading every row.
             if let Some(current) = PROVIDERS
@@ -1295,11 +1284,10 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
         }
         PickerKind::Tools => {
             let names = handle.tools().names();
-            let mut items = vec![PickerItem::new(
-                format!("{} tool(s) registered", names.len()),
-                String::new(),
-                "count".to_owned(),
-            )];
+            // The count is a header, not a row: as a row it was selectable, and both dispatch arms
+            // had to special-case the pseudo-id `count` so nothing acted on it.
+            let count = names.len();
+            let mut items = Vec::new();
             for name in names {
                 let enabled = handle.tools().is_enabled(&name);
                 let desc = handle
@@ -1315,7 +1303,9 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                 };
                 items.push(PickerItem::new(name.clone(), detail, name.clone()));
             }
-            app.open_picker(Picker::new(kind, "Tools", items));
+            app.open_picker(
+                Picker::new(kind, "Tools", items).with_note(format!("{count} tool(s) registered")),
+            );
         }
         PickerKind::Background => {
             // The daemon is a separate process with its own rows in the same database, so this
@@ -1487,12 +1477,6 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                     format!("{}", view.tokens.calls),
                     "calls".to_owned(),
                 ));
-            } else {
-                items.push(PickerItem::new(
-                    "no session is selected".to_owned(),
-                    String::new(),
-                    "error".to_owned(),
-                ));
             }
             if let Some(rate) = metrics.tokens_per_sec {
                 items.push(PickerItem::new(
@@ -1501,15 +1485,18 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                     "rate".to_owned(),
                 ));
             }
-            items.push(PickerItem::new(
-                "! reported numbers come from the provider; estimates never bill".to_owned(),
-                String::new(),
-                "hint".to_owned(),
-            ));
-            app.open_picker(Picker::new(kind, "Usage", items));
+            // Neither sentence is a metric: as rows they were counted and selectable, and Enter
+            // acted on the pseudo-ids `error` and `hint`. The note carries the one that applies.
+            let note = if app.display_session().is_some() {
+                "reported numbers come from the provider; estimates never bill"
+            } else {
+                "no session is selected"
+            };
+            app.open_picker(Picker::new(kind, "Usage", items).with_note(note));
         }
         PickerKind::Context => {
             let metrics = handle.snapshot().metrics;
+            let mut note: Option<String> = None;
             let mut items = vec![PickerItem::new(
                 "used",
                 format!(
@@ -1594,13 +1581,16 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                     "reserve".to_owned(),
                 ));
             } else {
-                items.push(PickerItem::new(
-                    "! no request has gone out yet: these are totals, not one prompt".to_owned(),
-                    String::new(),
-                    "hint".to_owned(),
-                ));
+                // The sentence is not a measurement: as a row it was counted beside the real
+                // numbers and Enter acted on the pseudo-id `hint`. It belongs in the note.
+                note = Some(
+                    "no request has gone out yet: these are totals, not one prompt".to_owned(),
+                );
             }
-            app.open_picker(Picker::new(kind, "Context", items));
+            app.open_picker(match note {
+                Some(note) => Picker::new(kind, "Context", items).with_note(note),
+                None => Picker::new(kind, "Context", items),
+            });
         }
         PickerKind::Doctor => {
             let checks = crate::doctor::checks(&handle.config());
@@ -2166,10 +2156,6 @@ fn apply_act(
             );
         }
         (PickerKind::Tools, Verb::Choose) => {
-            // The "N tool(s) registered" row is a count, not a tool.
-            if value == "count" {
-                return;
-            }
             if let Some(tool) = handle.tools().get(&value) {
                 let spec = tool.spec();
                 let mut lines = Vec::new();
@@ -2187,10 +2173,6 @@ fn apply_act(
             }
         }
         (PickerKind::Tools, Verb::Toggle) => {
-            // Toggling the count row used to persist a tool literally named `count` as disabled.
-            if value == "count" {
-                return;
-            }
             let enabled = handle.tools().is_enabled(&value);
             if enabled {
                 handle.tools().tool_disable(&value);

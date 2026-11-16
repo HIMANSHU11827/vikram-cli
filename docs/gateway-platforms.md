@@ -18,6 +18,10 @@ frozen `Transport` seam (`src/transport.rs`): build an `HttpRequest`, receive an
 That is what makes every adapter testable offline with a mock transport. Chunking is
 `helpers::truncate_message` (fence-aware); retries belong to `delivery::DeliveryLedger`; access
 decisions belong to `access::authorize_source`; chat/thread → session keys belong to `routing`.
+Every inbound platform event passes `authorize_source` before it can reach the runtime —
+default-deny. Allow remote senders with `GATEWAY_ALLOW_ALL_USERS=true`, `GATEWAY_ALLOWED_USERS`,
+per-platform `<PLATFORM>_ALLOWED_USERS` / `<PLATFORM>_ALLOW_ALL_USERS` / `<PLATFORM>_GROUP_ALLOWED_CHATS`
+/ `<PLATFORM>_ALLOW_BOTS`, or pairing approvals stored under `$VIKRAM_HOME/pairing`.
 
 ## Inventory
 
@@ -34,7 +38,7 @@ decisions belong to `access::authorize_source`; chat/thread → session keys bel
 | 9 | google_chat | 2,585 | webhook | `GOOGLE_CHAT_SERVICE_ACCOUNT_JSON` | `chat.googleapis.com/v1` | 4000 | **ported** (9 tests, webhook mode) |
 | 10 | buzz | 2,244 | relay WS / HTTP | `BUZZ_RELAY_URL`, `BUZZ_PRIVATE_KEY` | relay | — | **ported + wired** (46 tests, BIP-340 via k256) |
 | 11 | wecom | 2,171 | WS / callback | `WECOM_BOT_ID`, `WECOM_SECRET` | `wss://openws.work.weixin.qq.com` | 4000 | **ported** (7 tests) |
-| 12 | a2a | 2,115 | HTTP server / webhook | none (bearer optional, not enforced yet) | own host/port | — | **ported** (20 tests, engine + `/a2a`) |
+| 12 | a2a | 2,115 | HTTP server / webhook | `A2A_TOKEN` | own host/port | — | **ported** (20 tests, engine + `/a2a`) |
 | 13 | signal | 1,658 | `signal-cli` REST | `SIGNAL_HTTP_URL`, `SIGNAL_ACCOUNT` | local signal-cli HTTP | 8000 | **ported** (18 tests) |
 | 14 | whatsapp | 1,545 | Baileys bridge (HTTP) | `WHATSAPP_ENABLED` | `127.0.0.1:3000` bridge | 4096 | **ported** (9 tests) |
 | 15 | whatsapp_cloud | 1,538 | webhook | `WHATSAPP_CLOUD_*` | `graph.facebook.com` | 4096 | **ported** (10 tests) |
@@ -169,7 +173,7 @@ Run it with `GATEWAY_WEBHOOK_BIND=host:port`:
 | `/feishu` | `FEISHU_APP_ID`, `FEISHU_APP_SECRET`, `FEISHU_VERIFICATION_TOKEN` (+ `FEISHU_API_BASE`) | `header.token` must match; `url_verification` challenge is answered |
 | `/line` | `LINE_CHANNEL_ACCESS_TOKEN`, `LINE_CHANNEL_SECRET` | `X-Line-Signature` HMAC-SHA256 over the raw body |
 | `/slack` | `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET` (+ `SLACK_API_BASE`) | `X-Slack-Signature` `v0=` HMAC-SHA256 over `v0:{timestamp}:{body}`; `url_verification` challenge answered |
-| `/a2a` | none | JSON-RPC 2.0; `message/send` returns a submitted task, the reply is visible via `tasks/get` |
+| `/a2a` | `A2A_TOKEN` | JSON-RPC 2.0; `message/send` returns a submitted task, the reply is visible via `tasks/get`; bearer token required (403 when unset) |
 | `/.well-known/agent.json` (GET) | none | serves the A2A agent card |
 | `/google_chat` | `GOOGLE_CHAT_WEBHOOK_URL`, `GOOGLE_CHAT_PROJECT_NUMBER` | Google-signed JWT (`Authorization`), aud = project number |
 | `/teams` | `TEAMS_TENANT_ID`, `TEAMS_CLIENT_ID`, `TEAMS_CLIENT_SECRET` | Bot Framework JWT (`Authorization`), aud = client id |
