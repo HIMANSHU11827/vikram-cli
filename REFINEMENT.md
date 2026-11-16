@@ -96,3 +96,20 @@ now DONE (see batches 11-17). Still genuinely open: bots pane chip keyboard path
 verification of two pending approvals, `vikram chat` stdin-blocking with no message, DeliveryLedger
 wiring decision, context estimator anchor drift, shell process-group kill, `cron add` two-write,
 systemic zero-row Ok returns in vikram-store.
+
+## 2026-11-16 — batches 18-21 (commits 564f7d4…4bad80b, subagent-driven)
+
+- daemon: claim/settle/settle_cancelled/skip_run/adopt_orphans atomic; Once-job disable on refusal; enable persists next_run; Delivery::Rerouted for fallback posts; heartbeat consecutive streaks + stale stamp cleanup; store errors propagate to tick log.
+- runtime: PTY sandbox binds workspace_root not model cwd (was full-host RW escape); duplicated inner_shell removed; wrapped PTY gets cwd; verify/test_run/build_check honour sandbox; shared wait_with_timeout kills process group + deadline drain (no more hangs or orphaned grandchildren); spawn failure ≠ timeout; verify max_attempts honest 1; TestRun pnpm; dead git commit arm removed.
+- computer/process: ydotool hex click codes (Wayland clicks were silent no-ops); screenshot/ocr path confinement via canonical_resource; scroll "at the pointer"; process kill records pid, rejects pid<=0.
+- tui: wheel scrolls only under cursor & swallowed by modals; arrow keys scroll at selection boundary; PgUp/PgDn = viewport page; selection maps columns→chars (wide glyphs) and can't start on chrome.
+
+## Still open
+
+- DeliveryLedger in vikram-gateway dead code — wire or remove (architectural).
+- Context estimator anchor not cleared on in-place prune path (runtime.rs ~1256 replace_messages without anchor=None).
+- Bots pane chips keyboard path.
+- Store: zero-row Ok returns systemic (CLI checks are stopgap).
+- coalesce_overdue/stale_slot still two-write (daemon agent skipped, not in verified list).
+- Legacy heartbeat.reported keys orphaned (bounded).
+- computer.screenshot ActionKind Execute→Write judgment call — revisit if policy surprises.
