@@ -1548,8 +1548,8 @@ fn entities(action: EntitiesAction) -> std::process::ExitCode {
                     created_ms: now,
                     updated_ms: now,
                 };
-                store.save_entity(&row).map_err(|e| e.to_string())?;
-                // Scaffold context files.
+                // Scaffold first, then save: a row that exists without its context files is a
+                // worse failure than a directory that outlives a failed insert.
                 let base = vikram_runtime::config::vikram_home();
                 let dir = base.join(ek.folder()).join(&slug);
                 let loader = vikram_runtime::ContextLoader::new(
@@ -1557,14 +1557,21 @@ fn entities(action: EntitiesAction) -> std::process::ExitCode {
                     std::env::current_dir().unwrap_or_default(),
                 );
                 loader.scaffold_entity(&dir, &row.name, ek.as_str(), &row.title)?;
+                store.save_entity(&row).map_err(|e| e.to_string())?;
                 println!("{}", row.id);
             }
             EntitiesAction::Rm { id } => {
                 let id = vikram_contracts::EntityId::new(id);
-                if store.get_entity(&id).map_err(|e| e.to_string())?.is_none() {
+                let Some(row) = store.get_entity(&id).map_err(|e| e.to_string())? else {
                     return Err(format!("entity {id} not found"));
-                }
+                };
                 store.delete_entity(&id).map_err(|e| e.to_string())?;
+                // The scaffold directory is the entity's workspace; leaving it behind orphans
+                // files nothing references. Best-effort: the row is already gone either way.
+                let dir = vikram_runtime::config::vikram_home()
+                    .join(row.kind.folder())
+                    .join(&row.slug);
+                let _ = std::fs::remove_dir_all(&dir);
                 println!("removed {id}");
             }
             EntitiesAction::Enable { id } => entity_set_status(&store, &id, true)?,
