@@ -1187,6 +1187,11 @@ fn projects(action: ProjectAction) -> std::process::ExitCode {
             }
             ProjectAction::Disconnect { session } => {
                 let id = vikram_contracts::SessionId::new(session);
+                // set_session_project returns Ok on zero rows, so without this check a typo'd id
+                // prints "disconnected" for a session that never existed.
+                if store.get_session(&id).map_err(|e| e.to_string())?.is_none() {
+                    return Err(format!("session {id} not found"));
+                }
                 workspace
                     .disconnect_project(&id)
                     .map_err(|e| e.to_string())?;
