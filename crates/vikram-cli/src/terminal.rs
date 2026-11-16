@@ -182,23 +182,35 @@ fn apply_terminal_event(app: &mut App, event: Event) {
         }
         Event::Mouse(mouse) => match mouse.kind {
             // The wheel scrolls whatever is under the cursor: an open panel moves its cursor,
-            // otherwise the conversation scrolls. A panel that ignored the wheel would look frozen.
-            MouseEventKind::ScrollUp => {
-                if let Some(Overlay::Picker(picker)) = &mut app.overlay {
-                    picker.move_by(-2);
-                } else if let Some(Overlay::Skills { scroll }) = &mut app.overlay {
-                    *scroll = scroll.saturating_sub(3);
-                } else {
-                    app.scroll_up(3);
-                }
-            }
-            MouseEventKind::ScrollDown => {
-                if let Some(Overlay::Picker(picker)) = &mut app.overlay {
-                    picker.move_by(2);
-                } else if let Some(Overlay::Skills { scroll }) = &mut app.overlay {
-                    *scroll = scroll.saturating_add(3);
-                } else {
-                    app.scroll_down(3);
+            // the transcript moves only when the pointer is inside it, and a panel with no wheel
+            // of its own swallows the event so the transcript behind it cannot drift unseen.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                match app.overlay.as_mut() {
+                    Some(Overlay::Picker(picker)) => picker.move_by(if up { -2 } else { 2 }),
+                    Some(Overlay::Skills { scroll }) => {
+                        *scroll = if up {
+                            scroll.saturating_sub(3)
+                        } else {
+                            scroll.saturating_add(3)
+                        };
+                    }
+                    Some(_) => {}
+                    None => {
+                        let inside = app.conversation_rect.is_some_and(|(x, y, w, h)| {
+                            mouse.column >= x
+                                && mouse.column < x.saturating_add(w)
+                                && mouse.row >= y
+                                && mouse.row < y.saturating_add(h)
+                        });
+                        if inside {
+                            if up {
+                                app.scroll_up(3);
+                            } else {
+                                app.scroll_down(3);
+                            }
+                        }
+                    }
                 }
             }
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
@@ -335,9 +347,19 @@ fn apply_terminal_event(app: &mut App, event: Event) {
                         app.focus = vikram_tui::app::Focus::Conversation;
                     }
                 }
-                // Nothing else claimed the press, so it starts a drag. A press that never moves
+                // Nothing else claimed the press, so it starts a drag — but only inside the
+                // transcript. A drag begun on the input box, the tab strip or the status bar
+                // would copy chrome the operator never meant to take. A press that never moves
                 // selects nothing and copies nothing.
-                app.selection = Some(vikram_tui::app::Selection::new((x, mouse.row)));
+                if app.overlay.is_none()
+                    && let Some((cx, cy, cw, ch)) = app.conversation_rect
+                    && mouse.row >= cy
+                    && mouse.row < cy.saturating_add(ch)
+                    && x >= cx
+                    && x < cx.saturating_add(cw)
+                {
+                    app.selection = Some(vikram_tui::app::Selection::new((x, mouse.row)));
+                }
             }
             MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
                 if let Some(selection) = &mut app.selection {

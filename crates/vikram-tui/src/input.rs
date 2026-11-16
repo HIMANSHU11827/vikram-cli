@@ -247,11 +247,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         KeyCode::PageUp => {
-            app.scroll_up(10);
+            let page = app.page_lines();
+            app.scroll_up(page);
             return true;
         }
         KeyCode::PageDown => {
-            app.scroll_down(10);
+            let page = app.page_lines();
+            app.scroll_down(page);
             return true;
         }
         KeyCode::Esc => {
@@ -505,7 +507,13 @@ fn handle_conversation(app: &mut App, key: KeyEvent) -> bool {
                 if !session.activity.is_empty() {
                     let last = session.activity.len() - 1;
                     let cur = session.selected_activity.unwrap_or(last);
-                    session.selected_activity = Some(cur.saturating_sub(1));
+                    // At the top of the list the key belongs to the transcript again: a
+                    // selection that can never leave index 0 would trap every Up press.
+                    if cur == 0 {
+                        app.scroll_up(1);
+                    } else {
+                        session.selected_activity = Some(cur - 1);
+                    }
                 } else {
                     app.scroll_up(1);
                 }
@@ -517,7 +525,11 @@ fn handle_conversation(app: &mut App, key: KeyEvent) -> bool {
                 if !session.activity.is_empty() {
                     let last = session.activity.len() - 1;
                     let cur = session.selected_activity.unwrap_or(0);
-                    session.selected_activity = Some((cur + 1).min(last));
+                    if cur >= last {
+                        app.scroll_down(1);
+                    } else {
+                        session.selected_activity = Some(cur + 1);
+                    }
                 } else {
                     app.scroll_down(1);
                 }
@@ -525,11 +537,13 @@ fn handle_conversation(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         KeyCode::PageUp => {
-            app.scroll_up(10);
+            let page = app.page_lines();
+            app.scroll_up(page);
             true
         }
         KeyCode::PageDown => {
-            app.scroll_down(10);
+            let page = app.page_lines();
+            app.scroll_down(page);
             true
         }
         KeyCode::End => {

@@ -946,6 +946,11 @@ pub struct App {
     /// The last drawn frame as plain text, one string per row. A drag copies from this, because the
     /// cells on screen are exactly what the operator pointed at.
     pub screen: Vec<String>,
+    /// For each captured row, the `(char start, char end)` of the grapheme covering every display
+    /// column. A wide glyph or a combining mark makes chars and columns disagree, and a drag names
+    /// columns, so `selection_text` slices through this map. Rows filled by hand (tests) leave it
+    /// empty and the slice falls back to one char per column.
+    pub screen_cells: Vec<Vec<(u32, u32)>>,
     /// Text a copy produced, waiting for the host to hand it to the system clipboard.
     pub clipboard: Option<String>,
 }
@@ -1000,6 +1005,7 @@ impl App {
             thought_hits: Vec::new(),
             selection: None,
             screen: Vec::new(),
+            screen_cells: Vec::new(),
             clipboard: None,
         }
     }
@@ -1009,13 +1015,29 @@ impl App {
     pub fn capture_screen(&mut self, buffer: &ratatui::buffer::Buffer) {
         let area = buffer.area;
         self.screen.clear();
+        self.screen_cells.clear();
         self.screen.reserve(area.height as usize);
+        self.screen_cells.reserve(area.height as usize);
         for y in area.y..area.y.saturating_add(area.height) {
             let mut row = String::with_capacity(area.width as usize);
+            let mut cells = Vec::with_capacity(area.width as usize);
+            let mut chars = 0usize;
             for x in area.x..area.x.saturating_add(area.width) {
-                row.push_str(buffer[(x, y)].symbol());
+                let symbol = buffer[(x, y)].symbol();
+                if symbol.is_empty() {
+                    // The trailing cell of a wide glyph carries no text; it covers the same
+                    // chars as the column before it.
+                    let span = cells.last().copied().unwrap_or((0, 0));
+                    cells.push(span);
+                } else {
+                    let start = chars;
+                    chars += symbol.chars().count();
+                    cells.push((start as u32, chars as u32));
+                    row.push_str(symbol);
+                }
             }
             self.screen.push(row);
+            self.screen_cells.push(cells);
         }
     }
 
@@ -1035,9 +1057,24 @@ impl App {
             let Some(line) = self.screen.get(y as usize) else {
                 continue;
             };
-            let len = line.chars().count();
-            let start = (start as usize).min(len);
-            let end = (end as usize).saturating_add(1).min(len);
+            // `start`/`end` are display columns while `line` is chars: a wide glyph or a
+            // combining mark makes the two counts disagree, so slice through the capture's
+            // column map when there is one. A hand-filled screen has none and keeps char
+            // indexing, which is exact for the ASCII rows the tests use.
+            let (start, end) = match self.screen_cells.get(y as usize) {
+                Some(cells) if !cells.is_empty() => {
+                    let last = cells.len() - 1;
+                    let s = (start as usize).min(last);
+                    let e = (end as usize).min(last);
+                    (cells[s].0 as usize, cells[e].1 as usize)
+                }
+                _ => {
+                    let len = line.chars().count();
+                    let s = (start as usize).min(len);
+                    let e = (end as usize).saturating_add(1).min(len);
+                    (s, e)
+                }
+            };
             if start >= end {
                 continue;
             }
@@ -1869,6 +1906,15 @@ impl App {
             session.unread = 0;
         }
         self.focus = Focus::Input;
+    }
+
+    /// One page of transcript: the conversation viewport less a margin, so a page turn always
+    /// overlaps what was on screen and the operator keeps their bearings. Falls back to a fixed
+    /// page before the first draw has measured the pane.
+    pub fn page_lines(&self) -> usize {
+        self.conversation_rect
+            .map(|(_, _, _, height)| (height as usize).saturating_sub(2).max(1))
+            .unwrap_or(10)
     }
 
     pub fn scroll_up(&mut self, lines: usize) {
