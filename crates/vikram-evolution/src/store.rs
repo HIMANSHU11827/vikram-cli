@@ -358,7 +358,9 @@ impl EvolutionStore {
     }
     pub fn list_pending_jobs(&self) -> Result<Vec<ReflectionJob>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare("SELECT id,experience_id,agent_id,status,attempts,created_ms,updated_ms,error FROM reflection_jobs WHERE status IN ('pending','running','failed') ORDER BY created_ms ASC")
+        // `failed` is deliberately absent: process_pending retries whatever this returns, and a
+        // failed job belongs to list_failed_jobs — counting it as pending retried it forever.
+        let mut stmt = conn.prepare("SELECT id,experience_id,agent_id,status,attempts,created_ms,updated_ms,error FROM reflection_jobs WHERE status IN ('pending','running') ORDER BY created_ms ASC")
             .map_err(|e| EvolutionError::Store(e.to_string()))?;
         let rows = stmt
             .query_map([], map_job)

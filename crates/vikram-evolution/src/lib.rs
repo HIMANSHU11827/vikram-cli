@@ -26,12 +26,11 @@
 //! # Background runner
 //!
 //! There is no implicit thread: [`EvolutionEngine::recover_and_process`]
-//! drains reflection jobs synchronously and is what the runtime calls on
-//! boot (recovery) and after turn-end recording; a host that wants a
-//! background loop can `spawn` a task that calls it periodically. See
-//! `vikram-runtime`'s `Runtime::boot`, which calls it before serving,
-//! and `learning::on_turn_end`, which invokes evolution on every
-//! tool-bearing turn.
+//! drains reflection jobs synchronously. A host that wants a background
+//! loop can `spawn` a task that calls it periodically — nothing calls it
+//! today, so queued reflection jobs wait for an explicit caller.
+//! `learning::on_turn_end` is the one wired path: it records experience
+//! and runs reflection synchronously on every tool-bearing turn.
 //!
 //! # Store trait
 //!
