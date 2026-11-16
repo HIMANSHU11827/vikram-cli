@@ -869,6 +869,7 @@ async fn steer_cmd(config: Config, id: String, text: String) -> Result<(), Strin
     let handle = rt.handle();
     let sid = vikram_contracts::SessionId::new(id);
     handle.steer(&sid, text).map_err(|e| e.to_string())?;
+    println!("steered {sid}");
     Ok(())
 }
 
@@ -1332,7 +1333,7 @@ fn bots(action: BotsAction) -> std::process::ExitCode {
             BotsAction::List => {
                 let rows = store.list_bots().map_err(|e| e.to_string())?;
                 if rows.is_empty() {
-                    println!("no bots configured (they are seeded on first run of `vikram`)");
+                    println!("no bots yet — `vikram bots new <name>` creates one");
                 }
                 for row in rows {
                     println!("{:<24} {:<14} {}", row.name, row.role, row.description);
@@ -1942,7 +1943,7 @@ fn learning(action: LearningAction) -> std::process::ExitCode {
             }
             LearningAction::Show { id } => match mgr.find_proposal(&id) {
                 Some(p) => println!("{}", serde_json::to_string_pretty(&p).unwrap_or_default()),
-                None => println!("not found"),
+                None => return Err(format!("proposal `{id}` not found")),
             },
             LearningAction::Approve { id } => {
                 if let Some(p) = mgr.find_proposal(&id) {
@@ -1980,12 +1981,21 @@ fn learning(action: LearningAction) -> std::process::ExitCode {
                 }
             }
             LearningAction::Reject { id } => {
+                // `set_proposal_status` silently no-ops on an unknown id; saying "rejected" for a
+                // proposal that never existed is a lie the audit log would repeat.
+                if mgr.find_proposal(&id).is_none() {
+                    return Err(format!("proposal `{id}` not found"));
+                }
                 mgr.set_proposal_status(&id, "rejected");
                 mgr.save();
                 println!("rejected {id}");
             }
             LearningAction::History => {
-                for e in mgr.audit_log() {
+                let entries = mgr.audit_log();
+                if entries.is_empty() {
+                    println!("no learning events yet");
+                }
+                for e in entries {
                     println!(
                         "{}  {}  {}  {}  {}",
                         e.ts_ms, e.kind, e.action, e.target, e.outcome
@@ -2639,7 +2649,10 @@ fn config_command(action: ConfigAction, mut config: Config) -> std::process::Exi
                 }
             };
             match parsed.and_then(|_| config.save().map_err(|_| "could not write config")) {
-                Ok(()) => std::process::ExitCode::SUCCESS,
+                Ok(()) => {
+                    println!("set {key}");
+                    std::process::ExitCode::SUCCESS
+                }
                 Err(err) => {
                     eprintln!("vikram: {err}");
                     std::process::ExitCode::FAILURE
