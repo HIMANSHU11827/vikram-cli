@@ -53,8 +53,19 @@ impl WorkspaceManager {
     pub fn ensure_session_workspace(&self, session: &SessionId) -> Result<PathBuf> {
         let path = self.session_root(session).join("workspace");
         fs::create_dir_all(&path)?;
-        self.store
-            .set_session_workspace(session, "session", Some(&path), None, now_ms())?;
+        // A project-owned session keeps its project workspace row: rewriting mode to "session"
+        // here would leave sessions.project_id pointing at the project while resolution quietly
+        // moved to the session directory.
+        let project_owned = self
+            .store
+            .get_session_workspace(session)
+            .ok()
+            .flatten()
+            .is_some_and(|w| w.mode == "project");
+        if !project_owned {
+            self.store
+                .set_session_workspace(session, "session", Some(&path), None, now_ms())?;
+        }
         Ok(path)
     }
 
