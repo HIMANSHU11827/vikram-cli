@@ -363,6 +363,16 @@ impl SessionRuntime {
             eprintln!("vikram: session messages lock mutex poisoned; recovering");
             e.into_inner()
         }) = messages;
+        // The measured baseline described the transcript that no longer exists. Any wholesale
+        // replacement — fold, prune, drop — invalidates it, so it is cleared here rather than
+        // trusting each caller to remember.
+        self.context
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session context lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .anchor = None;
         self.updated_ms.store(now_ms, Ordering::Relaxed);
     }
 
