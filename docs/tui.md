@@ -184,9 +184,14 @@ the rectangle the mouse answers to, recorded during draw:
 - bot rows and controls → `app.bot_hits`
 - foldable activity rows → `app.thought_hits` / `fold_at`
 - picker rows → `app.picker_x` / `picker_rows`
+- suggestion rows → `app.suggestion_rows` (accept like Tab)
+- autocomplete candidates, history-search matches, approval request rows → `app.overlay_clicks`
+- bots pane / transcript bodies → `app.bots_rect` / `app.conversation_rect` (a press focuses the pane)
 - overlay bounds → `app.overlay_rect`, used to dismiss a read-only panel on an outside press
 
-Scroll wheel scrolls the transcript, or the picker list when one is open.
+Scroll wheel scrolls the transcript, or the picker list when one is open. Clicking inside the
+bots pane or the transcript hands it the keyboard (`Esc`/`Tab` or any unhandled key returns to
+the composer), which is what makes the pane keys below reachable.
 
 A press that lands on a band whose panel is empty does not vanish: it raises the same notice the
 keyboard does.
