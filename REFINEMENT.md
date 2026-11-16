@@ -53,11 +53,12 @@ Each entry: what was broken, what changed, how it was verified.
 - Editor doc_home/doc_end; Ctrl+Home/End now reach draft ends (were line-level duplicates).
 - /keys Ctrl+R description fixed; docs/tui.md approvals row matches real bindings.
 
-## In flight (subagents)
+## 2026-11-16 — batches 8-10 (commits 0c2e206, e36ea3e, 5f016c1)
 
-- store/daemon/gateway: session_fts orphan cleanup + fork re-key, DeliveryLedger::mark_partial/mark_failed state guards, Daemon tick error logging, recover_interrupted_session error propagation, delete_bot reference cleanup.
-- CLI: chat picks most-recent session, config set mode availability refusal, existence checks before success prints on rm/rename verbs, cron edit --enable --disable conflict.
-- runtime: hive.delegate real delegation or honest output, browser tool resources include action details, ContextLoader budget truncation + omitted-sections marker.
+- store: session deletes purge session_fts; fork_session copies fts/workspace/usage; recover_interrupted_session propagates errors; delete_bot clears references in one transaction.
+- gateway: DeliveryLedger mark_partial/mark_failed state guards; daemon tick errors logged.
+- cli: chat picks most-recent session; config set mode enforces availability refusal; mutating verbs verify ids before printing success; cron edit rejects --enable+--disable.
+- runtime: hive.delegate really delegates via spawn_agent; browser tool approvals carry action details; ContextLoader truncates to budget + reports omissions.
 
 ## Open / next
 
