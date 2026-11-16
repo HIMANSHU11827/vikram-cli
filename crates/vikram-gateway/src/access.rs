@@ -416,14 +416,9 @@ pub fn authorize_source(
     if input.allow_adapter_delegation && input.role_authorized {
         return true;
     }
-    // 6. Operator-approved pairing code.
-    if let Some(store) = pairing
-        && store.is_approved(platform_value, user_id)
-    {
-        return true;
-    }
 
-    // 7. Assembled allowlists.
+    // The assembled allowlists are resolved before pairing so `allowlist_suppresses_pairing`
+    // can tell a configured list from an absent one.
     let platform_allowlist = input
         .spec
         .allowed_users_env
@@ -443,6 +438,24 @@ pub fn authorize_source(
         .filter(|_| is_forum)
         .and_then(|k| env.get(k));
     let global_allowlist = env.get(GLOBAL_ALLOWED_ENV);
+
+    // 6. Operator-approved pairing code — unless the platform asked for an explicit allowlist to
+    // be the only door: a pairing approval must not widen a list the operator bothered to write.
+    let allowlist_configured = [
+        &platform_allowlist,
+        &group_user_allowlist,
+        &group_chat_allowlist,
+        &global_allowlist,
+    ]
+    .iter()
+    .any(|list| list.is_some());
+    let pairing_suppressed = input.spec.allowlist_suppresses_pairing && allowlist_configured;
+    if !pairing_suppressed
+        && let Some(store) = pairing
+        && store.is_approved(platform_value, user_id)
+    {
+        return true;
+    }
 
     if platform_allowlist.is_none()
         && group_user_allowlist.is_none()

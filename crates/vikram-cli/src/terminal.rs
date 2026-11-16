@@ -1081,10 +1081,9 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
             let items: Vec<PickerItem> = entries
                 .iter()
                 .map(|(scope, key, value)| {
-                    let preview: String = value.chars().take(40).collect();
                     PickerItem::new(
                         key.clone(),
-                        format!("{scope} · {preview}"),
+                        format!("{scope} · {}", memory_preview(value)),
                         format!("{scope}{MEMORY_SEPARATOR}{key}"),
                     )
                 })
@@ -1851,6 +1850,35 @@ const PROVIDERS: &[ProviderPreset] = &[
 
 fn has_no_rows(picker: &Picker) -> bool {
     picker.items.is_empty()
+}
+
+/// What a remembered value actually says.
+///
+/// The store keeps a JSON envelope (`kind`, `key`, `value`, `evidence`, `confidence`, `source`), so
+/// a raw prefix of it showed the envelope instead of the memory: the row read
+/// `{"kind":"preference","key":"communicatio` and never reached `prefers concise answers`. The
+/// remembered text is the point, so the envelope is unwrapped when there is one and the raw string
+/// is used when there is not. Whitespace is flattened because a row is one line, and a value that
+/// does not fit ends in an ellipsis instead of being cut mid-word with no sign that anything is gone.
+fn memory_preview(value: &str) -> String {
+    const FIELDS: [&str; 5] = ["value", "content", "text", "summary", "note"];
+    let text = serde_json::from_str::<serde_json::Value>(value)
+        .ok()
+        .and_then(|json| {
+            FIELDS.iter().find_map(|field| {
+                json.get(field)
+                    .and_then(|held| held.as_str())
+                    .filter(|held| !held.trim().is_empty())
+                    .map(str::to_owned)
+            })
+        })
+        .unwrap_or_else(|| value.to_owned());
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview: String = flat.chars().take(60).collect();
+    if flat.chars().count() > 60 {
+        preview.push('…');
+    }
+    preview
 }
 
 /// The action half: what happens once a row is chosen. Every branch reaches the runtime method that
