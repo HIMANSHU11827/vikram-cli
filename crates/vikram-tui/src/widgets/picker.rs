@@ -492,6 +492,11 @@ pub struct PickerBody {
     /// Index into `lines` of the first clickable row.
     pub first_row: usize,
     pub rows: usize,
+    /// For each drawn row, its index into [`Picker::visible`] — the number a click has to name.
+    /// The drawn window is a slice of `visible`, so the position on screen is not the position in
+    /// the list once the picker scrolls; carrying the mapping here is what keeps a click on the
+    /// first visible row from selecting the first row of the whole list.
+    pub row_positions: Vec<usize>,
     /// The footer buttons, with the columns each one occupies.
     pub verbs: Vec<VerbChip>,
 }
@@ -605,6 +610,7 @@ pub fn picker_body(picker: &Picker, theme: &Theme, width: u16) -> PickerBody {
 
     // ---- rows ------------------------------------------------------------------------------
     let first_row = lines.len();
+    let mut row_positions: Vec<usize> = Vec::new();
     if picker.items.is_empty() {
         lines.push(Line::from(Span::styled(
             format!("{}{bullet} nothing to choose yet", " ".repeat(PAD)),
@@ -621,6 +627,7 @@ pub fn picker_body(picker: &Picker, theme: &Theme, width: u16) -> PickerBody {
         )));
     } else {
         for (position, index) in rows.iter().enumerate() {
+            row_positions.push(start + position);
             let item = &picker.items[*index];
             let on_cursor = start + position == picker.selected;
             let marker = if on_cursor { cursor } else { " " };
@@ -743,6 +750,7 @@ pub fn picker_body(picker: &Picker, theme: &Theme, width: u16) -> PickerBody {
         lines,
         first_row,
         rows: rows_drawn,
+        row_positions,
         verbs,
     }
 }

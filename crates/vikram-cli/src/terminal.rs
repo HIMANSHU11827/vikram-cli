@@ -2090,6 +2090,10 @@ fn apply_act(
             );
         }
         (PickerKind::Tools, Verb::Choose) => {
+            // The "N tool(s) registered" row is a count, not a tool.
+            if value == "count" {
+                return;
+            }
             if let Some(tool) = handle.tools().get(&value) {
                 let spec = tool.spec();
                 let mut lines = Vec::new();
@@ -2107,6 +2111,10 @@ fn apply_act(
             }
         }
         (PickerKind::Tools, Verb::Toggle) => {
+            // Toggling the count row used to persist a tool literally named `count` as disabled.
+            if value == "count" {
+                return;
+            }
             let enabled = handle.tools().is_enabled(&value);
             if enabled {
                 handle.tools().tool_disable(&value);
@@ -2228,6 +2236,12 @@ fn apply_act(
             }
         }
         (PickerKind::Skill, Verb::Choose) => {
+            // The summary, hint and empty rows are labels, not skills: Enter on one used to warn
+            // "skill `summary` not found", which reads like a bug in the panel rather than a row
+            // that was never meant to be chosen.
+            if matches!(value.as_str(), "summary" | "hint" | "empty") {
+                return;
+            }
             if let Some(skill) = handle.skill_get(&value) {
                 let mut lines = Vec::new();
                 if !skill.description.is_empty() {
@@ -2257,6 +2271,9 @@ fn apply_act(
             }
         }
         (PickerKind::Skill, Verb::Toggle) => {
+            if matches!(value.as_str(), "summary" | "hint" | "empty") {
+                return;
+            }
             // determine current enabled state
             let enabled = handle
                 .skill_list()
@@ -2294,12 +2311,20 @@ fn apply_act(
                 vikram_tui::app::PromptAction::ImportSkill,
             );
         }
-        (PickerKind::Skill, Verb::Rename) => app.open_prompt(
-            "Rename skill",
-            "the new skill name, then press Enter",
-            vikram_tui::app::PromptAction::RenameSkill { skill: value },
-        ),
+        (PickerKind::Skill, Verb::Rename) => {
+            if matches!(value.as_str(), "summary" | "hint" | "empty") {
+                return;
+            }
+            app.open_prompt(
+                "Rename skill",
+                "the new skill name, then press Enter",
+                vikram_tui::app::PromptAction::RenameSkill { skill: value },
+            );
+        }
         (PickerKind::Skill, Verb::Remove) => {
+            if matches!(value.as_str(), "summary" | "hint" | "empty") {
+                return;
+            }
             let desc = handle
                 .skill_get(&value)
                 .map(|s| s.description)
@@ -2409,6 +2434,17 @@ fn apply_act(
             });
         }
         (PickerKind::Command, _) => open_command(handle, app, session, &value, ""),
+        // These panels declare no verbs: they are read-only, so Enter has nothing to commit. The
+        // picker already closed on the keypress; answering with a warning taught the operator that
+        // Enter does something here when it does not.
+        (
+            PickerKind::Status
+            | PickerKind::Usage
+            | PickerKind::Context
+            | PickerKind::Doctor
+            | PickerKind::Version,
+            _,
+        ) => {}
         (other, verb) => app.push_notice(
             NoticeLevel::Warn,
             format!("no `{:?}` action for a `{}` row yet", verb, other.as_str()),

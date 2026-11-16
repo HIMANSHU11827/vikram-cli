@@ -1005,17 +1005,21 @@ pub fn overlay(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         frame.render_widget(Paragraph::new(body.lines), inner);
 
         // The rows, so a click can name one. `first_row` is the only thing that knows where the
-        // header ended, so the hit test asks it instead of counting lines again.
-        for position in 0..body.rows {
+        // header ended, and `row_positions` carries the visible index each drawn row stands for —
+        // without it a click on a scrolled list selects the wrong row. A pseudo-row ("nothing to
+        // choose yet") has no position, so it gets no hit.
+        for (position, visible) in body.row_positions.iter().enumerate() {
             let y = inner.y + body.first_row as u16 + position as u16;
-            app.picker_rows.push((y, position));
+            if y >= inner.y && y < inner.y + inner.height {
+                app.picker_rows.push((y, *visible));
+            }
         }
         app.picker_x = Some((rect.x, rect.x + rect.width));
         // The footer buttons, so a press can name one. Coordinates are absolute, because that is
         // what the mouse reports; the body only knows its columns inside the frame.
         for chip in &body.verbs {
             let y = inner.y + chip.line as u16;
-            if y < rect.y + rect.height && y >= rect.y {
+            if y >= inner.y && y < inner.y + inner.height {
                 app.picker_verbs.push((
                     y,
                     inner.x + chip.start,
@@ -1089,7 +1093,7 @@ pub fn overlay(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
             continue;
         }
         let y = inner.y + shifted as u16;
-        if y < rect.y + rect.height && y >= rect.y {
+        if y >= inner.y && y < inner.y + inner.height {
             let (start, end) = hit.columns.map_or((inner.x, inner.x + inner.width), |(s, e)| {
                 (inner.x + s, inner.x + e)
             });

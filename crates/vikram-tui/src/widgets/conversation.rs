@@ -901,7 +901,9 @@ fn push_turn_header(
     lines.push(Line::from(""));
     let row = lines.len();
     lines.push(Line::from(spans));
-    let end = UnicodeWidthStr::width(label.as_str()).saturating_sub(1) as u16;
+    // `fold_at` treats this as an exclusive width and subtracts one itself; storing width-1 here
+    // subtracted it twice and left the chevron column itself dead to the mouse.
+    let end = UnicodeWidthStr::width(label.as_str()) as u16;
     marks.push((row, end, key, false));
     folded
 }

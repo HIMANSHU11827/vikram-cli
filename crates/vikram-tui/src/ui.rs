@@ -15,6 +15,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let theme = Theme::new(app.ascii).with_colours(app.theme_bg, app.theme_accent);
     let area = frame.area();
     app.thought_hits.clear();
+    // Every hit region is rewritten by the widget that draws it, and only when that widget draws.
+    // A panel that is not on screen this frame — closed overlay, hidden bots pane, a terminal too
+    // small to lay out — must not leave the last frame's rectangles answering clicks.
+    app.tab_hits.clear();
+    app.new_session_x = None;
+    app.picker_rows.clear();
+    app.picker_x = None;
+    app.picker_verbs.clear();
+    app.overlay_clicks.clear();
+    app.overlay_rect = None;
+    app.bot_hits.clear();
 
     // Painted once, over the whole window, before anything is drawn on it. Every widget after this
     // writes a foreground and leaves the background alone, so one pass is enough — and a second

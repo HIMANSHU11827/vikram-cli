@@ -1212,7 +1212,14 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
     };
     match overlay {
         Overlay::Help | Overlay::Inspector(_) => match key.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
+            KeyCode::Esc | KeyCode::Enter => {
+                app.overlay = None;
+                true
+            }
+            // `q`/`?` are answers, not chords: Ctrl+Q must not close the panel it was aimed at.
+            KeyCode::Char('q') | KeyCode::Char('?')
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 app.overlay = None;
                 true
             }
@@ -1257,7 +1264,8 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
                     true
                 }
                 // The answers line up with `APPROVAL_ACTIONS`: approve, deny, remember without
-                // running it, and approve while remembering.
+                // running it, and approve while remembering. A chord like Ctrl+A is a global
+                // shortcut, not an answer — without the guard it approved and persisted.
                 KeyCode::Enter => {
                     let (allow, persist) = match app.approval_action {
                         1 => (false, false),
@@ -1268,15 +1276,21 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
                     answer_approval(app, allow, persist);
                     true
                 }
-                KeyCode::Char('a') => {
+                KeyCode::Char('a')
+                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
                     answer_approval(app, true, false);
                     true
                 }
-                KeyCode::Char('p') => {
+                KeyCode::Char('p')
+                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
                     answer_approval(app, true, true);
                     true
                 }
-                KeyCode::Char('d') => {
+                KeyCode::Char('d')
+                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
                     answer_approval(app, false, false);
                     true
                 }
@@ -1315,7 +1329,13 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
         } => handle_autocomplete_overlay(app, candidates, selected, key),
         Overlay::Picker(picker) => handle_picker_overlay(app, picker, key),
         Overlay::Info { .. } => match key.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
+            KeyCode::Esc | KeyCode::Enter => {
+                app.overlay = None;
+                true
+            }
+            KeyCode::Char('q') | KeyCode::Char('?')
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 app.overlay = None;
                 true
             }
@@ -1476,12 +1496,27 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         Overlay::Confirm { yes, .. } => match key.code {
-            KeyCode::Enter | KeyCode::Char('y') => {
+            KeyCode::Enter => {
                 app.commands.push(*yes);
                 app.overlay = None;
                 true
             }
-            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+            // `y` commits and `n`/`q` decline — plain letters only, so Ctrl+N cannot decline a
+            // dialog it was never aimed at and Ctrl+Y cannot commit one.
+            KeyCode::Char('y')
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                app.commands.push(*yes);
+                app.overlay = None;
+                true
+            }
+            KeyCode::Esc => {
+                app.overlay = None;
+                true
+            }
+            KeyCode::Char('n') | KeyCode::Char('q')
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 app.overlay = None;
                 true
             }
@@ -1505,7 +1540,12 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
                 app.overlay = Some(Overlay::Skills { scroll: next });
             }
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(8) | KeyCode::Enter => {
+                KeyCode::Esc | KeyCode::F(8) | KeyCode::Enter => {
+                    app.overlay = None;
+                }
+                KeyCode::Char('q')
+                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
                     app.overlay = None;
                 }
                 _ => {}
@@ -1907,6 +1947,21 @@ pub fn handle_paste(app: &mut App, text: &str) -> bool {
     }
     if let Some(Overlay::ReverseHistorySearch { query, .. }) = &mut app.overlay {
         query.push_str(text);
+        return true;
+    }
+    // A prompt is a text field like any other: without this arm a paste landed in the composer
+    // draft hidden behind the dialog.
+    if let Some(Overlay::Prompt { editor, .. }) = &mut app.overlay {
+        editor.insert_str(text);
+        return true;
+    }
+    if let Some(Overlay::Picker(picker)) = &mut app.overlay {
+        picker.type_str(text);
+        return true;
+    }
+    // Any other open panel has no text field: swallowing the paste is the honest answer, since
+    // inserting it into the composer draft behind the dialog writes where nobody can see it.
+    if app.overlay.is_some() {
         return true;
     }
     if let Some(session) = app.active_session_mut() {
