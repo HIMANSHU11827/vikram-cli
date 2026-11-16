@@ -1607,7 +1607,7 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                 PickerItem::new("Ctrl+Tab", "next session", "ctrl_tab".to_owned()),
                 PickerItem::new("Ctrl+B", "toggle the BOTS panel", "ctrl_b".to_owned()),
                 PickerItem::new("Ctrl+O", "approvals", "ctrl_o".to_owned()),
-                PickerItem::new("Ctrl+R", "rename the session", "ctrl_r".to_owned()),
+                PickerItem::new("Ctrl+R", "reverse search input history", "ctrl_r".to_owned()),
                 PickerItem::new("r", "resume selected bot", "r".to_owned()),
                 PickerItem::new("F2", "background tasks", "f2".to_owned()),
                 PickerItem::new("F3", "MCP servers", "f3".to_owned()),

@@ -160,7 +160,9 @@ Composer:
 Bots pane: `Up`/`Down` select, `Enter` open that bot, `Esc`/`Tab` back to the composer, `p` pause,
 `s` stop, `r` resume.
 
-Approvals: `y` or `Enter` accept, `n`/`q`/`Esc` reject, `a` always allow, `p`/`d` posture.
+Approvals: `Up`/`Down` pick the request (when several wait), `Tab`/`Left`/`Right` move between
+the answers, `Enter` gives the selected answer, `a` approve once, `p` approve and remember,
+`d` deny, `Esc` close.
 
 Picker: `Esc` close, `Enter` commit the selection, `Up`/`Down`/`PageUp`/`PageDown`/`Home`/`End`
 move, `Backspace` clears the filter. `Ctrl+D`/`Ctrl+U` half-page only when the panel's footer does

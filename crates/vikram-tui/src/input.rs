@@ -453,13 +453,13 @@ fn handle_input(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Home if ctrl => {
             if let Some(session) = app.active_session_mut() {
-                session.editor.home();
+                session.editor.doc_home();
             }
             true
         }
         KeyCode::End if ctrl => {
             if let Some(session) = app.active_session_mut() {
-                session.editor.end();
+                session.editor.doc_end();
             }
             true
         }

@@ -179,6 +179,18 @@ impl Editor {
         self.col = self.current().chars().count();
     }
 
+    /// Start of the whole draft, not just the line — what Ctrl+Home advertises.
+    pub fn doc_home(&mut self) {
+        self.row = 0;
+        self.col = 0;
+    }
+
+    /// End of the whole draft — what Ctrl+End advertises.
+    pub fn doc_end(&mut self) {
+        self.row = self.lines.len().saturating_sub(1);
+        self.col = self.current().chars().count();
+    }
+
     pub fn word_left(&mut self) {
         let chars: Vec<char> = self.current().chars().collect();
         let mut i = self.col;
