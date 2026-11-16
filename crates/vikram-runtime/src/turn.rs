@@ -1410,8 +1410,14 @@ async fn run_tool_once(
     // `ask_user` does not answer a question, it asks one. The reply is registered as a pending
     // question, published, and waited on with the same oneshot discipline the approval gate uses;
     // the operator's answer is appended to the tool result so the model sees it as the outcome of
-    // its own call. Cancellation resolves the wait and fails the call instead of hanging.
-    if ok && let Some((request_id, question, choices)) = parse_question(&content) {
+    // its own call. Cancellation resolves the wait and fails the call instead of hanging. Only
+    // `ask_user` may pose a question: any other tool's output that happens to start with
+    // `QUESTION:` (a file, a search hit, a page) used to park the whole turn waiting for an answer
+    // nobody was asked for.
+    if ok
+        && call.name == "ask_user"
+        && let Some((request_id, question, choices)) = parse_question(&content)
+    {
         let receiver = inner.open_question(&request_id);
         inner.emit(RuntimeEvent::UserQuestion {
             session: session.id.clone(),

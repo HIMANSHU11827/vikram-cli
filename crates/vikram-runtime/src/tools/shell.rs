@@ -423,6 +423,21 @@ impl Tool for Git {
             "branch" => "git branch -a".to_string(),
             "show" => {
                 let commit = args.get("commit").and_then(Value::as_str).unwrap_or("HEAD");
+                // The value is interpolated into a shell string, so it must be a revision and
+                // nothing else: `HEAD; curl …` used to run with the read-only permission the
+                // subcommand carries. Revisions are hex, refs and the `~^@.` punctuation git uses;
+                // a leading `-` would smuggle in an option like `--output=`.
+                let valid = !commit.is_empty()
+                    && !commit.starts_with('-')
+                    && commit
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '~' | '^' | '@' | '-'));
+                if !valid {
+                    return Ok(ToolOutput {
+                        content: format!("`{commit}` is not a git revision"),
+                        ok: false,
+                    });
+                }
                 format!("git show {}", commit)
             }
             other => {

@@ -96,11 +96,13 @@ macro_rules! cmd_check_tool {
                     .get("command")
                     .and_then(Value::as_str)
                     .unwrap_or($default);
-                let head = command.split_whitespace().next().unwrap_or("cargo");
+                // The resource is what the approval prompt and the journal show. Recording only
+                // the first word (`test_run cargo`) hid the rest of an arbitrary `sh -c` string —
+                // the operator approved a description narrower than the command that ran.
                 Ok(PermissionRequest::new(
                     ActionKind::Execute,
                     $verb,
-                    head,
+                    command,
                     SideEffect::LocalMutation,
                     Trust::Model,
                 ))

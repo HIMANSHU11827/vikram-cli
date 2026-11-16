@@ -90,14 +90,48 @@ impl Tool for PermissionCheck {
         ))
     }
 
-    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let verb = arg_str(args, "verb")?;
         let resource = arg_str(args, "resource")?;
+        let action = match args
+            .get("action_kind")
+            .and_then(Value::as_str)
+            .unwrap_or("read")
+        {
+            "write" => ActionKind::Write,
+            "execute" => ActionKind::Execute,
+            "network" => ActionKind::Network,
+            "delegate" => ActionKind::Delegate,
+            "spend" => ActionKind::Spend,
+            "admin" => ActionKind::Admin,
+            _ => ActionKind::Read,
+        };
+        let Some(runtime) = ctx.runtime.as_ref() else {
+            return Ok(ToolOutput {
+                content: "Permission check: no runtime policy in this context — the answer would be invented".to_owned(),
+                ok: false,
+            });
+        };
+        // Ask the same judge a real call goes through, so the answer is the decision the runtime
+        // would actually make — not a fabricated "allowed".
+        let request = PermissionRequest::new(
+            action,
+            verb.clone(),
+            resource.clone(),
+            SideEffect::LocalMutation,
+            Trust::Model,
+        );
+        let decision = runtime.judge(&request);
+        let verdict = match &decision {
+            vikram_contracts::Decision::Allow => "allowed".to_owned(),
+            vikram_contracts::Decision::Deny { reason } => format!("denied: {reason}"),
+            vikram_contracts::Decision::RequireApproval { reason, .. } => {
+                format!("requires approval: {reason}")
+            }
+        };
         Ok(ToolOutput {
-            content: format!(
-                "Permission check: {verb} on {resource} → allowed (policy evaluation requires runtime context)"
-            ),
-            ok: true,
+            content: format!("Permission check: {verb} on {resource} → {verdict}"),
+            ok: decision.is_allowed(),
         })
     }
 }

@@ -535,11 +535,14 @@ impl Tool for Diagnostics {
     }
 
     fn permission(&self, _args: &Value) -> Result<PermissionRequest, VikramError> {
+        // `cargo check` compiles the workspace, which runs build scripts and proc macros — that is
+        // code execution, not a read. Declaring it Read/None auto-allowed arbitrary build.rs code
+        // with no approval and no floor check.
         Ok(PermissionRequest::new(
-            ActionKind::Read,
+            ActionKind::Execute,
             "diagnostics.collect",
-            "diagnostics",
-            SideEffect::None,
+            "cargo check",
+            SideEffect::LocalMutation,
             Trust::Model,
         ))
     }
