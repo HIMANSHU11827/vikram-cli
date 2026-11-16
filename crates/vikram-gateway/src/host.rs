@@ -639,6 +639,14 @@ impl A2aPlatform {
     /// Bind an A2A context to the task the engine created for it.
     pub fn remember(&self, context_id: &str, task_id: &str) {
         if let Ok(mut tasks) = self.tasks.lock() {
+            // Bounded like the DingTalk webhook cache: an evicted context simply gets "no A2A
+            // task" on reply instead of growing the map forever.
+            const MAX_TASKS: usize = 4096;
+            if tasks.len() >= MAX_TASKS
+                && let Some(oldest) = tasks.keys().next().cloned()
+            {
+                tasks.remove(&oldest);
+            }
             tasks.insert(context_id.to_string(), task_id.to_string());
         }
     }
@@ -668,7 +676,13 @@ impl GatewayPlatform for A2aPlatform {
             return SendResult::failed("no A2A task for this context", Some("not_found"));
         };
         match self.engine.complete(&task_id, content) {
-            Some(_) => SendResult::ok(task_id),
+            // The binding is spent: the task is complete, so the entry goes with it.
+            Some(_) => {
+                if let Ok(mut tasks) = self.tasks.lock() {
+                    tasks.remove(chat_id);
+                }
+                SendResult::ok(task_id)
+            }
             None => SendResult::failed("A2A task is no longer completable", Some("not_found")),
         }
     }
