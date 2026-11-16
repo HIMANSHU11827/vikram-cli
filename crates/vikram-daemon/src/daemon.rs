@@ -559,7 +559,9 @@ impl Daemon {
             eprintln!("[vikram] conversation delivery unavailable: {err}");
         }
         loop {
-            let _ = self.tick(time::now_ms()).await;
+            if let Err(err) = self.tick(time::now_ms()).await {
+                eprintln!("[vikram] tick failed: {err}");
+            }
             tokio::select! {
                 _ = stop.notified() => return Ok(()),
                 _ = tokio::time::sleep(Duration::from_millis(self.tick_ms)) => {}

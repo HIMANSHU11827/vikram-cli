@@ -25,6 +25,8 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("corrupt data: {0}")]
     Parse(String),
+    #[error("contract: {0}")]
+    Vikram(#[from] VikramError),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -918,6 +920,25 @@ impl Store {
              SELECT ?2, seq, ts_ms, kind, effect, payload FROM journal WHERE session = ?1 ORDER BY seq ASC",
             params![id.as_str(), fork.id.as_str()],
         )?;
+        // The fork inherits the conversation, so its search index, workspace binding and usage
+        // history move with it. FTS5 is best-effort like everywhere else it is touched.
+        let _ = tx.execute(
+            "INSERT INTO session_fts (session, content)
+             SELECT ?2, content FROM session_fts WHERE session = ?1",
+            params![id.as_str(), fork.id.as_str()],
+        );
+        tx.execute(
+            "INSERT INTO session_workspaces (session, mode, workspace_path, project_id, created_ms, updated_ms)
+             SELECT ?2, mode, workspace_path, project_id, created_ms, updated_ms
+             FROM session_workspaces WHERE session = ?1",
+            params![id.as_str(), fork.id.as_str()],
+        )?;
+        tx.execute(
+            "INSERT INTO usage (session, ts_ms, model, prompt_tokens, completion_tokens, total_tokens, measured)
+             SELECT ?2, ts_ms, model, prompt_tokens, completion_tokens, total_tokens, measured
+             FROM usage WHERE session = ?1",
+            params![id.as_str(), fork.id.as_str()],
+        )?;
         tx.commit()?;
         Ok(Some(fork))
     }
@@ -1058,9 +1079,7 @@ impl Store {
         };
         for call in &interrupted.pending_calls {
             let content = "the run ended before this call finished";
-            // JournalSink reports a storage failure as VikramError; surface it through the
-            // store's own error by converting through a JSON error round-trip.
-            let _ = self.journal().append(&NewRecord::new(
+            self.journal().append(&NewRecord::new(
                 id.clone(),
                 RecordKind::ToolResult,
                 serde_json::json!({
@@ -1073,9 +1092,9 @@ impl Store {
                         false
                     ),
                 }),
-            ));
+            ))?;
         }
-        let _ = self.journal().append(&NewRecord::new(
+        self.journal().append(&NewRecord::new(
             id.clone(),
             RecordKind::Status,
             serde_json::json!({
@@ -1083,8 +1102,8 @@ impl Store {
                 "answered": interrupted.pending_calls.len(),
                 "tool": interrupted.tool_preview,
             }),
-        ));
-        let _ = self.touch_session(id, now_ms);
+        ))?;
+        self.touch_session(id, now_ms)?;
         Ok(interrupted.pending_calls)
     }
 
@@ -1211,6 +1230,11 @@ impl Store {
             params![id.as_str()],
         )?;
         tx.execute("DELETE FROM usage WHERE session = ?1", params![id.as_str()])?;
+        // FTS5 is best-effort: the table may not exist where the virtual table is unavailable.
+        let _ = tx.execute(
+            "DELETE FROM session_fts WHERE session = ?1",
+            params![id.as_str()],
+        );
         tx.execute("DELETE FROM sessions WHERE id = ?1", params![id.as_str()])?;
         tx.commit()?;
         Ok(())
@@ -1642,8 +1666,28 @@ impl Store {
     }
 
     pub fn delete_bot(&self, id: &BotId) -> Result<()> {
-        self.lock()
-            .execute("DELETE FROM bots WHERE id = ?1", params![id.as_str()])?;
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        // Detach dependents rather than leaving dangling bot references, the same way
+        // delete_project clears project links: sessions keep existing, only their bot link is gone.
+        tx.execute(
+            "UPDATE sessions SET bot_id = NULL WHERE bot_id = ?1",
+            params![id.as_str()],
+        )?;
+        tx.execute(
+            "UPDATE artifacts SET bot_id = NULL WHERE bot_id = ?1",
+            params![id.as_str()],
+        )?;
+        tx.execute(
+            "UPDATE file_changes SET bot_id = NULL WHERE bot_id = ?1",
+            params![id.as_str()],
+        )?;
+        tx.execute(
+            "DELETE FROM hive_roster_members WHERE bot = ?1",
+            params![id.as_str()],
+        )?;
+        tx.execute("DELETE FROM bots WHERE id = ?1", params![id.as_str()])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1879,6 +1923,8 @@ impl Store {
                 tx.execute("DELETE FROM artifacts WHERE session = ?1", params![sid])?;
                 tx.execute("DELETE FROM file_changes WHERE session = ?1", params![sid])?;
                 tx.execute("DELETE FROM usage WHERE session = ?1", params![sid])?;
+                // FTS5 is best-effort: the table may not exist where the virtual table is unavailable.
+                let _ = tx.execute("DELETE FROM session_fts WHERE session = ?1", params![sid]);
                 tx.execute("DELETE FROM sessions WHERE id = ?1", params![sid])?;
             }
             // Cascade hive sessions belonging to this profile.
@@ -1945,6 +1991,8 @@ impl Store {
             tx.execute("DELETE FROM artifacts WHERE session = ?1", params![sid])?;
             tx.execute("DELETE FROM file_changes WHERE session = ?1", params![sid])?;
             tx.execute("DELETE FROM usage WHERE session = ?1", params![sid])?;
+            // FTS5 is best-effort: the table may not exist where the virtual table is unavailable.
+            let _ = tx.execute("DELETE FROM session_fts WHERE session = ?1", params![sid]);
             tx.execute("DELETE FROM sessions WHERE id = ?1", params![sid])?;
         }
         // Entities owned by this user may own a profile link; detach before profile delete.
@@ -2075,6 +2123,8 @@ impl Store {
             tx.execute("DELETE FROM artifacts WHERE session = ?1", params![sid])?;
             tx.execute("DELETE FROM file_changes WHERE session = ?1", params![sid])?;
             tx.execute("DELETE FROM usage WHERE session = ?1", params![sid])?;
+            // FTS5 is best-effort: the table may not exist where the virtual table is unavailable.
+            let _ = tx.execute("DELETE FROM session_fts WHERE session = ?1", params![sid]);
             tx.execute("DELETE FROM sessions WHERE id = ?1", params![sid])?;
         }
         tx.execute(

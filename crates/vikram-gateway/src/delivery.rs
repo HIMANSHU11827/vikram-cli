@@ -451,7 +451,7 @@ impl DeliveryLedger {
                     error_kind = NULL,
                     flood_not_before = 0,
                     updated_at = ?4
-              WHERE ledger_id = ?1 AND state <> 'abandoned'",
+              WHERE ledger_id = ?1 AND state NOT IN ('delivered', 'abandoned')",
             params![ledger_id, total_chunks, delivered, now],
         )?;
         if changed == 0 {
@@ -497,14 +497,14 @@ impl DeliveryLedger {
         } else {
             now.saturating_add(delay)
         };
-        self.conn.execute(
+        let changed = self.conn.execute(
             "UPDATE gateway_delivery_ledger
                 SET state = ?2,
                     last_error = ?3,
                     error_kind = ?4,
                     flood_not_before = ?5,
                     updated_at = ?6
-              WHERE ledger_id = ?1",
+              WHERE ledger_id = ?1 AND state NOT IN ('delivered', 'abandoned')",
             params![
                 ledger_id,
                 state.as_str(),
@@ -514,6 +514,9 @@ impl DeliveryLedger {
                 now
             ],
         )?;
+        if changed == 0 {
+            return Ok(None);
+        }
         self.get(ledger_id)
     }
 
