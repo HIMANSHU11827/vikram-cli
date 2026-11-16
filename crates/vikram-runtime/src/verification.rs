@@ -12,6 +12,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use vikram_contracts::VikramError;
 
+use crate::sandbox::Sandbox;
+
 /// Why a verification run failed, from reading its output. Unknown shapes stay unknown; the
 /// raw output is always preserved for the model of the next attempt.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,36 +129,58 @@ impl Budget {
 }
 
 /// Run the plan once in `workspace_root` and return the steps with their results.
-fn attempt_steps(workspace_root: &Path, plan: &VerificationPlan) -> Vec<StepResult> {
+fn attempt_steps(
+    workspace_root: &Path,
+    plan: &VerificationPlan,
+    sandbox: &Sandbox,
+) -> Vec<StepResult> {
     plan.steps
         .iter()
-        .map(|step| run_step(workspace_root, step))
+        .map(|step| run_step(workspace_root, step, sandbox))
         .collect()
 }
 
-fn run_step(workspace_root: &Path, step: &PlanStep) -> StepResult {
+fn run_step(workspace_root: &Path, step: &PlanStep, sandbox: &Sandbox) -> StepResult {
     let started = Instant::now();
     let mut cmd = shell_cmd(&step.command);
+    sandbox.wrap_command(&mut cmd, workspace_root);
     cmd.current_dir(workspace_root);
+    let sandbox_note = sandbox.enforcement_notice();
     #[cfg(not(target_os = "windows"))]
     if let Ok(vars) = std::env::var("CARGO_INCREMENTAL") {
         cmd.env("CARGO_INCREMENTAL", vars);
     }
 
     let mut timed_out = false;
-    let output = wait_with_timeout(&mut cmd, step.timeout).unwrap_or_else(|| {
-        timed_out = true;
-        std::process::Output {
-            status: exit_status_failure(),
-            stdout: Vec::new(),
-            stderr: b"verification step timed out".to_vec(),
+    let output = match wait_with_timeout(&mut cmd, step.timeout) {
+        Ok(Some(output)) => output,
+        Ok(None) => {
+            timed_out = true;
+            std::process::Output {
+                status: exit_status_failure(),
+                stdout: Vec::new(),
+                stderr: b"verification step timed out".to_vec(),
+            }
         }
-    });
-    let text = format!(
+        Err(e) => {
+            // A spawn or wait failure is not a timeout; report what happened.
+            return StepResult {
+                name: step.name.clone(),
+                ok: false,
+                output: e,
+                duration_ms: started.elapsed().as_millis() as u64,
+                timed_out: false,
+            };
+        }
+    };
+    let mut text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    if let Some(note) = &sandbox_note {
+        text.push_str(&format!("\n[sandbox] {note}"));
+    }
     StepResult {
         name: step.name.clone(),
         ok: output.status.success(),
@@ -191,41 +215,104 @@ pub(crate) fn shell_cmd(command: &str) -> Command {
     }
 }
 
+/// Run `cmd` under `timeout`, capturing stdout and stderr.
+///
+/// `Ok(Some)` is a finished command, `Ok(None)` is a timeout, and `Err` is a
+/// spawn or wait failure — the three must stay distinct so a command that never
+/// started is never reported as having timed out. On Unix the child leads its
+/// own process group, so a timeout kills the whole group: a backgrounded
+/// grandchild cannot outlive the call. The pipes are drained on detached threads
+/// with a deadline (the `computer.rs` pattern): `wait_with_output` would block
+/// on pipe EOF forever when a surviving grandchild holds stdout open.
 pub(crate) fn wait_with_timeout(
     cmd: &mut Command,
     timeout: Duration,
-) -> Option<std::process::Output> {
+) -> Result<Option<std::process::Output>, String> {
     use std::io::Read;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .ok()?;
+        .map_err(|e| format!("failed to start command: {e}"))?;
     let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(Some(_)) = child.try_wait() {
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            if let Some(mut s) = child.stdout.take() {
-                let _ = s.read_to_end(&mut stdout);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    kill_tree(&mut child);
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(25));
             }
-            if let Some(mut s) = child.stderr.take() {
-                let _ = s.read_to_end(&mut stderr);
+            Err(e) => {
+                kill_tree(&mut child);
+                return Err(format!("failed while waiting: {e}"));
             }
-            let status = child.wait().ok()?;
-            return Some(std::process::Output {
-                status,
-                stdout,
-                stderr,
+        }
+    };
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
+    // Detached readers: they must not be joined, or a grandchild holding the pipe
+    // would block this call exactly like `wait_with_output` did. They exit when
+    // the pipe finally closes.
+    match child.stdout.take() {
+        Some(mut pipe) => {
+            std::thread::spawn(move || {
+                let mut buffer = Vec::new();
+                let _ = pipe.read_to_end(&mut buffer);
+                let _ = out_tx.send(buffer);
             });
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
+        None => {
+            let _ = out_tx.send(Vec::new());
         }
-        std::thread::sleep(Duration::from_millis(25));
     }
+    match child.stderr.take() {
+        Some(mut pipe) => {
+            std::thread::spawn(move || {
+                let mut buffer = Vec::new();
+                let _ = pipe.read_to_end(&mut buffer);
+                let _ = err_tx.send(buffer);
+            });
+        }
+        None => {
+            let _ = err_tx.send(Vec::new());
+        }
+    }
+    let drain_deadline = Instant::now() + Duration::from_secs(1);
+    let collect = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
+        rx.recv_timeout(drain_deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_default()
+    };
+    Ok(Some(std::process::Output {
+        status,
+        stdout: collect(out_rx),
+        stderr: collect(err_rx),
+    }))
+}
+
+/// Kill the child and, on Unix, its whole process group. The child was spawned
+/// with `process_group(0)`, so its pid is also the pgid and a negative pid
+/// addresses the group — `child.kill()` alone would leave grandchildren running.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id();
+        let _ = Command::new("kill")
+            .args(["-s", "KILL", &format!("-{pid}")])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(not(windows))]
@@ -252,6 +339,7 @@ pub fn verify(
     workspace_root: &Path,
     plan: &VerificationPlan,
     budget: &Budget,
+    sandbox: &Sandbox,
     mut repair: impl FnMut(&str, &str) -> Option<Vec<PathBuf>>,
 ) -> Result<VerificationOutcome, VikramError> {
     let mut all_steps: Vec<StepResult> = Vec::new();
@@ -269,7 +357,7 @@ pub fn verify(
         attempt += 1;
         let mut green = true;
         let mut failing: Option<(String, FailureKind)> = None;
-        for step in attempt_steps(workspace_root, plan) {
+        for step in attempt_steps(workspace_root, plan, sandbox) {
             all_steps.push(step.clone());
             if !step.ok {
                 let kind = FailureKind::classify(&step.output, step.timed_out);
@@ -391,7 +479,14 @@ mod tests {
             steps: vec![PlanStep::new("true", "true", Duration::from_secs(5))],
         };
         let ws = workspace_with("green", "");
-        let outcome = verify(&ws, &plan, &Budget::attempts(3), |_, _| None).unwrap();
+        let outcome = verify(
+            &ws,
+            &plan,
+            &Budget::attempts(3),
+            &Sandbox::disabled("test"),
+            |_, _| None,
+        )
+        .unwrap();
         assert!(outcome.ok, "{outcome:?}");
         assert_eq!(outcome.attempts, 1);
     }
@@ -407,20 +502,26 @@ mod tests {
                 PlanStep::new("all-ok", "true", Duration::from_secs(5)),
             ],
         };
-        let outcome = verify(&dir, &plan, &Budget::attempts(3), |_, _| {
-            let seen = counter_for_repair.metadata().map(|m| m.len()).unwrap_or(0);
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&counter_for_repair)
-                .unwrap();
-            writeln!(f, "x").unwrap();
-            if seen == 0 {
-                let _ = std::fs::write(dir.join("marker.txt"), "now ok");
-                return Some(vec![dir.join("marker.txt")]);
-            }
-            None
-        })
+        let outcome = verify(
+            &dir,
+            &plan,
+            &Budget::attempts(3),
+            &Sandbox::disabled("test"),
+            |_, _| {
+                let seen = counter_for_repair.metadata().map(|m| m.len()).unwrap_or(0);
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&counter_for_repair)
+                    .unwrap();
+                writeln!(f, "x").unwrap();
+                if seen == 0 {
+                    let _ = std::fs::write(dir.join("marker.txt"), "now ok");
+                    return Some(vec![dir.join("marker.txt")]);
+                }
+                None
+            },
+        )
         .unwrap();
         assert!(outcome.ok, "{outcome:?}");
         assert_eq!(outcome.attempts, 2);
@@ -436,9 +537,13 @@ mod tests {
                 Duration::from_secs(5),
             )],
         };
-        let outcome = verify(&dir, &plan, &Budget::attempts(2), |_, _| {
-            Some(vec![dir.join("untouched.txt")])
-        })
+        let outcome = verify(
+            &dir,
+            &plan,
+            &Budget::attempts(2),
+            &Sandbox::disabled("test"),
+            |_, _| Some(vec![dir.join("untouched.txt")]),
+        )
         .unwrap();
         assert!(!outcome.ok);
         assert_eq!(outcome.attempts, 2);
@@ -456,7 +561,14 @@ mod tests {
                 Duration::from_secs(5),
             )],
         };
-        let outcome = verify(&dir, &plan, &Budget::attempts(5), |_, _| Some(Vec::new())).unwrap();
+        let outcome = verify(
+            &dir,
+            &plan,
+            &Budget::attempts(5),
+            &Sandbox::disabled("test"),
+            |_, _| Some(Vec::new()),
+        )
+        .unwrap();
         assert!(!outcome.ok);
         assert_eq!(outcome.attempts, 1, "no-change repair must not burn budget");
     }

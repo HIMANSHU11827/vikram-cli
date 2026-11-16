@@ -8,12 +8,12 @@ impl Tool for VerifyRun {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "verify".into(),
-            description: "Run the build+test verification loop and return structured pass/fail."
+            description: "Run the build+test verification loop (single attempt, no auto-repair) and return structured pass/fail."
                 .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "max_attempts": {"type": "integer"}
+                    "max_attempts": {"type": "integer", "description": "accepted for compatibility; only one attempt runs because no repair step is wired"}
                 }
             }),
         }
@@ -30,16 +30,20 @@ impl Tool for VerifyRun {
     }
 
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+        // The repair closure below always declines, so a second attempt can never
+        // change the outcome. Cap the knob at 1 rather than advertise retries
+        // that silently never happen.
         let max_attempts = args
             .get("max_attempts")
             .and_then(Value::as_u64)
             .unwrap_or(1)
-            .clamp(1, 10) as u32;
+            .clamp(1, 1) as u32;
         let budget = crate::verification::Budget::attempts(max_attempts);
         let outcome = crate::verification::verify(
             &ctx.workspace_root,
             &crate::verification::VerificationPlan::cargo(),
             &budget,
+            &ctx.sandbox,
             |_, _| None,
         )?;
         let steps = outcome
@@ -121,15 +125,27 @@ macro_rules! cmd_check_tool {
                     .clamp(1_000, 300_000);
 
                 let mut cmd = crate::verification::shell_cmd(&command);
+                ctx.sandbox.wrap_command(&mut cmd, &ctx.workspace_root);
                 cmd.current_dir(&ctx.workspace_root);
+                let sandbox_note = ctx.sandbox.enforcement_notice();
 
-                let Some(output) =
-                    crate::verification::wait_with_timeout(&mut cmd, Duration::from_millis(timeout_ms))
-                else {
-                    return Ok(ToolOutput {
-                        content: format!("command timed out after {timeout_ms} ms"),
-                        ok: false,
-                    });
+                let output = match crate::verification::wait_with_timeout(
+                    &mut cmd,
+                    Duration::from_millis(timeout_ms),
+                ) {
+                    Ok(Some(output)) => output,
+                    Ok(None) => {
+                        return Ok(ToolOutput {
+                            content: format!("command timed out after {timeout_ms} ms"),
+                            ok: false,
+                        });
+                    }
+                    Err(e) => {
+                        return Ok(ToolOutput {
+                            content: e,
+                            ok: false,
+                        });
+                    }
                 };
 
                 let mut body = String::from_utf8_lossy(&output.stdout).to_string();
@@ -145,6 +161,7 @@ macro_rules! cmd_check_tool {
                     body = format!("(no output, exit {:?})", output.status.code());
                 }
                 body.push_str(&format!("\n[exit {}]", output.status.code().unwrap_or(-1)));
+                append_sandbox_note(&mut body, &sandbox_note);
                 Ok(ToolOutput {
                     content: truncated(body),
                     ok: output.status.success(),

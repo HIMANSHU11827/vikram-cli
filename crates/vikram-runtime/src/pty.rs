@@ -68,6 +68,7 @@ fn counter() -> &'static AtomicU64 {
 /// result string count (logged by the caller via `Sandbox::enforcement_notice`).
 pub fn open_sandboxed(
     sandbox: &crate::sandbox::Sandbox,
+    workspace_root: &std::path::Path,
     name: Option<&str>,
     shell: Option<&str>,
     cwd: Option<&str>,
@@ -82,12 +83,13 @@ pub fn open_sandboxed(
         .or_else(|| std::env::var("SHELL").ok())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(default_shell);
-    let ws = cwd
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // The sandbox's writable root is the real workspace, never the model-chosen
+    // `cwd`: `cwd: "/"` would otherwise make the whole host filesystem writable
+    // inside the wrapper. `cwd` is only the process working directory, applied
+    // to the CommandBuilder below.
     // Reuse the sandbox wrapper on a throwaway Command to learn the wrapper argv.
     let mut probe = std::process::Command::new(&inner_shell);
-    sandbox.wrap_command(&mut probe, &ws);
+    sandbox.wrap_command(&mut probe, workspace_root);
     let program = probe.get_program().to_string_lossy().into_owned();
     let args: Vec<String> = probe
         .get_args()
@@ -98,9 +100,10 @@ pub fn open_sandboxed(
         (inner_shell.clone(), None)
     } else {
         // program is the wrapper (bwrap / sandbox-exec); re-run through sh -c.
+        // rewrap already ended the argv with inner_shell — appending it again
+        // produced `sh sh`, which dies instantly under an enforced sandbox.
         let mut parts = vec![program.clone()];
         parts.extend(args.clone());
-        parts.push(inner_shell.clone());
         let joined = parts
             .iter()
             .map(|p| {
@@ -122,6 +125,9 @@ pub fn open_sandboxed(
         let mut cmd = CommandBuilder::new("sh");
         cmd.arg("-c");
         cmd.arg(&arg);
+        if let Some(cwd) = cwd {
+            cmd.cwd(cwd);
+        }
         return open_named_cmd(name, cmd, cwd, rows, cols);
     }
     open_named(name, Some(&cmd_shell), cwd, rows, cols)

@@ -1,5 +1,5 @@
 use serde_json::{Value, json};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use vikram_contracts::{ActionKind, PermissionRequest, SideEffect, Trust, VikramError};
 
 use crate::tools::*;
@@ -36,55 +36,24 @@ fn run_shell_command(command: &str, ctx: &ToolContext, timeout_ms: u64) -> ToolO
     };
     ctx.sandbox.wrap_command(&mut cmd, &ctx.workspace_root);
     let sandbox_note = ctx.sandbox.enforcement_notice();
+    cmd.current_dir(&ctx.workspace_root);
 
-    let mut child = match cmd
-        .current_dir(&ctx.workspace_root)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            return ToolOutput {
-                content: format!("failed to start command: {e}"),
-                ok: false,
-            };
-        }
-    };
-
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
+    let output =
+        match crate::verification::wait_with_timeout(&mut cmd, Duration::from_millis(timeout_ms)) {
+            Ok(Some(output)) => output,
             Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return ToolOutput {
-                        content: format!("command timed out after {timeout_ms} ms"),
-                        ok: false,
-                    };
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(e) => {
                 return ToolOutput {
-                    content: format!("failed while waiting: {e}"),
+                    content: format!("command timed out after {timeout_ms} ms"),
                     ok: false,
                 };
             }
-        }
-    }
-
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(e) => {
-            return ToolOutput {
-                content: format!("failed while waiting: {e}"),
-                ok: false,
-            };
-        }
-    };
+            Err(e) => {
+                return ToolOutput {
+                    content: e,
+                    ok: false,
+                };
+            }
+        };
     let mut body = String::new();
     body.push_str(&String::from_utf8_lossy(&output.stdout));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -110,7 +79,7 @@ fn run_shell_command(command: &str, ctx: &ToolContext, timeout_ms: u64) -> ToolO
 
 /// Append the degradation notice when the OS sandbox is not enforcing. Kept tiny so
 /// it never drowns the command output it qualifies.
-fn append_sandbox_note(body: &mut String, note: &Option<String>) {
+pub(crate) fn append_sandbox_note(body: &mut String, note: &Option<String>) {
     if let Some(note) = note {
         body.push_str(&format!("\n[sandbox] {note}"));
     }
@@ -153,93 +122,7 @@ impl Tool for RunShell {
             .and_then(Value::as_u64)
             .unwrap_or(30_000)
             .clamp(1_000, 120_000);
-
-        #[cfg(windows)]
-        let mut cmd = {
-            let comspec = std::env::var("COMSPEC")
-                .ok()
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "cmd".to_owned());
-            let mut c = std::process::Command::new(&comspec);
-            c.args(["/C", &command]);
-            c
-        };
-        #[cfg(not(windows))]
-        let mut cmd = {
-            let shell = std::env::var("SHELL")
-                .ok()
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "sh".to_owned());
-            let mut c = std::process::Command::new(&shell);
-            c.args(["-c", &command]);
-            c
-        };
-        ctx.sandbox.wrap_command(&mut cmd, &ctx.workspace_root);
-        let sandbox_note = ctx.sandbox.enforcement_notice();
-
-        let mut child = match cmd
-            .current_dir(&ctx.workspace_root)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(e) => {
-                return Ok(ToolOutput {
-                    content: format!("failed to start command: {e}"),
-                    ok: false,
-                });
-            }
-        };
-
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => {
-                    if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Ok(ToolOutput {
-                            content: format!("command timed out after {timeout_ms} ms"),
-                            ok: false,
-                        });
-                    }
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-                Err(e) => {
-                    return Ok(ToolOutput {
-                        content: format!("failed while waiting: {e}"),
-                        ok: false,
-                    });
-                }
-            }
-        }
-
-        let output = child
-            .wait_with_output()
-            .map_err(|e| VikramError::EffectFailed(e.to_string()))?;
-        let mut body = String::new();
-        body.push_str(&String::from_utf8_lossy(&output.stdout));
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.trim().is_empty() {
-            if !body.is_empty() && !body.ends_with('\n') {
-                body.push('\n');
-            }
-            body.push_str("[stderr]\n");
-            body.push_str(&stderr);
-        }
-        if body.trim().is_empty() {
-            body = format!("(no output, exit {:?})", output.status.code());
-        }
-        body.push_str(&format!("\n[exit {}]", output.status.code().unwrap_or(-1)));
-        append_sandbox_note(&mut body, &sandbox_note);
-        Ok(ToolOutput {
-            content: truncated(body),
-            ok: output.status.success(),
-        })
+        Ok(run_shell_command(&command, ctx, timeout_ms))
     }
 }
 
@@ -306,6 +189,7 @@ impl Tool for TerminalTool {
                 } else {
                     match crate::pty::open_sandboxed(
                         &ctx.sandbox,
+                        &ctx.workspace_root,
                         name,
                         shell,
                         Some(&cwd),
@@ -395,7 +279,6 @@ impl Tool for Git {
         let sub = arg_str(args, "subcommand")?;
         let (action, side_effect) = match sub.as_str() {
             "status" | "diff" | "log" | "branch" | "show" => (ActionKind::Read, SideEffect::None),
-            "commit" => (ActionKind::Write, SideEffect::LocalMutation),
             _ => (ActionKind::Read, SideEffect::None),
         };
         Ok(PermissionRequest::new(
@@ -429,9 +312,10 @@ impl Tool for Git {
                 // a leading `-` would smuggle in an option like `--output=`.
                 let valid = !commit.is_empty()
                     && !commit.starts_with('-')
-                    && commit
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '~' | '^' | '@' | '-'));
+                    && commit.chars().all(|c| {
+                        c.is_ascii_alphanumeric()
+                            || matches!(c, '.' | '_' | '/' | '~' | '^' | '@' | '-')
+                    });
                 if !valid {
                     return Ok(ToolOutput {
                         content: format!("`{commit}` is not a git revision"),
@@ -528,7 +412,11 @@ impl Tool for TestRun {
         let command = if root.join("Cargo.toml").is_file() {
             "cargo test".to_string()
         } else if root.join("package.json").is_file() {
-            "npm test".to_string()
+            if root.join("pnpm-lock.yaml").is_file() {
+                "pnpm test".to_string()
+            } else {
+                "npm test".to_string()
+            }
         } else if root.join("pytest.ini").is_file() || root.join("pyproject.toml").is_file() {
             "pytest".to_string()
         } else {
