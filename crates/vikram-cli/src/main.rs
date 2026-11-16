@@ -801,7 +801,15 @@ fn main() -> std::process::ExitCode {
                 return run_async(chat::run_interactive(config, first, fresh));
             }
             let text = if message.is_empty() {
-                use std::io::Read;
+                use std::io::{IsTerminal, Read};
+                // On a terminal, read_to_string blocks until Ctrl+D with no prompt — the
+                // operator sees a hang, not a choice. Refuse up front and name the ways out.
+                if std::io::stdin().is_terminal() {
+                    eprintln!(
+                        "vikram: no message given — pass --interactive for a session, or pipe the message on stdin"
+                    );
+                    return std::process::ExitCode::FAILURE;
+                }
                 let mut buffer = String::new();
                 if std::io::stdin().read_to_string(&mut buffer).is_err() || buffer.trim().is_empty()
                 {
