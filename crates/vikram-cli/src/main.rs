@@ -2584,9 +2584,10 @@ fn registered_serve_pids() -> Vec<u32> {
     pids
 }
 
-/// On Linux, find `vikram mcp serve` processes directly so a server started before pidfiles
-/// existed is still reported. Other platforms rely on the pidfile registry alone.
-#[cfg(target_os = "linux")]
+/// On Linux and Android (Termux exposes /proc too), find `vikram mcp serve` processes directly so
+/// a server started before pidfiles existed is still reported. Other platforms rely on the
+/// pidfile registry alone.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn proc_serve_pids() -> Vec<u32> {
     let mut pids = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -2611,14 +2612,14 @@ fn proc_serve_pids() -> Vec<u32> {
     pids
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn proc_serve_pids() -> Vec<u32> {
     Vec::new()
 }
 
 /// `/proc/<pid>/cmdline` is NUL-separated argv. A serve is `vikram mcp serve` — the binary's own
 /// name may be a path, so the check is on the argument tail, not argv[0].
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn cmdline_is_serve(cmdline: &[u8]) -> bool {
     let args: Vec<&[u8]> = cmdline
         .split(|byte| *byte == 0)

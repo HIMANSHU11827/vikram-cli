@@ -191,7 +191,8 @@ pub fn checks(config: &Config) -> Vec<Check> {
     check_tool(&mut out, "tesseract", &["tesseract"], true);
     check_tool(&mut out, "xdotool", &["xdotool"], true);
 
-    if cfg!(target_os = "linux") {
+    // Android (Termux) is Linux for tool purposes: bwrap simply won't be installed there.
+    if cfg!(any(target_os = "linux", target_os = "android")) {
         check_tool(&mut out, "bwrap", &["bwrap"], true);
     } else {
         out.push(Check::new(
@@ -299,6 +300,18 @@ fn dep_hint(name: &str) -> &'static str {
             "bwrap" => "brew install bubblewrap",
             "sqlite3" => "brew install sqlite",
             _ => "install it and keep it on PATH",
+        }
+    } else if cfg!(target_os = "android") {
+        // Termux installs everything through pkg — the same binary names, different manager.
+        match name {
+            "git" => "pkg install git",
+            "cargo" | "rustc" => "pkg install rust",
+            "node" => "pkg install nodejs",
+            "python" => "pkg install python",
+            "chromium" => "pkg install chromium",
+            "bwrap" => "not available on Android; sandbox runs pass-through",
+            "sqlite3" => "pkg install sqlite",
+            _ => "pkg install <name>",
         }
     } else if cfg!(target_os = "windows") {
         match name {

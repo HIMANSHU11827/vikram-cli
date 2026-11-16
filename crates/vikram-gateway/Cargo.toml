@@ -22,6 +22,7 @@ tokio = { workspace = true }
 futures-util = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
+rustls.workspace = true
 rusqlite = { workspace = true }
 tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 # `socket.rs` builds its TLS line socket on tokio-rustls with the webpki root store; both were

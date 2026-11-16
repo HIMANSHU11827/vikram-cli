@@ -199,6 +199,7 @@ pub struct ReqwestTransport {
 
 impl ReqwestTransport {
     pub fn new() -> Result<Self, TransportError> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let build = |redirects: bool| {
             let mut builder = reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))

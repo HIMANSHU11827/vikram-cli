@@ -598,6 +598,7 @@ pub struct ReqwestSse {
 
 impl ReqwestSse {
     pub fn connect(url: impl Into<String>, token: impl Into<String>) -> Result<Self, String> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::builder()
             .build()
             .map_err(|err| format!("photon sse client: {err}"))?;

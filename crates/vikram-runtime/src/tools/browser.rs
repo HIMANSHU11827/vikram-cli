@@ -41,6 +41,7 @@ impl Tool for BrowserFetch {
             .filter(|&n| n > 0)
             .unwrap_or(10_000);
 
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = match reqwest::blocking::Client::builder()
             .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .timeout(Duration::from_secs(20))

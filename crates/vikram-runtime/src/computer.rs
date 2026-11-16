@@ -72,6 +72,12 @@ pub const HELPERS: [&str; 7] = [
 /// Linux, `brew` on macOS, and `choco`/`scoop` (or "install manually" where no package exists) on
 /// Windows. Unknown helpers get a generic PATH hint on every platform.
 pub fn install_hint(name: &str) -> &'static str {
+    if cfg!(target_os = "android") {
+        return match name {
+            "tesseract" => "pkg install tesseract",
+            _ => "pkg install <name>",
+        };
+    }
     if cfg!(target_os = "macos") {
         return match name {
             "xdotool" => "brew install xdotool",

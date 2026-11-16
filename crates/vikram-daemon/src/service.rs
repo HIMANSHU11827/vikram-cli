@@ -45,7 +45,7 @@ impl Platform {
 
 /// Which service manager this build is talking to.
 pub fn platform() -> Platform {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         if Path::new("/run/systemd/system").exists() || Path::new("/usr/bin/systemctl").exists() {
             return Platform::Systemd;

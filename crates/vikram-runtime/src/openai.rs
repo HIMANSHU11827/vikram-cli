@@ -52,6 +52,7 @@ impl OpenAiProvider {
         api_key: impl Into<String>,
         context_window: Option<u64>,
     ) -> Self {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(600))
@@ -354,6 +355,7 @@ pub async fn list_models(
     base_url: &str,
     api_key: &str,
 ) -> std::result::Result<Vec<String>, String> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(20))

@@ -377,6 +377,7 @@ fn encode(value: &str) -> String {
 
 /// Shared client for both backends: one user agent, bounded connect and total time.
 pub fn client() -> Result<reqwest::blocking::Client, SearchError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(Duration::from_secs(10))

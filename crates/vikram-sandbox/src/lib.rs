@@ -75,7 +75,9 @@ impl Sandbox {
                 resource_limits: limits,
             };
         }
-        let (mechanism, passthrough_reason) = if cfg!(target_os = "linux") {
+        // Android (Termux) shares the Linux kernel but has neither bwrap nor landlock in
+        // practice — check anyway so a user who installed them isn't told otherwise.
+        let (mechanism, passthrough_reason) = if cfg!(any(target_os = "linux", target_os = "android")) {
             if bwrap_available() {
                 (SandboxMechanism::Bubblewrap, None)
             } else if landlock_available() {

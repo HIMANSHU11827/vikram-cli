@@ -58,11 +58,12 @@ tokio = { version = "1.54", features = [
 futures-util = "0.3"
 async-trait = "0.1"
 reqwest = { version = "0.13", default-features = false, features = [
-    "rustls",
+    "rustls-no-provider",
     "json",
     "stream",
     "http2",
 ] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 ratatui-textarea = "0.9"
