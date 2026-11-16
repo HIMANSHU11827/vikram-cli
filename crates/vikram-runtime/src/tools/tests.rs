@@ -513,11 +513,12 @@ fn task_is_registered() {
 }
 
 #[test]
-fn diagnostics_declares_read_permission() {
+fn diagnostics_declares_execute_permission() {
+    // cargo check runs build scripts — code execution, not a read.
     let req = Diagnostics.permission(&json!({})).unwrap();
-    assert_eq!(req.action, ActionKind::Read);
+    assert_eq!(req.action, ActionKind::Execute);
     assert_eq!(req.verb, "diagnostics.collect");
-    assert_eq!(req.side_effect, SideEffect::None);
+    assert_eq!(req.side_effect, SideEffect::LocalMutation);
 }
 
 #[test]
@@ -851,14 +852,19 @@ fn interactive_browser_tools_declare_their_permission_shapes() {
 }
 
 #[test]
-fn an_interaction_names_its_session_as_the_resource() {
+fn an_interaction_names_its_session_and_arguments_as_the_resource() {
     let registry = ToolRegistry::with_builtins();
-    for name in ["browser.click", "browser.type", "browser.text"] {
+    // The resource must show what the call will do, not just which session it targets.
+    for (name, expected) in [
+        ("browser.click", "browser-7: #a"),
+        ("browser.type", "browser-7: #a = t"),
+        ("browser.text", "browser-7"),
+    ] {
         let tool = registry.get(name).unwrap();
         let req = tool
             .permission(&json!({"session": "browser-7", "selector": "#a", "text": "t"}))
             .unwrap();
-        assert_eq!(req.resource, "browser-7", "{name}");
+        assert_eq!(req.resource, expected, "{name}");
     }
     let req = BrowserOpen
         .permission(&json!({"url": "https://example.com/x"}))
@@ -872,12 +878,12 @@ fn interactive_browser_tools_refuse_a_permission_without_their_arguments() {
     assert!(BrowserOpen.permission(&json!({})).is_err());
     assert!(BrowserEval.permission(&json!({"js": "1"})).is_err());
     assert!(BrowserClick.permission(&json!({"selector": "#a"})).is_err());
-    // The session is all a permission request needs: a call with no `text` is still described
-    // to policy, and the missing argument is caught when the tool runs.
+    // The resource names the text being typed, so a call without `text` cannot be described
+    // to policy and is refused here rather than described vaguely.
     assert!(
         BrowserType
             .permission(&json!({"session": "browser-1", "selector": "#a"}))
-            .is_ok()
+            .is_err()
     );
     assert!(BrowserScroll.permission(&json!({})).is_err());
     assert!(BrowserText.permission(&json!({})).is_err());

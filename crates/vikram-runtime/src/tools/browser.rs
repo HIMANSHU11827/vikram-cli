@@ -140,6 +140,20 @@ fn browser_timeout(args: &Value) -> u64 {
         .clamp(1_000, 120_000)
 }
 
+/// The approval prompt prints the resource verbatim, so it has to say what the call will do —
+/// a bare session id hid the script, selector or text being sent to the page. Kept to one line
+/// and roughly 120 characters.
+fn resource_summary(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = flat.chars();
+    let head: String = chars.by_ref().take(120).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 /// The readable text of a page as the browser rendered it.
 ///
 /// The difference from `browser.fetch` is the whole point: `--dump-dom` runs the page's scripts
@@ -421,10 +435,11 @@ impl Tool for BrowserEval {
 
     fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
         let session = arg_str(args, "session")?;
+        let js = arg_str(args, "js")?;
         Ok(PermissionRequest::new(
             ActionKind::Execute,
             "browser.eval",
-            session,
+            resource_summary(&format!("{session}: {js}")),
             SideEffect::None,
             Trust::Model,
         ))
@@ -469,10 +484,11 @@ impl Tool for BrowserClick {
 
     fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
         let session = arg_str(args, "session")?;
+        let selector = arg_str(args, "selector")?;
         Ok(PermissionRequest::new(
             ActionKind::Execute,
             "browser.click",
-            session,
+            resource_summary(&format!("{session}: {selector}")),
             // A click changes the page, and a page can submit a form: that is a local mutation.
             SideEffect::LocalMutation,
             Trust::Model,
@@ -519,10 +535,12 @@ impl Tool for BrowserType {
 
     fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
         let session = arg_str(args, "session")?;
+        let selector = arg_str(args, "selector")?;
+        let text = arg_str(args, "text")?;
         Ok(PermissionRequest::new(
             ActionKind::Execute,
             "browser.type",
-            session,
+            resource_summary(&format!("{session}: {selector} = {text}")),
             SideEffect::LocalMutation,
             Trust::Model,
         ))
@@ -569,10 +587,32 @@ impl Tool for BrowserScroll {
 
     fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
         let session = arg_str(args, "session")?;
+        let x = args.get("x").and_then(Value::as_i64).unwrap_or(0);
+        let y = args.get("y").and_then(Value::as_i64).unwrap_or(0);
+        let mut parts = Vec::new();
+        if x != 0 {
+            parts.push(format!(
+                "{} {}px",
+                if x > 0 { "right" } else { "left" },
+                x.abs()
+            ));
+        }
+        if y != 0 {
+            parts.push(format!(
+                "{} {}px",
+                if y > 0 { "down" } else { "up" },
+                y.abs()
+            ));
+        }
+        let direction = if parts.is_empty() {
+            "no movement".to_string()
+        } else {
+            parts.join(", ")
+        };
         Ok(PermissionRequest::new(
             ActionKind::Execute,
             "browser.scroll",
-            session,
+            resource_summary(&format!("{session}: scroll {direction}")),
             SideEffect::None,
             Trust::Model,
         ))

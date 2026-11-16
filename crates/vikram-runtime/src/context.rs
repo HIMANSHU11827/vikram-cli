@@ -57,6 +57,9 @@ pub struct ContextSection {
 #[derive(Clone, Debug, Default)]
 pub struct ContextBundle {
     pub sections: Vec<ContextSection>,
+    /// Sections dropped because the token budget was already spent; rendered as one summary
+    /// line so a truncated bundle never looks complete.
+    pub omitted_sections: usize,
 }
 
 impl ContextBundle {
@@ -73,8 +76,41 @@ impl ContextBundle {
                 out.push_str("\n\n");
             }
         }
+        if self.omitted_sections > 0 {
+            out.push_str(&format!(
+                "[{} context sections omitted: token budget]\n",
+                self.omitted_sections
+            ));
+        }
         out
     }
+}
+
+/// Fit `content` inside `token_budget`: whole when it already fits, otherwise the longest
+/// prefix that leaves room for a `[truncated]` marker. `None` when even the marker does not
+/// fit, meaning the section has to be omitted entirely. The estimate is monotone in prefix
+/// length, so a binary search over char boundaries finds the cut.
+fn fit_content(content: &str, token_budget: u64) -> Option<(String, u64)> {
+    const MARKER: &str = "\n[truncated]";
+    let whole = vikram_contracts::TokenMeter::estimate(content);
+    if whole <= token_budget {
+        return Some((content.to_owned(), whole));
+    }
+    let room = token_budget.checked_sub(vikram_contracts::TokenMeter::estimate(MARKER))?;
+    let mut bounds: Vec<usize> = content.char_indices().map(|(i, _)| i).collect();
+    bounds.push(content.len());
+    let (mut lo, mut hi) = (0usize, bounds.len() - 1);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if vikram_contracts::TokenMeter::estimate(&content[..bounds[mid]]) <= room {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let fitted = format!("{}{MARKER}", &content[..bounds[lo]]);
+    let tokens = vikram_contracts::TokenMeter::estimate(&fitted);
+    Some((fitted, tokens))
 }
 
 #[derive(Clone, Debug)]
@@ -178,24 +214,28 @@ impl ContextLoader {
     }
 
     fn try_add(&self, bundle: &mut ContextBundle, file: ContextFile, path: PathBuf) -> bool {
-        if bundle.total_tokens() >= self.token_budget {
+        let Some(content) = self.read_file(&path) else {
+            return false;
+        };
+        // Duplicate prevention: skip if identical content already present.
+        if bundle.sections.iter().any(|s| s.content == content) {
             return false;
         }
-        if let Some(content) = self.read_file(&path) {
-            // Duplicate prevention: skip if identical content already present.
-            if bundle.sections.iter().any(|s| s.content == content) {
-                return false;
+        let remaining = self.token_budget.saturating_sub(bundle.total_tokens());
+        match fit_content(&content, remaining) {
+            Some((content, tokens)) => {
+                bundle.sections.push(ContextSection {
+                    file,
+                    path,
+                    content,
+                    tokens,
+                });
+                true
             }
-            let tokens = vikram_contracts::TokenMeter::estimate(&content);
-            bundle.sections.push(ContextSection {
-                file,
-                path,
-                content,
-                tokens,
-            });
-            true
-        } else {
-            false
+            None => {
+                bundle.omitted_sections += 1;
+                false
+            }
         }
     }
 
@@ -256,15 +296,17 @@ impl ContextLoader {
 
         // Authorized user/profile context is passed by caller via task_context appended as a section
         // only if explicitly provided and within budget.
-        if let Some(tc) = task_context
-            && bundle.total_tokens() < self.token_budget
-        {
-            bundle.sections.push(ContextSection {
-                file: ContextFile::Instructions,
-                path: PathBuf::from("<task>"),
-                content: tc.to_owned(),
-                tokens: vikram_contracts::TokenMeter::estimate(tc),
-            });
+        if let Some(tc) = task_context {
+            let remaining = self.token_budget.saturating_sub(bundle.total_tokens());
+            match fit_content(tc, remaining) {
+                Some((content, tokens)) => bundle.sections.push(ContextSection {
+                    file: ContextFile::Instructions,
+                    path: PathBuf::from("<task>"),
+                    content,
+                    tokens,
+                }),
+                None => bundle.omitted_sections += 1,
+            }
         }
 
         self.load_project_agents(&mut bundle);
@@ -304,15 +346,17 @@ impl ContextLoader {
         self.try_add(&mut bundle, ContextFile::Memory, dir.join("MEMORY.md"));
         self.try_add(&mut bundle, ContextFile::Tools, dir.join("TOOLS.md"));
 
-        if let Some(tc) = task_context
-            && bundle.total_tokens() < self.token_budget
-        {
-            bundle.sections.push(ContextSection {
-                file: ContextFile::Instructions,
-                path: PathBuf::from("<task>"),
-                content: tc.to_owned(),
-                tokens: vikram_contracts::TokenMeter::estimate(tc),
-            });
+        if let Some(tc) = task_context {
+            let remaining = self.token_budget.saturating_sub(bundle.total_tokens());
+            match fit_content(tc, remaining) {
+                Some((content, tokens)) => bundle.sections.push(ContextSection {
+                    file: ContextFile::Instructions,
+                    path: PathBuf::from("<task>"),
+                    content,
+                    tokens,
+                }),
+                None => bundle.omitted_sections += 1,
+            }
         }
 
         self.load_project_agents(&mut bundle);

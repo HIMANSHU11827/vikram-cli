@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use vikram_contracts::{ActionKind, BotId, PermissionRequest, SideEffect, Trust, VikramError};
 
@@ -187,21 +188,63 @@ impl Tool for HiveDelegate {
         ))
     }
 
-    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let hive = arg_str(args, "hive")?;
         let task = arg_str(args, "task")?;
         let agent = args.get("agent").and_then(Value::as_str).map(BotId::new);
-        let mgr = HiveRosterManager::load();
-        match mgr.delegate_task(&hive, &task, agent) {
-            Ok(()) => Ok(ToolOutput {
-                content: format!("delegated task to hive `{hive}`"),
-                ok: true,
-            }),
-            Err(e) => Ok(ToolOutput {
-                content: e,
+        let Some(runtime) = ctx.runtime.as_ref() else {
+            return Ok(ToolOutput {
+                content: "delegation needs a live runtime".into(),
                 ok: false,
-            }),
+            });
+        };
+        let handle = crate::runtime::RuntimeHandle {
+            inner: Arc::clone(runtime),
+        };
+        if let Err(e) = handle.hive_roster_delegate(hive.clone(), task.clone(), agent.clone()) {
+            return Ok(ToolOutput {
+                content: e.to_string(),
+                ok: false,
+            });
         }
+        // Recording the task on the roster is only half of delegating: each target member gets a
+        // real session through the same spawn path `agent.delegate` uses.
+        let targets = match agent {
+            Some(agent) => vec![agent],
+            None => handle
+                .hive_roster_get(&hive)
+                .map(|roster| roster.members)
+                .unwrap_or_default(),
+        };
+        if targets.is_empty() {
+            return Ok(ToolOutput {
+                content: format!("recorded task on hive `{hive}`, but it has no members to run it"),
+                ok: false,
+            });
+        }
+        let Some(parent) = ctx.session.clone() else {
+            return Ok(ToolOutput {
+                content: format!(
+                    "recorded task on hive `{hive}` but did not run it: no session to delegate from"
+                ),
+                ok: false,
+            });
+        };
+        let mut lines = vec![format!("delegated task to hive `{hive}`")];
+        let mut started = 0usize;
+        for target in &targets {
+            match handle.spawn_agent(target.clone(), task.clone(), parent.clone()) {
+                Ok(()) => {
+                    started += 1;
+                    lines.push(format!("- {target}: started"));
+                }
+                Err(e) => lines.push(format!("- {target}: {e}")),
+            }
+        }
+        Ok(ToolOutput {
+            content: truncated(lines.join("\n")),
+            ok: started > 0,
+        })
     }
 }
 
