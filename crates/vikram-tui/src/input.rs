@@ -585,6 +585,13 @@ fn handle_conversation(app: &mut App, key: KeyEvent) -> bool {
     }
 }
 
+/// A bare character press: Ctrl/Alt turn `p` into a chord, not the pause chip.
+fn plain_key(key: KeyEvent) -> bool {
+    !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
 fn handle_bots(app: &mut App, key: KeyEvent) -> bool {
     if app.bots.is_empty() {
         return false;
@@ -610,31 +617,24 @@ fn handle_bots(app: &mut App, key: KeyEvent) -> bool {
             app.focus = Focus::Input;
             true
         }
-        KeyCode::Char('p') => {
-            if let Some(agent) = app.bots.get(app.bot_selection) {
-                app.commands.push(UiCommand::BotControl {
-                    bot: agent.profile.id.clone(),
-                    action: BotAction::Pause,
-                });
-            }
-            true
-        }
-        KeyCode::Char('s') => {
-            if let Some(agent) = app.bots.get(app.bot_selection) {
-                app.commands.push(UiCommand::BotControl {
-                    bot: agent.profile.id.clone(),
-                    action: BotAction::Stop,
-                });
-            }
-            true
-        }
-        KeyCode::Char('r') => {
-            if let Some(agent) = app.bots.get(app.bot_selection) {
-                app.commands.push(UiCommand::BotControl {
-                    bot: agent.profile.id.clone(),
-                    action: BotAction::Resume,
-                });
-            }
+        // Every chip the pane draws gets a key, routed through the same `run_bot_click` the
+        // mouse uses — a drawn control with no keyboard path is a mouse-only feature.
+        KeyCode::Char(ch) if plain_key(key) => {
+            let click = match ch {
+                'a' => BotClick::Spawn,
+                'n' => BotClick::NewBot,
+                'e' => BotClick::Rename,
+                't' => BotClick::Tag,
+                'o' => BotClick::Soul,
+                'c' => BotClick::NewChat,
+                'x' => BotClick::Remove,
+                'm' => BotClick::Mode,
+                'p' => BotClick::Pause,
+                's' => BotClick::Stop,
+                'r' => BotClick::Resume,
+                _ => return false,
+            };
+            run_bot_click(app, click);
             true
         }
         _ => false,

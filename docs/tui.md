@@ -157,8 +157,9 @@ Composer:
 | `Up` / `Down` | Move a line |
 | `Backspace` / `Delete` | Delete before / after the cursor |
 
-Bots pane: `Up`/`Down` select, `Enter` open that bot, `Esc`/`Tab` back to the composer, `p` pause,
-`s` stop, `r` resume.
+Bots pane: `Up`/`Down` select, `Enter` open that bot, `Esc`/`Tab` back to the composer. Every chip
+has a key — `a` agent, `n` new bot, `e` rename, `t` tag, `o` soul, `c` new chat, `x` remove,
+`m` mode, `p` pause, `s` stop, `r` resume — all routed through the same handler the mouse uses.
 
 Approvals: `Up`/`Down` pick the request (when several wait), `Tab`/`Left`/`Right` move between
 the answers, `Enter` gives the selected answer, `a` approve once, `p` approve and remember,
