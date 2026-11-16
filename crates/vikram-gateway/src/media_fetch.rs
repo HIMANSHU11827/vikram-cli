@@ -29,9 +29,8 @@
 //! - The guard resolves nothing. A public hostname that resolves to `10.0.0.1` at connect time
 //!   (**DNS rebinding**) gets through; defeating that needs a resolver hooked into the connection,
 //!   which is out of scope for this simple lexical guard.
-//! - Redirects are followed by the underlying HTTP client. A public URL that redirects to a
-//!   private one is not re-checked. Closing that needs a per-request redirect policy on the
-//!   transport, which would change the behaviour every adapter shares.
+//! - Redirects are not followed: the byte transport is built with `redirect::Policy::none()`, so a
+//!   public URL that answers 302 to a private one is refused rather than re-checked.
 //! - Only still images are fetched. Video, audio, PDFs and platform-specific sticker/animation
 //!   payloads are skipped even when the adapter recorded a URL for them.
 //! - The whole body is buffered by the transport before the byte cap is applied, so a hostile

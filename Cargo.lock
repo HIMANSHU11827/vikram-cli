@@ -3429,6 +3429,7 @@ dependencies = [
  "vikram-daemon",
  "vikram-gateway",
  "vikram-mcp",
+ "vikram-policy",
  "vikram-runtime",
  "vikram-skills",
  "vikram-store",

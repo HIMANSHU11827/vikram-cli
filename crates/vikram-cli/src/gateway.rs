@@ -12,6 +12,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use vikram_contracts::{ImageSource, Message, PermissionMode};
+use vikram_gateway::access::{
+    AuthzInput, EnvLookup, PairingVerdict, PlatformAuthSpec, authorize_source,
+};
 use vikram_gateway::event::MessageEvent;
 use vikram_gateway::host::{
     BuzzPlatform, ChannelPlatform, DingTalkStreamPlatform, DiscordPlatform, EmailPlatform,
@@ -23,6 +26,7 @@ use vikram_gateway::ingress::{
     WebhookHandler, WebhookHub, WebhookPlatform, event_route, serve as serve_webhooks,
 };
 use vikram_gateway::media_fetch::{MediaFetchLimits, fetch_images_with_skips};
+use vikram_gateway::pairing::PairingStore;
 use vikram_gateway::platform::MessageHandler;
 use vikram_gateway::platform::PlatformAdapter;
 use vikram_gateway::platforms::bluebubbles::BlueBubblesAdapter;
@@ -53,7 +57,7 @@ use vikram_gateway::platforms::whatsapp_cloud::WhatsAppCloudAdapter;
 use vikram_gateway::platforms::yuanbao::{YuanbaoAdapter, YuanbaoConfig};
 use vikram_gateway::socket::{TcpLineSocket, TlsLineSocket, WsBinarySocket, WsSocket};
 use vikram_gateway::transport::{ReqwestTransport, SharedTransport};
-use vikram_runtime::config::Config;
+use vikram_runtime::config::{Config, vikram_home};
 use vikram_runtime::types::RuntimeEvent;
 use vikram_runtime::{Runtime, RuntimeHandle};
 
@@ -83,6 +87,64 @@ fn env(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// The process environment as [`EnvLookup`], through the same trim-and-drop-empty `env` helper
+/// every credential read uses.
+struct ProcessEnv;
+
+impl EnvLookup for ProcessEnv {
+    fn get(&self, key: &str) -> Option<String> {
+        env(key)
+    }
+}
+
+/// What the inbound path needs to run `access::authorize_source`: the environment view the
+/// allowlists are read from, and the pairing store operator-approved codes are checked against.
+struct IngressAuth {
+    env: ProcessEnv,
+    pairing: Option<Arc<PairingStore>>,
+}
+
+/// The per-platform slice of the central authorizer's configuration. The env names follow the
+/// `<PLATFORM>_ALLOWED_USERS` / `_ALLOW_ALL_USERS` / `_GROUP_ALLOWED_CHATS` / `_ALLOW_BOTS`
+/// convention every adapter documents, derived from the platform's own name; the global lists
+/// (`GATEWAY_ALLOWED_USERS`, `GATEWAY_ALLOW_ALL_USERS`) are read inside `authorize_source` itself.
+fn auth_spec(platform: &str) -> PlatformAuthSpec {
+    let prefix = platform
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let named = |suffix: &str| Some(format!("{prefix}_{suffix}"));
+    PlatformAuthSpec {
+        allowed_users_env: named("ALLOWED_USERS"),
+        allow_all_env: named("ALLOW_ALL_USERS"),
+        group_allowed_chats_env: named("GROUP_ALLOWED_CHATS"),
+        allow_bots_env: named("ALLOW_BOTS"),
+        // A2A's only ingress is the bearer-checked `/a2a` route, so by the time an event exists
+        // the upstream credential was already verified (access.rs decision 1). Its events carry
+        // no user id, which the central layer would otherwise deny outright.
+        trusted_inbound: platform == "a2a",
+        ..PlatformAuthSpec::default()
+    }
+}
+
+/// Constant-time token comparison, the same shape every webhook verifier in this workspace uses.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        difference |= a ^ b;
+    }
+    difference == 0
 }
 
 pub async fn run(config: Config) -> Result<(), String> {
@@ -913,7 +975,11 @@ pub async fn run(config: Config) -> Result<(), String> {
             ),
         }
 
-        // A2A needs no credentials: it is the agent-facing protocol itself.
+        // A2A is agent-facing: an unauthenticated `/a2a` would let anyone who can reach the bind
+        // submit turns to the runtime, so the route requires `A2A_TOKEN` as a bearer credential —
+        // the same shared-secret shape the other webhook routes verify. Without it configured the
+        // route refuses rather than running open.
+        let a2a_token = env("A2A_TOKEN");
         let engine = Arc::new(vikram_gateway::platforms::a2a::A2aEngine::new());
         let a2a = vikram_gateway::host::A2aPlatform::new(Arc::clone(&engine));
         let sender = a2a.sender();
@@ -925,9 +991,21 @@ pub async fn run(config: Config) -> Result<(), String> {
                 let engine = Arc::clone(&route_engine);
                 let platform = Arc::clone(&route_platform);
                 let sender = sender.clone();
+                let a2a_token = a2a_token.clone();
                 Box::pin(async move {
                     if request.method != "POST" {
                         return (405, "method not allowed".to_string());
+                    }
+                    match a2a_token.as_deref() {
+                        Some(expected) => {
+                            let authorization = request.header("Authorization").unwrap_or_default();
+                            let presented =
+                                authorization.strip_prefix("Bearer ").unwrap_or_default();
+                            if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+                                return (401, "bad token".to_string());
+                            }
+                        }
+                        None => return (403, "a2a is not configured".to_string()),
                     }
                     let Ok(text) = request.body_text() else {
                         return (400, "body is not utf-8".to_string());
@@ -1003,8 +1081,26 @@ pub async fn run(config: Config) -> Result<(), String> {
     }
 
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let sessions: Arc<Mutex<HashMap<String, vikram_contracts::SessionId>>> =
+    // Sessions are keyed by (platform, chat id): two platforms can hand out the same chat id, and
+    // a shared key would merge their transcripts into one session.
+    let sessions: Arc<Mutex<HashMap<(String, String), vikram_contracts::SessionId>>> =
         Arc::new(Mutex::new(HashMap::new()));
+
+    // Inbound authorization (access::authorize_source) runs on every event before a turn exists.
+    // The pairing store holds the operator-approved senders; if it cannot be opened the gateway
+    // still runs — allowlists and GATEWAY_ALLOW_ALL_USERS keep working, only pairing approvals are
+    // lost, which is the deny-first direction.
+    let pairing = match PairingStore::open(vikram_home().join("pairing")) {
+        Ok(store) => Some(Arc::new(store)),
+        Err(err) => {
+            eprintln!("[gateway] pairing store unavailable: {err}; pairing approvals disabled");
+            None
+        }
+    };
+    let auth = Arc::new(IngressAuth {
+        env: ProcessEnv,
+        pairing,
+    });
 
     if let Some(bind) = webhook_bind {
         if webhook_routes == 0 {
@@ -1032,8 +1128,17 @@ pub async fn run(config: Config) -> Result<(), String> {
         let handle = handle.clone();
         let sessions = Arc::clone(&sessions);
         let media = Arc::clone(&media_transport);
+        let auth = Arc::clone(&auth);
+        let spec = auth_spec(platform.name());
         let handler: vikram_gateway::host::ReplyHandler = Arc::new(move |event| {
-            turn(handle.clone(), Arc::clone(&sessions), media.clone(), event)
+            turn(
+                handle.clone(),
+                Arc::clone(&sessions),
+                media.clone(),
+                Arc::clone(&auth),
+                spec.clone(),
+                event,
+            )
         });
         let stop = stop_rx.clone();
         let name = platform.name().to_string();
@@ -1091,22 +1196,53 @@ fn message_for_event(text: &str, images: Vec<ImageSource>) -> Message {
 }
 
 /// One inbound event → one runtime turn → the turn's text.
+///
+/// Authorization runs first: `access::authorize_source` decides whether this sender may talk to
+/// the agent at all, and an unauthorized event is dropped before a session exists or a single
+/// attachment is fetched. Synthetic `internal` events (the raft wake bridge) are exempt — they are
+/// produced inside this process, not by a chat peer.
 fn turn(
     handle: RuntimeHandle,
-    sessions: Arc<Mutex<HashMap<String, vikram_contracts::SessionId>>>,
+    sessions: Arc<Mutex<HashMap<(String, String), vikram_contracts::SessionId>>>,
     media_transport: SharedTransport,
+    auth: Arc<IngressAuth>,
+    spec: PlatformAuthSpec,
     event: MessageEvent,
 ) -> vikram_gateway::host::ReplyFuture {
     Box::pin(async move {
+        if !event.internal {
+            let input = AuthzInput {
+                source: &event.source,
+                role_authorized: event.source.role_authorized,
+                is_bot: event.source.is_bot,
+                spec: &spec,
+                allow_adapter_delegation: true,
+            };
+            let pairing = auth
+                .pairing
+                .as_deref()
+                .map(|store| store as &dyn PairingVerdict);
+            if !authorize_source(&input, &auth.env, pairing, None) {
+                eprintln!(
+                    "[gateway:{}] dropped message from unauthorized sender (chat {}, user {:?})",
+                    event.source.platform, event.source.chat_id, event.source.user_id
+                );
+                return None;
+            }
+        }
         let chat = event.source.chat_id.clone();
-        let existing = sessions.lock().ok().and_then(|map| map.get(&chat).cloned());
+        let session_key = (event.source.platform.as_str().to_string(), chat.clone());
+        let existing = sessions
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&session_key).cloned());
         let session = match existing {
             Some(session) => session,
             None => {
                 let title = format!("{} · {}", event.source.platform, chat);
                 let session = handle.create_session(Some(title)).ok()?;
                 if let Ok(mut map) = sessions.lock() {
-                    map.insert(chat.clone(), session.clone());
+                    map.insert(session_key, session.clone());
                 }
                 session
             }
@@ -1153,11 +1289,19 @@ fn turn(
             }
         }
         let mut reply = String::new();
+        // A lagged receiver skipped events, so what was collected may be a prefix of the real
+        // reply. Keep draining for the turn's end (bounded — a flooded channel must not spin
+        // forever), but never send the partial text as if it were the final answer.
+        let mut incomplete = false;
+        let mut lags = 0u32;
         loop {
             match events.recv().await {
                 Ok(RuntimeEvent::StreamDelta {
                     session: sid, text, ..
-                }) if sid == session => reply.push_str(&text),
+                }) if sid == session => {
+                    reply.push_str(&text);
+                    lags = 0;
+                }
                 Ok(RuntimeEvent::TurnFinished {
                     session: sid,
                     state,
@@ -1173,9 +1317,29 @@ fn turn(
                     break;
                 }
                 Ok(RuntimeEvent::Shutdown) => break,
-                Ok(_) => {}
-                Err(_) => break,
+                Ok(_) => {
+                    lags = 0;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    incomplete = true;
+                    lags += 1;
+                    if lags > 32 {
+                        eprintln!(
+                            "[gateway:{}] event stream stayed lagged; dropping the reply",
+                            event.source.platform
+                        );
+                        return None;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
+        }
+        if incomplete {
+            eprintln!(
+                "[gateway:{}] reply for {} was truncated by event lag; not sent",
+                event.source.platform, chat
+            );
+            return None;
         }
         if reply.trim().is_empty() {
             None

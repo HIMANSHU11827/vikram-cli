@@ -2274,6 +2274,53 @@ struct ServeExecutor {
     registry: Arc<vikram_runtime::tools::ToolRegistry>,
     workspace_root: PathBuf,
     sandbox: vikram_runtime::config::SandboxSettings,
+    policy: vikram_policy::Policy,
+}
+
+/// The same evaluator a runtime turn consults: the operator's saved rules first, then the
+/// built-in conventions, under a floor neither tier can widen. `mcp serve` has no session and no
+/// one to ask, so [`PermissionMode::Yolo`] resolves the posture below — `approved_tools` is the
+/// operator's grant for this surface, while `Deny` rules and the mandatory floor still apply.
+fn serve_policy(config: &Config, workspace_root: &std::path::Path) -> vikram_policy::Policy {
+    use vikram_contracts::ActionKind;
+    use vikram_policy::{MandatoryFloor, Policy, ResourcePattern, Rule};
+
+    let root = workspace_root.to_string_lossy().into_owned();
+    let floor = MandatoryFloor {
+        workspace_root: Some(root.clone()),
+        extra_write_roots: vec![
+            vikram_home()
+                .join("sessions")
+                .to_string_lossy()
+                .into_owned(),
+        ],
+        ..MandatoryFloor::default()
+    };
+    let defaults = vec![
+        Rule::allow(ActionKind::Read, ResourcePattern::Any),
+        Rule::allow(ActionKind::Write, ResourcePattern::Subtree(root)),
+        Rule::ask(
+            ActionKind::Execute,
+            ResourcePattern::Any,
+            "commands run with your authority",
+        ),
+        Rule::ask(
+            ActionKind::Network,
+            ResourcePattern::Any,
+            "network access leaves this machine",
+        ),
+        Rule::allow(ActionKind::Delegate, ResourcePattern::Any),
+    ];
+    let mut rules = vikram_runtime::rules::RuleBook::open();
+    rules.set_workspace_root(Some(workspace_root.to_path_buf()));
+    let mut merged = std::collections::HashMap::new();
+    for (key, value) in &config.tool_permissions {
+        merged.insert(key.clone(), value.clone());
+    }
+    for (key, value) in &config.security.tool_permissions {
+        merged.insert(key.clone(), value.clone());
+    }
+    Policy::with_defaults(rules.snapshot(), defaults, floor).with_tool_permissions(merged)
 }
 
 impl vikram_mcp::server::ToolExecutor for ServeExecutor {
@@ -2286,7 +2333,23 @@ impl vikram_mcp::server::ToolExecutor for ServeExecutor {
             .registry
             .get(name)
             .ok_or_else(|| format!("tool not found: {name}"))?;
-        let _ = tool.permission(&arguments).map_err(|e| e.to_string())?;
+        // `run` does not re-check permission, so the request the tool describes has to be judged
+        // here: a saved deny, a config override or a mandatory-floor veto refuses the call instead
+        // of being computed and thrown away.
+        let request = tool.permission(&arguments).map_err(|e| e.to_string())?;
+        let decision = vikram_contracts::PermissionMode::Yolo.resolve(
+            self.policy.evaluate_at_depth(&request, 0),
+            &request,
+            vikram_contracts::Posture::default(),
+        );
+        if !decision.is_allowed() {
+            let reason = match decision {
+                vikram_contracts::Decision::Deny { reason }
+                | vikram_contracts::Decision::RequireApproval { reason, .. } => reason,
+                vikram_contracts::Decision::Allow => unreachable!("checked above"),
+            };
+            return Err(format!("permission denied: {reason}"));
+        }
         let ctx =
             vikram_runtime::tools::ToolContext::new(self.workspace_root.clone(), &self.sandbox);
         let output = tool.run(&arguments, &ctx).map_err(|e| e.to_string())?;
@@ -2322,7 +2385,9 @@ async fn mcp_serve() -> Result<(), String> {
         .workspace_root
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let workspace_root = std::fs::canonicalize(&workspace_root).unwrap_or(workspace_root);
     let sandbox_settings = app_config.security.sandbox.clone();
+    let policy = serve_policy(&app_config, &workspace_root);
 
     let registry = Arc::new(vikram_runtime::tools::ToolRegistry::with_builtins());
     for name in &serve_config.approved_tools {
@@ -2349,6 +2414,7 @@ async fn mcp_serve() -> Result<(), String> {
         registry,
         workspace_root,
         sandbox: sandbox_settings,
+        policy,
     }));
 
     eprintln!(

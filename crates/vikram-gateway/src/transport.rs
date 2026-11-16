@@ -191,16 +191,27 @@ pub type SharedTransport = Arc<dyn Transport>;
 /// The real transport. Built once and shared by every adapter in the process.
 pub struct ReqwestTransport {
     client: reqwest::Client,
+    /// `execute_bytes` serves untrusted attachment URLs. It uses a client that does not follow
+    /// redirects: the SSRF guard in `media_fetch` vets the URL it was handed, and a 302 would move
+    /// the fetch to a host that was never checked.
+    bytes_client: reqwest::Client,
 }
 
 impl ReqwestTransport {
     pub fn new() -> Result<Self, TransportError> {
-        reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .map(|client| Self { client })
-            .map_err(|err| TransportError::Request(err.to_string()))
+        let build = |redirects: bool| {
+            let mut builder = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(60));
+            if !redirects {
+                builder = builder.redirect(reqwest::redirect::Policy::none());
+            }
+            builder.build()
+        };
+        Ok(Self {
+            client: build(true).map_err(|err| TransportError::Request(err.to_string()))?,
+            bytes_client: build(false).map_err(|err| TransportError::Request(err.to_string()))?,
+        })
     }
 
     pub fn into_shared(self) -> SharedTransport {
@@ -209,13 +220,17 @@ impl ReqwestTransport {
 
     /// Build and send the request. Both body modes share this so verbs, headers and bodies can
     /// never drift between them.
-    async fn send(&self, request: HttpRequest) -> Result<reqwest::Response, TransportError> {
+    async fn send(
+        &self,
+        client: &reqwest::Client,
+        request: HttpRequest,
+    ) -> Result<reqwest::Response, TransportError> {
         let mut builder = match request.method {
-            HttpMethod::Get => self.client.get(&request.url),
-            HttpMethod::Post => self.client.post(&request.url),
-            HttpMethod::Put => self.client.put(&request.url),
-            HttpMethod::Patch => self.client.patch(&request.url),
-            HttpMethod::Delete => self.client.delete(&request.url),
+            HttpMethod::Get => client.get(&request.url),
+            HttpMethod::Post => client.post(&request.url),
+            HttpMethod::Put => client.put(&request.url),
+            HttpMethod::Patch => client.patch(&request.url),
+            HttpMethod::Delete => client.delete(&request.url),
         };
         for (name, value) in &request.headers {
             builder = builder.header(name, value);
@@ -233,7 +248,7 @@ impl ReqwestTransport {
 #[async_trait]
 impl Transport for ReqwestTransport {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
-        let response = self.send(request).await?;
+        let response = self.send(&self.client, request).await?;
         let status = response.status().as_u16();
         let retry_after = response
             .headers()
@@ -252,7 +267,14 @@ impl Transport for ReqwestTransport {
     }
 
     async fn execute_bytes(&self, request: HttpRequest) -> Result<Vec<u8>, TransportError> {
-        let response = self.send(request).await?;
+        let response = self.send(&self.bytes_client, request).await?;
+        // Redirects are not followed for binary downloads; a 3xx here means the attachment URL
+        // tried to move the fetch somewhere the caller's SSRF guard never vetted.
+        if response.status().is_redirection() {
+            return Err(TransportError::Request(
+                "the server answered with a redirect, which is not followed".to_string(),
+            ));
+        }
         let bytes = response
             .bytes()
             .await

@@ -942,15 +942,23 @@ mod tests {
         let runs = Arc::new(Mutex::new(0usize));
         let installs = Arc::new(Mutex::new(0usize));
         let installs_clone = installs.clone();
+        let ready = Arc::new(Mutex::new(false));
+        let probe_state = ready.clone();
+        let install_state = ready.clone();
         let mut registry = PlatformRegistry::new();
         registry
             .register(
                 PlatformEntry::bundled("signal", "Signal", loader("signal", runs.clone()))
-                    .with_check(Arc::new(|| {
-                        DependencyStatus::Missing(vec!["signal-cli".into()])
+                    .with_check(Arc::new(move || {
+                        if *probe_state.lock().expect("lock") {
+                            DependencyStatus::Ready
+                        } else {
+                            DependencyStatus::Missing(vec!["signal-cli".into()])
+                        }
                     }))
                     .with_ensure_dependencies(Arc::new(move || {
                         *installs_clone.lock().expect("lock") += 1;
+                        *install_state.lock().expect("lock") = true;
                         Ok(())
                     })),
             )
@@ -962,11 +970,36 @@ mod tests {
         assert_eq!(registry.install_count("signal"), 1);
         assert_eq!(registry.load_count("signal"), 1);
         assert_eq!(*runs.lock().expect("lock"), 1);
-        // Brand new: connect twice reuses the same adapter and does not install again.
+        // Brand new: connect twice reuses the same adapter; the second connect finds the
+        // dependencies already satisfied, so the installer does not run again.
         let again = registry.connect("signal", &ctx).expect("connect again");
         assert!(Arc::ptr_eq(&adapter, &again));
-        assert_eq!(*installs.lock().expect("lock"), 2, "installer still asks");
+        assert_eq!(*installs.lock().expect("lock"), 1);
         assert_eq!(*runs.lock().expect("lock"), 1, "adapter built once");
+    }
+
+    #[test]
+    fn connect_fails_when_dependencies_stay_missing() {
+        let mut registry = PlatformRegistry::new();
+        registry
+            .register(
+                PlatformEntry::bundled(
+                    "signal",
+                    "Signal",
+                    counting_loader(Arc::new(Mutex::new(0))),
+                )
+                .with_check(Arc::new(|| {
+                    DependencyStatus::Missing(vec!["signal-cli".into()])
+                })),
+            )
+            .expect("register");
+        let fixture = Fixture::new();
+        let err = match registry.connect("signal", &fixture.ctx(true)) {
+            Ok(_) => panic!("a platform with missing dependencies must not load"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, RegistryError::DependenciesMissing { .. }));
+        assert!(!registry.is_loaded("signal"));
     }
 
     #[test]
