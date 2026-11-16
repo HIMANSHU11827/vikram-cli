@@ -2,7 +2,7 @@
 //!
 //! This engine classifies actions by risk and determines approval requirements.
 
-use crate::error::Result;
+use crate::error::{EvolutionError, Result};
 use crate::store::EvolutionStore;
 use crate::types::{gen_id, now_ms};
 use serde::{Deserialize, Serialize};
@@ -69,6 +69,7 @@ pub struct ApprovalRequest {
     pub risk_level: AutonomyLevel,
     pub timestamp_ms: u64,
     pub status: ApprovalStatus,
+    pub approved_by: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +145,7 @@ impl AutonomyManager {
             risk_level: level,
             timestamp_ms: now_ms(),
             status: ApprovalStatus::Pending,
+            approved_by: None,
         };
 
         self.pending_approvals.push(request.clone());
@@ -151,16 +153,31 @@ impl AutonomyManager {
     }
 
     /// Execute an automatic action.
+    ///
+    /// Only actions classified [`AutonomyLevel::Automatic`] by
+    /// [`Self::determine_autonomy_level`] may run through this path. Anything
+    /// requiring controlled development or approval is rejected; use
+    /// [`Self::request_approval`] followed by [`Self::execute_controlled`]
+    /// instead.
     pub fn execute_automatic(
         &mut self,
         action: ActionType,
         description: &str,
     ) -> Result<ActionRecord> {
+        let level = self.determine_autonomy_level(&action);
+        if level != AutonomyLevel::Automatic {
+            return Err(EvolutionError::Security(format!(
+                "action {:?} requires {:?} autonomy; automatic execution is only \
+                 permitted for Automatic-level actions",
+                action, level
+            )));
+        }
+
         let record = ActionRecord {
             id: gen_id("action"),
             action_type: action,
             description: description.to_string(),
-            autonomy_level: AutonomyLevel::Automatic,
+            autonomy_level: level,
             approved: true,
             executed: true,
             approved_by: Some("system".to_string()),
@@ -172,25 +189,54 @@ impl AutonomyManager {
         Ok(record)
     }
 
-    /// Execute a controlled development action.
+    /// Execute a controlled development or approval-required action.
+    ///
+    /// `approval_request_id` must reference an [`ApprovalRequest`] previously
+    /// created by [`Self::request_approval`] and marked
+    /// [`ApprovalStatus::Approved`] via [`Self::approve_request`], and its
+    /// `action_type` must match `action`. A bare caller assertion is not
+    /// sufficient — there is no `approved: bool` shortcut.
     pub fn execute_controlled(
         &mut self,
         action: ActionType,
         description: &str,
-        approved: bool,
+        approval_request_id: &str,
     ) -> Result<ActionRecord> {
+        let request = self
+            .pending_approvals
+            .iter()
+            .find(|r| r.id == approval_request_id)
+            .ok_or_else(|| {
+                EvolutionError::NotFound(format!(
+                    "approval request {approval_request_id} not found"
+                ))
+            })?;
+
+        if request.status != ApprovalStatus::Approved {
+            return Err(EvolutionError::Security(format!(
+                "approval request {approval_request_id} is {:?}, not Approved",
+                request.status
+            )));
+        }
+
+        if request.action_type != action {
+            return Err(EvolutionError::Validation(format!(
+                "approval request {approval_request_id} covers {:?}, not {:?}",
+                request.action_type, action
+            )));
+        }
+
+        let level = self.determine_autonomy_level(&action);
+        let approved_by = request.approved_by.clone();
+
         let record = ActionRecord {
             id: gen_id("action"),
             action_type: action,
             description: description.to_string(),
-            autonomy_level: AutonomyLevel::ControlledDevelopment,
-            approved,
-            executed: approved,
-            approved_by: if approved {
-                Some("user".to_string())
-            } else {
-                None
-            },
+            autonomy_level: level,
+            approved: true,
+            executed: true,
+            approved_by,
             timestamp_ms: now_ms(),
         };
 
@@ -201,36 +247,55 @@ impl AutonomyManager {
 
     /// Approve a pending request.
     pub fn approve_request(&mut self, request_id: &str, approved_by: &str) -> Result<()> {
-        if let Some(req) = self
+        let req = self
             .pending_approvals
             .iter_mut()
             .find(|r| r.id == request_id)
-        {
-            req.status = ApprovalStatus::Approved;
-            let record = ActionRecord {
-                id: gen_id("action"),
-                action_type: req.action_type.clone(),
-                description: req.description.clone(),
-                autonomy_level: req.risk_level,
-                approved: true,
-                executed: false,
-                approved_by: Some(approved_by.to_string()),
-                timestamp_ms: now_ms(),
-            };
-            self.action_history.push(record);
+            .ok_or_else(|| {
+                EvolutionError::NotFound(format!("approval request {request_id} not found"))
+            })?;
+
+        if req.status != ApprovalStatus::Pending {
+            return Err(EvolutionError::Conflict(format!(
+                "approval request {request_id} is already {:?}",
+                req.status
+            )));
         }
+
+        req.status = ApprovalStatus::Approved;
+        req.approved_by = Some(approved_by.to_string());
+        let record = ActionRecord {
+            id: gen_id("action"),
+            action_type: req.action_type.clone(),
+            description: req.description.clone(),
+            autonomy_level: req.risk_level,
+            approved: true,
+            executed: false,
+            approved_by: Some(approved_by.to_string()),
+            timestamp_ms: now_ms(),
+        };
+        self.action_history.push(record);
         Ok(())
     }
 
     /// Reject a pending request.
     pub fn reject_request(&mut self, request_id: &str) -> Result<()> {
-        if let Some(req) = self
+        let req = self
             .pending_approvals
             .iter_mut()
             .find(|r| r.id == request_id)
-        {
-            req.status = ApprovalStatus::Rejected;
+            .ok_or_else(|| {
+                EvolutionError::NotFound(format!("approval request {request_id} not found"))
+            })?;
+
+        if req.status != ApprovalStatus::Pending {
+            return Err(EvolutionError::Conflict(format!(
+                "approval request {request_id} is already {:?}",
+                req.status
+            )));
         }
+
+        req.status = ApprovalStatus::Rejected;
         Ok(())
     }
 
@@ -275,5 +340,133 @@ impl AutonomyManager {
             }),
         })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::EvolutionStore;
+
+    fn manager() -> AutonomyManager {
+        AutonomyManager::new(EvolutionStore::open_in_memory().unwrap())
+    }
+
+    #[test]
+    fn automatic_execution_rejects_non_automatic_actions() {
+        let mut manager = manager();
+
+        for action in [
+            ActionType::ModifySourceCode,
+            ActionType::ChangeSecurityPolicy,
+            ActionType::ModifySecrets,
+            ActionType::DisableProtections,
+            ActionType::ExposeUserData,
+        ] {
+            let err = manager
+                .execute_automatic(action.clone(), "should not run")
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("automatic execution is only"),
+                "unexpected error for {action:?}: {msg}"
+            );
+        }
+        assert!(manager.get_action_history().is_empty());
+    }
+
+    #[test]
+    fn controlled_execution_requires_an_approved_matching_request() {
+        let mut manager = manager();
+
+        // No approval request at all.
+        assert!(
+            manager
+                .execute_controlled(ActionType::ModifySourceCode, "change", "approval-missing",)
+                .is_err()
+        );
+
+        // A pending (unapproved) request is not enough.
+        let pending =
+            manager.request_approval(ActionType::ModifySourceCode, "change", "need approval");
+        assert!(
+            manager
+                .execute_controlled(ActionType::ModifySourceCode, "change", &pending.id,)
+                .is_err()
+        );
+
+        // An approval for a different action does not cover this one.
+        let other = manager.request_approval(ActionType::RunTests, "run tests", "need approval");
+        manager.approve_request(&other.id, "user").unwrap();
+        assert!(
+            manager
+                .execute_controlled(ActionType::ModifySourceCode, "change", &other.id,)
+                .is_err()
+        );
+
+        // The matching approved request executes and records the real tier.
+        manager.approve_request(&pending.id, "user").unwrap();
+        let record = manager
+            .execute_controlled(ActionType::ModifySourceCode, "change", &pending.id)
+            .unwrap();
+        assert!(record.approved);
+        assert!(record.executed);
+        assert_eq!(record.autonomy_level, AutonomyLevel::ControlledDevelopment);
+        assert_eq!(record.approved_by.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn approval_required_action_executes_only_after_approval() {
+        let mut manager = manager();
+
+        let request = manager.request_approval(
+            ActionType::ChangeSecurityPolicy,
+            "loosen policy",
+            "requested",
+        );
+        assert_eq!(request.risk_level, AutonomyLevel::ApprovalRequired);
+        assert!(
+            manager
+                .execute_controlled(
+                    ActionType::ChangeSecurityPolicy,
+                    "loosen policy",
+                    &request.id,
+                )
+                .is_err()
+        );
+
+        manager.approve_request(&request.id, "admin").unwrap();
+        let record = manager
+            .execute_controlled(
+                ActionType::ChangeSecurityPolicy,
+                "loosen policy",
+                &request.id,
+            )
+            .unwrap();
+        assert_eq!(record.autonomy_level, AutonomyLevel::ApprovalRequired);
+        assert_eq!(record.approved_by.as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn approve_and_reject_fail_for_unknown_ids() {
+        let mut manager = manager();
+
+        assert!(manager.approve_request("approval-nope", "user").is_err());
+        assert!(manager.reject_request("approval-nope").is_err());
+        assert!(manager.get_action_history().is_empty());
+    }
+
+    #[test]
+    fn approve_and_reject_fail_for_already_resolved_requests() {
+        let mut manager = manager();
+
+        let request = manager.request_approval(ActionType::RunTests, "tests", "reason");
+        manager.approve_request(&request.id, "user").unwrap();
+        assert!(manager.approve_request(&request.id, "user").is_err());
+        assert!(manager.reject_request(&request.id).is_err());
+
+        let rejected = manager.request_approval(ActionType::RunTests, "tests", "reason");
+        manager.reject_request(&rejected.id).unwrap();
+        assert!(manager.approve_request(&rejected.id, "user").is_err());
     }
 }
