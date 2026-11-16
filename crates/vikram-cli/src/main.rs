@@ -1454,6 +1454,11 @@ fn profiles(action: ProfilesAction) -> std::process::ExitCode {
             }
             ProfilesAction::New { user, name } => {
                 let uid = vikram_contracts::UserId::new(user);
+                // A profile for a user that does not exist is an orphan row the store cannot
+                // cascade back to anything.
+                if store.get_user(&uid).map_err(|e| e.to_string())?.is_none() {
+                    return Err(format!("user {uid} not found"));
+                }
                 let now = vikram_runtime::types::now_ms();
                 let row = store
                     .create_profile(&uid, &name, now)
