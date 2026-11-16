@@ -71,12 +71,24 @@ pub fn parse_head(head: &str) -> Option<ParsedHead> {
         let (name, value) = line.split_once(':')?;
         headers.push((name.trim().to_string(), value.trim().to_string()));
     }
-    let length = headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.parse::<usize>().ok())
-        .unwrap_or(0);
-    Some((method, path, headers, length))
+    // Duplicate Content-Length headers are only safe when they agree; conflicting values are a
+    // request-smuggling shape, so the head is rejected outright.
+    let mut length = None;
+    for (name, value) in &headers {
+        if !name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        let Ok(declared) = value.parse::<usize>() else {
+            return None;
+        };
+        if let Some(previous) = length
+            && previous != declared
+        {
+            return None;
+        }
+        length = Some(declared);
+    }
+    Some((method, path, headers, length.unwrap_or(0)))
 }
 
 #[async_trait]
@@ -188,6 +200,11 @@ async fn handle_connection(
             break;
         }
         body.extend_from_slice(&chunk[..read]);
+    }
+    // A peer that declares N bytes and hangs up early must not have its truncated body dispatched:
+    // a signature or parse check over half a payload is not a check at all.
+    if body.len() < declared {
+        return respond(&mut stream, 400, "incomplete body").await;
     }
     body.truncate(declared);
 
@@ -349,6 +366,16 @@ mod tests {
     fn a_request_without_content_length_has_an_empty_body() {
         let (_, _, _, length) = parse_head("POST /x HTTP/1.1\r\nHost: y\r\n").unwrap();
         assert_eq!(length, 0);
+    }
+
+    #[test]
+    fn duplicate_content_length_headers_must_agree() {
+        let head = "POST /x HTTP/1.1\r\nHost: y\r\nContent-Length: 3\r\ncontent-length: 3\r\n";
+        assert_eq!(parse_head(head).expect("parsed").3, 3);
+        let head = "POST /x HTTP/1.1\r\nHost: y\r\nContent-Length: 3\r\nContent-Length: 4\r\n";
+        assert!(parse_head(head).is_none());
+        let head = "POST /x HTTP/1.1\r\nHost: y\r\nContent-Length: nope\r\n";
+        assert!(parse_head(head).is_none());
     }
 
     #[test]

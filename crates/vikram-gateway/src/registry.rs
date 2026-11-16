@@ -162,6 +162,8 @@ pub enum RegistryError {
     EmptyName(String),
     #[error("dependency installation failed for `{name}`: {detail}")]
     DependencyInstall { name: String, detail: String },
+    #[error("platform `{name}` cannot connect; missing dependencies: {}", missing.join(", "))]
+    DependenciesMissing { name: String, missing: Vec<String> },
     #[error("platform `{name}` failed to load: {detail}")]
     Load { name: String, detail: String },
 }
@@ -475,13 +477,21 @@ impl PlatformRegistry {
     /// Connect-time entry point: provision dependencies, then build the adapter.
     ///
     /// This is the only path that may install, and it is only reached once the operator decided to
-    /// connect (activation already said yes).
+    /// connect (activation already said yes). A platform whose probe still reports missing
+    /// dependencies after the installer ran — or that never declared one — fails here rather than
+    /// loading an adapter that cannot work.
     pub fn connect(
         &self,
         name: &str,
         ctx: &ActivationContext<'_>,
     ) -> Result<LoadedPlatform, RegistryError> {
-        self.ensure_dependencies(name, ctx)?;
+        let status = self.ensure_dependencies(name, ctx)?;
+        if !status.is_ready() {
+            return Err(RegistryError::DependenciesMissing {
+                name: normalize(name),
+                missing: status.missing().to_vec(),
+            });
+        }
         self.load(name)
     }
 

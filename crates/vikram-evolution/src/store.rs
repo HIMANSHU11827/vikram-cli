@@ -516,6 +516,15 @@ impl EvolutionStore {
         };
         collect_rows(rows)
     }
+
+    /// Total learning events, uncapped — `list_events` is a page, not a count.
+    pub fn count_events(&self) -> Result<usize> {
+        let conn = self.lock();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM learning_events", [], |r| r.get(0))
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        Ok(count.max(0) as usize)
+    }
 }
 
 // ---------- checked (de)serialisation helpers ----------

@@ -41,7 +41,7 @@ impl Dashboard {
             proposals_total: proposals.len(),
             candidates: self.store.list_candidates(None)?.len(),
             hive_lessons: self.store.list_hive_lessons()?.len(),
-            learning_events: self.store.list_events(None, 10000)?.len(),
+            learning_events: self.store.count_events()?,
             reflection_jobs_pending: jobs.len(),
         })
     }
