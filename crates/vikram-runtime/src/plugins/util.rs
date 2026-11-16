@@ -46,6 +46,18 @@ pub(crate) fn copy_dir(source: &Path, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Canonicalise `dir` and confirm it still sits under `root`.
+///
+/// When either side fails to canonicalise the lexical check stands in: callers only reach this
+/// with single-component ids joined onto `root`, which cannot traverse on its own — the
+/// canonicalisation exists to catch a symlinked plugin directory pointing outside the root.
+pub(crate) fn under_root(dir: &Path, root: &Path) -> bool {
+    match (dir.canonicalize(), root.canonicalize()) {
+        (Ok(dir), Ok(root)) => dir.starts_with(root),
+        _ => dir.starts_with(root),
+    }
+}
+
 pub(crate) fn write_atomic(path: &Path, body: &str) -> Result<(), String> {
     let parent = path
         .parent()

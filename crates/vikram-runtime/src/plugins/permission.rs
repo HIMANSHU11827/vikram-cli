@@ -69,8 +69,10 @@ impl PluginPermission {
 /// Parse a declared permission string into the closed vocabulary.
 ///
 /// Accepted spellings are case-insensitive, tolerate `_`/`:` in place of `.`, and ignore a
-/// trailing `:scope` suffix (`fs.read:workspace` is `fs.read`). An unrecognised spelling is
-/// `None` — never a grant.
+/// trailing `:scope` suffix (`fs.read:workspace` is `fs.read`). The scope is advisory only:
+/// nothing enforces it yet, so `fs.read:workspace` grants exactly what `fs.read` grants — the
+/// whole filesystem — until scoped enforcement lands. An unrecognised spelling is `None` —
+/// never a grant.
 pub fn parse_permission(raw: &str) -> Option<PluginPermission> {
     canonical_permission(raw).or_else(|| {
         let bare = raw.split(':').next().unwrap_or_default();

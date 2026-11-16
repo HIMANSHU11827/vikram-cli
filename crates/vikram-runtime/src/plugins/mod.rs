@@ -25,8 +25,10 @@
 //!
 //! Permissions: a manifest's `permissions` list is parsed into the closed [`PluginPermission`]
 //! vocabulary, and [`PluginRegistry::execute`] refuses to spawn an entry point unless the manifest
-//! declares `process` or `network`. Unknown permissions and unknown component types are warnings
-//! from [`PluginRegistry::validate`], never install-blockers.
+//! declares `process` or `network`. A trailing `:scope` (`fs.read:workspace`) parses but is
+//! advisory — scopes are not enforced yet, so it grants the unscoped capability. Unknown
+//! permissions and unknown component types are warnings from [`PluginRegistry::validate`], never
+//! install-blockers.
 
 use serde::{Deserialize, Serialize};
 

@@ -183,10 +183,17 @@ impl PluginRegistry {
     where
         A: PluginArgs,
     {
+        // Resolve by id first, then by name — the same order `plugin_dir` uses — so
+        // `plugin.execute id:"acme.tools"` reaches a plugin whose display name differs.
         let plugin = self
             .plugins
             .iter()
-            .find(|p| p.name == plugin_name)
+            .find(|p| p.id() == plugin_name)
+            .or_else(|| {
+                self.plugins
+                    .iter()
+                    .find(|p| p.name == plugin_name || dir_name(&p.path) == plugin_name)
+            })
             .ok_or_else(|| format!("plugin not found: {plugin_name}"))?;
         if !plugin.loaded {
             return Err(format!("plugin not loaded: {plugin_name}"));
@@ -251,10 +258,49 @@ impl PluginRegistry {
         cmd.stderr(std::process::Stdio::piped());
 
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+        // Drain both pipes on detached threads while the child runs (the `computer.rs` /
+        // `verification.rs` pattern): a plugin that fills a pipe must not deadlock against a
+        // parent that only reads after `wait_with_output`.
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        match child.stdout.take() {
+            Some(mut pipe) => {
+                std::thread::spawn(move || {
+                    let mut buffer = Vec::new();
+                    let _ = std::io::Read::read_to_end(&mut pipe, &mut buffer);
+                    let _ = out_tx.send(buffer);
+                });
+            }
+            None => {
+                let _ = out_tx.send(Vec::new());
+            }
+        }
+        match child.stderr.take() {
+            Some(mut pipe) => {
+                std::thread::spawn(move || {
+                    let mut buffer = Vec::new();
+                    let _ = std::io::Read::read_to_end(&mut pipe, &mut buffer);
+                    let _ = err_tx.send(buffer);
+                });
+            }
+            None => {
+                let _ = err_tx.send(Vec::new());
+            }
+        }
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(status)) => {
+                    let collect = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
+                        rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default()
+                    };
+                    let stdout = collect(out_rx);
+                    let stderr = collect(err_rx);
+                    let code = status.code().unwrap_or(-1);
+                    let stdout = String::from_utf8_lossy(&stdout);
+                    let stderr = String::from_utf8_lossy(&stderr);
+                    return Ok(format!("exit: {code}\nstdout: {stdout}\nstderr: {stderr}"));
+                }
                 Ok(None) => {
                     if Instant::now() >= deadline {
                         let _ = child.kill();
@@ -266,11 +312,6 @@ impl PluginRegistry {
                 Err(e) => return Err(e.to_string()),
             }
         }
-        let output = child.wait_with_output().map_err(|e| e.to_string())?;
-        let code = output.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Ok(format!("exit: {code}\nstdout: {stdout}\nstderr: {stderr}"))
     }
 
     pub fn merge(&mut self, other: Self) {

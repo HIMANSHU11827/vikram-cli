@@ -341,9 +341,18 @@ impl PluginRegistry {
     }
 
     /// Resolve an id (or plugin name) to its directory on disk.
+    ///
+    /// `id` must be a single usable directory name — the same rule install applies — so a
+    /// caller-supplied `../x` or absolute path can never escape the plugins root. The direct
+    /// `<root>/<id>` hit is additionally canonicalised and required to stay under the root.
     pub(crate) fn plugin_dir(&self, id: &str) -> Option<PathBuf> {
-        let direct = self.root().join(id);
-        if direct.join("plugin.json").is_file() {
+        let id = id.trim();
+        if id.is_empty() || id == "." || id == ".." || id.contains('/') || id.contains('\\') {
+            return None;
+        }
+        let root = self.root();
+        let direct = root.join(id);
+        if direct.join("plugin.json").is_file() && under_root(&direct, &root) {
             return Some(direct);
         }
         self.plugins
