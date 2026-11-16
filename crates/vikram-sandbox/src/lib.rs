@@ -195,7 +195,9 @@ impl Sandbox {
 
     /// Name of the platform this binary runs on, for diagnostics.
     pub fn platform() -> &'static str {
-        if cfg!(target_os = "linux") {
+        if cfg!(target_os = "android") {
+            "android"
+        } else if cfg!(target_os = "linux") {
             "linux"
         } else if cfg!(target_os = "macos") {
             "macos"
@@ -358,7 +360,7 @@ fn sandbox_exec_available() -> bool {
 
 fn landlock_available() -> bool {
     // Landlock is a Linux kernel feature (>=5.13). Check via /proc.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         std::fs::read_to_string("/proc/self/status")
             .map(|s| s.contains("Seccomp"))
@@ -366,7 +368,7 @@ fn landlock_available() -> bool {
             || Path::new("/sys/kernel/security/landlock").exists()
             || Path::new("/proc/sys/kernel/unprivileged_userns_clone").exists()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         false
     }
