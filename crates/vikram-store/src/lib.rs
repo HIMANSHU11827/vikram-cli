@@ -3624,11 +3624,13 @@ fn migrate(conn: &Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT 'ready'",
     )?;
     if title_migration_needed(conn)? {
-        // First upgrade only: sort the existing names into `generic` (a placeholder worth replacing)
-        // and `auto` (derived, so replaceable but already meaningful). A second run must not re-judge
-        // titles the operator has since renamed by hand.
-        classify_legacy_titles(conn)?;
+        // The version is marked BEFORE classifying, and classification is best-effort: if it
+        // fails partway, the next open must not re-run it, because by then the operator may have
+        // renamed sessions by hand and a second pass cannot tell those names from unclassified
+        // ones. Worst case of skipping is a placeholder title staying `manual` — conservative,
+        // never destructive.
         mark_title_migration_done(conn)?;
+        let _ = classify_legacy_titles(conn);
     }
 
     // FTS5 session message search (Hermes-shaped). Best-effort: if FTS5 is unavailable the table
