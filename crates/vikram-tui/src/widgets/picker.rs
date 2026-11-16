@@ -593,10 +593,11 @@ pub fn picker_body(picker: &Picker, theme: &Theme, width: u16) -> PickerBody {
         Span::styled(counter, theme.muted()),
     ]));
 
-    // One blank line between the search field and the list. A note is drawn only when there is no
-    // row to draw: then it is the reason (`connection refused`, `no model is set`), not a legend.
-    // A legend above a list repeats what the footer buttons already print.
-    if let Some(note) = picker.note.as_ref().filter(|_| picker.items.is_empty()) {
+    // One blank line between the search field and the list, which becomes the note when there is
+    // one. The note is the reason the list is short (`connection refused`, `nothing is scheduled`),
+    // so it has to be readable beside real rows too — a caller that needed it visible over a
+    // populated list used to push it as an item, which made it selectable and counted it.
+    if let Some(note) = picker.note.as_ref() {
         lines.push(Line::from(vec![
             Span::styled(" ".repeat(PAD), theme.muted()),
             Span::styled(

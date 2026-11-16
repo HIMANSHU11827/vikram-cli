@@ -848,13 +848,43 @@ fn edit_in_editor(name: &str, current: &str) -> Result<String, String> {
     if editor.trim().is_empty() {
         return Err("EDITOR is empty; pass --body <file> instead".to_owned());
     }
-    let path = std::env::temp_dir().join(format!(
+    // A predictable name in shared /tmp can be pre-created or symlinked by another user; create
+    // exclusively with owner-only permissions and retry on collision.
+    let mut path = std::env::temp_dir().join(format!(
         "vikram-skill-{}-{}.md",
         sanitize(name),
         std::process::id()
     ));
-    std::fs::write(&path, current)
-        .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
+    let mut attempts = 0;
+    loop {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(current.as_bytes())
+                    .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && attempts < 8 => {
+                attempts += 1;
+                path = std::env::temp_dir().join(format!(
+                    "vikram-skill-{}-{}-{}.md",
+                    sanitize(name),
+                    std::process::id(),
+                    attempts
+                ));
+            }
+            Err(err) => {
+                return Err(format!("cannot write {}: {err}", path.display()));
+            }
+        }
+    }
 
     let mut parts = editor.split_whitespace();
     let program = parts

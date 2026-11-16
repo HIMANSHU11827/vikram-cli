@@ -1387,19 +1387,11 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                 Err(err) => note = Some(err),
             }
             let picker = Picker::new(kind, "Background", items);
+            // The note is the reason the list is short, so it is drawn beside real rows too. It
+            // used to be pushed as an item when rows existed, which made an advisory selectable and
+            // counted it — the panel read `1 of 3` over two things that could actually be pressed.
             app.open_picker(match note {
-                // A note only draws on an empty list, so an error beside real rows would vanish.
-                // It becomes a footnote row instead — visible either way.
-                Some(note) if has_no_rows(&picker) => picker.with_note(note),
-                Some(note) => {
-                    let mut picker = picker;
-                    picker.items.push(PickerItem::new(
-                        format!("! {note}"),
-                        String::new(),
-                        "note".to_owned(),
-                    ));
-                    picker
-                }
+                Some(note) => picker.with_note(note),
                 None => picker,
             });
         }
@@ -1612,7 +1604,7 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
         }
         PickerKind::Doctor => {
             let checks = crate::doctor::checks(&handle.config());
-            let mut items: Vec<PickerItem> = checks
+            let items: Vec<PickerItem> = checks
                 .iter()
                 .map(|check| {
                     PickerItem::new(
@@ -1626,16 +1618,15 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                 .iter()
                 .filter(|check| check.level.is_failure())
                 .count();
-            items.push(PickerItem::new(
-                if problems == 0 {
-                    "! no blocking problems".to_owned()
-                } else {
-                    format!("! {problems} blocking problem(s)")
-                },
-                String::new(),
-                "summary".to_owned(),
-            ));
-            app.open_picker(Picker::new(kind, "Doctor", items));
+            // The verdict is a line above the list, not a row in it. As a row it was counted by the
+            // counter and took the cursor, so the panel read as if the summary were a check you
+            // could select. The checks are the rows; the verdict is the note.
+            let summary = if problems == 0 {
+                "! no blocking problems".to_owned()
+            } else {
+                format!("! {problems} blocking problem(s)")
+            };
+            app.open_picker(Picker::new(kind, "Doctor", items).with_note(summary));
         }
         PickerKind::Version => {
             let snapshot = handle.snapshot();
