@@ -831,12 +831,16 @@ impl LspClient {
             }
         }
         self.drain(DRAIN_TIMEOUT);
+        // A missing entry means the server has not published for this file — that is "no report
+        // yet", not "clean". The flag keeps the two apart for the caller.
+        let reported = self.published.contains_key(&uri);
         let items = self.published.get(&uri).cloned().unwrap_or_default();
         Ok(json!({
             "source": "textDocument/publishDiagnostics",
             "server": self.server.display(),
             "uri": uri,
             "count": items.len(),
+            "reported": reported,
             "diagnostics": items
         }))
     }
