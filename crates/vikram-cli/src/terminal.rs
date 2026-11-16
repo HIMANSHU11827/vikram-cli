@@ -910,10 +910,13 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                     PickerItem::new(rule.describe(), "enter forgets it", index.to_string())
                 })
                 .collect();
-            app.open_picker(
-                Picker::new(kind, "Saved allow-list", items)
-                    .with_note("ctrl+a saves a rule · enter forgets the one under the cursor"),
-            );
+            let picker = Picker::new(kind, "Saved allow-list", items);
+            // The footer prints every chord; a legend note only draws on an empty list anyway.
+            app.open_picker(if has_no_rows(&picker) {
+                picker.with_note("no rules saved yet — ctrl+a adds one")
+            } else {
+                picker
+            });
         }
         PickerKind::Bot => {
             let mut items: Vec<PickerItem> = Vec::new();
@@ -944,7 +947,7 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
             app.open_picker(if has_no_rows(&picker) {
                 picker.with_note("no MCP server has been configured for this process")
             } else {
-                picker.with_note("enter flips visibility")
+                picker
             });
         }
         PickerKind::Session => {
@@ -999,7 +1002,7 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
             app.open_picker(if has_no_rows(&picker) {
                 picker.with_note("nothing is running in the background")
             } else {
-                picker.with_note("enter stops the task")
+                picker
             });
         }
         PickerKind::Pending => {
@@ -1036,9 +1039,7 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                             "nothing waiting — Enter queues while a turn runs, Ctrl+Enter steers",
                         )
                     } else {
-                        picker.with_note(
-                            "ctrl+e edit · ctrl+d delete · ctrl+f steer/queue · ctrl+k/j reorder",
-                        )
+                        picker
                     });
                 }
                 Err(err) => report(app, err),
@@ -1070,7 +1071,7 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
             app.open_picker(if has_no_rows(&picker) {
                 picker.with_note("nothing has been remembered yet")
             } else {
-                picker.with_note("enter reads the whole value")
+                picker
             });
         }
         PickerKind::Setting => {
@@ -1086,10 +1087,9 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                     "bots",
                 ),
             ];
-            app.open_picker(
-                Picker::new(kind, "Settings", items)
-                    .with_note("enter flips the setting; it applies immediately"),
-            );
+            // No note: the two rows are never empty, so a note could never draw — and the footer
+            // already prints the chords.
+            app.open_picker(Picker::new(kind, "Settings", items));
         }
         PickerKind::HiveRoster => {
             let rosters = handle.hive_roster_list();
@@ -1266,9 +1266,13 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                     "empty".to_owned(),
                 ));
             }
-            app.open_picker(Picker::new(kind, "Plugins", items).with_note(
-                "enter inspects · ctrl+t enable/disable · ctrl+i install · ctrl+x uninstall",
-            ));
+            // The footer prints every chord; a legend note only draws on an empty list anyway.
+            let picker = Picker::new(kind, "Plugins", items);
+            app.open_picker(if has_no_rows(&picker) {
+                picker.with_note("no plugins installed")
+            } else {
+                picker
+            });
         }
         PickerKind::Tools => {
             let names = handle.tools().names();
@@ -1365,7 +1369,18 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
             }
             let picker = Picker::new(kind, "Background", items);
             app.open_picker(match note {
-                Some(note) => picker.with_note(note),
+                // A note only draws on an empty list, so an error beside real rows would vanish.
+                // It becomes a footnote row instead — visible either way.
+                Some(note) if has_no_rows(&picker) => picker.with_note(note),
+                Some(note) => {
+                    let mut picker = picker;
+                    picker.items.push(PickerItem::new(
+                        format!("! {note}"),
+                        String::new(),
+                        "note".to_owned(),
+                    ));
+                    picker
+                }
                 None => picker,
             });
         }
@@ -2182,6 +2197,10 @@ fn apply_act(
             }
         }
         (PickerKind::Background, Verb::Toggle) => {
+            // The footnote row an error leaves behind is a label, not a job.
+            if value == "note" {
+                return;
+            }
             // One panel, two kinds of row: the heartbeat row flips the beat, a job row flips that
             // job. Both write to the store the daemon reads, so the change takes effect on its
             // next tick without restarting anything.
