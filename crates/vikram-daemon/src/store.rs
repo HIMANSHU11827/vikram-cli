@@ -518,6 +518,28 @@ impl ScheduleStore {
         Ok(changed == 1)
     }
 
+    /// Skip a slot that can no longer run: move `next_run_ms` and record the skipped outcome in
+    /// one commit, so the schedule and `last_status` can never disagree.
+    pub fn skip_slot(
+        &self,
+        id: &str,
+        next: Option<Millis>,
+        now: Millis,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE daemon_jobs SET next_run_ms = ?2, updated_ms = ?3 WHERE id = ?1",
+            params![id, next, now],
+        )?;
+        tx.execute(
+            "UPDATE daemon_jobs SET last_status = ?2 WHERE id = ?1",
+            params![id, RunStatus::Skipped.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Move the next wake-up without touching the rest of the job. A retry uses this to come back
     /// sooner than the schedule says; the run rows keep what actually happened.
     pub fn set_next_run(

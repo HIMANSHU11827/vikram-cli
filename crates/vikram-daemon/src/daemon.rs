@@ -360,8 +360,7 @@ impl Daemon {
             return Ok(false);
         }
         let next = self.jobs.next_slot(job, now);
-        self.store.set_next_run(&job.id, next, now)?;
-        self.store.note_outcome(&job.id, RunStatus::Skipped)?;
+        self.store.skip_slot(&job.id, next, now)?;
         Ok(true)
     }
 

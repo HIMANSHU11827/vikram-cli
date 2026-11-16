@@ -395,8 +395,7 @@ impl JobManager {
                 continue;
             }
             let next = self.next_slot(&job, now);
-            self.store.set_next_run(&job.id, next, now)?;
-            self.store.note_outcome(&job.id, RunStatus::Skipped)?;
+            self.store.skip_slot(&job.id, next, now)?;
             job.next_run_ms = next;
             job.last_status = RunStatus::Skipped.as_str().to_string();
             skipped.push(job);
