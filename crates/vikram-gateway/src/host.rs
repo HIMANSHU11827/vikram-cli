@@ -509,6 +509,13 @@ impl GatewayPlatform for DingTalkStreamPlatform {
             .and_then(|value| value.as_str())
             && let Ok(mut webhooks) = self.webhooks.lock()
         {
+            // The map is a cache of the newest webhook per chat — bounded so a long-running
+            // gateway can't grow it forever. An evicted chat simply re-registers on its next
+            // inbound message.
+            const MAX_WEBHOOKS: usize = 4096;
+            if webhooks.len() >= MAX_WEBHOOKS {
+                webhooks.pop_first();
+            }
             webhooks.insert(event.source.chat_id.clone(), webhook.to_string());
         }
         Ok(vec![event])
