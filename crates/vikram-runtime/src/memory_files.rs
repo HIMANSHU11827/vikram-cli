@@ -31,20 +31,31 @@ impl MemoryFile {
         &self.path
     }
 
-    /// Load entries from disk (or empty if missing).
+    /// Load entries from disk; a missing file yields empty. Read/decode
+    /// failures are swallowed here for compatibility — use `try_load` when a
+    /// failure must not be silently ignored (e.g. before overwriting).
     pub fn load(&self) -> Vec<String> {
+        self.try_load().unwrap_or_default()
+    }
+
+    /// Load entries, distinguishing a missing file (empty) from read/decode
+    /// errors so a destructive write can be refused.
+    pub fn try_load(&self) -> Result<Vec<String>, String> {
         match fs::read_to_string(&self.path) {
-            Ok(s) => s
+            Ok(s) => Ok(s
                 .split(ENTRY_DELIM)
                 .map(str::trim)
                 .filter(|e| !e.is_empty())
                 .map(str::to_owned)
-                .collect(),
-            Err(_) => Vec::new(),
+                .collect()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(format!("cannot read {}: {e}", self.path.display())),
         }
     }
 
-    /// Frozen snapshot captured on first load (prefix-cache stability).
+    /// Frozen snapshot captured on first load (prefix-cache stability). It is
+    /// never refreshed, even after `add`/`remove`, so the system-prompt prefix
+    /// stays byte-stable for the life of this `MemoryFile`.
     pub fn snapshot(&mut self) -> String {
         if self.snapshot.is_none() {
             self.snapshot = Some(self.load().join(ENTRY_DELIM));
@@ -53,8 +64,12 @@ impl MemoryFile {
     }
 
     pub fn char_count(&self) -> usize {
-        self.load().iter().map(|e| e.chars().count()).sum::<usize>()
-            + (self.load().len().saturating_sub(1)) * ENTRY_DELIM.len()
+        Self::entries_len(&self.load())
+    }
+
+    fn entries_len(entries: &[String]) -> usize {
+        entries.iter().map(|e| e.chars().count()).sum::<usize>()
+            + entries.len().saturating_sub(1) * ENTRY_DELIM.len()
     }
 
     pub fn budget(&self) -> usize {
@@ -67,33 +82,32 @@ impl MemoryFile {
         if entry.is_empty() {
             return Err("empty entry".into());
         }
-        let mut entries = self.load();
+        // Refuse to overwrite a file we cannot read/decode — that would be
+        // silent data loss.
+        let mut entries = self.try_load()?;
         // dedup exact
         if entries.iter().any(|e| e == entry) {
             return Ok(());
         }
-        let new_count = self.char_count() + entry.chars().count() + ENTRY_DELIM.len();
+        let current = Self::entries_len(&entries);
+        let new_count = current + entry.chars().count() + ENTRY_DELIM.len();
         if new_count > self.budget {
             return Err(format!(
                 "memory file full ({}/{} chars); remove an entry first",
-                self.char_count(),
-                self.budget
+                current, self.budget
             ));
         }
         entries.push(entry.to_owned());
-        self.write(&entries)?;
-        self.snapshot = None;
-        Ok(())
+        self.write(&entries)
     }
 
     pub fn remove(&mut self, needle: &str) -> Result<usize, String> {
-        let mut entries = self.load();
+        let mut entries = self.try_load()?;
         let before = entries.len();
         entries.retain(|e| !e.contains(needle));
         let removed = before - entries.len();
         if removed > 0 {
             self.write(&entries)?;
-            self.snapshot = None;
         }
         Ok(removed)
     }
@@ -151,6 +165,33 @@ mod tests {
         f.add("beta").unwrap();
         let n = f.remove("alpha").unwrap();
         assert_eq!(n, 1);
+        assert_eq!(f.load().len(), 1);
+    }
+    #[test]
+    fn add_refuses_to_overwrite_undecodable_file() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let mut f = MemoryFile::new(home.join("memories").join("M.md"), 100);
+        fs::create_dir_all(f.path().parent().unwrap()).unwrap();
+        fs::write(f.path(), b"\xff\xfe invalid utf8").unwrap();
+        let before = fs::read(f.path()).unwrap();
+
+        assert!(f.add("new entry").is_err());
+        assert!(f.remove("anything").is_err());
+        assert_eq!(fs::read(f.path()).unwrap(), before);
+    }
+    #[test]
+    fn snapshot_stays_frozen_after_writes() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let mut f = memory_file(home);
+        f.add("first").unwrap();
+        let snap = f.snapshot();
+        assert!(snap.contains("first"));
+
+        f.add("second").unwrap();
+        f.remove("first").unwrap();
+        assert_eq!(f.snapshot(), snap);
         assert_eq!(f.load().len(), 1);
     }
 }

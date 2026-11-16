@@ -356,8 +356,10 @@ impl TicketManager {
             .ok_or_else(|| format!("ticket {ticket} not found"))?;
         let is_owner = ticket_row.owner_key == viewer_key;
         let is_admin = self.can_admin(ticket, viewer_key);
-        let is_participant = self.is_participant(ticket, viewer_key);
-        if !is_participant && !is_owner && !is_admin {
+        // A participant row alone is not enough: the row's can_read flag (or
+        // can_admin, or ticket ownership) is required to read messages.
+        let can_read = self.can_read(ticket, viewer_key);
+        if !can_read && !is_admin && !is_owner {
             return Err(format!(
                 "participant `{viewer_key}` may not read ticket {ticket}"
             ));
@@ -704,5 +706,64 @@ impl TicketManager {
     }
     pub fn entity_key(id: &EntityId) -> String {
         format!("entity:{}", id.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manager() -> TicketManager {
+        TicketManager::new(Arc::new(vikram_store::Store::open_in_memory().unwrap()))
+    }
+
+    fn participant(ticket: &TicketId, key: &str, can_read: bool) -> TicketParticipantRow {
+        TicketParticipantRow {
+            ticket: ticket.clone(),
+            participant_key: key.to_owned(),
+            participant_kind: "user".to_owned(),
+            entity_id: None,
+            user_id: None,
+            role: "member".to_owned(),
+            can_read,
+            can_write: false,
+            can_admin: false,
+            joined_ms: 1,
+        }
+    }
+
+    #[test]
+    fn participant_without_can_read_gets_no_messages() {
+        let m = manager();
+        let ticket = m
+            .create(
+                "owner", "user", "general", "T", "req", "", None, None, None, None, 1,
+            )
+            .unwrap();
+        m.add_participant(&participant(&ticket.id, "viewer", false))
+            .unwrap();
+        m.post_message(&ticket.id, "owner", "user", "hello", "shared", None, 2)
+            .unwrap();
+
+        assert!(m.messages_for(&ticket.id, "viewer").is_err());
+        assert_eq!(m.messages_for(&ticket.id, "owner").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn participant_with_can_read_sees_shared_messages() {
+        let m = manager();
+        let ticket = m
+            .create(
+                "owner", "user", "general", "T", "req", "", None, None, None, None, 1,
+            )
+            .unwrap();
+        m.add_participant(&participant(&ticket.id, "viewer", true))
+            .unwrap();
+        m.post_message(&ticket.id, "owner", "user", "hello", "shared", None, 2)
+            .unwrap();
+
+        let msgs = m.messages_for(&ticket.id, "viewer").unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "hello");
     }
 }
