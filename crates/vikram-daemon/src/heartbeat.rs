@@ -357,22 +357,36 @@ impl<'a> Heartbeat<'a> {
     pub fn agent(&self, now: Millis) -> Result<Beat, StoreError> {
         let mut issues = Vec::new();
         let runs = self.store.recent_runs(200)?;
-        let failures: Vec<_> = runs
-            .iter()
-            .filter(|run| run.status == RunStatus::Failed && run.finished_ms.is_some())
-            .collect();
 
         for job in self.store.list_jobs()? {
-            let mine: Vec<_> = failures.iter().filter(|run| run.job_id == job.id).collect();
-            if mine.len() >= 3 {
+            // Runs come back newest first. The streak is the leading run of failures: anything
+            // else — a success, a skip, a cancellation, a run still in flight — breaks the row,
+            // so three failures spread across a week of successes are not "in a row".
+            let mut streak = 0usize;
+            let mut counting = true;
+            let mut newest_failure = None;
+            for run in runs.iter().filter(|run| run.job_id == job.id) {
+                if run.status == RunStatus::Failed && run.finished_ms.is_some() {
+                    if newest_failure.is_none() {
+                        newest_failure = Some(run);
+                    }
+                    if counting {
+                        streak += 1;
+                    }
+                } else {
+                    counting = false;
+                }
+            }
+            if streak >= 3 {
                 issues.push(Issue::new(
                     format!("job.failing.{}", job.id),
                     Health::Degraded,
-                    format!("{} has failed {} times in a row", job.name, mine.len()),
+                    format!("{} has failed {streak} times in a row", job.name),
                 ));
             }
-            if let Some(run) = mine.first()
+            if let Some(run) = newest_failure
                 && run.delivery != crate::store::Delivery::Delivered
+                && run.delivery != crate::store::Delivery::Rerouted
                 && run.delivery != crate::store::Delivery::None
             {
                 issues.push(Issue::new(
@@ -434,16 +448,26 @@ impl<'a> Heartbeat<'a> {
             BeatKind::Workers => self.workers(now)?,
         };
         self.stamp(kind, now)?;
-        beat.notify = self.release(beat.issues.clone(), now)?;
+        beat.notify = self.release(kind, beat.issues.clone(), now)?;
         Ok(beat)
     }
 
     /// Which of these issues are past their cooldown. An issue that is no longer present is
     /// forgotten, so a problem that comes back is reported again rather than staying silent.
-    pub fn release(&self, issues: Vec<Issue>, now: Millis) -> Result<Vec<Issue>, StoreError> {
+    /// Stamps are kept per beat kind: one beat's clean bill must not quiet another beat's issue,
+    /// and stale stamps are deleted so the table does not grow forever.
+    pub fn release(
+        &self,
+        kind: BeatKind,
+        issues: Vec<Issue>,
+        now: Millis,
+    ) -> Result<Vec<Issue>, StoreError> {
+        let prefix = format!("heartbeat.reported.{}.", kind.as_str());
         let mut send = Vec::new();
+        let mut current = Vec::new();
         for issue in issues {
-            let key = format!("heartbeat.reported.{}", issue.key);
+            let key = format!("{prefix}{}", issue.key);
+            current.push(key.clone());
             let last = self.store.state_ms(&key).ok().flatten();
             let quiet = last.is_some_and(|last| now - last < self.policy.cooldown_ms);
             if quiet {
@@ -451,6 +475,11 @@ impl<'a> Heartbeat<'a> {
             }
             self.store.set_state_ms(&key, now)?;
             send.push(issue);
+        }
+        for stale in self.store.state_keys(&prefix)? {
+            if !current.contains(&stale) {
+                self.store.delete_state(&stale)?;
+            }
         }
         Ok(send)
     }

@@ -258,7 +258,12 @@ impl JobManager {
         if on {
             job.next_run_ms = self.next_slot(&job, now);
         }
-        self.store.set_enabled(&job.id, on, now)?;
+        if !self
+            .store
+            .set_enabled_next(&job.id, on, job.next_run_ms, now)?
+        {
+            return Err(ManagerError::Missing(job.id.clone()));
+        }
         job.enabled = on;
         job.updated_ms = now;
         Ok(job)
@@ -267,8 +272,9 @@ impl JobManager {
     /// Bring the next run forward to now without disturbing the schedule.
     pub fn run_now(&self, needle: &str, now: Millis) -> Result<Job, ManagerError> {
         let mut job = self.find(needle)?;
-        self.store.set_next_run(&job.id, Some(now), now)?;
-        self.store.set_enabled(&job.id, true, now)?;
+        if !self.store.set_enabled_next(&job.id, true, Some(now), now)? {
+            return Err(ManagerError::Missing(job.id.clone()));
+        }
         job.next_run_ms = Some(now);
         job.enabled = true;
         job.updated_ms = now;
@@ -294,10 +300,12 @@ impl JobManager {
         now: Millis,
     ) -> Result<Option<Claimed>, ManagerError> {
         let next = self.next_slot(job, slot);
-        if !self.store.claim(&job.id, slot, next)? {
+        let Some(run) = self
+            .store
+            .claim_begin_run(&job.id, slot, next, job, slot, None)?
+        else {
             return Ok(None);
-        }
-        let run = self.store.begin_run(job, slot, None)?;
+        };
         let mut job = job.clone();
         job.next_run_ms = next;
         job.last_run_ms = Some(slot);
@@ -314,41 +322,54 @@ impl JobManager {
         output: &str,
         error: &str,
         now: Millis,
-    ) -> Result<Settled, ManagerError> {
+    ) -> Result<Settled, StoreError> {
         let status = if ok { RunStatus::Ok } else { RunStatus::Failed };
-        self.store
-            .finish_run(&run.id, status, output, error, delivery_for(job, ok))?;
-        self.store.note_outcome(&job.id, status)?;
-
-        if !ok && run.attempt <= job.retries {
-            let at = now + retry_delay_ms(run.attempt);
-            self.store.set_next_run(&job.id, Some(at), now)?;
-            return Ok(Settled {
-                retry_at: Some(at),
-                disabled: false,
-            });
-        }
-
+        // A retry is a new slot, not a replay: the run rows keep the failed attempt and the
+        // retry both. It comes back sooner than the schedule says, on its own backoff.
+        let retry_at = if !ok && run.attempt <= job.retries {
+            Some(now + retry_delay_ms(run.attempt))
+        } else {
+            None
+        };
         // A one-time job has no next slot, so it is switched off rather than left enabled with
         // nothing to do.
-        let disabled = job.next_run_ms.is_none();
-        if disabled {
-            self.store.set_enabled(&job.id, false, now)?;
-        }
-        Ok(Settled {
-            retry_at: None,
-            disabled,
-        })
+        let disabled = retry_at.is_none() && job.next_run_ms.is_none();
+        self.store.settle_run(
+            &run.id,
+            status,
+            output,
+            error,
+            delivery_for(job, ok),
+            &job.id,
+            retry_at,
+            disabled.then_some(false),
+            now,
+        )?;
+        Ok(Settled { retry_at, disabled })
     }
 
     /// A run the operator cancelled is not a failure, so it earns no retry and no alert — but the
     /// job still has a status of its own and a one-time job still switches itself off.
-    pub fn settle_cancelled(&self, job: &Job, now: Millis) -> Result<Settled, ManagerError> {
-        self.store.note_outcome(&job.id, RunStatus::Cancelled)?;
+    pub fn settle_cancelled(
+        &self,
+        job: &Job,
+        run: &Run,
+        output: &str,
+        error: &str,
+        now: Millis,
+    ) -> Result<Settled, StoreError> {
         let disabled = job.next_run_ms.is_none();
-        if disabled {
-            self.store.set_enabled(&job.id, false, now)?;
-        }
+        self.store.settle_run(
+            &run.id,
+            RunStatus::Cancelled,
+            output,
+            error,
+            Delivery::None,
+            &job.id,
+            None,
+            disabled.then_some(false),
+            now,
+        )?;
         Ok(Settled {
             retry_at: None,
             disabled,

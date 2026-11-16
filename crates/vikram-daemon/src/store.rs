@@ -107,6 +107,9 @@ pub enum Delivery {
     None,
     Pending,
     Delivered,
+    /// Delivered, but not where the job asked: the named session was not reachable, so the
+    /// report landed in the daemon's own reports conversation instead.
+    Rerouted,
     Failed,
 }
 
@@ -116,6 +119,7 @@ impl Delivery {
             Self::None => "none",
             Self::Pending => "pending",
             Self::Delivered => "delivered",
+            Self::Rerouted => "rerouted",
             Self::Failed => "failed",
         }
     }
@@ -124,6 +128,7 @@ impl Delivery {
         match text {
             "pending" => Self::Pending,
             "delivered" => Self::Delivered,
+            "rerouted" => Self::Rerouted,
             "failed" => Self::Failed,
             _ => Self::None,
         }
@@ -467,6 +472,33 @@ impl ScheduleStore {
         Ok(changed == 1)
     }
 
+    /// Claim a slot and open its run row in one commit. The compare-and-set and the INSERT used
+    /// to be separate writes, so a crash between them left a slot claimed with no run to show for
+    /// it; inside one transaction the pair either both land or neither does.
+    pub fn claim_begin_run(
+        &self,
+        id: &str,
+        expected: Millis,
+        next: Option<Millis>,
+        job: &Job,
+        slot_ms: Millis,
+        session: Option<&str>,
+    ) -> Result<Option<Run>, StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE daemon_jobs SET next_run_ms = ?3, last_run_ms = ?2 WHERE id = ?1
+             AND next_run_ms = ?2",
+            params![id, expected, next],
+        )?;
+        if changed != 1 {
+            return Ok(None);
+        }
+        let run = begin_run_in(&tx, job, slot_ms, session)?;
+        tx.commit()?;
+        Ok(Some(run))
+    }
+
     /// Record a run's outcome on the job row, so `list` can show it without reading run history.
     pub fn note_outcome(&self, id: &str, status: RunStatus) -> Result<(), StoreError> {
         let conn = self.lock();
@@ -502,6 +534,23 @@ impl ScheduleStore {
         Ok(changed == 1)
     }
 
+    /// Switch a job on or off and give it its next slot in one write, so the flag and the
+    /// schedule can never disagree about whether there is anything left to run.
+    pub fn set_enabled_next(
+        &self,
+        id: &str,
+        enabled: bool,
+        next: Option<Millis>,
+        now: Millis,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE daemon_jobs SET enabled = ?2, next_run_ms = ?3, updated_ms = ?4 WHERE id = ?1",
+            params![id, i64::from(enabled), next, now],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub fn delete_job(&self, id: &str) -> Result<bool, StoreError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
@@ -522,48 +571,90 @@ impl ScheduleStore {
         session: Option<&str>,
     ) -> Result<Run, StoreError> {
         let conn = self.lock();
-        let attempt: u32 = conn.query_row(
-            "SELECT COALESCE(MAX(attempt), 0) FROM daemon_runs WHERE job_id = ?1 AND slot_ms = ?2",
-            params![job.id, slot_ms],
-            |row| row.get::<_, i64>(0),
-        )? as u32
-            + 1;
-        let run = Run {
-            id: format!("run_{}_{}_{}", job.id, slot_ms, attempt),
-            job_id: job.id.clone(),
-            slot_ms,
-            attempt,
-            started_ms: crate::time::now_ms(),
-            finished_ms: None,
-            status: RunStatus::Running,
-            session: session.map(str::to_string),
-            output: String::new(),
-            error: String::new(),
-            delivery: if job.target.trim().is_empty() || job.target.trim() == "none" {
-                Delivery::None
-            } else {
-                Delivery::Pending
-            },
-            delivery_note: String::new(),
-        };
-        conn.execute(
-            "INSERT INTO daemon_runs (id, job_id, slot_ms, attempt, started_ms, status, session,
-                 output, error, delivery)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        begin_run_in(&conn, job, slot_ms, session)
+    }
+
+    /// Finish a run and write what it means for the job — its status, a moved slot, or the
+    /// switch going off — in one commit, so a crash cannot leave half of a settlement behind.
+    /// `next_run` moves the slot (a retry coming back sooner), `enabled` flips the switch; either
+    /// may be absent when the job keeps what it had.
+    #[allow(clippy::too_many_arguments)]
+    pub fn settle_run(
+        &self,
+        run_id: &str,
+        status: RunStatus,
+        output: &str,
+        error: &str,
+        delivery: Delivery,
+        job_id: &str,
+        next_run: Option<Millis>,
+        enabled: Option<bool>,
+        now: Millis,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE daemon_runs SET finished_ms = ?2, status = ?3, output = ?4, error = ?5,
+                 delivery = ?6 WHERE id = ?1",
             params![
-                run.id,
-                run.job_id,
-                run.slot_ms,
-                run.attempt,
-                run.started_ms,
-                run.status.as_str(),
-                run.session,
-                run.output,
-                run.error,
-                run.delivery.as_str(),
+                run_id,
+                crate::time::now_ms(),
+                status.as_str(),
+                output,
+                error,
+                delivery.as_str()
             ],
         )?;
-        Ok(run)
+        tx.execute(
+            "UPDATE daemon_jobs SET last_status = ?2 WHERE id = ?1",
+            params![job_id, status.as_str()],
+        )?;
+        if let Some(next) = next_run {
+            tx.execute(
+                "UPDATE daemon_jobs SET next_run_ms = ?2, updated_ms = ?3 WHERE id = ?1",
+                params![job_id, next, now],
+            )?;
+        }
+        if let Some(enabled) = enabled {
+            tx.execute(
+                "UPDATE daemon_jobs SET enabled = ?2, updated_ms = ?3 WHERE id = ?1",
+                params![job_id, i64::from(enabled), now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Close a run the pool refused to start and move the job's next slot in one commit. A job
+    /// with no next slot — a one-time job, or a schedule that has run out — is switched off:
+    /// enabled with nothing to fire is a state that only looks healthy.
+    pub fn skip_run(
+        &self,
+        run_id: &str,
+        job_id: &str,
+        error: &str,
+        next: Option<Millis>,
+        now: Millis,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE daemon_runs SET finished_ms = ?2, status = 'skipped', error = ?3,
+                 delivery = 'none' WHERE id = ?1",
+            params![run_id, crate::time::now_ms(), error],
+        )?;
+        tx.execute(
+            "UPDATE daemon_jobs SET next_run_ms = ?2, updated_ms = ?3 WHERE id = ?1",
+            params![job_id, next, now],
+        )?;
+        if next.is_none() {
+            tx.execute(
+                "UPDATE daemon_jobs SET enabled = 0, updated_ms = ?2 WHERE id = ?1",
+                params![job_id, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn finish_run(
@@ -652,12 +743,13 @@ impl ScheduleStore {
     /// finished after the process that owned it died — so they become `unknown`, which is the one
     /// state that tells the operator to check rather than assume.
     pub fn adopt_orphans(&self, job_id: Option<&str>) -> Result<Vec<Run>, StoreError> {
-        let conn = self.lock();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
         let mut stmt = match job_id {
-            Some(_) => conn.prepare(&format!(
+            Some(_) => tx.prepare(&format!(
                 "SELECT {RUN_COLUMNS} FROM daemon_runs WHERE status = 'running' AND job_id = ?1"
             ))?,
-            None => conn.prepare(&format!(
+            None => tx.prepare(&format!(
                 "SELECT {RUN_COLUMNS} FROM daemon_runs WHERE status = 'running'"
             ))?,
         };
@@ -670,14 +762,22 @@ impl ScheduleStore {
                 .collect::<Result<Vec<_>, _>>()?,
         };
         drop(stmt);
+        let now = crate::time::now_ms();
         for run in &rows {
-            conn.execute(
+            tx.execute(
                 "UPDATE daemon_runs SET status = 'unknown', finished_ms = ?2,
                      error = CASE WHEN error = '' THEN 'interrupted by a restart' ELSE error END
                  WHERE id = ?1",
-                params![run.id, crate::time::now_ms()],
+                params![run.id, now],
+            )?;
+            // The job's own status is what `jobs list` shows, so it has to say what the run rows
+            // now say instead of keeping the last settled outcome.
+            tx.execute(
+                "UPDATE daemon_jobs SET last_status = ?2 WHERE id = ?1",
+                params![run.job_id, RunStatus::Unknown.as_str()],
             )?;
         }
+        tx.commit()?;
         Ok(rows)
     }
 
@@ -727,6 +827,24 @@ impl ScheduleStore {
         self.set_state(key, &value.to_string())
     }
 
+    /// Every state key under a prefix, so a caller can retire the ones it no longer writes.
+    pub fn state_keys(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT key FROM daemon_state WHERE substr(key, 1, ?1) = ?2 ORDER BY key")?;
+        let keys = stmt
+            .query_map(params![prefix.len() as i64, prefix], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(keys)
+    }
+
+    /// Remove one state key; deleting a key that is not there is not an error.
+    pub fn delete_state(&self, key: &str) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute("DELETE FROM daemon_state WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
     pub fn state_bool(&self, key: &str, fallback: bool) -> Result<bool, StoreError> {
         Ok(match self.state(key)?.as_deref() {
             Some("1") | Some("true") => true,
@@ -754,6 +872,58 @@ pub fn member_stop_key(run: &str, agent: &str) -> String {
 const RUN_COLUMNS: &str =
     "id, job_id, slot_ms, attempt, started_ms, finished_ms, status, session, output, error,
     delivery, delivery_note";
+
+/// The run-row half of `begin_run`, on any connection — including one inside a transaction, so a
+/// caller can pair the INSERT with another write in the same commit.
+fn begin_run_in(
+    conn: &Connection,
+    job: &Job,
+    slot_ms: Millis,
+    session: Option<&str>,
+) -> Result<Run, StoreError> {
+    let attempt: u32 = conn.query_row(
+        "SELECT COALESCE(MAX(attempt), 0) FROM daemon_runs WHERE job_id = ?1 AND slot_ms = ?2",
+        params![job.id, slot_ms],
+        |row| row.get::<_, i64>(0),
+    )? as u32
+        + 1;
+    let run = Run {
+        id: format!("run_{}_{}_{}", job.id, slot_ms, attempt),
+        job_id: job.id.clone(),
+        slot_ms,
+        attempt,
+        started_ms: crate::time::now_ms(),
+        finished_ms: None,
+        status: RunStatus::Running,
+        session: session.map(str::to_string),
+        output: String::new(),
+        error: String::new(),
+        delivery: if job.target.trim().is_empty() || job.target.trim() == "none" {
+            Delivery::None
+        } else {
+            Delivery::Pending
+        },
+        delivery_note: String::new(),
+    };
+    conn.execute(
+        "INSERT INTO daemon_runs (id, job_id, slot_ms, attempt, started_ms, status, session,
+             output, error, delivery)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            run.id,
+            run.job_id,
+            run.slot_ms,
+            run.attempt,
+            run.started_ms,
+            run.status.as_str(),
+            run.session,
+            run.output,
+            run.error,
+            run.delivery.as_str(),
+        ],
+    )?;
+    Ok(run)
+}
 
 fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
     let mode: String = row.get(5)?;

@@ -340,13 +340,13 @@ impl Daemon {
                 continue;
             };
             match self.jobs.claim(&job, slot, now) {
-                Ok(Some(claimed)) => self.dispatch(claimed, now, &mut report),
+                Ok(Some(claimed)) => self.dispatch(claimed, now, &mut report)?,
                 Ok(None) => {}
                 Err(err) => report.refused.push(format!("{}: {err}", job.id)),
             }
         }
 
-        self.collect(&mut report, now).await;
+        self.collect(&mut report, now).await?;
         self.beat(now, &mut report).await;
         Ok(report)
     }
@@ -365,7 +365,12 @@ impl Daemon {
         Ok(true)
     }
 
-    fn dispatch(&mut self, claimed: Claimed, now: Millis, report: &mut TickReport) {
+    fn dispatch(
+        &mut self,
+        claimed: Claimed,
+        now: Millis,
+        report: &mut TickReport,
+    ) -> Result<(), StoreError> {
         let Claimed { job, run, .. } = claimed;
         let timeout = job.timeout_ms.unwrap_or(DEFAULT_JOB_TIMEOUT_MS).max(1_000);
         let stop = Some(member_probe(self.store.clone(), &run.id));
@@ -378,25 +383,23 @@ impl Daemon {
                     run_id: run.id.clone(),
                 });
                 report.dispatched.push(job.id);
+                Ok(())
             }
             Err(err) => {
                 // No free slot is not a failure of the job: the run is closed so the next tick can
                 // take it again, and the reason is recorded rather than left in flight forever.
-                let _ = self.store.finish_run(
-                    &run.id,
-                    RunStatus::Skipped,
-                    "",
-                    &format!("not started: {err}"),
-                    Delivery::None,
-                );
+                // `skip_run` also switches the job off when it has no next slot — a one-time job
+                // whose dispatch was refused would otherwise sit enabled forever, never firing.
                 let next = self.jobs.next_slot(&job, now);
-                let _ = self.store.set_next_run(&job.id, next, now);
+                self.store
+                    .skip_run(&run.id, &job.id, &format!("not started: {err}"), next, now)?;
                 report.refused.push(format!("{}: {err}", job.id));
+                Ok(())
             }
         }
     }
 
-    async fn collect(&mut self, report: &mut TickReport, now: Millis) {
+    async fn collect(&mut self, report: &mut TickReport, now: Millis) -> Result<(), StoreError> {
         while let Ok(finished) = self.results.try_recv() {
             report.finished.push(finished);
         }
@@ -408,10 +411,11 @@ impl Daemon {
                 .position(|entry| entry.run_id == done.id)
             {
                 let running = self.running.remove(index);
-                self.settle(&running, done, now, report).await;
+                self.settle(&running, done, now, report).await?;
             }
         }
         report.finished = finished;
+        Ok(())
     }
 
     async fn settle(
@@ -420,12 +424,12 @@ impl Daemon {
         done: &Finished,
         now: Millis,
         report: &mut TickReport,
-    ) {
+    ) -> Result<(), StoreError> {
         let Ok(Some(job)) = self.store.get_job(&running.job_id) else {
-            return;
+            return Ok(());
         };
         let Ok(Some(run)) = self.store.get_run(&running.run_id) else {
-            return;
+            return Ok(());
         };
         let ok = done.outcome.ok && !done.cancelled;
         let error = if done.cancelled {
@@ -440,28 +444,17 @@ impl Daemon {
         } else {
             RunStatus::Failed
         };
-        let _ = self.store.finish_run(
-            &run.id,
-            status,
-            &done.outcome.output,
-            &error,
-            if done.cancelled {
-                Delivery::None
-            } else {
-                Delivery::Pending
-            },
-        );
         if done.cancelled {
             // `settle` would record this as a failure and offer it a retry, overwriting the
             // cancellation the operator asked for.
-            let _ = self.jobs.settle_cancelled(&job, now);
-            return;
+            self.jobs
+                .settle_cancelled(&job, &run, &done.outcome.output, &error, now)?;
+            return Ok(());
         }
         // `settle` decides what the job's next slot is, including a retry that comes back sooner
         // than the schedule would have said.
-        let _ = self
-            .jobs
-            .settle(&job, &run, ok, &done.outcome.output, &error, now);
+        self.jobs
+            .settle(&job, &run, ok, &done.outcome.output, &error, now)?;
         let notice = Notice {
             job: job.id.clone(),
             name: job.name.clone(),
@@ -472,19 +465,26 @@ impl Daemon {
         };
         match Destination::parse(&job.target) {
             Ok(destination) => {
+                // Set when a session delivery landed somewhere other than the session the job
+                // named, so the record can say `rerouted` instead of claiming the asked-for
+                // destination was reached.
+                let mut rerouted = false;
                 let delivered = match &destination {
                     // A conversation is written to directly. The daemon keeps a runtime for exactly
                     // this, and what it writes lands in the same database the terminal reads, so the
                     // report is there the next time that conversation is opened.
                     Destination::Session(wanted) => {
                         match self.postbox.post(wanted, &notice.line()).await {
-                            Ok((session, note)) => notify::Report {
-                                delivered: true,
-                                detail: match note {
-                                    Some(note) => format!("session {session}: {note}"),
-                                    None => format!("session {session}"),
-                                },
-                            },
+                            Ok((session, note)) => {
+                                rerouted = note.is_some();
+                                notify::Report {
+                                    delivered: true,
+                                    detail: match note {
+                                        Some(note) => format!("session {session}: {note}"),
+                                        None => format!("session {session}"),
+                                    },
+                                }
+                            }
                             Err(err) => notify::Report {
                                 delivered: false,
                                 detail: err,
@@ -497,18 +497,19 @@ impl Daemon {
                 // delivered would claim a delivery that by definition never happened.
                 let state = match destination {
                     Destination::None => Delivery::None,
-                    _ if delivered.delivered => Delivery::Delivered,
-                    _ => Delivery::Failed,
+                    _ if !delivered.delivered => Delivery::Failed,
+                    _ if rerouted => Delivery::Rerouted,
+                    _ => Delivery::Delivered,
                 };
                 // The note is part of the record: `delivery: failed` on its own tells an operator
                 // nothing about what to fix.
-                let _ = self
-                    .store
-                    .set_delivery_note(&run.id, state, &delivered.detail);
+                self.store
+                    .set_delivery_note(&run.id, state, &delivered.detail)?;
                 report.delivered.push((job.id, delivered.delivered));
             }
             Err(err) => report.refused.push(format!("{}: {err}", job.id)),
         }
+        Ok(())
     }
 
     /// Ask the heartbeats whether anything needs attention, and report what they raised.
