@@ -983,6 +983,18 @@ pub fn overlay(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
             })
             .collect();
         frame.render_widget(Paragraph::new(lines), inner);
+        // The dropdown highlights a row, so it has to answer a press on one too.
+        for (index, _) in candidates.iter().enumerate() {
+            let y = inner.y + index as u16;
+            if y < inner.y + inner.height {
+                app.overlay_clicks.push((
+                    y,
+                    inner.x,
+                    inner.x + inner.width,
+                    OverlayClick::AutocompleteRow(index),
+                ));
+            }
+        }
         return;
     }
 
@@ -1207,7 +1219,22 @@ fn overlay_content(
                     lines.push(Line::from(Span::styled(format!("  {}", entry), style)));
                 }
             }
-            let clicks = push_chips(&mut lines, theme, &[("esc close", OverlayClick::PromptCancel)]);
+            // The query sits on line 0, so match `i` is body line `i + 1`. Highlighted rows that
+            // ignore a press are the same lie as a dead chip.
+            let mut clicks: Vec<OverlayHit> = matches
+                .iter()
+                .enumerate()
+                .map(|(i, _)| OverlayHit {
+                    line: i + 1,
+                    columns: None,
+                    click: OverlayClick::HistoryMatch(i),
+                })
+                .collect();
+            clicks.extend(push_chips(
+                &mut lines,
+                theme,
+                &[("esc close", OverlayClick::PromptCancel)],
+            ));
             ("Reverse search".to_owned(), lines, clicks)
         }
         Overlay::Autocomplete { .. } => ("Autocomplete".to_owned(), vec![], Vec::new()),
@@ -1327,6 +1354,10 @@ pub enum OverlayClick {
     ConfirmYes,
     /// Answer a confirmation with no.
     ConfirmNo,
+    /// One candidate of the autocomplete dropdown, by index — a click accepts it like Enter.
+    AutocompleteRow(usize),
+    /// One match row of the history/reverse search, by index — a click accepts it like Enter.
+    HistoryMatch(usize),
 }
 
 /// One press target in a panel body, before the draw turns its line into a screen row.

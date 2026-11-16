@@ -1745,6 +1745,25 @@ pub fn run_overlay_click(app: &mut App, click: crate::widgets::OverlayClick) {
             app.approval_action = index;
             handle_overlay(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         }
+        OverlayClick::AutocompleteRow(index) => {
+            if let Some(Overlay::Autocomplete { selected, .. }) = &mut app.overlay {
+                *selected = index;
+            }
+            handle_overlay(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        OverlayClick::HistoryMatch(index) => {
+            // All three search overlays share the {query, selected} shape; Enter then accepts the
+            // row exactly as it would for the highlighted one.
+            match &mut app.overlay {
+                Some(
+                    Overlay::HistorySearch { selected, .. }
+                    | Overlay::ReverseSearch { selected, .. }
+                    | Overlay::ReverseHistorySearch { selected, .. },
+                ) => *selected = index,
+                _ => return,
+            }
+            handle_overlay(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
         OverlayClick::AddBotSpawn | OverlayClick::PromptSubmit | OverlayClick::ConfirmYes => {
             handle_overlay(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         }
