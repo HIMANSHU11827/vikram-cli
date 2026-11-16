@@ -927,6 +927,11 @@ pub struct App {
     /// Rows and chips the Bots panel drew last frame, in screen coordinates. Cleared and refilled
     /// on every draw, so a hit can never outlive the pixels that showed it.
     pub bot_hits: Vec<(u16, u16, u16, BotClick)>,
+    /// Where the bots pane and the transcript were drawn this frame, so a press inside one can
+    /// hand it the keyboard. Without these the pane's documented keys were unreachable: nothing
+    /// ever set `Focus::Bots` or `Focus::Conversation`.
+    pub bots_rect: Option<(u16, u16, u16, u16)>,
+    pub conversation_rect: Option<(u16, u16, u16, u16)>,
     /// The rectangle the open panel occupies, as `(x, y, width, height)`. A press outside a
     /// read-only panel dismisses it, which is what every dialog on a desktop does.
     pub overlay_rect: Option<(u16, u16, u16, u16)>,
@@ -985,6 +990,8 @@ impl App {
             picker_verbs: Vec::new(),
             overlay_clicks: Vec::new(),
             bot_hits: Vec::new(),
+            bots_rect: None,
+            conversation_rect: None,
             overlay_rect: None,
             thought_hits: Vec::new(),
             selection: None,

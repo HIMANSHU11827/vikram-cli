@@ -26,6 +26,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.overlay_clicks.clear();
     app.overlay_rect = None;
     app.bot_hits.clear();
+    app.bots_rect = None;
+    app.conversation_rect = None;
 
     // Painted once, over the whole window, before anything is drawn on it. Every widget after this
     // writes a foreground and leaves the background alone, so one pass is enough — and a second
@@ -50,6 +52,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // directly above the input so it can never be confused with the transcript or the status line.
     let show_notice = app.live_notice().is_some();
     let regions = layout::layout(area, show_hive, show_bots, input_lines, show_notice);
+    app.bots_rect = regions
+        .bots
+        .map(|r| (r.x, r.y, r.width, r.height));
+    app.conversation_rect = Some((
+        regions.conversation.x,
+        regions.conversation.y,
+        regions.conversation.width,
+        regions.conversation.height,
+    ));
 
     widgets::session_tabs(frame, regions.tabs, app, &theme);
 

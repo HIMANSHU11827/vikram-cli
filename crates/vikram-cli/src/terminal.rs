@@ -304,6 +304,27 @@ fn apply_terminal_event(app: &mut App, event: Event) {
                     }
                     return;
                 }
+                // A press inside a pane hands it the keyboard — checked last so chips, rows,
+                // tabs and fold headers keep winning. The bots pane's documented keys and the
+                // transcript's pane keys were unreachable because nothing ever set those focuses.
+                // Neither returns: a drag starting here still selects text as before.
+                if app.overlay.is_none() {
+                    if let Some((bx, by, bw, bh)) = app.bots_rect
+                        && mouse.row >= by
+                        && mouse.row < by + bh
+                        && x >= bx
+                        && x < bx + bw
+                    {
+                        app.focus = vikram_tui::app::Focus::Bots;
+                    } else if let Some((cx, cy, cw, ch)) = app.conversation_rect
+                        && mouse.row >= cy
+                        && mouse.row < cy + ch
+                        && x >= cx
+                        && x < cx + cw
+                    {
+                        app.focus = vikram_tui::app::Focus::Conversation;
+                    }
+                }
                 // Nothing else claimed the press, so it starts a drag. A press that never moves
                 // selects nothing and copies nothing.
                 app.selection = Some(vikram_tui::app::Selection::new((x, mouse.row)));
