@@ -1647,22 +1647,16 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
         PickerKind::Approvals => {
             let snapshot = handle.snapshot();
             let mut items = Vec::new();
-            if snapshot.approvals.is_empty() {
+            for approval in &snapshot.approvals {
                 items.push(PickerItem::new(
-                    "nothing waiting".to_owned(),
-                    String::new(),
-                    "empty".to_owned(),
+                    approval.verb.clone(),
+                    approval.resource.clone(),
+                    format!("{:?}", approval.approval),
                 ));
-            } else {
-                for approval in &snapshot.approvals {
-                    items.push(PickerItem::new(
-                        approval.verb.clone(),
-                        approval.resource.clone(),
-                        format!("{:?}", approval.approval),
-                    ));
-                }
             }
-            app.open_picker(Picker::new(kind, "Approvals", items));
+            // An empty panel says so as a note, not as a row. The placeholder it used to push read
+            // `1 of 1` over nothing and answered `open` against an approval that does not exist.
+            app.open_picker(Picker::new(kind, "Approvals", items).with_note("nothing waiting"));
         }
         PickerKind::Keys => {
             let items = vec![

@@ -613,10 +613,15 @@ pub fn picker_body(picker: &Picker, theme: &Theme, width: u16) -> PickerBody {
     let first_row = lines.len();
     let mut row_positions: Vec<usize> = Vec::new();
     if picker.items.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("{}{bullet} nothing to choose yet", " ".repeat(PAD)),
-            theme.secondary(),
-        )));
+        // A note already says why the list is short, so the generic bullet would repeat it in worse
+        // words — `/tasks` and `/queue` printed both, one under the other. The bullet is only for a
+        // panel that has no explanation of its own.
+        if picker.note.is_none() {
+            lines.push(Line::from(Span::styled(
+                format!("{}{bullet} nothing to choose yet", " ".repeat(PAD)),
+                theme.secondary(),
+            )));
+        }
     } else if rows.is_empty() {
         lines.push(Line::from(Span::styled(
             format!(

@@ -39,12 +39,26 @@ impl ExperienceCollector {
         if let Some(f) = &exp.feedback {
             exp.feedback = Some(sanitize_for_storage(f)?);
         }
+        // metadata and tools_used are stored fields too — a producer that puts text there must
+        // not bypass the same scan the named fields get.
+        for tool in exp.tools_used.iter_mut() {
+            *tool = sanitize_for_storage(tool)?;
+        }
+        if let serde_json::Value::Object(map) = &mut exp.metadata {
+            for value in map.values_mut() {
+                if let serde_json::Value::String(text) = value {
+                    *text = sanitize_for_storage(text)?;
+                }
+            }
+        }
         // Sensitivity gating: secret -> drop value
         if exp.sensitivity == crate::types::Sensitivity::Secret {
             exp.user_request = "[REDACTED SECRET EXPERIENCE]".to_string();
             exp.errors.clear();
             exp.corrections.clear();
             exp.feedback = None;
+            exp.tools_used.clear();
+            exp.metadata = serde_json::json!({});
         }
         self.store.save_experience(&exp)?;
         Ok(exp)
