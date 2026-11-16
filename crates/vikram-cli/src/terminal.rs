@@ -688,8 +688,19 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
             Err(err) => report(app, err),
         },
         UiCommand::StopTask { id } => {
-            handle.complete_task(&id, vikram_runtime::types::TaskState::Cancelled);
-            app.push_notice(NoticeLevel::Info, format!("stopped task {id}"));
+            // Marking the record Cancelled while its turn keeps running was cosmetic: find the
+            // task's session and cancel the turn itself, then close the record. An unknown id
+            // gets an honest warning instead of a success notice.
+            match handle.tasks().into_iter().find(|task| task.id == id) {
+                Some(task) => {
+                    if let Err(err) = handle.cancel(&task.session) {
+                        report(app, err);
+                    }
+                    handle.complete_task(&id, vikram_runtime::types::TaskState::Cancelled);
+                    app.push_notice(NoticeLevel::Info, format!("stopped task {id}"));
+                }
+                None => app.push_notice(NoticeLevel::Warn, format!("no task `{id}` is running")),
+            }
         }
         UiCommand::AnswerApproval {
             approval,
