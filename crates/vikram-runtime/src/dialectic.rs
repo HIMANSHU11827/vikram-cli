@@ -18,7 +18,7 @@
 //! - Injection is budgeted: [`render_supplement`] stops adding lines once the token estimate
 //!   would exceed the configured budget, so the supplement can never blow the window.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -143,15 +143,25 @@ fn slugify(phrase: &str) -> String {
     }
 }
 
-/// The part of `text` after `marker`, clipped to the first clause (up to `.` or `,`)
-/// and to a bounded length. Returns `None` when the marker is absent or nothing
-/// meaningful follows it.
+/// Byte index of the first ASCII case-insensitive occurrence of `marker` in `text`.
+fn find_marker(text: &str, marker: &str) -> Option<usize> {
+    text.as_bytes()
+        .windows(marker.len())
+        .position(|w| w.eq_ignore_ascii_case(marker.as_bytes()))
+}
+
+/// The part of `text` after `marker` (matched case-insensitively), clipped to the
+/// first clause (up to `.`, `,` or newline) and to a bounded length. Returns `None`
+/// when the marker is absent or nothing meaningful follows it.
 fn capture_after(text: &str, marker: &str) -> Option<String> {
-    let idx = text.find(marker)?;
+    let idx = find_marker(text, marker)?;
     let rest = text[idx + marker.len()..].trim_start();
     // Skip a leading "to " so "i want to ship" captures "ship".
-    let rest = rest.strip_prefix("to ").unwrap_or(rest);
-    let clause_end = rest.find(['.', '\n']).unwrap_or(rest.len());
+    let rest = match rest.get(..3) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("to ") => rest[3..].trim_start(),
+        _ => rest,
+    };
+    let clause_end = rest.find(['.', ',', '\n']).unwrap_or(rest.len());
     let captured = rest[..clause_end]
         .trim()
         .trim_matches(|c| c == '"' || c == '\'');
@@ -164,7 +174,6 @@ fn capture_after(text: &str, marker: &str) -> Option<String> {
 
 /// Extract insights from a single user turn. Pure and deterministic.
 pub fn extract_insights(user_text: &str) -> Vec<Insight> {
-    let text = user_text.to_lowercase();
     let source: String = user_text.chars().take(120).collect();
     let mut out = Vec::new();
 
@@ -176,7 +185,7 @@ pub fn extract_insights(user_text: &str) -> Vec<Insight> {
         "i enjoy ",
         "i prefer to ",
     ] {
-        if let Some(captured) = capture_after(&text, marker) {
+        if let Some(captured) = capture_after(user_text, marker) {
             out.push(Insight::new(
                 InsightKind::Preference,
                 slugify(&captured),
@@ -193,7 +202,7 @@ pub fn extract_insights(user_text: &str) -> Vec<Insight> {
         "i hate ",
         "i never want ",
     ] {
-        if let Some(captured) = capture_after(&text, marker) {
+        if let Some(captured) = capture_after(user_text, marker) {
             out.push(Insight::new(
                 InsightKind::Preference,
                 slugify(&captured),
@@ -205,7 +214,7 @@ pub fn extract_insights(user_text: &str) -> Vec<Insight> {
     }
     // Standing instructions that read as preferences.
     for marker in ["always use ", "please always use ", "please use "] {
-        if let Some(captured) = capture_after(&text, marker) {
+        if let Some(captured) = capture_after(user_text, marker) {
             out.push(Insight::new(
                 InsightKind::Preference,
                 slugify(&captured),
@@ -221,7 +230,7 @@ pub fn extract_insights(user_text: &str) -> Vec<Insight> {
         "please don't use ",
         "please do not use ",
     ] {
-        if let Some(captured) = capture_after(&text, marker) {
+        if let Some(captured) = capture_after(user_text, marker) {
             out.push(Insight::new(
                 InsightKind::Preference,
                 slugify(&captured),
@@ -241,7 +250,7 @@ pub fn extract_insights(user_text: &str) -> Vec<Insight> {
         "every day i ",
         "i work by ",
     ] {
-        if let Some(captured) = capture_after(&text, marker) {
+        if let Some(captured) = capture_after(user_text, marker) {
             out.push(Insight::new(
                 InsightKind::Habit,
                 slugify(&captured),
@@ -263,7 +272,7 @@ pub fn extract_insights(user_text: &str) -> Vec<Insight> {
         "i am working on ",
         "i aim to ",
     ] {
-        if let Some(captured) = capture_after(&text, marker) {
+        if let Some(captured) = capture_after(user_text, marker) {
             out.push(Insight::new(
                 InsightKind::Goal,
                 slugify(&captured),
@@ -401,6 +410,25 @@ pub fn render_supplement(insights: &[Insight], budget_tokens: u64) -> Option<Str
     }
 }
 
+/// Cap total retained insights deterministically: drop lowest confidence,
+/// tie-broken by (kind, key) descending so the cut is stable.
+fn enforce_cap(state: &mut DialecticState, cap: usize) {
+    if state.insights.len() <= cap {
+        return;
+    }
+    let mut all: Vec<(InsightKind, String)> = state.insights.keys().cloned().collect();
+    all.sort_by(|a, b| {
+        let ca = state.insights[&a.clone()].confidence;
+        let cb = state.insights[&b.clone()].confidence;
+        ca.partial_cmp(&cb)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.cmp(a))
+    });
+    for key in all.iter().take(state.insights.len() - cap) {
+        state.insights.remove(key);
+    }
+}
+
 /// The dialectic engine: rolling history + merged insights, thread-safe and deterministic.
 #[derive(Debug)]
 pub struct DialecticEngine {
@@ -487,22 +515,7 @@ impl DialecticEngine {
                 }
             }
         }
-        // Cap total retained insights deterministically: drop lowest confidence,
-        // tie-broken by (kind, key) descending so the cut is stable.
-        let cap = self.config.max_insights.max(1);
-        if state.insights.len() > cap {
-            let mut all: Vec<(InsightKind, String)> = state.insights.keys().cloned().collect();
-            all.sort_by(|a, b| {
-                let ca = state.insights[&a.clone()].confidence;
-                let cb = state.insights[&b.clone()].confidence;
-                ca.partial_cmp(&cb)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| b.cmp(a))
-            });
-            for key in all.iter().take(state.insights.len() - cap) {
-                state.insights.remove(key);
-            }
-        }
+        enforce_cap(state, self.config.max_insights.max(1));
         extracted
     }
 
@@ -529,6 +542,7 @@ impl DialecticEngine {
     /// Persist every insight as a structured JSON entry under [`DIALECTIC_SCOPE`].
     /// Returns how many entries were written. Errors are reported, never panicked on.
     pub fn persist_to(&self, store: &MemoryStore) -> usize {
+        let mut written_keys = BTreeSet::new();
         let mut written = 0usize;
         for insight in self.insights() {
             let key = format!("{}:{}", insight.kind.as_str(), insight.key);
@@ -536,6 +550,16 @@ impl DialecticEngine {
                 && store.save(&key, &value, DIALECTIC_SCOPE).is_ok()
             {
                 written += 1;
+                written_keys.insert(key);
+            }
+        }
+        // Remove stale entries (evicted insights, renamed keys) so storage
+        // mirrors the in-memory model.
+        if let Ok(entries) = store.list(DIALECTIC_SCOPE) {
+            for (key, _) in entries {
+                if !written_keys.contains(&key) {
+                    let _ = store.delete(&key, DIALECTIC_SCOPE);
+                }
             }
         }
         written
@@ -557,6 +581,7 @@ impl DialecticEngine {
                 .insert((insight.kind, insight.key.clone()), insight);
             loaded += 1;
         }
+        enforce_cap(&mut state, self.config.max_insights.max(1));
         loaded
     }
 }

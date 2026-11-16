@@ -215,9 +215,17 @@ pub fn consolidate(
 
     // ---- 2. Contradiction detection per (scope, key) -----------------------
     if policy.supersession_on_conflict {
-        // Index by (scope, key)
+        // Index by (scope, key). Superseded/Expired rows are retained for
+        // provenance but never re-enter contradiction candidacy, so they can
+        // never be promoted back to Active.
         let mut groups: HashMap<(String, String), Vec<usize>> = HashMap::new();
         for (i, obs) in deduped.iter().enumerate() {
+            if matches!(
+                obs.status,
+                ObservationStatus::Superseded | ObservationStatus::Expired
+            ) {
+                continue;
+            }
             groups
                 .entry((obs.scope.clone(), obs.key.clone()))
                 .or_default()
@@ -240,7 +248,7 @@ pub fn consolidate(
             }
             report.contradictions_detected += 1;
             let _ = gk;
-            // Winner = max (confidence, score, updated_ms)
+            // Winner = max (confidence, updated_ms, score)
             let winner_idx = *idxs
                 .iter()
                 .max_by(|&&a, &&b| {
@@ -248,8 +256,8 @@ pub fn consolidate(
                     let ob = &deduped[b];
                     let sa = score(oa, now_ms, policy);
                     let sb = score(ob, now_ms, policy);
-                    (oa.confidence, sa, oa.updated_ms)
-                        .partial_cmp(&(ob.confidence, sb, ob.updated_ms))
+                    (oa.confidence, oa.updated_ms, sa)
+                        .partial_cmp(&(ob.confidence, ob.updated_ms, sb))
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .unwrap();
@@ -276,7 +284,10 @@ pub fn consolidate(
 
     // ---- 3. Aging / expiration ---------------------------------------------
     for obs in deduped.iter_mut() {
-        if obs.status == ObservationStatus::Superseded {
+        if matches!(
+            obs.status,
+            ObservationStatus::Superseded | ObservationStatus::Expired
+        ) {
             continue;
         }
         // Staged obs are promoted to Active if not expired/superseded.
@@ -529,7 +540,9 @@ fn row_to_observation(row: &rusqlite::Row) -> std::result::Result<Observation, r
         importance: row.get(4)?,
         confidence: row.get(5)?,
         source: row.get(6)?,
-        status: ObservationStatus::parse(&status_str).unwrap_or(ObservationStatus::Staged),
+        status: ObservationStatus::parse(&status_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
+        })?,
         created_ms: (row.get::<_, i64>(8)?) as u64,
         updated_ms: (row.get::<_, i64>(9)?) as u64,
         last_accessed_ms: (row.get::<_, i64>(10)?) as u64,
