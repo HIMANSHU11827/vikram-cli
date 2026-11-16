@@ -140,9 +140,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             return true;
         }
         KeyCode::Char('l') if ctrl => {
+            // Clearing the screen is the host's job — the interface owns no terminal handle — so
+            // the key asks for a repaint instead of only saying one happened.
+            app.commands.push(UiCommand::Redraw);
             app.push_notice(
                 vikram_runtime::types::NoticeLevel::Info,
-                "screen redrawn; history preserved",
+                "screen repainted; history preserved",
             );
             return true;
         }
@@ -197,7 +200,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             return true;
         }
         KeyCode::F(8) => {
-            app.overlay = Some(Overlay::Skills);
+            app.overlay = Some(Overlay::Skills { scroll: 0 });
             return true;
         }
         KeyCode::Char('o') if ctrl => {
@@ -1343,6 +1346,7 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
                         return true;
                     }
                     if let Some(session) = session_id {
+                        let owner = action.owner_panel();
                         let command = match action {
                             PromptAction::SetModel => UiCommand::SlashCommand {
                                 session,
@@ -1411,6 +1415,11 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
                             }
                         };
                         app.commands.push(command);
+                        // The list the operator was working in comes back, so the row they just
+                        // added is on screen instead of a notice over an empty terminal.
+                        if let Some(kind) = owner {
+                            app.commands.push(UiCommand::OpenPicker { kind });
+                        }
                     }
                     app.overlay = None;
                     true
@@ -1478,15 +1487,31 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
             }
             _ => true,
         },
-        Overlay::Skills => match key.code {
+        Overlay::Skills { scroll } => {
             // The panel prints "F8 to close" and treats Enter as confirm, so the keys that leave
             // it are the keys it advertises. A panel that names a key it ignores is a dead button.
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(8) | KeyCode::Enter => {
-                app.overlay = None;
-                true
+            // The list is longer than the screen, so the page keys move the window; the render
+            // clamps `scroll` to what actually fits.
+            let next = match key.code {
+                KeyCode::PageUp => scroll.saturating_sub(10),
+                KeyCode::Up => scroll.saturating_sub(1),
+                KeyCode::PageDown => scroll.saturating_add(10),
+                KeyCode::Down => scroll.saturating_add(1),
+                KeyCode::Home => 0,
+                KeyCode::End => usize::MAX,
+                _ => scroll,
+            };
+            if next != scroll {
+                app.overlay = Some(Overlay::Skills { scroll: next });
             }
-            _ => true,
-        },
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(8) | KeyCode::Enter => {
+                    app.overlay = None;
+                }
+                _ => {}
+            }
+            true
+        }
         Overlay::HistorySearch { query, selected }
         | Overlay::ReverseSearch { query, selected }
         | Overlay::ReverseHistorySearch { query, selected } => {
@@ -1615,14 +1640,31 @@ fn answer_approval(app: &mut App, allow: bool, persist: bool) {
     let index = app
         .approval_selection
         .min(app.approvals.len().saturating_sub(1));
-    if let Some(prompt) = app.approvals.get(index) {
-        app.commands.push(UiCommand::AnswerApproval {
-            approval: prompt.approval.clone(),
-            allow,
-            persist,
-        });
+    let Some(approval) = app
+        .approvals
+        .get(index)
+        .map(|prompt| prompt.approval.clone())
+    else {
+        app.overlay = None;
+        return;
+    };
+    app.commands.push(UiCommand::AnswerApproval {
+        approval,
+        allow,
+        persist,
+    });
+    // One answer leaves the panel open for the rest. Closing it here used to hide every other
+    // pending request, so the operator had to remember they existed and open the panel again.
+    let remaining = app.approvals.len().saturating_sub(1);
+    if remaining == 0 {
+        app.overlay = None;
+        return;
     }
-    app.overlay = None;
+    app.approval_selection = index.min(remaining - 1);
+    app.push_notice(
+        vikram_runtime::types::NoticeLevel::Info,
+        format!("answered — {remaining} more waiting"),
+    );
 }
 
 /// Answer a click on a chip inside a dialog. Each chip stands for a key the dialog already handles,
@@ -1662,28 +1704,27 @@ pub fn run_overlay_click(app: &mut App, click: crate::widgets::OverlayClick) {
 /// Answer a click on the Bots panel: a row selects an agent, a chip runs a command the keyboard can
 /// also produce. The mouse is a shortcut here, never the only way through.
 pub fn run_bot_click(app: &mut App, click: BotClick) {
-    if let BotClick::Row(index) = click {
-        let Some(agent) = app.bots.get(index) else {
-            return;
-        };
-        // A row is a conversation, not a checkbox. The operator pressed the agent, so the click
-        // hands them the chat that agent owns — the same tab the keyboard would switch to, and one
-        // created for a bot that has never run. It never asks a question first: a spawn prompt in
-        // the way of "open my chat" is the wrong answer to a click. Neither path takes the
-        // keyboard: `bot_selection` alone decides what the chips act on.
-        let bot = agent.profile.id.clone();
-        app.bot_selection = index;
-        app.commands.push(UiCommand::OpenBotChat { bot });
-        return;
-    }
-
     let selected = app
         .bots
         .get(app.bot_selection)
         .map(|agent| agent.profile.id.clone());
 
     match click {
-        BotClick::Row(_) => {}
+        // The row arm was answered by an early `if let` that returned before the match, which left
+        // this arm as dead code that could never run. The body lives here now, where it is read.
+        BotClick::Row(index) => {
+            let Some(agent) = app.bots.get(index) else {
+                return;
+            };
+            // A row is a conversation, not a checkbox. The operator pressed the agent, so the click
+            // hands them the chat that agent owns — the same tab the keyboard would switch to, and one
+            // created for a bot that has never run. It never asks a question first: a spawn prompt in
+            // the way of "open my chat" is the wrong answer to a click. Neither path takes the
+            // keyboard: `bot_selection` alone decides what the chips act on.
+            let bot = agent.profile.id.clone();
+            app.bot_selection = index;
+            app.commands.push(UiCommand::OpenBotChat { bot });
+        }
         BotClick::Spawn => app.overlay = Some(Overlay::AddBot { selected: app.bot_selection }),
         BotClick::NewBot => app.open_prompt(
             "New bot",
@@ -1768,7 +1809,22 @@ pub fn run_bot_click(app: &mut App, click: BotClick) {
         }
         BotClick::Remove => {
             if let Some(bot) = selected {
-                app.commands.push(UiCommand::DeleteBot { bot });
+                // A profile cannot be brought back, so the chip asks first — the same confirmation
+                // the picker's delete verb shows, instead of one door being guarded and this one not.
+                let name = app
+                    .bots
+                    .iter()
+                    .find(|agent| agent.profile.id == bot)
+                    .map(|agent| agent.profile.name.clone())
+                    .unwrap_or_else(|| bot.to_string());
+                app.open_confirm(
+                    "Delete a bot",
+                    vec![
+                        name,
+                        "! the profile is removed from the store and cannot be undone".to_owned(),
+                    ],
+                    UiCommand::DeleteBot { bot },
+                );
             }
         }
         BotClick::Mode => app
@@ -2796,5 +2852,22 @@ mod tests {
         assert_eq!(app.approval_action, 0, "not the answer");
         assert!(handle_overlay(&mut app, key(KeyCode::Tab)));
         assert_eq!(app.approval_action, 1, "tab still moves the answer");
+    }
+
+    #[test]
+    fn answering_one_of_several_keeps_the_panel_open_for_the_rest() {
+        let mut app = app_with_approvals(2);
+        assert!(handle_overlay(&mut app, key(KeyCode::Enter)));
+        assert!(
+            matches!(app.overlay, Some(Overlay::Approvals)),
+            "the second request is still reachable"
+        );
+        assert_eq!(app.approval_selection, 0);
+        assert!(
+            app.notices
+                .iter()
+                .any(|notice| notice.text.contains("1 more waiting")),
+            "the notice counts what is left"
+        );
     }
 }

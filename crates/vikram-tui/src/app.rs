@@ -231,7 +231,9 @@ pub enum Overlay {
         candidates: Vec<String>,
         selected: usize,
     },
-    Skills,
+    /// The skills the workspace carries. `scroll` is how many lines are above the top of the
+    /// panel: the list is longer than any screen, so without it the footer never draws.
+    Skills { scroll: usize },
     /// The searchable chooser that a `/` command opens instead of printing a list.
     Picker(crate::widgets::Picker),
     /// A panel of what the runtime already knows. Read-only on purpose: there is no choice to make,
@@ -305,6 +307,33 @@ pub enum PromptAction {
     InstallPlugin,
     /// The typed text is "key: value" to remember under the global scope.
     SaveMemory,
+}
+
+impl PromptAction {
+    /// The panel this prompt writes into, when the typed text becomes a row in a list.
+    ///
+    /// A prompt that creates something used to close and leave only a notice, so the new row was
+    /// invisible until the operator reopened the panel and wondered whether it had worked. Reopening
+    /// the owning list is what makes a create feel finished.
+    pub fn owner_panel(&self) -> Option<crate::widgets::PickerKind> {
+        use crate::widgets::PickerKind;
+        match self {
+            PromptAction::CreateBot
+            | PromptAction::RenameBot { .. }
+            | PromptAction::SetBotTag { .. }
+            | PromptAction::SetBotSoul { .. } => Some(PickerKind::Bot),
+            PromptAction::CreateHiveRoster => Some(PickerKind::HiveRoster),
+            PromptAction::AddAllowRule => Some(PickerKind::Permissions),
+            PromptAction::CreateSkill
+            | PromptAction::ImportSkill
+            | PromptAction::RenameSkill { .. } => Some(PickerKind::Skill),
+            PromptAction::InstallPlugin => Some(PickerKind::Plugins),
+            PromptAction::SaveMemory => Some(PickerKind::Memory),
+            PromptAction::EditPending { .. } => Some(PickerKind::Pending),
+            // These two configure the process itself; there is no list holding the result.
+            PromptAction::SetModel | PromptAction::SetEndpoint => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -497,6 +526,9 @@ pub enum UiCommand {
         key: String,
     },
     RefreshMetrics,
+    /// Repaint the terminal from scratch. The interface cannot clear a screen it does not own, so
+    /// it asks the host; the transcript itself is untouched, only the pixels are redrawn.
+    Redraw,
     Quit,
 }
 
@@ -1181,7 +1213,12 @@ impl App {
     pub fn dismissable_from_outside(&self) -> bool {
         matches!(
             self.overlay,
-            Some(Overlay::Help | Overlay::Info { .. } | Overlay::Inspector(_) | Overlay::Skills)
+            Some(
+                Overlay::Help
+                | Overlay::Info { .. }
+                | Overlay::Inspector(_)
+                | Overlay::Skills { .. },
+            )
         )
     }
 

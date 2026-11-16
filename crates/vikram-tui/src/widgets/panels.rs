@@ -1028,6 +1028,12 @@ pub fn overlay(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         return;
     }
 
+    // The skills panel is the only overlay that scrolls: its list is longer than any screen, so
+    // the offset comes from the overlay itself and is clamped against the room actually drawn.
+    let scroll = match &current {
+        Overlay::Skills { scroll } => *scroll,
+        _ => 0,
+    };
     let (title, lines, clicks) = overlay_content(&*app, &current, theme);
     // A panel is as wide as the widest line it has to show, up to the region. Sixty-two columns is
     // the floor, not the ceiling: an inspector or a doctor report that wraps at the floor hides the
@@ -1059,11 +1065,30 @@ pub fn overlay(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     );
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
-    frame.render_widget(Paragraph::new(lines), inner);
+    // The stored offset can overshoot — End asks for the bottom without knowing the height — so
+    // the render is where it becomes the largest value that still fills the panel, and the
+    // clamped value is written back or the next PageUp would subtract from a number that was
+    // never real.
+    let max_scroll = lines.len().saturating_sub(inner.height as usize);
+    let scroll = scroll.min(max_scroll);
+    if let Some(Overlay::Skills { scroll: slot }) = &mut app.overlay {
+        *slot = scroll;
+    }
+    frame.render_widget(
+        Paragraph::new(lines).scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+        inner,
+    );
 
-    // The buttons and rows this panel drew, in screen coordinates.
+    // The buttons and rows this panel drew, in screen coordinates. A scrolled line sits that many
+    // rows higher; one above the window drew nothing, so it gets no hit either.
     for hit in clicks {
-        let y = inner.y + hit.line as u16;
+        let Some(shifted) = (hit.line as i64).checked_sub(scroll as i64) else {
+            continue;
+        };
+        if shifted < 0 {
+            continue;
+        }
+        let y = inner.y + shifted as u16;
         if y < rect.y + rect.height && y >= rect.y {
             let (start, end) = hit.columns.map_or((inner.x, inner.x + inner.width), |(s, e)| {
                 (inner.x + s, inner.x + e)
@@ -1176,7 +1201,7 @@ fn overlay_content(
             ("Reverse search".to_owned(), lines, clicks)
         }
         Overlay::Autocomplete { .. } => ("Autocomplete".to_owned(), vec![], Vec::new()),
-        Overlay::Skills => {
+        Overlay::Skills { .. } => {
             let (title, mut lines) = skills_lines(app, theme);
             let clicks = push_chips(&mut lines, theme, &[("esc close", OverlayClick::PromptCancel)]);
             (title, lines, clicks)
@@ -2519,12 +2544,22 @@ mod tests {
     }
 }
 
-fn skills_lines(_app: &App, theme: &Theme) -> (String, Vec<Line<'static>>) {
+/// The skills under the workspace this session is working in.
+///
+/// The panel used to re-scan the process directory on every frame, so it listed whichever project
+/// happened to be the shell's cwd rather than the one being worked on, and it counted the scan
+/// afresh while the runtime was already counting skills itself. Both are answered from the session
+/// now, and the root is printed so the list can be trusted without guessing where it came from.
+fn skills_lines(app: &App, theme: &Theme) -> (String, Vec<Line<'static>>) {
     let mut lines: Vec<Line> = Vec::new();
-    let root = std::env::current_dir().unwrap_or_default();
+    let root = if app.workspace_root.as_os_str().is_empty() {
+        std::env::current_dir().unwrap_or_default()
+    } else {
+        app.workspace_root.clone()
+    };
     let registry = vikram_runtime::SkillRegistry::for_workspace(&root);
     let skills = registry.list();
-    let count = skills.len();
+    let found = skills.len();
     if skills.is_empty() {
         lines.push(Line::styled("  no skills found", theme.secondary()));
     } else {
@@ -2541,10 +2576,21 @@ fn skills_lines(_app: &App, theme: &Theme) -> (String, Vec<Line<'static>>) {
     }
     lines.push(Line::from(""));
     lines.push(Line::styled(
+        format!("  {}", clip(&root.display().to_string(), 64, theme.ascii)),
+        theme.muted(),
+    ));
+    lines.push(Line::styled(
         "  F8 to close · bodies load on demand",
         theme.muted(),
     ));
-    (format!("Skills {}", count), lines)
+    let discovered = app.metrics.skills_discovered.max(found);
+    let loaded = app.metrics.skills_loaded.min(discovered);
+    let title = if loaded == 0 {
+        format!("Skills {discovered}")
+    } else {
+        format!("Skills {discovered} · {loaded} loaded")
+    };
+    (title, lines)
 }
 
 #[cfg(test)]

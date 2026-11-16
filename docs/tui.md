@@ -124,7 +124,7 @@ Global:
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous session |
 | `Ctrl+B` | Show or hide the bots pane |
 | `Ctrl+P` | Help |
-| `Ctrl+L` | Redraw notice |
+| `Ctrl+L` | Repaint the screen, history preserved |
 | `Ctrl+T` | Expand or fold thinking rows |
 | `Ctrl+O` | Approvals |
 | `Ctrl+R` | Reverse search over this session's input |
@@ -136,7 +136,7 @@ Global:
 | `F5` | Sub-agents |
 | `F6` | Context |
 | `F7` | Model |
-| `F8` | Skills |
+| `F8` | Skills (scrolls: `Up`/`Down`/`PageUp`/`PageDown`/`Home`/`End`, mouse wheel) |
 | `?` | Help, when the composer is empty |
 | `PageUp` / `PageDown` | Scroll the transcript |
 | `Esc` | Leave the focused pane and give the keys back to the composer; cancel when a turn is running |

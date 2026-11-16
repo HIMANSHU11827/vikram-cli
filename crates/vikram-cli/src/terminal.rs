@@ -117,6 +117,13 @@ async fn event_loop(
         app.capture_screen(completed.buffer);
 
         for command in app.take_commands() {
+            // Repainting needs the terminal handle, which the command dispatcher does not hold.
+            if matches!(command, UiCommand::Redraw) {
+                terminal
+                    .clear()
+                    .map_err(|err| format!("clear: {err}"))?;
+                continue;
+            }
             execute(handle, app, command);
         }
         for (request_id, answer) in app.take_answers() {
@@ -181,6 +188,8 @@ fn apply_terminal_event(app: &mut App, event: Event) {
             MouseEventKind::ScrollUp => {
                 if let Some(Overlay::Picker(picker)) = &mut app.overlay {
                     picker.move_by(-2);
+                } else if let Some(Overlay::Skills { scroll }) = &mut app.overlay {
+                    *scroll = scroll.saturating_sub(3);
                 } else {
                     app.scroll_up(3);
                 }
@@ -188,6 +197,8 @@ fn apply_terminal_event(app: &mut App, event: Event) {
             MouseEventKind::ScrollDown => {
                 if let Some(Overlay::Picker(picker)) = &mut app.overlay {
                     picker.move_by(2);
+                } else if let Some(Overlay::Skills { scroll }) = &mut app.overlay {
+                    *scroll = scroll.saturating_add(3);
                 } else {
                     app.scroll_down(3);
                 }
@@ -682,6 +693,9 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
         UiCommand::RefreshMetrics => {
             app.sync_snapshot(handle.snapshot());
         }
+        // Never reaches here: the event loop intercepts it, because clearing a screen needs the
+        // terminal handle and this dispatcher only holds the runtime.
+        UiCommand::Redraw => {}
         UiCommand::Quit => {
             handle.shutdown();
             app.should_quit = true;
