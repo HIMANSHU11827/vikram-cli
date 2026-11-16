@@ -21,11 +21,24 @@ impl Tool for Process {
         }
     }
 
-    fn permission(&self, _args: &Value) -> Result<PermissionRequest, VikramError> {
+    fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
+        // The resource is what the approval prompt and the journal show, so a kill names the pid
+        // it would terminate rather than the bare word "process".
+        let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
+        let resource = match (action, args.get("pid").and_then(Value::as_i64)) {
+            ("kill", Some(pid)) if pid > 0 => format!("process kill pid={pid}"),
+            ("kill", Some(pid)) => {
+                return Err(VikramError::ProviderRejected(format!(
+                    "`pid` must be a positive integer, got {pid}"
+                )));
+            }
+            ("kill", None) => "process kill".to_string(),
+            _ => format!("process {action}"),
+        };
         Ok(PermissionRequest::new(
             ActionKind::Execute,
             "process.run",
-            "process",
+            resource,
             SideEffect::LocalMutation,
             Trust::Model,
         ))
@@ -70,6 +83,13 @@ impl Tool for Process {
                 let pid = args.get("pid").and_then(Value::as_i64).ok_or_else(|| {
                     VikramError::ProviderRejected("missing integer argument `pid`".into())
                 })?;
+                // pid 0 (and negatives) address a process group or nothing at all, never one
+                // process the operator could have meant to approve.
+                if pid <= 0 {
+                    return Err(VikramError::ProviderRejected(format!(
+                        "`pid` must be a positive integer, got {pid}"
+                    )));
+                }
                 #[cfg(windows)]
                 let mut cmd = {
                     let mut c = std::process::Command::new("taskkill");

@@ -34,7 +34,7 @@ use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use vikram_contracts::{ActionKind, PermissionRequest, SideEffect, Trust, VikramError};
 
-use crate::tools::{Tool, ToolContext, ToolOutput, ToolRegistry, ToolSpec};
+use crate::tools::{Tool, ToolContext, ToolOutput, ToolRegistry, ToolSpec, canonical_resource};
 
 /// Wall-clock limit for a single helper invocation.
 pub const TIMEOUT_SECS: u64 = 10;
@@ -471,11 +471,12 @@ pub fn ocr_screen() -> Result<String, String> {
     Ok(truncated(body))
 }
 
-/// Move the pointer to `(x, y)` and click `button` (1 left, 2 middle, 3 right).
+/// Move the pointer to `(x, y)` and click `button` (1 left, 2 middle, 3 right, 4/5 wheel).
 ///
 /// On a Wayland session with `ydotool` installed, the move and the click go through `ydotool`
 /// (an absolute move followed by a click, since `ydotool` has no combined form); otherwise through
-/// `xdotool`.
+/// `xdotool`. `ydotool click` takes a button bitmask rather than the xdotool button number, and it
+/// has no wheel event, so buttons 4/5 are refused on that path.
 pub fn click(x: i64, y: i64, button: u8) -> Result<String, String> {
     if x < 0 || y < 0 {
         return Err(format!(
@@ -489,12 +490,25 @@ pub fn click(x: i64, y: i64, button: u8) -> Result<String, String> {
     }
     let (x_text, y_text, button_text) = (x.to_string(), y.to_string(), button.to_string());
     if prefer_ydotool() {
+        // `ydotool click` wants the evdev button bitmask (left 0xC0, right 0xC1, middle 0xC2),
+        // not the decimal xdotool button number — "1" would click nothing while reporting success.
+        let code = match button {
+            1 => "0xC0",
+            2 => "0xC2",
+            3 => "0xC1",
+            _ => {
+                return Err(format!(
+                    "button {button} is a wheel click; ydotool has no wheel event, so it cannot \
+                     be injected on this session"
+                ));
+            }
+        };
         run_command(
             "ydotool",
             &["mousemove", "--absolute", &x_text, &y_text],
             None,
         )?;
-        run_command("ydotool", &["click", &button_text], None)?;
+        run_command("ydotool", &["click", code], None)?;
         return Ok(format!(
             "clicked button {button_text} at ({x_text}, {y_text}) via ydotool"
         ));
@@ -573,7 +587,9 @@ pub fn key(combo: &str) -> Result<String, String> {
     })
 }
 
-/// Scroll `amount` steps in `direction` (`up` or `down`). One step is one wheel click.
+/// Scroll `amount` steps in `direction` (`up` or `down`). One step is one wheel click, delivered
+/// at the pointer position — whatever is under the pointer scrolls, not necessarily the focused
+/// window.
 ///
 /// A wheel click is an X11 input event with no `ydotool` equivalent, so scrolling stays on
 /// `xdotool` even when the rest of the input path prefers `ydotool` on Wayland — where it therefore
@@ -606,13 +622,14 @@ pub fn scroll(direction: &str, amount: u32) -> Result<String, String> {
     for _ in 0..amount {
         run_command("xdotool", &["click", button], None)?;
     }
+    // Wheel clicks are injected at the pointer position, not into the focused window.
     Ok(if session_kind() == "wayland" {
         format!(
-            "scrolled {direction} {amount} step(s) via xdotool (Wayland: wheel clicks reach \
-             XWayland windows only)"
+            "scrolled {direction} {amount} step(s) at the pointer via xdotool (Wayland: wheel \
+             clicks reach XWayland windows only)"
         )
     } else {
-        format!("scrolled {direction} {amount} step(s)")
+        format!("scrolled {direction} {amount} step(s) at the pointer")
     })
 }
 
@@ -784,8 +801,10 @@ impl Tool for Screenshot {
 
     fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
         let path = arg_str(args, "path")?;
+        // Write, not Execute: the host resolves Read/Write resources against the workspace root
+        // before policy sees them, so the approval prompt names the real destination path.
         Ok(PermissionRequest::new(
-            ActionKind::Execute,
+            ActionKind::Write,
             "computer.screenshot",
             path,
             SideEffect::LocalMutation,
@@ -795,12 +814,8 @@ impl Tool for Screenshot {
 
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let raw = arg_str(args, "path")?;
-        let resolved = if Path::new(&raw).is_absolute() {
-            PathBuf::from(&raw)
-        } else {
-            ctx.workspace_root.join(&raw)
-        };
-        Ok(reported(screenshot(&resolved.to_string_lossy())))
+        let (_path, display) = canonical_resource(&ctx.workspace_root, &raw)?;
+        Ok(reported(screenshot(&display)))
     }
 }
 
@@ -819,7 +834,7 @@ impl Tool for Click {
                     "y": {"type": "integer", "description": "Screen Y coordinate in pixels."},
                     "button": {
                         "type": "integer",
-                        "description": "1 left (default), 2 middle, 3 right."
+                        "description": "1 left (default), 2 middle, 3 right, 4/5 wheel (xdotool only)."
                     }
                 },
                 "required": ["x", "y"]
@@ -925,7 +940,8 @@ impl Tool for Scroll {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "computer.scroll".into(),
-            description: "Scroll the focused window up or down by a number of wheel clicks.".into(),
+            description: "Scroll at the pointer position up or down by a number of wheel clicks."
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -1050,12 +1066,8 @@ impl Tool for Ocr {
 
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let raw = arg_str(args, "path")?;
-        let resolved = if Path::new(&raw).is_absolute() {
-            PathBuf::from(&raw)
-        } else {
-            ctx.workspace_root.join(&raw)
-        };
-        Ok(reported(ocr(&resolved.to_string_lossy())))
+        let (_path, display) = canonical_resource(&ctx.workspace_root, &raw)?;
+        Ok(reported(ocr(&display)))
     }
 }
 
@@ -1382,7 +1394,6 @@ mod tests {
     fn input_tools_declare_execute_with_a_local_mutation() {
         let registry = ToolRegistry::with_builtins();
         let cases = [
-            ("computer.screenshot", json!({"path": "shot.png"})),
             ("computer.click", json!({"x": 10, "y": 20})),
             ("computer.type", json!({"text": "hello"})),
             ("computer.key", json!({"keys": "ctrl+l"})),
@@ -1577,6 +1588,21 @@ mod tests {
         // Unknown helpers get the generic PATH hint on every platform.
         assert_eq!(install_hint("mystery"), "install it and keep it on PATH");
         assert_eq!(install_hint(""), "install it and keep it on PATH");
+    }
+
+    #[test]
+    fn screenshot_writes_a_file_so_it_declares_write() {
+        // Write (not Execute) is what lets the host resolve the resource against the workspace
+        // root before policy sees it — the approval prompt then names the real path.
+        let registry = ToolRegistry::with_builtins();
+        let req = registry
+            .get("computer.screenshot")
+            .unwrap()
+            .permission(&json!({"path": "shots/a.png"}))
+            .unwrap();
+        assert_eq!(req.action, ActionKind::Write);
+        assert_eq!(req.verb, "computer.screenshot");
+        assert_eq!(req.side_effect, SideEffect::LocalMutation);
     }
 
     #[test]
