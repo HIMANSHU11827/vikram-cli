@@ -60,7 +60,24 @@ Each entry: what was broken, what changed, how it was verified.
 - cli: chat picks most-recent session; config set mode enforces availability refusal; mutating verbs verify ids before printing success; cron edit rejects --enable+--disable.
 - runtime: hive.delegate really delegates via spawn_agent; browser tool approvals carry action details; ContextLoader truncates to budget + reports omissions.
 
+## 2026-11-16 — batches 11-17 (commits 1b6dd60…38573c9)
+
+- Pane focus: clicking bots pane/transcript focuses it — p/s/r and transcript pane keys reachable (verified live: click BOTS title, `p` paused a bot).
+- Click targets added: suggestion rows accept, autocomplete candidates accept, history/reverse-search match rows accept, approval request rows select.
+- /tasks stop cancels the task's session turn, not just the label; bogus id warns.
+- Picker `with_note` legends stripped (dead text — notes only render on empty lists); Background error note became a footnote row instead of vanishing.
+- Title migration marks version before classifying — operator renames can't be re-judged.
+- CLI: entities scaffold-before-save + rm cleans dir; profiles new verifies user; hive/tickets send verify parent; project disconnect verifies session.
+- Docs: tui.md mouse contract updated for all new hit regions.
+
 ## Open / next
+
+- In flight: daemon transaction atomicity agent; computer.rs/pty.rs/terminal-tool audit agent.
+- DeliveryLedger in vikram-gateway is dead code — outbound sends have no retry; wire it or remove it (architectural decision).
+- Context estimator anchor not cleared after in-place transcript pruning (context.rs).
+- Shell timeout kills only the direct child, not the process group (grandchildren survive).
+- `cron add` create+update is two writes (main.rs ~2834).
+- Store: dozens of UPDATE/DELETE helpers return Ok on zero rows — systemic; CLI checks are the stopgap.
 
 - Picker `with_note` legends on non-empty lists are dead text (footer prints the same verbs) — decide per call site: strip legends, keep empty-state reasons.
 - Dead `Focus::Conversation`/`Focus::Bots` — handlers unreachable; either wire a focus key or remove handlers + fix docs/tui.md:160-161 (bots pane keys are documented but unreachable).
@@ -71,3 +88,11 @@ Each entry: what was broken, what changed, how it was verified.
 - CLI: sessions/users/profiles/entities/hive/tickets rm print success on bogus ids (agent covering), chat blocks on stdin with no message + TTY, `entities new` saves row before scaffolding, `entities rm` orphans scaffold dir, `profiles new` accepts nonexistent user, `hive send`/`tickets send` don't verify parent exists, `project disconnect` same, `cron edit` two-write non-atomic, gateway DeliveryLedger dead code (sends have no retry), daemon settle/claim non-atomic writes, session_fts not copied on fork (agent covering), title migration can reclassify manual titles, steps/context-anchor minor counter drift.
 - vikram-store: dozens of UPDATE/DELETE helpers return Ok on zero rows (systemic; CLI-layer checks are the stopgap).
 - Unverified live: two pending approvals reachable end-to-end (unit-tested only).
+
+## Status update (end of pass 2)
+
+Items above marked "agent covering"/dead handlers/cosmetic stop/picker notes/click hits are
+now DONE (see batches 11-17). Still genuinely open: bots pane chip keyboard path, live
+verification of two pending approvals, `vikram chat` stdin-blocking with no message, DeliveryLedger
+wiring decision, context estimator anchor drift, shell process-group kill, `cron add` two-write,
+systemic zero-row Ok returns in vikram-store.
