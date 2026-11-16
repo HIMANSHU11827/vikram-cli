@@ -1741,6 +1741,13 @@ pub fn run_overlay_click(app: &mut App, click: crate::widgets::OverlayClick) {
                 app.overlay = Some(Overlay::AddBot { selected: index });
             }
         }
+        // A request row is a selection, not an answer: the panel stays up with that request
+        // under the cursor, ready for an answer button or a chord.
+        OverlayClick::ApprovalRequest(index) => {
+            if app.approvals.len() > index {
+                app.approval_selection = index;
+            }
+        }
         OverlayClick::ApprovalAction(index) => {
             app.approval_action = index;
             handle_overlay(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));

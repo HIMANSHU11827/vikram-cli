@@ -1141,16 +1141,22 @@ fn overlay_content(
             ("Keys".to_owned(), lines, clicks)
         }
         Overlay::Approvals => {
-            let (title, lines, action_rows) = approval_lines(app, theme);
-            let clicks = action_rows
+            let (title, lines, action_rows, request_rows) = approval_lines(app, theme);
+            let mut clicks: Vec<OverlayHit> = request_rows
                 .into_iter()
-                .enumerate()
-                .map(|(index, line)| OverlayHit {
+                .map(|(line, index)| OverlayHit {
+                    line,
+                    columns: None,
+                    click: OverlayClick::ApprovalRequest(index),
+                })
+                .collect();
+            clicks.extend(action_rows.into_iter().enumerate().map(|(index, line)| {
+                OverlayHit {
                     line,
                     columns: None,
                     click: OverlayClick::ApprovalAction(index),
-                })
-                .collect();
+                }
+            }));
             (title, lines, clicks)
         }
         Overlay::Inspector(kind) => {
@@ -1346,6 +1352,8 @@ pub enum OverlayClick {
     AddBotSpawn,
     /// One of [`APPROVAL_ACTIONS`], by index.
     ApprovalAction(usize),
+    /// One pending request's header row, by index — a click selects it like ↑/↓.
+    ApprovalRequest(usize),
     /// Commit whatever the open text field holds.
     PromptSubmit,
     /// Leave the open text field (or the spawn list) as it was.
@@ -1396,14 +1404,23 @@ fn chip_row(
 /// The caller reserves exactly this many rows so the question never covers the rows it is asking
 /// about: the transcript is laid out above the reserved strip and stays readable behind it.
 pub fn approval_panel_height(app: &App, theme: &Theme) -> u16 {
-    let (_, lines, _) = approval_lines(app, theme);
+    let (_, lines, _, _) = approval_lines(app, theme);
     (lines.len() as u16 + 2).clamp(3, 16)
 }
 
-/// The panel body plus the line each answer button sits on, so a press can name one.
-fn approval_lines(app: &App, theme: &Theme) -> (String, Vec<Line<'static>>, Vec<usize>) {
+/// The panel body plus the line each request header and answer button sits on, so a press can
+/// name either: a request row selects it, an answer row answers the selected request.
+type ApprovalBody = (
+    String,
+    Vec<Line<'static>>,
+    Vec<usize>,
+    Vec<(usize, usize)>,
+);
+
+fn approval_lines(app: &App, theme: &Theme) -> ApprovalBody {
     let mut lines: Vec<Line> = Vec::new();
     let mut action_rows: Vec<usize> = Vec::new();
+    let mut request_rows: Vec<(usize, usize)> = Vec::new();
     if app.approvals.is_empty() {
         lines.push(Line::styled("  nothing is waiting", theme.secondary()));
     } else {
@@ -1417,6 +1434,7 @@ fn approval_lines(app: &App, theme: &Theme) -> (String, Vec<Line<'static>>, Vec<
             } else {
                 Style::default().fg(theme.text)
             };
+            request_rows.push((lines.len(), index));
             lines.push(Line::from(vec![
                 Span::styled(format!("{marker} {} ", theme.filled_dot()), style),
                 Span::styled(format!("{} {}", approval.verb, approval.resource), style),
@@ -1466,6 +1484,7 @@ fn approval_lines(app: &App, theme: &Theme) -> (String, Vec<Line<'static>>, Vec<
         format!("Permissions {}", app.approvals.len()),
         lines,
         action_rows,
+        request_rows,
     )
 }
 
