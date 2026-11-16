@@ -1,7 +1,8 @@
 //! Conversational Control: Natural language interface for evolution control.
 //!
-//! This engine provides natural language commands for controlling the
-//! autonomous evolution system.
+//! SCAFFOLD: nothing in the workspace calls this engine yet, and several
+//! handlers report canned outcomes ("rolled back", "queued") without doing the
+//! work. Do not surface its responses as fact until the actions are real.
 
 use crate::error::Result;
 use crate::store::EvolutionStore;

@@ -1,8 +1,8 @@
-//! Self-Awareness Engine: Runtime inspection and self-model maintenance.
+//! Runtime inspection and self-model maintenance.
 //!
-//! This engine builds and maintains a machine-readable self-model synchronized
-//! with the actual Vikram runtime. It never claims capabilities without verifying
-//! them against the real implementation.
+//! SCAFFOLD: nothing in the workspace calls this engine yet, and its inspect_*
+//! methods return representative constants rather than live runtime state. Do
+//! not surface its output as fact until it is wired to real inspection.
 
 use crate::error::{EvolutionError, Result};
 use crate::store::EvolutionStore;

@@ -1,7 +1,7 @@
 //! Self-Recovery Engine: Recover from failed changes and operational problems.
 //!
-//! This engine provides configuration snapshots, change history, versioned skills,
-//! Git-based source checkpoints, automatic rollback, and recovery verification.
+//! SCAFFOLD: nothing in the workspace calls this engine yet; snapshots capture
+//! no real state and rollbacks record intent without restoring anything.
 
 use crate::error::{EvolutionError, Result};
 use crate::store::EvolutionStore;
