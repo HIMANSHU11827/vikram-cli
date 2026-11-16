@@ -1,361 +1,232 @@
-# 🧠 VIKRAM — Terminal AI Runtime
+# VIKRAM
 
-> A multi-user, multi-entity AI harness in Rust. One binary. Deny-first permissions.
-> Durable SQLite state. Hive teams, bots, sub-agents and a unified Ticket System.
-> Vikram is a personal AI assistant with a real personality — a friend and family member to the user —
-> virtually present, still in active development. Not a robot and not just a CLI; a proper AI assistant
-> person, primarily private to the user while supporting multiple users. Chats politely and clearly.
+**A personal AI runtime for the terminal.** One Rust binary that runs an interactive TUI, a
+headless chat, a multi-platform message gateway, and a scheduled-job daemon — all over one
+deny-first permission model and one durable SQLite store.
+
+VIKRAM is built to be a presence, not a tool: a personal assistant that remembers context across
+sessions, delegates work to bots and agent teams, answers from your own machines' messaging apps,
+and runs scheduled jobs while you're away. It is honest by design — it reports what it actually
+did, asks before it acts, and never claims a success it didn't earn.
 
 [![Rust](https://img.shields.io/badge/rust-1.89%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![Edition](https://img.shields.io/badge/edition-2024-blue)]()
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)]()
 [![Status](https://img.shields.io/badge/status-pre--release-yellow)]()
-[![Crates](https://img.shields.io/badge/crates-10-informational)]()
+[![Tests](https://img.shields.io/badge/tests-2000%2B-brightgreen)]()
 
 ---
 
-## Table of Contents
+## Why VIKRAM
 
-- [What is VIKRAM](#what-is-vikram)
-- [Features](#features)
-- [Quick Start](#quick-start)
-- [Terminal Interface](#terminal-interface)
-- [Architecture](#architecture)
-- [Permission Model](#permission-model)
-- [Unified Ticket System](#unified-ticket-system)
-- [Crates](#crates)
-- [CLI Reference](#cli-reference)
-- [Configuration](#configuration)
-- [Documentation](#documentation)
-- [Testing](#testing)
-- [License](#license)
+Most terminal AI tools are a prompt box with tools bolted on. VIKRAM is a runtime:
 
----
-
-## What is VIKRAM
-
-VIKRAM is a terminal AI runtime and a personal AI assistant with a real personality — a friend and
-family member to the user — virtually present, still in active development. Not a robot and not just
-a CLI; a proper AI assistant person, primarily private to the user while supporting multiple users
-(family and friends). A single binary (`vikram`) drives an interactive TUI, headless chat, and a
-full set of operator commands, usable from the CLI. It is **multi-user and multi-entity**: humans,
-a main orchestrator (Vikram), delegated sub-agents, dedicated bots and Hive collaborative teams all
-share one runtime, one permission model and one durable store. Vikram remembers and understands the
-user, helps with many tasks, and never sugarcoats — honest and direct, like a true friend. It
-chats politely and clearly, like talking with a friend or family member, introduces itself as an
-AI assistant, and keeps a respectful tone in every conversation.
-
-- **Journal-first** execution: append-only event log, idempotent effects, crash-safe.
-- **Deny-first** permissions with a non-widenable mandatory floor.
-- **Durable** SQLite state — crashes do not lose work.
-- **Replaceable seams** (provider, policy, journal, tools) behind typed contracts.
+- **Journal-first execution** — every effect is recorded before it is applied; a crash mid-turn
+  resumes from the journal instead of repeating or losing work.
+- **Deny-first permissions** — a `Deny` outranks every `Allow`, and a mandatory security floor
+  cannot be widened by config, plugins, or policy files. Untrusted content can never grant itself
+  `grant.*`, `policy.*`, or `self.*` verbs.
+- **Real multi-entity work** — hives (agent teams), bots (persistent workers), and sub-agents
+  share one Ticket engine: conversations, assignments, reports, and recovery all live in SQLite.
+- **Beyond the terminal** — a gateway answers Telegram, Discord, Slack, WhatsApp, email, IRC,
+  matrix and ~30 more platforms, behind per-sender authorization. A daemon runs cron-scheduled
+  agent jobs with retries, delivery tracking, and heartbeats.
+- **Honest UI** — every drawn control has a handler, every key printed has an effect, and panels
+  show live data or say why they can't.
 
 ---
 
-## Features
-
-| Area | Highlights |
-|---|---|
-| 🧠 **Runtime** | Turn loop (kernel removed; turn loop is the execution path), cancellation, token meter, event bus |
-| 🔐 **Security** | Deny-first policy, mandatory floor, 7 posture modes, durable allow-list, posture resolution |
-| 💾 **Persistence** | SQLite (WAL), sessions, agents, teams, hives, tickets, journal, users, profiles, entities, projects, artifacts, file changes |
-| 🎫 **Tickets** | One unified engine for Hive teams, bots and sub-agents — conversations, participants, permissions, assignments, reports, recovery |
-| 🐝 **Hive** | Collaborative agent teams with shared conversation, parallel/sequential/specialized strategies |
-| 🤖 **Bots** | Independent AI workers with their own Tickets and isolation |
-| 👶 **Sub-agents** | Parent-managed workers with isolated execution and authorized reports |
-| 🧩 **Skills** | Discovery, loading, activation, bundles, installation, history, rollback |
-| 🔌 **MCP** | Client discovery/connections/tools + server surface |
-| 🧠 **Memory** | Per user/profile/entity SQLite KV store |
-| 📚 **Context** | Permission-aware markdown loader with mtime invalidation, token budgeting, dedup |
-| 🌐 **Browser/PTY/Computer** | Headless Chromium, persistent PTYs, desktop automation |
-| 🔧 **LSP/Search** | Language server pool, web search |
-| 🧬 **Self-improvement** | Learning pipeline + evolution engine (experiences, reflection, skills, optimization) |
-| 🖥️ **TUI** | ratatui interface, responsive layout, interactive input, widgets |
-
----
-
-## Quick Start
-
-### Build
+## Quick start
 
 ```sh
 cargo build --release
 ./target/release/vikram
 ```
 
-Requires **Rust 1.89+**. SQLite is compiled in (`rusqlite/bundled`) — no system `libsqlite3`.
-
-### First run
+Requires **Rust 1.89+**. SQLite is bundled (`rusqlite/bundled`) — no system dependencies.
 
 ```sh
-vikram                      # interactive TUI
+vikram                    # interactive TUI
 vikram chat "explain this repo"
-vikram doctor               # check prerequisites
+vikram chat --interactive # REPL-style session
+vikram doctor             # check prerequisites and config
 ```
 
-### Operator commands
-
-```sh
-vikram sessions list
-vikram agents
-vikram entities list
-vikram hive list
-vikram tickets list
-vikram config show
-```
+First run creates `~/.vikram/` with config, database, and journal. Point it at a model with
+`--model`, `--base-url`, or `VIKRAM_*` env vars — any OpenAI-compatible endpoint works.
 
 ---
 
-## Terminal Interface
+## The terminal interface
 
-`vikram` with no arguments opens the TUI: session tabs, conversation transcript, optional HIVE and
-BOTS panes, a one-line notice row, the composer and a shortcut row that changes with focus.
+`vikram` opens a responsive TUI: session tabs, transcript, optional BOTS and HIVE panes, a notice
+row, and a composer with an explicit send mode (`Tab` flips between *queue* and *steer* — the
+border title always says which is armed).
 
-**The composer has two send modes.** `Tab` flips it and the border title always says which is armed:
+- **35 slash commands** behind one table — popup, `/help`, and palette can't disagree.
+- **Mouse = keyboard** — every chip, tab, picker row, suggestion, approval request, and pane
+  records its hit region while drawing; a click runs the same handler the chord does.
+- **Honest panels** — read-only views show no fake verbs; empty states explain themselves;
+  pickers scroll, filter, and answer clicks.
+- **Approvals that stay reachable** — pending permission requests queue up and each is answerable
+  by key or click; `a`/`d`/`p` chords and `allow` rules persist what you decide.
 
-```
-┏❯ queue …        Enter sends, the turn starts now
-┏❯ steer …        Ctrl+Enter steers the running turn
-┏❯ steer <text> … the pending steer is shown in the title
-```
-
-**Every notice is visible.** An action with nothing to act on answers in the notice row instead of
-returning silently — an empty `/allow` pressed with Enter says ``` `allow` has nothing to forget yet ```.
-Notices age out after 8 seconds (errors after 24) so the row goes back to the conversation.
-
-**35 slash commands**, one table behind the popup, `/help`, the palette and the dispatcher:
-
-| Group | Commands |
-|---|---|
-| Model & endpoint | `/model` `/provider` `/settings` |
-| Permission | `/permissions` `/allow` `/approvals` |
-| Conversation | `/sessions` `/rename` `/close` `/new` `/clear` `/compact` `/queue` |
-| Work | `/tasks` `/schedule` `/diff` `/test` `/build` `/doctor` |
-| Team | `/bot` `/hive` `/skills` `/tools` `/plugins` `/mcp` `/files` `/memory` |
-| Info | `/status` `/usage` `/context` `/version` `/keys` `/help` `/copy` `/exit` |
-
-Near misses resolve, so `/session` finds `/sessions`. `!` runs a shell command, `@` completes a
-workspace path. Read-only panels (`/status`, `/usage`, `/context`, `/doctor`, `/version`) show no
-action verbs, because offering an action over data the panel cannot change is a lie the operator
-only discovers by pressing it.
-
-**Mouse and keyboard are the same path.** Every chip, footer verb, session tab, bot row and
-foldable activity row records its rectangle while drawing, and a press answers through exactly the
-same handler the chord does. Anything the mouse can do, a key can do. Scroll wheel scrolls the
-transcript, or the picker when one is open.
-
-Key highlights: `Ctrl+C` cancel/quit · `Ctrl+N` new session · `Ctrl+Tab` cycle sessions ·
-`Ctrl+B` bots pane · `Ctrl+O` approvals · `Ctrl+R` reverse search · `Ctrl+T` thinking ·
-`Ctrl+A` open a bot · `F1`–`F8` help, background, MCP, plugins, sub-agents, context, model, skills ·
-`Esc` leaves a pane before it cancels anything.
-
-Full command table, key map and hit-region contract: [docs/tui.md](docs/tui.md).
+Key map and hit-region contract: [`docs/tui.md`](docs/tui.md)
 
 ---
 
 ## Architecture
 
 ```
-User (TUI / CLI / Chat)
-  └─► Runtime::boot (store, memory, provider, MCP, plugins, skills, evolution)
-        └─► SessionRuntime::begin_turn
-              └─► Turn loop
-                    ├─ inject skills / identity / preamble
-                    ├─ stream provider (OpenAI-compatible SSE)
-                    ├─ run tools under policy gate (+ approvals)
-                    └─ journal results, repeat
-        └─► Finish (usage, events, dequeue)
-  └─► Shutdown (cancel all)
+User (TUI / headless chat / gateway platforms / daemon jobs)
+  └─► Runtime::boot ── store · memory · provider · MCP · plugins · skills · evolution
+        └─► Turn loop ── skills/identity injection → provider stream → tools under policy → journal
+  └─► Shutdown (cancel all, flush journal)
 ```
 
-**Crate layers (no circular deps):**
+Crate layers, acyclic:
 
 ```
-vikram-contracts  (IDs, messages, policy, journal, trust, versioning, tickets)
-   ▲
-   ├── vikram-policy   (deny-first, floor, rules, posture)
-   └── vikram-store    (SQLite durable state)
-         ▲
-         └── vikram-runtime  (host, providers, tools, MCP, plugins, skills, memory, context, learning, workspace, sandbox, tickets)
-               ▲
-               ├── vikram-tui   (ratatui interface)
-               └── vikram-cli   (entry point + operator commands)
-vikram-skills / vikram-mcp / vikram-evolution  (supporting crates)
+vikram-contracts   IDs, messages, policy types, journal, trust, tickets
+vikram-policy      deny-first evaluation + non-widenable mandatory floor
+vikram-store       SQLite durable state (WAL)
+vikram-runtime     host: sessions, agents, providers, tools, MCP, plugins, skills, memory,
+                   context engine, learning, workspace, sandbox, tickets
+vikram-gateway     ~30 platform adapters + access control + ingress
+vikram-daemon      scheduled jobs: claim/settle transactions, retries, delivery, heartbeats
+vikram-evolution   experience → reflection → proposals learning pipeline
+vikram-tui         ratatui interface
+vikram-cli         the `vikram` binary: TUI, chat, operator commands, gateway, daemon, mcp serve
+supporting         vikram-skills · vikram-mcp · vikram-sandbox · vikram-terminals ·
+                   vikram-codeindex · vikram-acp · vikram-bench
 ```
-
-**Core properties:**
-
-- **Journal-first**: every effect is journalled before it is applied; an effect id already
-  present means the action is skipped rather than repeated (crash-safe).
-- **Auditable**: the journal is the record of what happened and what policy said.
-- **Safe by construction**: permission is evaluated in the turn loop (turn-based) against the
-  trust of the content that produced the request.
 
 ---
 
-## Permission Model
+## Security model
 
-**Deny-first.** A `Deny` outranks every `Allow`; no rule means no permission. A mandatory
-floor cannot be widened by config, plugins or substituted policy implementations:
+- **Deny-first policy** with posture modes: `ask` (default), `edit-ok`, `plan` (read-only),
+  `smart`, `unattended`, `yolo` (stops prompting, never overrides the floor), `allow-list`.
+- **Mandatory floor** — mutations outside the workspace root are always denied; delegation depth
+  is capped; shell commands that smuggle redirection/substitution past an allow rule are caught
+  by segment-level matching.
+- **Gateway authorization** — every inbound platform message passes `authorize_source`
+  (default-deny) before it can reach the runtime. Allow senders via `GATEWAY_ALLOWED_USERS`,
+  `GATEWAY_ALLOW_ALL_USERS=true`, per-platform `<PLATFORM>_ALLOWED_USERS`, or pairing approvals.
+- **Sandboxed execution** — shell/PTY/verify tools honour `ctx.sandbox` (bubblewrap/seatbelt
+  where available); timeouts kill the whole process group.
+- **Plugin isolation** — plugin ids are validated and canonicalized under the plugin root;
+  `plugin.uninstall` cannot escape it.
 
-- mutations outside the workspace root are always denied;
-- untrusted content cannot authorize `grant.*` / `policy.*` / `self.*` verbs;
-- delegation is cut off beyond `max_delegation_depth` (3).
-
-**Postures:** `ask` (default) · `edit-ok` · `plan` (read-only) · `smart` ·
-`unattended` · `yolo` (stops prompting, never overrides the floor) · `allow-list`.
-
----
-
-## Unified Ticket System
-
-One engine for all participant types. A Ticket is one persistent unit of work keeping the
-original request, participants, messages, assignments, progress, execution history, reports,
-follow-ups and results.
-
-| Behaviour | Hive member | Independent bot | Sub-agent |
-|---|---|---|---|
-| Shared team chat | ✅ | ❌ | ❌ (default) |
-| Read others' shared messages | ✅ | ❌ | ❌ |
-| Direct collaboration | ✅ | ❌ | ❌ (default) |
-| Work assignment | by coordinator | owns its own | by parent |
-| Own execution context | ✅ | ✅ | ✅ |
-| Submit reports | ✅ | ✅ | ✅ (to parent) |
-| Parent coordination | team coordinator | — | parent agent |
-
-**Communication patterns:**
-
-- **Hive shared conversation** — authorized members read/participate in the shared team chat.
-- **Independent bot conversation** — bot + authorized users only; no auto cross-bot access.
-- **Sub-agent private execution + parent reports** — isolated contexts; parent receives
-  authorized progress/reports; siblings cannot read each other's private messages.
-
-**Strategies (Hive):** `parallel` · `sequential` · `specialized` (recorded on Ticket/Assignment).
-
-**Persistence:** tickets, participants, messages, assignments and events live in SQLite and
-survive restarts, session termination and agent failures. Follow-ups continue the existing
-Ticket. Discord is an optional external surface; the canonical Ticket stays in Vikram.
-
-📖 Full reference: [`docs/tickets.md`](docs/tickets.md)
+📖 [`docs/security.md`](docs/security.md) · [`docs/permissions.md`](docs/permissions.md) ·
+[`docs/gateway-platforms.md`](docs/gateway-platforms.md)
 
 ---
 
-## Crates
+## Entities and work
 
-| Crate | Role |
+| Concept | What it is |
 |---|---|
-| `vikram-contracts` | Stable typed contracts (IDs, messages, policy, journal, trust, versioning, tickets) |
-| `vikram-policy` | Deny-first permission evaluation with non-widenable mandatory floor |
-| `vikram-store` | Durable SQLite state (sessions, agents, teams, hives, tickets, journal, users, profiles, entities, projects, artifacts, file changes) |
-| `vikram-runtime` | Host: sessions, agents, tasks, teams, hives, tickets, providers, tools, MCP, plugins, skills, memory, context, learning, workspace, sandbox |
-| `vikram-skills` | Skill discovery, loading, activation, installation, bundles, history |
-| `vikram-tui` | Terminal interface (ratatui): state, rendering, input, widgets, theme, layout |
-| `vikram-cli` | The `vikram` command: TUI, headless chat, operator commands |
-| `vikram-mcp` | Model Context Protocol server |
-| `vikram-evolution` | Self-evolution engine: experiences, reflection, memory, skills, optimization, hive learning |
+| **Session** | One conversation with full history, workspace, and journal |
+| **Bot** | Persistent worker with its own context files and Tickets |
+| **Sub-agent** | Delegated worker under a parent, isolated execution, authorized reports |
+| **Hive** | Team chat of agents/bots with shared authorized context |
+| **Ticket** | One durable unit of work shared across all participant types |
+| **Entity** | User/profile-scoped named thing (agent, bot, org, project…) with scaffolded context |
+
+Tickets carry conversations, participants (with `can_read`/`can_write` enforced), assignments,
+reports, follow-ups, and recovery — in SQLite, surviving restarts.
 
 ---
 
-## CLI Reference
+## Gateway and daemon
+
+**Gateway** (`vikram gateway`) connects the runtime to messaging platforms — Telegram, Discord,
+Slack, WhatsApp (Baileys + Cloud API), email, IRC, matrix, Signal, Google Chat, Teams, and more.
+Webhook signatures are verified per platform; `/a2a` requires `A2A_TOKEN`. Inbound senders are
+authorized centrally; replies route back to the originating platform.
+
+**Daemon** (`vikram cron`) runs scheduled agent jobs — prompts or shell commands on cron
+expressions, with retries, per-job delivery targets (session report, webhook, none), skip-on-
+overdue semantics, and heartbeat monitoring. All scheduler writes are transactional.
+
+---
+
+## CLI surface
 
 ```sh
-# Sessions / projects / workspaces
-vikram sessions list|new|show|rename|archive|duplicate|rm
-vikram project   list|select|show|disconnect
-vikram workspace show|changes|restore
-vikram files     list|rm
-
-# Entities / agents / teams / hives
-vikram agents
-vikram entities  list|new|rm
-vikram hive      list|new|show|add-participant|remove-participant|send|run|rm
-
-# Tickets (unified)
-vikram tickets   list|show|new|add-participant|send|assign|complete|close|reopen|rm
-
-# Users / profiles
-vikram users     list|new|rm
-vikram profiles  list|new|rm
-
-# Config / tools / skills / mcp
-vikram config    show|init|set|path
-vikram tools     [list]
-vikram skills    ...
-vikram mcp       list|status|serve
-vikram allow     list|add|rm
-vikram doctor
+vikram                  # TUI
+vikram chat "…"         # one-shot headless turn
+vikram sessions|project|workspace|files …
+vikram agents|entities|users|profiles …
+vikram hive|tickets …   # teams and unified work items
+vikram bots …           # bot lifecycle
+vikram cron …           # scheduled jobs (add/list/edit/remove/run)
+vikram gateway …        # platform gateway
+vikram plugins|skills|mcp|tools …
+vikram config|allow|doctor|learning …
 ```
+
+Every mutating verb verifies the target exists before claiming success.
 
 ---
 
 ## Configuration
 
-Config lives in `~/.vikram/config.json`:
+`~/.vikram/config.json`:
 
 ```json
 {
-  "model": "...",
-  "base_url": "...",
-  "provider": "openai",
+  "model": "…", "base_url": "…", "provider": "openai",
   "api_key_env": "OPENAI_API_KEY",
-  "context_window": 128000,
-  "workspace_root": "/work",
-  "max_steps": 24,
-  "max_output_tokens": 4096,
-  "ascii_fallback": false,
-  "thinking": false,
-  "mode": "ask",
-  "security": { "disable_yolo": false, "disable_auto_approve": false, "disable_always_allow": false }
+  "context_window": 128000, "workspace_root": "/work",
+  "max_steps": 24, "max_output_tokens": 4096,
+  "mode": "ask", "thinking": false, "ascii_fallback": false
 }
 ```
 
-Override via flags: `--model`, `--base-url`, `--workspace`, `--mode`, `--ascii`.
+Flags: `--model --base-url --workspace --mode --ascii`. See [`docs/cli.md`](docs/cli.md).
 
 ---
 
-## Documentation
-
-| Doc | Description |
-|---|---|
-| [`HARNESS.md`](HARNESS.md) | Architecture overview |
-| [`docs/concepts.md`](docs/concepts.md) | Core concepts (users, profiles, agents, bots, Hive, teams, tickets, sessions, permissions, memory) |
-| [`docs/tickets.md`](docs/tickets.md) | Unified Ticket System (Hive, bots, sub-agents) |
-| [`docs/agents.md`](docs/agents.md) | Agents, bots, Hive, teams, assignments |
-| [`docs/permissions.md`](docs/permissions.md) | Permission model, postures, floor, allow-list |
-| [`docs/runtime.md`](docs/runtime.md) | Turn-based execution architecture and runtime host integration (turn loop is the path; kernel removed) |
-| [`docs/store.md`](docs/store.md) | Durable SQLite state and tables |
-| [`docs/memory.md`](docs/memory.md) | Memory and self-improvement |
-| [`docs/context.md`](docs/context.md) | Context loader |
-| [`docs/tools.md`](docs/tools.md) | Tool surface and execution |
-| [`docs/plugins.md`](docs/plugins.md) | Plugin system |
-| [`docs/tui.md`](docs/tui.md) | Terminal interface |
-| [`docs/cli.md`](docs/cli.md) | CLI operator commands |
-| [`docs/security.md`](docs/security.md) | Security model and gaps |
-| [`docs/session-workspace.md`](docs/session-workspace.md) | Sessions, workspaces, projects, artifacts, checkpoints |
-| [`docs/evolution.md`](docs/evolution.md) | Self-evolution engine |
-| [`docs/roadmap.md`](docs/roadmap.md) | Prioritised roadmap: cross-platform, gateway capabilities, providers, CI |
-| [`docs/docker.md`](docs/docker.md) | Docker usage |
-| [`docs/kubernetes.md`](docs/kubernetes.md) | Kubernetes usage |
-| [`docs/termux.md`](docs/termux.md) | Termux / Android usage |
-| [`docs/audit/VIKRAM-AZ-AUDIT.md`](docs/audit/VIKRAM-AZ-AUDIT.md) | Full A–Z audit |
-| [`docs/skills/`](docs/skills/) | Skills system reference |
-| [`docs/development/`](docs/development/) | Testing strategy, implementation notes |
-| [`docs/research/`](docs/research/) | Competitor and architecture research |
-| [`docs/decisions/`](docs/decisions/) | Architecture decision records |
-| [`docs/mcp/`](docs/mcp/) | MCP overview, architecture, audit |
-
----
-
-## Testing
+## Development
 
 ```sh
+cargo build --workspace
 cargo test --workspace
 cargo fmt --all
 cargo clippy --workspace --all-targets
 ```
 
-Suites: contracts · policy · store (sessions + tickets) · runtime (turn loop, incl. ticket
-workflows) · skills · tui · cli · mcp · evolution.
+Rust 2024 edition, MSRV 1.86 (toolchain 1.89+ recommended). Tests live in crate-local
+`#[cfg(test)]` modules; the workspace currently passes 2000+ tests.
+
+Project conventions for agents: [`AGENTS.md`](AGENTS.md) · refinement log:
+[`REFINEMENT.md`](REFINEMENT.md)
+
+---
+
+## Documentation
+
+| Doc | Contents |
+|---|---|
+| [`HARNESS.md`](HARNESS.md) | Architecture deep-dive |
+| [`docs/tui.md`](docs/tui.md) | TUI layout, keys, mouse contract, commands |
+| [`docs/concepts.md`](docs/concepts.md) | Users, profiles, entities, sessions, permissions |
+| [`docs/tickets.md`](docs/tickets.md) | Unified Ticket System |
+| [`docs/agents.md`](docs/agents.md) | Agents, bots, hives, assignments |
+| [`docs/permissions.md`](docs/permissions.md) | Policy model, postures, floor, allow-list |
+| [`docs/security.md`](docs/security.md) | Security model and known gaps |
+| [`docs/gateway-platforms.md`](docs/gateway-platforms.md) | Platform adapters, auth env, webhook routes |
+| [`docs/runtime.md`](docs/runtime.md) | Turn loop and runtime host |
+| [`docs/store.md`](docs/store.md) | SQLite schema and durability |
+| [`docs/tools.md`](docs/tools.md) | Tool surface |
+| [`docs/plugins.md`](docs/plugins.md) · [`docs/skills/`](docs/skills/) | Extension systems |
+| [`docs/memory.md`](docs/memory.md) · [`docs/context.md`](docs/context.md) | Memory and context management |
+| [`docs/evolution.md`](docs/evolution.md) | Learning pipeline |
+| [`docs/cli.md`](docs/cli.md) | Operator command reference |
+| [`docs/session-workspace.md`](docs/session-workspace.md) | Workspaces, projects, checkpoints |
+| [`docs/roadmap.md`](docs/roadmap.md) | Priorities |
+| [`docs/docker.md`](docs/docker.md) · [`docs/kubernetes.md`](docs/kubernetes.md) · [`docs/termux.md`](docs/termux.md) | Deployment guides |
 
 ---
 
