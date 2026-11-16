@@ -113,3 +113,26 @@ systemic zero-row Ok returns in vikram-store.
 - coalesce_overdue/stale_slot still two-write (daemon agent skipped, not in verified list).
 - Legacy heartbeat.reported keys orphaned (bounded).
 - computer.screenshot ActionKind Execute→Write judgment call — revisit if policy surprises.
+
+## 2026-11-16 — batches 22-30 (commits 2601873…d466170)
+
+- store/daemon leftovers: skip_slot atomic; entities/profiles/hive/tickets/project existence checks; chat TTY stdin refusal; title migration ordering.
+- plugins: path-traversal closed at plugin_dir + under_root; execute resolves by manifest id, drains pipes concurrently (no deadlock); :scope documented advisory.
+- tickets can_read enforced; memory_files refuses to overwrite unreadable files; snapshot stays frozen.
+- consolidation: superseded/expired can't resurrect; winner tuple matches docs; unknown status fails load. dialectic: original case, ',' clause end, cap+stale-key cleanup.
+- evolution: autonomy tiers enforced at execution boundary; self_dev/self_config stop fabricating; failed reflection jobs don't retry forever; sanitize covers metadata/tools_used; category stats bounds; dashboard real count; lib.rs docs honest.
+- workspace: ensure_session_workspace keeps project mode.
+- lsp: publishDiagnostics distinguishes "no report" from "clean".
+- skills.rs editor temp file: create_new + 0600.
+- policy (fa90b29): command_segments splits on > < ` $( (( { }; deny-first across tiers AND tool overrides; empty/filesystem-root workspace fails closed; within_root normalizes ..
+- gateway audit CRITICAL in flight: authorize_source never called — agent wiring it into inbound path + A2A auth + session keys + ingress truncation + media_fetch redirects.
+
+## Still open
+
+- self_awareness/conversational/self_recovery are unwired scaffolding with fabricated content — decide wire-or-stub-mark (LOW operational, HIGH dishonesty if surfaced).
+- access.rs allowlist_suppresses_pairing dead field; buzz allowlist asymmetry (LOW).
+- DingTalk webhook map unbounded; A2A task map stale (LOW).
+- plugins.rs run no confirm — judged acceptable (explicit operator command).
+- redact.rs "sk-" over-matches task-/risk- (fail-safe, LOW).
+- optimization.rs pareto fallback ignores `passed`; propose_candidate unscrubbed fields (LOW, unwired).
+- store.rs zero-row Ok systemic remains the big one.
