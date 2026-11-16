@@ -202,37 +202,40 @@ impl CodeIndex {
             stats.symbols += symbols.len();
         }
 
-        // Build reference edges (simple name-based).
-        self.conn.execute("DELETE FROM refs", [])?;
-        // For each symbol name, find files containing it as a token.
-        let all_symbols: Vec<(String, String)> = {
-            let mut stmt = self.conn.prepare("SELECT file, name FROM symbols")?;
-            let rows = stmt.query_map([], |r| {
-                let f: String = r.get(0)?;
-                let n: String = r.get(1)?;
-                Ok((f, n))
-            })?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-        let file_contents: HashMap<String, String> = current
-            .iter()
-            .filter_map(|p| {
-                let rel = p
-                    .strip_prefix(&self.root)
-                    .unwrap_or(p)
-                    .to_string_lossy()
-                    .to_string();
-                fs::read_to_string(p).ok().map(|c| (rel, c))
-            })
-            .collect();
-        for (from_file, content) in &file_contents {
-            for (_, sym) in &all_symbols {
-                if content.contains(sym.as_str()) {
-                    // crude: record edge if the symbol name appears in this file and isn't defined here
-                    self.conn.execute(
-                        "INSERT INTO refs(from_file, to_symbol) VALUES (?1,?2)",
-                        params![from_file, sym],
-                    )?;
+        // Build reference edges (simple name-based). This is O(files × symbols) substring
+        // scans — skip it entirely when nothing changed, which is the common case.
+        if stats.indexed > 0 || stats.removed > 0 {
+            self.conn.execute("DELETE FROM refs", [])?;
+            // For each symbol name, find files containing it as a token.
+            let all_symbols: Vec<(String, String)> = {
+                let mut stmt = self.conn.prepare("SELECT file, name FROM symbols")?;
+                let rows = stmt.query_map([], |r| {
+                    let f: String = r.get(0)?;
+                    let n: String = r.get(1)?;
+                    Ok((f, n))
+                })?;
+                rows.filter_map(|r| r.ok()).collect()
+            };
+            let file_contents: HashMap<String, String> = current
+                .iter()
+                .filter_map(|p| {
+                    let rel = p
+                        .strip_prefix(&self.root)
+                        .unwrap_or(p)
+                        .to_string_lossy()
+                        .to_string();
+                    fs::read_to_string(p).ok().map(|c| (rel, c))
+                })
+                .collect();
+            for (from_file, content) in &file_contents {
+                for (_, sym) in &all_symbols {
+                    if content.contains(sym.as_str()) {
+                        // crude: record edge if the symbol name appears in this file and isn't defined here
+                        self.conn.execute(
+                            "INSERT INTO refs(from_file, to_symbol) VALUES (?1,?2)",
+                            params![from_file, sym],
+                        )?;
+                    }
                 }
             }
         }

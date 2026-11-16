@@ -157,19 +157,30 @@ impl ReflectionEngine {
     }
 
     /// Run reflection for one experience, producing proposals and applying low-risk ones.
-    pub fn run_reflection(&self, experience_id: &str) -> Result<Vec<LearningProposal>> {
+    /// `auto_apply_memory` gates the unconditional `AddMemory` writes below — the caller's learning
+    /// policy decides; `false` still records proposals but never touches the memory layer.
+    pub fn run_reflection(
+        &self,
+        experience_id: &str,
+        auto_apply_memory: bool,
+    ) -> Result<Vec<LearningProposal>> {
         let exp = self
             .collector
             .get(experience_id)?
             .ok_or_else(|| crate::error::EvolutionError::NotFound(experience_id.to_string()))?;
-        let proposals = self.reflector.reflect(&exp)?;
+        let mut proposals = self.reflector.reflect(&exp)?;
+        // Deterministic ids keyed by experience: a retry of the same reflection replaces its
+        // proposals instead of duplicating them (fresh `gen_id`s made every run unique).
+        for (idx, p) in proposals.iter_mut().enumerate() {
+            p.id = format!("prop-{}-{}", exp.id, idx);
+        }
         for p in &proposals {
             self.store.save_proposal(p)?;
         }
         // Apply low-risk memory additions automatically. Errors are
         // propagated, not swallowed with `let _ =`.
         for p in &proposals {
-            if p.kind == ProposalKind::AddMemory && !p.requires_approval {
+            if auto_apply_memory && p.kind == ProposalKind::AddMemory && !p.requires_approval {
                 if let Some(corr) = p.details.get("corrections")
                     && let Some(arr) = corr.as_array()
                 {
@@ -178,7 +189,7 @@ impl ReflectionEngine {
                             self.memory.remember(
                                 crate::types::MemoryLayer::User,
                                 &format!("agent:{}", p.agent_id),
-                                &format!("correction-{}", gen_id("k")),
+                                &format!("correction-{}-{}", exp.id, p.id),
                                 s,
                                 crate::types::KnowledgeStatus::UserStated,
                                 p.confidence,
@@ -235,7 +246,7 @@ impl ReflectionEngine {
             j.attempts += 1;
             j.updated_ms = now_ms();
             self.store.save_job(&j)?;
-            match self.run_reflection(&j.experience_id) {
+            match self.run_reflection(&j.experience_id, true) {
                 Ok(_) => {
                     j.status = ReflectionJobStatus::Done;
                     j.updated_ms = now_ms();
@@ -243,7 +254,13 @@ impl ReflectionEngine {
                     done += 1;
                 }
                 Err(e) => {
-                    j.status = ReflectionJobStatus::Failed;
+                    // A transient failure (locked DB, bad row) must not dead-letter the job on the
+                    // first try — `attempts` exists for exactly this. Three strikes and it fails.
+                    j.status = if j.attempts < 3 {
+                        ReflectionJobStatus::Pending
+                    } else {
+                        ReflectionJobStatus::Failed
+                    };
                     j.error = Some(e.to_string());
                     j.updated_ms = now_ms();
                     self.store.save_job(&j)?;

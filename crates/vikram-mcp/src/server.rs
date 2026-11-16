@@ -354,12 +354,12 @@ impl McpServer {
                         }
                     }
                 } else {
+                    // No executor means the call cannot run — a stub "success" would tell the
+                    // client work happened that never did.
                     json!({
                         "jsonrpc": "2.0",
                         "id": id,
-                        "result": {
-                            "content": [{"type": "text", "text": "tool invoked (no executor configured)"}]
-                        }
+                        "error": {"code": -32601, "message": "no tool executor configured"}
                     })
                 }
             }

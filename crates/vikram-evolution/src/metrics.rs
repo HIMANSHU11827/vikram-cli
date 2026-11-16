@@ -357,8 +357,7 @@ impl EvolutionStore {
         let since = now.saturating_sub(window_ms);
         let all_time = self.outcome_counts(category, None)?;
         let recent = self.outcome_counts(category, Some(since))?;
-        let (first_timestamp_ms, last_timestamp_ms) =
-            self.experience_time_bounds_for(category)?;
+        let (first_timestamp_ms, last_timestamp_ms) = self.experience_time_bounds_for(category)?;
         Ok(ExperienceStats {
             window_ms,
             all_time,

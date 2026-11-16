@@ -494,6 +494,16 @@ impl ScheduleStore {
         if changed != 1 {
             return Ok(None);
         }
+        // One run per job at a time: the slot CAS only stops double-claiming the same slot, not a
+        // manual `run now` overlapping a run that is still in flight.
+        let in_flight: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM daemon_runs WHERE job_id = ?1 AND status = 'running'",
+            params![id],
+            |row| row.get(0),
+        )?;
+        if in_flight > 0 {
+            return Ok(None);
+        }
         let run = begin_run_in(&tx, job, slot_ms, session)?;
         tx.commit()?;
         Ok(Some(run))
@@ -520,12 +530,7 @@ impl ScheduleStore {
 
     /// Skip a slot that can no longer run: move `next_run_ms` and record the skipped outcome in
     /// one commit, so the schedule and `last_status` can never disagree.
-    pub fn skip_slot(
-        &self,
-        id: &str,
-        next: Option<Millis>,
-        now: Millis,
-    ) -> Result<(), StoreError> {
+    pub fn skip_slot(&self, id: &str, next: Option<Millis>, now: Millis) -> Result<(), StoreError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         tx.execute(
@@ -666,7 +671,7 @@ impl ScheduleStore {
             params![run_id, crate::time::now_ms(), error],
         )?;
         tx.execute(
-            "UPDATE daemon_jobs SET next_run_ms = ?2, updated_ms = ?3 WHERE id = ?1",
+            "UPDATE daemon_jobs SET next_run_ms = ?2, updated_ms = ?3, last_status = 'skipped' WHERE id = ?1",
             params![job_id, next, now],
         )?;
         if next.is_none() {
@@ -839,6 +844,20 @@ impl ScheduleStore {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    /// Whether the `sessions` table still holds this id. The runtime keeps its own in-memory copy
+    /// of every session it rehydrated, so a row deleted while the daemon runs would keep accepting
+    /// posts into a transcript nothing reads. `false` also covers a store without the table (the
+    /// in-memory test store), where no session can be verified and none should be trusted.
+    pub fn session_exists(&self, id: &str) -> bool {
+        self.lock()
+            .query_row("SELECT 1 FROM sessions WHERE id = ?1", params![id], |_| {
+                Ok(())
+            })
+            .optional()
+            .map(|row| row.is_some())
+            .unwrap_or(false)
     }
 
     pub fn state_ms(&self, key: &str) -> Result<Option<Millis>, StoreError> {

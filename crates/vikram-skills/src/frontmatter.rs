@@ -222,7 +222,11 @@ struct Block<'a> {
     lines: Vec<&'a str>,
     pos: usize,
     path: PathBuf,
+    depth: usize,
 }
+
+/// Nesting deeper than this is not a skill file, it is an attack on the parser's stack.
+const MAX_DEPTH: usize = 32;
 
 impl<'a> Block<'a> {
     fn new(text: &'a str, path: &Path) -> Self {
@@ -230,6 +234,7 @@ impl<'a> Block<'a> {
             lines: text.split('\n').collect(),
             pos: 0,
             path: path.to_path_buf(),
+            depth: 0,
         }
     }
 
@@ -314,13 +319,19 @@ impl<'a> Block<'a> {
     fn continuation(&mut self, parent_indent: usize) -> Result<Yaml> {
         match self.peek()? {
             Some((idx, indent)) if indent > parent_indent => {
+                if self.depth >= MAX_DEPTH {
+                    return Err(self.err(format!("frontmatter nested deeper than {MAX_DEPTH}")));
+                }
                 let line = self.lines.get(idx).copied().unwrap_or("");
                 let content = line.get(indent..).unwrap_or("");
-                if is_seq_item(content) {
+                self.depth += 1;
+                let result = if is_seq_item(content) {
                     self.parse_seq(indent)
                 } else {
-                    Ok(Yaml::Map(self.parse_map(indent)?))
-                }
+                    self.parse_map(indent).map(Yaml::Map)
+                };
+                self.depth -= 1;
+                result
             }
             _ => Ok(Yaml::Null),
         }

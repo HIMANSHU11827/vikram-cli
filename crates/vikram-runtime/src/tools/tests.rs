@@ -554,6 +554,7 @@ fn mcp_tool_declares_execute_network_permission() {
         registry: Arc::new(Mutex::new(McpRegistry::load(
             crate::config::McpConfig::default().into_specs(),
         ))),
+        visibility: Arc::new(Mutex::new(vikram_mcp::visibility::VisibilityManager::new())),
     };
     let spec = tool.spec();
     assert_eq!(spec.name, "mcp.fs.read");

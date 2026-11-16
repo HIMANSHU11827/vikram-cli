@@ -46,16 +46,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let show_hive = !app.rosters.is_empty();
     let show_bots = app.show_bots && !app.bots.is_empty();
     let input_lines = app
-        .active_session()
+        .display_session()
         .map(|s| s.editor.line_count())
         .unwrap_or(1);
     // A notice is feedback the operator asked for by pressing something. It gets a row of its own
     // directly above the input so it can never be confused with the transcript or the status line.
     let show_notice = app.live_notice().is_some();
     let regions = layout::layout(area, show_hive, show_bots, input_lines, show_notice);
-    app.bots_rect = regions
-        .bots
-        .map(|r| (r.x, r.y, r.width, r.height));
+    app.bots_rect = regions.bots.map(|r| (r.x, r.y, r.width, r.height));
     app.conversation_rect = Some((
         regions.conversation.x,
         regions.conversation.y,
@@ -227,7 +225,7 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         Focus::Bots => theme.accent_dim,
         _ => theme.border,
     };
-    let session = app.active_session();
+    let session = app.display_session();
     let title = session.map_or_else(String::new, |s| {
         if let Some(text) = &s.steer_text {
             format!("{} steer {} ", theme.prompt(), preview(text))

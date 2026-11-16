@@ -469,6 +469,8 @@ impl Daemon {
         // than the schedule would have said.
         self.jobs
             .settle(&job, &run, ok, &done.outcome.output, &error, now)?;
+        // Bound history: without this every run row (with its output blob) is kept forever.
+        let _ = self.store.prune_runs(&job.id, 200);
         let notice = Notice {
             job: job.id.clone(),
             name: job.name.clone(),
@@ -549,11 +551,12 @@ impl Daemon {
                             session: None,
                             at: beat.at,
                         };
-                        let _ =
+                        let delivered =
                             notify::deliver(&Destination::Local, &notice, &self.home, None).await;
-                        report
-                            .delivered
-                            .push((format!("heartbeat.{}", beat.kind.as_str()), true));
+                        report.delivered.push((
+                            format!("heartbeat.{}", beat.kind.as_str()),
+                            delivered.delivered,
+                        ));
                     }
                     report.beats.push(beat);
                 }

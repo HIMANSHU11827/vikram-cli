@@ -1242,6 +1242,9 @@ fn workspace_cmd(action: WorkspaceAction) -> std::process::ExitCode {
             }
             WorkspaceAction::Changes { session } => {
                 let id = vikram_contracts::SessionId::new(session);
+                if store.get_session(&id).map_err(|e| e.to_string())?.is_none() {
+                    return Err(format!("session {id} not found"));
+                }
                 let changes = workspace.file_changes(&id).map_err(|e| e.to_string())?;
                 if changes.is_empty() {
                     println!("no tracked file changes");
@@ -1304,7 +1307,7 @@ fn files(action: FilesAction) -> std::process::ExitCode {
                 if removed {
                     println!("removed artifact record {id} (file untouched)");
                 } else {
-                    println!("no artifact {id}");
+                    return Err(format!("no artifact {id}"));
                 }
             }
         }
@@ -1653,6 +1656,7 @@ async fn hive(action: HiveAction) -> Result<(), String> {
                     store
                         .create_user("default", now)
                         .map(|u| u.id)
+                        .map_err(|e| eprintln!("warning: could not create default user: {e}"))
                         .unwrap_or_else(|_| vikram_contracts::UserId::generate())
                 });
             let row = vikram_store::HiveRow {
@@ -1694,6 +1698,9 @@ async fn hive(action: HiveAction) -> Result<(), String> {
         HiveAction::AddParticipant { hive, entity } => {
             let hid = vikram_contracts::HiveId::new(hive);
             let eid = vikram_contracts::EntityId::new(entity);
+            if store.get_hive(&hid).map_err(|e| e.to_string())?.is_none() {
+                return Err(format!("hive {hid} not found"));
+            }
             let ent = store
                 .get_entity(&eid)
                 .map_err(|e| e.to_string())?
@@ -1897,6 +1904,9 @@ fn tickets(action: TicketsAction) -> std::process::ExitCode {
                 kind,
             } => {
                 let tid = vikram_contracts::TicketId::new(ticket);
+                if store.get_ticket(&tid).map_err(|e| e.to_string())?.is_none() {
+                    return Err(format!("ticket {tid} not found"));
+                }
                 store
                     .add_ticket_participant(&vikram_store::TicketParticipantRow {
                         ticket: tid,
@@ -1946,6 +1956,9 @@ fn tickets(action: TicketsAction) -> std::process::ExitCode {
                 title,
             } => {
                 let tid = vikram_contracts::TicketId::new(ticket);
+                if store.get_ticket(&tid).map_err(|e| e.to_string())?.is_none() {
+                    return Err(format!("ticket {tid} not found"));
+                }
                 let a = vikram_store::AssignmentRow {
                     id: vikram_contracts::AssignmentId::generate(),
                     ticket: tid,
@@ -2040,6 +2053,12 @@ fn learning(action: LearningAction) -> std::process::ExitCode {
             },
             LearningAction::Approve { id } => {
                 if let Some(p) = mgr.find_proposal(&id) {
+                    if p.status != "pending" {
+                        return Err(format!(
+                            "proposal `{id}` is {} — only pending proposals can be approved",
+                            p.status
+                        ));
+                    }
                     if p.kind == "memory" {
                         let scope = if p.target == "user" { "user" } else { "memory" };
                         let mem = vikram_runtime::MemoryStore::open(
@@ -2055,7 +2074,8 @@ fn learning(action: LearningAction) -> std::process::ExitCode {
                         } else {
                             &p.target
                         };
-                        let _ = m.create(name, &p.reason, &p.content);
+                        m.create(name, &p.reason, &p.content)
+                            .map_err(|e| e.to_string())?;
                     }
                     mgr.set_proposal_status(&id, "approved");
                     mgr.audit(vikram_runtime::LearningAuditEntry {
@@ -2076,8 +2096,15 @@ fn learning(action: LearningAction) -> std::process::ExitCode {
             LearningAction::Reject { id } => {
                 // `set_proposal_status` silently no-ops on an unknown id; saying "rejected" for a
                 // proposal that never existed is a lie the audit log would repeat.
-                if mgr.find_proposal(&id).is_none() {
-                    return Err(format!("proposal `{id}` not found"));
+                match mgr.find_proposal(&id) {
+                    None => return Err(format!("proposal `{id}` not found")),
+                    Some(p) if p.status != "pending" => {
+                        return Err(format!(
+                            "proposal `{id}` is {} — only pending proposals can be rejected",
+                            p.status
+                        ));
+                    }
+                    Some(_) => {}
                 }
                 mgr.set_proposal_status(&id, "rejected");
                 mgr.save();
@@ -2380,7 +2407,9 @@ async fn mcp_serve() -> Result<(), String> {
     // rejects every request.
     server_cfg.validate().map_err(|err| err.to_string())?;
 
-    let app_config = Config::load().unwrap_or_default();
+    // A corrupt config must not silently downgrade the served tools to default workspace,
+    // sandbox, and policy — fail like the sibling subcommands do.
+    let app_config = Config::load().map_err(|err| format!("cannot load config: {err}"))?;
     let workspace_root = app_config
         .workspace_root
         .clone()

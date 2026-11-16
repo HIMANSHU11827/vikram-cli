@@ -614,7 +614,8 @@ fn record_and_reflect(
         let Ok(recorded) = engine.experience.record(experience) else {
             return;
         };
-        match engine.reflection.run_reflection(&recorded.id) {
+        let auto_memory = inner.learning.surface.policy_memory() != LearningPolicy::Disabled;
+        match engine.reflection.run_reflection(&recorded.id, auto_memory) {
             Ok(proposals) => proposals,
             Err(_) => return,
         }
@@ -652,7 +653,7 @@ pub(crate) fn apply_or_stage(
         return;
     }
     if proposal.kind == "memory" {
-        let scope = scope_of(&proposal.target);
+        let scope = scope_of(&proposal.target, &proposal.session);
         let existing = match inner.memory.list(scope) {
             Ok(existing) => existing,
             Err(err) => {
@@ -685,7 +686,11 @@ pub(crate) fn apply_or_stage(
     let outcome = if proposal.kind == "memory" {
         inner
             .memory
-            .save(&proposal.key, &proposal.content, scope_of(&proposal.target))
+            .save(
+                &proposal.key,
+                &proposal.content,
+                scope_of(&proposal.target, &proposal.session),
+            )
             .map(|_| format!("auto-applied{}", tail(&proposal.reason)))
             .unwrap_or_else(|err| format!("could not save memory: {err}"))
     } else {
@@ -709,8 +714,12 @@ pub(crate) fn apply_or_stage(
     inner.learning.surface.save();
 }
 
-fn scope_of(target: &str) -> &'static str {
-    if target == "user" { "user" } else { "memory" }
+/// Memory writes land in the session's own scope: automatic recall only reads `global` +
+/// the session id, and the shared store has no user dimension — a literal `user`/`memory`
+/// scope would be both invisible to recall and readable by every other session.
+fn scope_of(target: &str, session: &SessionId) -> String {
+    let _ = target;
+    session.as_str().to_owned()
 }
 
 fn tail(reason: &str) -> String {

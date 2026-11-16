@@ -117,7 +117,7 @@ impl NtfyAdapter {
 
     /// Absolute URL of a topic on this server (`{server}/{topic}`).
     fn topic_url(&self, topic: &str) -> String {
-        format!("{}/{topic}", self.server)
+        format!("{}/{}", self.server, encode_segment(topic))
     }
 
     /// The poll URL for `since`: `{server}/{topic}/json?poll=1&since=<since>`.
@@ -533,6 +533,20 @@ fn missing_id_result() -> SendResult {
     let mut result = SendResult::ok(String::new());
     result.message_id = None;
     result
+}
+
+/// Percent-encode a single URL path segment (unreserved chars kept verbatim).
+fn encode_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

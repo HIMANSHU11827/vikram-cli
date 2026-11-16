@@ -183,10 +183,16 @@ impl Rule {
         if self.actions.is_empty() || !self.actions.contains(&req.action) {
             return false;
         }
-        if let Some(prefix) = &self.verb_prefix
-            && !req.verb.starts_with(prefix.as_str())
-        {
-            return false;
+        if let Some(prefix) = &self.verb_prefix {
+            // Segment-boundary match: `fs.read` covers `fs.read` and `fs.read.x`, never `fs.readx`.
+            let verb_matches = req.verb == *prefix
+                || req
+                    .verb
+                    .strip_prefix(prefix.as_str())
+                    .is_some_and(|rest| rest.starts_with('.'));
+            if !verb_matches {
+                return false;
+            }
         }
         self.matches_resource(req)
     }
@@ -468,11 +474,7 @@ impl Policy {
 
         // Deny is final across every source: a saved rule, a built-in default, or a config
         // override. An allow from any of them cannot outvote a refusal.
-        if self
-            .tool_permissions
-            .get(&req.verb)
-            .is_some_and(|v| v == "deny")
-        {
+        if self.tool_override(&req.verb).is_some_and(|v| v == "deny") {
             return Decision::Deny {
                 reason: format!("tool `{}` is denied by config override", req.verb),
             };
@@ -487,7 +489,7 @@ impl Policy {
         }
 
         // Overrides still outrank prompts and quiet allows, but never a deny.
-        if let Some(override_value) = self.tool_permissions.get(&req.verb) {
+        if let Some(override_value) = self.tool_override(&req.verb) {
             match override_value.as_str() {
                 "allow" => return Decision::Allow,
                 "ask" => {
@@ -577,15 +579,22 @@ impl Policy {
             req.clone()
         }
     }
+    /// `tool_permissions` is documented as "tool name -> allow/deny/ask", but requests carry a
+    /// verb like `terminal.open` or `process.run`. Match the exact verb first, then the tool
+    /// family (the segment before the first `.`) so `{"terminal": "deny"}` is not a dead rule.
+    fn tool_override<'a>(&'a self, verb: &str) -> Option<&'a String> {
+        self.tool_permissions.get(verb).or_else(|| {
+            verb.split('.')
+                .next()
+                .and_then(|head| self.tool_permissions.get(head))
+        })
+    }
+
     /// Whether a rule the operator wrote permits this request. `allow-list` mode asks exactly this:
     /// a default that allows is not enough, the human has to have saved the shape.
     pub fn has_allow(&self, req: &PermissionRequest) -> bool {
         let req = self.normalize_request(req);
-        if self
-            .tool_permissions
-            .get(&req.verb)
-            .is_some_and(|v| v == "allow")
-        {
+        if self.tool_override(&req.verb).is_some_and(|v| v == "allow") {
             return true;
         }
         self.rules

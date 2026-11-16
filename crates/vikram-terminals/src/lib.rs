@@ -1,7 +1,9 @@
 //! Unified terminal execution backends: local, docker, ssh, and (later) cloud.
 //!
-//! Every backend implements `TerminalBackend`. The runtime selects one via config
-//! (`terminal.backend`) and never bypasses the permission/sandbox layer.
+//! EXPERIMENTAL — not wired into the runtime. No call sites exist; the backends are stubs
+//! (`create` does not spawn, `status` is hardcoded, `read_output` always returns ""). Do not
+//! rely on this crate until it is connected to `terminal.backend` config and the permission
+//! layer.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

@@ -82,6 +82,9 @@ pub struct SessionRuntime {
     /// Derivation has already been started for this session in this process. In-memory on purpose:
     /// a session that restarted without a title should still be allowed to get one.
     pub titling_started: AtomicBool,
+    /// The one turn slot this session may run at a time, claimed atomically at spawn so two
+    /// submits that both pass `is_busy` cannot start concurrent turns. Released in `finish`.
+    turn_claimed: AtomicBool,
 }
 
 impl SessionRuntime {
@@ -116,6 +119,7 @@ impl SessionRuntime {
             title_source: Mutex::new(row.title_source),
             title_status: Mutex::new(row.title_status),
             titling_started: AtomicBool::new(false),
+            turn_claimed: AtomicBool::new(false),
         }
     }
 
@@ -172,6 +176,28 @@ impl SessionRuntime {
     pub fn release_titling(&self) {
         self.titling_started
             .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Atomically claim the session's single turn slot. Returns false when a turn already holds
+    /// it — the loser must queue its message rather than spawn a second concurrent turn. The
+    /// `is_busy` check and the spawn are separate steps, so this claim is what actually makes
+    /// "one turn per session" true under a race.
+    pub fn claim_turn(&self) -> bool {
+        !self
+            .turn_claimed
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Hand the turn slot back. Called when a turn finishes, before the queue is drained, so the
+    /// next turn claims the same slot through `claim_turn`.
+    pub fn release_turn(&self) {
+        self.turn_claimed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether this session's turn slot is currently claimed.
+    pub fn turn_claimed(&self) -> bool {
+        self.turn_claimed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn parent(&self) -> Option<SessionId> {
@@ -599,13 +625,13 @@ impl SessionRuntime {
         if from >= queue.len() {
             return false;
         }
-        let to = to.min(queue.len() - 1);
-        if let Some(text) = queue.remove(from) {
-            queue.insert(to, text);
-            true
-        } else {
-            false
-        }
+        let Some(text) = queue.remove(from) else {
+            return false;
+        };
+        // After removal the valid insert range is 0..=len — `to == len` is the back position.
+        let to = to.min(queue.len());
+        queue.insert(to, text);
+        true
     }
 
     /// Drop a pending steer without running it.

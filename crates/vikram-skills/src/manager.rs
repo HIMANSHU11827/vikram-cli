@@ -368,7 +368,12 @@ impl Manager {
     fn set_disabled(&self, name: &str, disabled: bool) -> Result<()> {
         let id = SkillId::new(name)?;
         let path = self.disabled_path();
-        let mut names: Vec<String> = paths::read_json(&path).unwrap_or_default();
+        let mut names: Vec<String> = paths::read_json_strict(&path)
+            .map_err(|reason| SkillError::Io {
+                path: path.clone(),
+                reason,
+            })?
+            .unwrap_or_default();
         names.retain(|entry| SkillId::new(entry).is_ok());
         names.sort();
         names.dedup();
@@ -722,8 +727,9 @@ mod tests {
         manager
             .disable("alpha")
             .expect("disable twice is idempotent");
-        let stored: Vec<String> =
-            paths::read_json(&manager.disabled_path()).expect("disabled.json");
+        let stored: Vec<String> = paths::read_json_strict(&manager.disabled_path())
+            .expect("disabled.json")
+            .unwrap();
         assert_eq!(stored, vec!["alpha".to_string()]);
 
         let opts = DiscoveryOptions::roots_only()
@@ -743,8 +749,9 @@ mod tests {
         );
 
         manager.enable("alpha").expect("enable");
-        let stored: Vec<String> =
-            paths::read_json(&manager.disabled_path()).expect("disabled.json");
+        let stored: Vec<String> = paths::read_json_strict(&manager.disabled_path())
+            .expect("disabled.json")
+            .unwrap();
         assert!(stored.is_empty());
         let catalog = Catalog::discover(&opts);
         assert!(catalog.resolve("alpha").expect("found").enabled);

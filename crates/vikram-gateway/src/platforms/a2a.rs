@@ -388,7 +388,18 @@ impl A2aEngine {
             status_message: None,
         };
         let rendered = task.to_value();
-        self.store().insert(task.id.clone(), task);
+        {
+            let mut store = self.store();
+            // Bound the store: an unauthenticated peer can otherwise grow it without limit.
+            // Evict the oldest task by creation order when the cap is hit.
+            const MAX_TASKS: usize = 1024;
+            if store.len() >= MAX_TASKS
+                && let Some(oldest) = store.values().min_by_key(|t| t.seq).map(|t| t.id.clone())
+            {
+                store.remove(&oldest);
+            }
+            store.insert(task.id.clone(), task);
+        }
         ok_response(id, rendered)
     }
 

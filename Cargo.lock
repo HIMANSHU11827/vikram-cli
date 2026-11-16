@@ -3395,7 +3395,6 @@ dependencies = [
  "vikram-sandbox",
  "vikram-skills",
  "vikram-store",
- "vikram-terminals",
  "webpki-roots 1.0.11",
 ]
 

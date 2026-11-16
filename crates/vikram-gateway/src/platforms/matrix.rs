@@ -232,6 +232,13 @@ impl MatrixAdapter {
             .reaction_events
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Bound the map: reactions on messages that are never un-reacted would otherwise
+        // accumulate for the process lifetime. Clearing only loses the ability to redact
+        // old annotations — memory stays bounded.
+        const MAX_REACTION_EVENTS: usize = 4096;
+        if events.len() >= MAX_REACTION_EVENTS {
+            events.clear();
+        }
         events.insert(
             (room_id.to_string(), event_id.to_string(), key.to_string()),
             reaction_event_id.to_string(),

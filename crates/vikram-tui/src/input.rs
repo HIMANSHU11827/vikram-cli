@@ -25,7 +25,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if app.pending_question.is_some() && !(ctrl_held && key.code == KeyCode::Char('c')) {
         return handle_question(app, key);
     }
-    if app.suggestions.is_some() && handle_suggestion_key(app, key) {
+    // Suggestions yield to overlays and to modified chords: Ctrl+Tab must still cycle sessions,
+    // Ctrl+Enter must still steer, and Esc must close the overlay before it dismisses the popup.
+    let bare = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
+    if app.overlay.is_none() && bare && app.suggestions.is_some() && handle_suggestion_key(app, key)
+    {
         return true;
     }
     if key.code == KeyCode::Esc && app.selected_bot.is_some() {
@@ -98,8 +102,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('c') if ctrl => {
             app.overlay = None;
             app.suggestions = None;
-            if app.active_session().is_some_and(|s| s.is_busy()) {
-                if let Some(session) = app.active_session() {
+            if app.display_session().is_some_and(|s| s.is_busy()) {
+                if let Some(session) = app.display_session() {
                     app.commands.push(UiCommand::Cancel {
                         session: session.id.clone(),
                     });
@@ -152,7 +156,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('t') if ctrl => {
             // Thinking is folded by default because a reasoning stream is the longest thing a
             // model emits and it should not push the answer off the screen.
-            let Some(session) = app.active_session_mut() else {
+            let Some(session) = app.display_session_mut() else {
                 app.push_notice(
                     vikram_runtime::types::NoticeLevel::Info,
                     "no session to show thinking in",
@@ -238,7 +242,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char('?') => {
             let empty = app
-                .active_session()
+                .display_session()
                 .map(|s| s.editor.is_empty())
                 .unwrap_or(true);
             if empty {
@@ -263,8 +267,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 app.focus = Focus::Input;
                 return true;
             }
-            if app.active_session().is_some_and(|s| s.is_busy())
-                && let Some(session) = app.active_session()
+            if app.display_session().is_some_and(|s| s.is_busy())
+                && let Some(session) = app.display_session()
             {
                 app.commands.push(UiCommand::Cancel {
                     session: session.id.clone(),
@@ -345,7 +349,7 @@ fn handle_input(app: &mut App, key: KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Enter if shift => {
-            if let Some(session) = app.active_session_mut() {
+            if let Some(session) = app.display_session_mut() {
                 session.editor.insert_newline();
             }
             true
@@ -364,7 +368,7 @@ fn handle_input(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Tab => {
             let text = app
-                .active_session()
+                .display_session()
                 .map(|s| s.editor.text())
                 .unwrap_or_default();
             if text.trim().starts_with('/') {
@@ -386,7 +390,7 @@ fn handle_input(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         KeyCode::Backspace => {
-            if let Some(session) = app.active_session_mut() {
+            if let Some(session) = app.display_session_mut() {
                 if ctrl {
                     session.editor.delete_word_left();
                 } else {
@@ -396,41 +400,41 @@ fn handle_input(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         KeyCode::Delete => {
-            if let Some(session) = app.active_session_mut() {
+            if let Some(session) = app.display_session_mut() {
                 session.editor.delete();
             }
             true
         }
         KeyCode::Left if ctrl => {
-            if let Some(session) = app.active_session_mut() {
+            if let Some(session) = app.display_session_mut() {
                 session.editor.word_left();
             }
             true
         }
         KeyCode::Right if ctrl => {
-            if let Some(session) = app.active_session_mut() {
+            if let Some(session) = app.display_session_mut() {
                 session.editor.word_right();
             }
             true
         }
         KeyCode::Left => {
-            if let Some(session) = app.active_session_mut() {
+            if let Some(session) = app.display_session_mut() {
                 session.editor.move_left();
             }
             true
         }
         KeyCode::Right => {
-            if let Some(session) = app.active_session_mut() {
+            if let Some(session) = app.display_session_mut() {
                 session.editor.move_right();
             }
             true
         }
         KeyCode::Up => {
             let single = app
-                .active_session()
+                .display_session()
                 .map(|s| s.editor.line_count() == 1)
                 .unwrap_or(true);
-            if let Some(session) = app.active_session_mut() {
+            if let Some(session) = app.display_session_mut() {
                 if single {
                     session.editor.history_previous();
                 } else {
@@ -441,10 +445,10 @@ fn handle_input(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Down => {
             let single = app
-                .active_session()
+                .display_session()
                 .map(|s| s.editor.line_count() == 1)
                 .unwrap_or(true);
-            if let Some(session) = app.active_session_mut() {
+            if let Some(session) = app.display_session_mut() {
                 if single {
                     session.editor.history_next();
                 } else {
@@ -454,44 +458,44 @@ fn handle_input(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         KeyCode::Home if ctrl => {
-            if let Some(session) = app.active_session_mut() {
+            if let Some(session) = app.display_session_mut() {
                 session.editor.doc_home();
             }
             true
         }
         KeyCode::End if ctrl => {
-            if let Some(session) = app.active_session_mut() {
+            if let Some(session) = app.display_session_mut() {
                 session.editor.doc_end();
             }
             true
         }
         KeyCode::Home => {
-            if let Some(session) = app.active_session_mut() {
+            if let Some(session) = app.display_session_mut() {
                 session.editor.home();
             }
             true
         }
         KeyCode::End => {
-            if let Some(session) = app.active_session_mut() {
+            if let Some(session) = app.display_session_mut() {
                 session.editor.end();
             }
             true
         }
         KeyCode::Char('u') if ctrl => {
-            if let Some(session) = app.active_session_mut() {
+            if let Some(session) = app.display_session_mut() {
                 session.editor.clear();
             }
             true
         }
         KeyCode::Char('w') if ctrl => {
-            if let Some(session) = app.active_session_mut() {
+            if let Some(session) = app.display_session_mut() {
                 session.editor.word_left();
                 session.editor.delete();
             }
             true
         }
         KeyCode::Char(ch) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-            if let Some(session) = app.active_session_mut() {
+            if let Some(session) = app.display_session_mut() {
                 session.editor.insert_char(ch);
             }
             true
@@ -503,7 +507,7 @@ fn handle_input(app: &mut App, key: KeyEvent) -> bool {
 fn handle_conversation(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Up => {
-            if let Some(session) = app.active_session_mut() {
+            if let Some(session) = app.display_session_mut() {
                 if !session.activity.is_empty() {
                     let last = session.activity.len() - 1;
                     let cur = session.selected_activity.unwrap_or(last);
@@ -521,7 +525,7 @@ fn handle_conversation(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         KeyCode::Down => {
-            if let Some(session) = app.active_session_mut() {
+            if let Some(session) = app.display_session_mut() {
                 if !session.activity.is_empty() {
                     let last = session.activity.len() - 1;
                     let cur = session.selected_activity.unwrap_or(0);
@@ -554,7 +558,7 @@ fn handle_conversation(app: &mut App, key: KeyEvent) -> bool {
         // transcript has focus, every character still belongs to the draft. Ctrl+E expands the
         // selected activity; a plain click on the header does the same.
         KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if let Some(session) = app.active_session_mut()
+            if let Some(session) = app.display_session_mut()
                 && !session.activity.is_empty()
             {
                 let idx = session
@@ -587,8 +591,7 @@ fn handle_conversation(app: &mut App, key: KeyEvent) -> bool {
 
 /// A bare character press: Ctrl/Alt turn `p` into a chord, not the pause chip.
 fn plain_key(key: KeyEvent) -> bool {
-    !key
-        .modifiers
+    !key.modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
@@ -606,10 +609,10 @@ fn handle_bots(app: &mut App, key: KeyEvent) -> bool {
             app.bot_selection = (app.bot_selection + 1).min(last);
             true
         }
+        // Enter on a row is the same press as clicking it: the row owns a conversation, so the
+        // command opens (or creates) that bot's chat — including one with no session yet.
         KeyCode::Enter => {
-            if let Some(agent) = app.bots.get(app.bot_selection) {
-                app.selected_bot = Some(agent.profile.id.clone());
-            }
+            run_bot_click(app, BotClick::Row(app.bot_selection));
             app.focus = Focus::Input;
             true
         }
@@ -668,7 +671,7 @@ fn handle_suggestion_key(app: &mut App, key: KeyEvent) -> bool {
             // out: `/cl` + Enter runs `/close`. A bare prefix (`/`, `@`, `!`) still opens its
             // panel, and a half-typed `@path` is only filled in, because the mention is part of
             // a sentence the operator is still writing.
-            let token = app.active_session().and_then(|session| {
+            let token = app.display_session().and_then(|session| {
                 let text = session.editor.text();
                 let (_, col) = session.editor.cursor();
                 current_token(&text, col)
@@ -761,7 +764,7 @@ fn current_token(text: &str, cursor: usize) -> Option<Token> {
 }
 
 fn refresh_suggestions(app: &mut App) {
-    let Some(session) = app.active_session() else {
+    let Some(session) = app.display_session() else {
         app.suggestions = None;
         return;
     };
@@ -901,7 +904,7 @@ fn accept_suggestion(app: &mut App) {
         return;
     };
     let item = item.clone();
-    let Some(session) = app.active_session_mut() else {
+    let Some(session) = app.display_session_mut() else {
         return;
     };
     let text = session.editor.text();
@@ -968,7 +971,7 @@ fn resolve_references(text: &str, cwd: std::path::PathBuf) -> String {
 
 /// Ctrl+Enter: steer the running turn with this text instead of queueing behind it.
 fn steer(app: &mut App) {
-    let Some(session) = app.active_session_mut() else {
+    let Some(session) = app.display_session_mut() else {
         return;
     };
     let text = session.editor.text();
@@ -987,7 +990,7 @@ fn steer(app: &mut App) {
 }
 
 fn submit(app: &mut App, queue: bool) {
-    let Some(session) = app.active_session_mut() else {
+    let Some(session) = app.display_session_mut() else {
         return;
     };
     let text = session.editor.text();
@@ -1069,7 +1072,7 @@ pub fn open_palette(app: &mut App) {
 /// Workspace files as references. Choosing one inserts `@path` — what the operator would have
 /// typed — and the file is not read until the message is sent.
 pub fn open_file_picker(app: &mut App) {
-    let Some(cwd) = app.active_session().map(|session| session.cwd.clone()) else {
+    let Some(cwd) = app.display_session().map(|session| session.cwd.clone()) else {
         return;
     };
     let paths = commands::workspace_files(&cwd, 400);
@@ -1090,7 +1093,7 @@ pub fn open_file_picker(app: &mut App) {
 /// `!` line still runs anything typed, so this is a shortcut, not a ceiling.
 pub fn open_shell_picker(app: &mut App) {
     let mut items: Vec<PickerItem> = Vec::new();
-    if let Some(session) = app.active_session() {
+    if let Some(session) = app.display_session() {
         for entry in session.editor.history() {
             if let Some(command) = entry.trim().strip_prefix('!') {
                 let command = command.trim();
@@ -1221,7 +1224,7 @@ fn commit_verb(app: &mut App, picker: &Picker, verb: crate::widgets::Verb) {
             return;
         }
     };
-    let Some(session) = app.active_session() else {
+    let Some(session) = app.display_session() else {
         return;
     };
     app.commands.push(UiCommand::Act {
@@ -1245,7 +1248,9 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
             }
             // `q`/`?` are answers, not chords: Ctrl+Q must not close the panel it was aimed at.
             KeyCode::Char('q') | KeyCode::Char('?')
-                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 app.overlay = None;
                 true
@@ -1304,19 +1309,25 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
                     true
                 }
                 KeyCode::Char('a')
-                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     answer_approval(app, true, false);
                     true
                 }
                 KeyCode::Char('p')
-                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     answer_approval(app, true, true);
                     true
                 }
                 KeyCode::Char('d')
-                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     answer_approval(app, false, false);
                     true
@@ -1361,7 +1372,9 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
                 true
             }
             KeyCode::Char('q') | KeyCode::Char('?')
-                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 app.overlay = None;
                 true
@@ -1374,7 +1387,7 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
             mut editor,
             action,
         } => {
-            let session_id = app.active_session().map(|view| view.id.clone());
+            let session_id = app.display_session().map(|view| view.id.clone());
             match key.code {
                 KeyCode::Esc => {
                     app.overlay = None;
@@ -1531,7 +1544,9 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
             // `y` commits and `n`/`q` decline — plain letters only, so Ctrl+N cannot decline a
             // dialog it was never aimed at and Ctrl+Y cannot commit one.
             KeyCode::Char('y')
-                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 app.commands.push(*yes);
                 app.overlay = None;
@@ -1542,7 +1557,9 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
                 true
             }
             KeyCode::Char('n') | KeyCode::Char('q')
-                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 app.overlay = None;
                 true
@@ -1571,7 +1588,9 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
                     app.overlay = None;
                 }
                 KeyCode::Char('q')
-                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     app.overlay = None;
                 }
@@ -1591,7 +1610,7 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
                 }
                 KeyCode::Enter => {
                     if let Some(chosen) = matches.get(selected).cloned()
-                        && let Some(session) = app.active_session_mut()
+                        && let Some(session) = app.display_session_mut()
                     {
                         session.editor.set_text(&chosen);
                     }
@@ -1650,18 +1669,19 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
                 }
             }
         }
-        Overlay::RenameSession { mut editor } => match key.code {
+        Overlay::RenameSession {
+            session: rename_target,
+            mut editor,
+        } => match key.code {
             KeyCode::Esc => {
                 app.overlay = None;
                 true
             }
             KeyCode::Enter => {
                 let title = editor.text().trim().to_owned();
-                if !title.is_empty()
-                    && let Some(session) = app.active_session()
-                {
+                if !title.is_empty() {
                     app.commands.push(UiCommand::RenameSession {
-                        session: session.id.clone(),
+                        session: rename_target.clone(),
                         title,
                     });
                 }
@@ -1670,32 +1690,50 @@ fn handle_overlay(app: &mut App, key: KeyEvent) -> bool {
             }
             KeyCode::Backspace => {
                 editor.backspace();
-                app.overlay = Some(Overlay::RenameSession { editor });
+                app.overlay = Some(Overlay::RenameSession {
+                    session: rename_target.clone(),
+                    editor,
+                });
                 true
             }
             KeyCode::Left => {
                 editor.move_left();
-                app.overlay = Some(Overlay::RenameSession { editor });
+                app.overlay = Some(Overlay::RenameSession {
+                    session: rename_target.clone(),
+                    editor,
+                });
                 true
             }
             KeyCode::Right => {
                 editor.move_right();
-                app.overlay = Some(Overlay::RenameSession { editor });
+                app.overlay = Some(Overlay::RenameSession {
+                    session: rename_target.clone(),
+                    editor,
+                });
                 true
             }
             KeyCode::Home => {
                 editor.home();
-                app.overlay = Some(Overlay::RenameSession { editor });
+                app.overlay = Some(Overlay::RenameSession {
+                    session: rename_target.clone(),
+                    editor,
+                });
                 true
             }
             KeyCode::End => {
                 editor.end();
-                app.overlay = Some(Overlay::RenameSession { editor });
+                app.overlay = Some(Overlay::RenameSession {
+                    session: rename_target.clone(),
+                    editor,
+                });
                 true
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 editor.insert_char(ch);
-                app.overlay = Some(Overlay::RenameSession { editor });
+                app.overlay = Some(Overlay::RenameSession {
+                    session: rename_target.clone(),
+                    editor,
+                });
                 true
             }
             _ => true,
@@ -1831,7 +1869,11 @@ pub fn run_bot_click(app: &mut App, click: BotClick) {
             app.bot_selection = index;
             app.commands.push(UiCommand::OpenBotChat { bot });
         }
-        BotClick::Spawn => app.overlay = Some(Overlay::AddBot { selected: app.bot_selection }),
+        BotClick::Spawn => {
+            app.overlay = Some(Overlay::AddBot {
+                selected: app.bot_selection,
+            })
+        }
         BotClick::NewBot => app.open_prompt(
             "New bot",
             "name: role: description — e.g. `reviewer: code review: reads diffs and reports`",
@@ -1933,9 +1975,9 @@ pub fn run_bot_click(app: &mut App, click: BotClick) {
                 );
             }
         }
-        BotClick::Mode => app
-            .commands
-            .push(UiCommand::OpenPicker { kind: PickerKind::Mode }),
+        BotClick::Mode => app.commands.push(UiCommand::OpenPicker {
+            kind: PickerKind::Mode,
+        }),
     }
 }
 
@@ -2000,7 +2042,7 @@ fn handle_autocomplete_overlay(
         }
         KeyCode::Enter | KeyCode::Tab => {
             if let Some(chosen) = candidates.get(selected).cloned()
-                && let Some(session) = app.active_session_mut()
+                && let Some(session) = app.display_session_mut()
             {
                 session.editor.clear();
                 session.editor.insert_str(&chosen);
@@ -2017,7 +2059,7 @@ pub fn handle_paste(app: &mut App, text: &str) -> bool {
         pending.input.push_str(text);
         return true;
     }
-    if let Some(Overlay::RenameSession { editor }) = &mut app.overlay {
+    if let Some(Overlay::RenameSession { editor, .. }) = &mut app.overlay {
         editor.insert_str(text);
         return true;
     }
@@ -2048,7 +2090,7 @@ pub fn handle_paste(app: &mut App, text: &str) -> bool {
     if app.overlay.is_some() {
         return true;
     }
-    if let Some(session) = app.active_session_mut() {
+    if let Some(session) = app.display_session_mut() {
         session.editor.insert_str(text);
         return true;
     }
@@ -2062,7 +2104,7 @@ pub fn open_inspector(app: &mut App, kind: InspectorKind) {
 
 /// Filter a session's submitted input history by `query` (case-insensitive substring), newest first.
 pub(crate) fn history_matches(app: &App, query: &str) -> Vec<String> {
-    let Some(session) = app.active_session() else {
+    let Some(session) = app.display_session() else {
         return Vec::new();
     };
     let needle = query.to_lowercase();
@@ -2122,9 +2164,12 @@ mod tests {
         let mut app = App::new(false);
         run_bot_click(&mut app, BotClick::Mode);
         assert!(
-            app.commands
-                .iter()
-                .any(|command| matches!(command, UiCommand::OpenPicker { kind: PickerKind::Mode })),
+            app.commands.iter().any(|command| matches!(
+                command,
+                UiCommand::OpenPicker {
+                    kind: PickerKind::Mode
+                }
+            )),
             "the mode chip must open the posture list"
         );
     }
@@ -2308,12 +2353,12 @@ mod tests {
         for ch in "hello".chars() {
             assert!(handle_key(&mut app, key(KeyCode::Char(ch))));
         }
-        assert_eq!(app.active_session().unwrap().editor.text(), "hello");
+        assert_eq!(app.display_session().unwrap().editor.text(), "hello");
         handle_key(&mut app, key(KeyCode::Enter));
         let commands = app.take_commands();
         assert_eq!(commands.len(), 1);
         assert!(matches!(commands[0], UiCommand::Queue { .. }));
-        assert!(app.active_session().unwrap().editor.is_empty());
+        assert!(app.display_session().unwrap().editor.is_empty());
     }
 
     #[test]
@@ -2328,7 +2373,7 @@ mod tests {
         for ch in "hi".chars() {
             handle_key(&mut app, key(KeyCode::Char(ch)));
         }
-        assert_eq!(app.active_session().unwrap().editor.text(), "hi");
+        assert_eq!(app.display_session().unwrap().editor.text(), "hi");
     }
 
     #[test]
@@ -2347,7 +2392,7 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Char('a')));
         let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
         handle_key(&mut app, shift_enter);
-        assert_eq!(app.active_session().unwrap().editor.text(), "a\n");
+        assert_eq!(app.display_session().unwrap().editor.text(), "a\n");
         assert!(app.take_commands().is_empty());
     }
 
@@ -2361,7 +2406,7 @@ mod tests {
             app.take_commands().is_empty(),
             "Tab arms a mode; it must not send the draft"
         );
-        assert_eq!(app.active_session().unwrap().editor.text(), "x");
+        assert_eq!(app.display_session().unwrap().editor.text(), "x");
     }
 
     #[test]
@@ -2409,7 +2454,7 @@ mod tests {
     fn ctrl_r_reverse_searches_history_and_enter_accepts_a_match() {
         let mut app = app_with_session();
         {
-            let session = app.active_session_mut().unwrap();
+            let session = app.display_session_mut().unwrap();
             session.editor.remember("first command");
             session.editor.remember("second command");
         }
@@ -2422,7 +2467,7 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Enter));
         assert!(app.overlay.is_none());
         assert_eq!(
-            app.active_session().unwrap().editor.text(),
+            app.display_session().unwrap().editor.text(),
             "second command"
         );
     }
@@ -2431,20 +2476,20 @@ mod tests {
     fn ctrl_r_escape_cancels_without_changing_the_draft() {
         let mut app = app_with_session();
         {
-            let session = app.active_session_mut().unwrap();
+            let session = app.display_session_mut().unwrap();
             session.editor.remember("remembered");
             session.editor.insert_str("draft");
         }
         handle_key(&mut app, ctrl(KeyCode::Char('r')));
         handle_key(&mut app, key(KeyCode::Esc));
         assert!(app.overlay.is_none());
-        assert_eq!(app.active_session().unwrap().editor.text(), "draft");
+        assert_eq!(app.display_session().unwrap().editor.text(), "draft");
     }
     #[test]
     fn paste_into_a_draft_preserves_newlines() {
         let mut app = app_with_session();
         handle_paste(&mut app, "a\nb");
-        assert_eq!(app.active_session().unwrap().editor.text(), "a\nb");
+        assert_eq!(app.display_session().unwrap().editor.text(), "a\nb");
     }
 
     fn app_with_question() -> App {
@@ -2465,7 +2510,7 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Char('b')));
         handle_key(&mut app, key(KeyCode::Backspace));
         // Nothing leaks into the draft and no submit command is emitted while answering.
-        assert_eq!(app.active_session().unwrap().editor.text(), "");
+        assert_eq!(app.display_session().unwrap().editor.text(), "");
         assert!(app.take_commands().is_empty());
 
         handle_key(&mut app, key(KeyCode::Enter));
@@ -2501,7 +2546,7 @@ mod tests {
             app.pending_question.as_ref().map(|q| q.input.as_str()),
             Some("src/main.rs")
         );
-        assert!(app.active_session().unwrap().editor.is_empty());
+        assert!(app.display_session().unwrap().editor.is_empty());
     }
 
     #[test]
@@ -2528,7 +2573,7 @@ mod tests {
         assert_eq!(popup.items[0].text, "/help");
         handle_key(&mut app, key(KeyCode::Tab));
         assert!(app.suggestions.is_none());
-        assert_eq!(app.active_session().unwrap().editor.text(), "/help ");
+        assert_eq!(app.display_session().unwrap().editor.text(), "/help ");
     }
 
     #[test]
@@ -2541,7 +2586,7 @@ mod tests {
         assert_eq!(popup.items[0].text, "/close");
         handle_key(&mut app, key(KeyCode::Enter));
         assert!(app.suggestions.is_none());
-        assert_eq!(app.active_session().unwrap().editor.text(), "");
+        assert_eq!(app.display_session().unwrap().editor.text(), "");
         assert!(
             matches!(
                 app.take_commands().as_slice(),
@@ -2566,7 +2611,7 @@ mod tests {
             "a spelled-out command runs on one Enter, and only once"
         );
         assert_eq!(
-            app.active_session().unwrap().editor.text(),
+            app.display_session().unwrap().editor.text(),
             "",
             "the line is spent once it has been run"
         );
@@ -2581,7 +2626,7 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Enter));
         assert!(app.suggestions.is_none());
         assert_eq!(
-            app.active_session().unwrap().editor.text(),
+            app.display_session().unwrap().editor.text(),
             "tell me about @main"
         );
         assert!(
@@ -2616,7 +2661,7 @@ mod tests {
         assert!(app.suggestions.is_some());
         handle_key(&mut app, key(KeyCode::Esc));
         assert!(app.suggestions.is_none());
-        assert_eq!(app.active_session().unwrap().editor.text(), "/");
+        assert_eq!(app.display_session().unwrap().editor.text(), "/");
     }
 
     fn picker_of(app: &App) -> &Picker {
@@ -2889,7 +2934,7 @@ mod tests {
             handle_key(&mut app, key(KeyCode::Char(ch)));
         }
         handle_key(&mut app, key(KeyCode::Tab));
-        let text = app.active_session().unwrap().editor.text();
+        let text = app.display_session().unwrap().editor.text();
         let word = text.trim().trim_start_matches('/');
         assert!(
             commands::find(word).is_some(),

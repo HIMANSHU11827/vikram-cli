@@ -11,6 +11,7 @@ pub struct McpTool {
     pub description: String,
     pub schema: Value,
     pub registry: Arc<std::sync::Mutex<McpRegistry>>,
+    pub visibility: Arc<std::sync::Mutex<vikram_mcp::visibility::VisibilityManager>>,
 }
 
 impl Tool for McpTool {
@@ -38,6 +39,18 @@ impl Tool for McpTool {
 
     #[allow(clippy::await_holding_lock)]
     fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+        // "Private" is a real gate, not a label: a private server's tools do not run.
+        let is_public = self
+            .visibility
+            .lock()
+            .map(|m| m.is_public(&self.server))
+            .unwrap_or(false);
+        if !is_public {
+            return Err(VikramError::EffectFailed(format!(
+                "MCP server `{}` is private — its tools are not exposed",
+                self.server
+            )));
+        }
         let registry = Arc::clone(&self.registry);
         let server = self.server.clone();
         let tool = self.tool.clone();

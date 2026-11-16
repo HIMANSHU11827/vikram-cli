@@ -192,7 +192,10 @@ impl DiscordAdapter {
         body: &Value,
         classify: fn(&HttpResponse) -> SendResult,
     ) -> Result<Value, Box<SendResult>> {
-        let request = self.post_json(&format!("/channels/{chat_id}/messages"), body);
+        let request = self.post_json(
+            &format!("/channels/{}/messages", encode_path_segment(chat_id, "")),
+            body,
+        );
         match self.transport.execute(request).await {
             Ok(response) if response.ok() => response.json().map_err(|err| {
                 Box::new(SendResult::failed(

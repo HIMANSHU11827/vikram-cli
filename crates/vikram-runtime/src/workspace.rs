@@ -133,6 +133,11 @@ impl WorkspaceManager {
     // ---- projects --------------------------------------------------------
 
     pub fn select_project(&self, session: &SessionId, path: &Path) -> Result<ProjectRow> {
+        // Verify the session before creating anything — a bogus id must not leave an orphan
+        // project row behind.
+        if self.store.get_session(session)?.is_none() {
+            return Err(RuntimeError::SessionNotFound(session.clone()));
+        }
         let canon = fs::canonicalize(path)
             .map_err(|e| RuntimeError::Io(format!("project path unreadable: {e}")))?;
         if !canon.is_dir() {

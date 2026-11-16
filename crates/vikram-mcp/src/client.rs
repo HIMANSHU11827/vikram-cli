@@ -539,6 +539,14 @@ async fn establish(
             Err(_) => continue,
         };
         if value.get("id").and_then(Value::as_u64) == Some(2) {
+            if let Some(err) = value.get("error") {
+                let cleanup = terminate(&mut child).await;
+                let rejected = format!("tools/list rejected: {err}");
+                return Err(match cleanup {
+                    Ok(()) => rejected,
+                    Err(err) => format!("{rejected} (also failed to stop child: {err})"),
+                });
+            }
             if let Some(arr) = value
                 .get("result")
                 .and_then(|r| r.get("tools"))
@@ -587,6 +595,14 @@ async fn establish(
             Err(_) => continue,
         };
         if value.get("id").and_then(Value::as_u64) == Some(3) {
+            if let Some(err) = value.get("error") {
+                let cleanup = terminate(&mut child).await;
+                let rejected = format!("resources/list rejected: {err}");
+                return Err(match cleanup {
+                    Ok(()) => rejected,
+                    Err(err) => format!("{rejected} (also failed to stop child: {err})"),
+                });
+            }
             if let Some(arr) = value
                 .get("result")
                 .and_then(|r| r.get("resources"))
@@ -638,6 +654,14 @@ async fn establish(
             Err(_) => continue,
         };
         if value.get("id").and_then(Value::as_u64) == Some(4) {
+            if let Some(err) = value.get("error") {
+                let cleanup = terminate(&mut child).await;
+                let rejected = format!("prompts/list rejected: {err}");
+                return Err(match cleanup {
+                    Ok(()) => rejected,
+                    Err(err) => format!("{rejected} (also failed to stop child: {err})"),
+                });
+            }
             if let Some(arr) = value
                 .get("result")
                 .and_then(|r| r.get("prompts"))

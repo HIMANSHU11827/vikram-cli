@@ -748,7 +748,10 @@ pub fn picker_body(picker: &Picker, theme: &Theme, width: u16) -> PickerBody {
         });
     }
     if col + 2 + "esc close".len() <= width {
-        spans.push(Span::styled("  esc close", Style::default().fg(theme.faint)));
+        spans.push(Span::styled(
+            "  esc close",
+            Style::default().fg(theme.faint),
+        ));
     }
     lines.push(Line::from(spans));
 

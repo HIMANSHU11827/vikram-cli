@@ -301,9 +301,20 @@ pub(crate) fn remove_path(path: &Path) {
     }
 }
 
-pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
-    let text = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+/// Distinguishes "absent" (Ok(None)) from "present but unreadable or corrupt" (Err).
+/// Security-relevant state files must not silently reset to defaults when a parse fails —
+/// a corrupt `disabled.json` would re-enable every disabled skill.
+pub(crate) fn read_json_strict<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> std::result::Result<Option<T>, String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("{}: {err}", path.display())),
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|err| format!("{}: {err}", path.display()))
 }
 
 #[cfg(test)]

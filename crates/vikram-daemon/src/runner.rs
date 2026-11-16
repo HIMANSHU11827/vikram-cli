@@ -197,6 +197,10 @@ async fn turn(config: Config, request: AgentRequest, title: String) -> RunOutcom
                 break;
             }
             Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                // Fell behind the bus — skipped events are deltas, not terminal state.
+                continue;
+            }
             Err(err) => {
                 failure.get_or_insert_with(|| format!("event stream closed: {err}"));
                 break;
@@ -739,6 +743,9 @@ async fn wait_for(
                 break;
             }
             Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                continue;
+            }
             Err(err) => {
                 failure.get_or_insert_with(|| format!("event stream closed: {err}"));
                 break;

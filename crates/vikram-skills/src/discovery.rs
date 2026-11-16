@@ -588,9 +588,14 @@ fn summarize(
 
 fn read_disabled(state_dir: &Path) -> BTreeSet<SkillId> {
     let path = state_dir.join("disabled.json");
-    let names: Vec<String> = match paths::read_json(&path) {
-        Some(names) => names,
-        None => return BTreeSet::new(),
+    let names: Vec<String> = match paths::read_json_strict(&path) {
+        Ok(Some(names)) => names,
+        Ok(None) => return BTreeSet::new(),
+        // Corrupt disabled.json must not silently re-enable every disabled skill.
+        Err(reason) => {
+            eprintln!("vikram: ignoring unreadable {}: {reason}", path.display());
+            return BTreeSet::new();
+        }
     };
     names
         .iter()

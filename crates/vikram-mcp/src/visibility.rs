@@ -4,9 +4,12 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Visibility {
+    // Public is the default: Private is an explicit operator choice to withhold a server's
+    // tools, and `McpTool::run` enforces it. Defaulting to Private would silently disable
+    // every MCP server on first run.
     #[default]
-    Private,
     Public,
+    Private,
 }
 
 impl Visibility {
@@ -35,7 +38,7 @@ impl ServerVisibility {
     pub fn new(server_name: String) -> Self {
         Self {
             server_name,
-            visibility: Visibility::Private,
+            visibility: Visibility::Public,
             exposed_tools: Vec::new(),
             authorized_clients: Vec::new(),
         }
@@ -64,25 +67,26 @@ impl VisibilityManager {
             entries: std::collections::HashMap::new(),
             persist_path: Some(path.clone()),
         };
-        if let Ok(raw) = std::fs::read_to_string(&path)
-            && let Ok(entries) =
-                serde_json::from_str::<std::collections::HashMap<String, ServerVisibility>>(&raw)
-        {
-            vm.entries = entries;
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => match serde_json::from_str::<
+                std::collections::HashMap<String, ServerVisibility>,
+            >(&raw)
+            {
+                Ok(entries) => vm.entries = entries,
+                // A corrupt file must not silently reset Private markings to Public.
+                Err(err) => eprintln!("vikram: ignoring unreadable {}: {err}", path.display()),
+            },
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                eprintln!("vikram: cannot read {}: {err}", path.display());
+            }
+            Err(_) => {}
         }
         vm
     }
 
     /// Load visibility state from disk.
     pub fn load(path: &std::path::Path) -> Self {
-        let mut vm = Self::with_persist_path(path.to_path_buf());
-        if let Ok(raw) = std::fs::read_to_string(path)
-            && let Ok(entries) =
-                serde_json::from_str::<std::collections::HashMap<String, ServerVisibility>>(&raw)
-        {
-            vm.entries = entries;
-        }
-        vm
+        Self::with_persist_path(path.to_path_buf())
     }
 
     /// Save visibility state to disk (if persist_path is set).

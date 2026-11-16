@@ -103,6 +103,10 @@ impl WeixinAdapter {
     /// Remember the peer's latest `context_token`; a reply must echo it.
     pub fn remember_context_token(&self, chat_id: &str, token: &str) {
         if let Ok(mut map) = self.context_tokens.lock() {
+            const MAX_TRACKED_CHATS: usize = 4096;
+            if map.len() >= MAX_TRACKED_CHATS && !map.contains_key(chat_id) {
+                map.clear();
+            }
             map.insert(chat_id.to_string(), token.to_string());
         }
     }

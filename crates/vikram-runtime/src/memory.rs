@@ -294,7 +294,7 @@ impl MemoryStore {
         let scope_placeholders = scopes.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let clauses = terms
             .iter()
-            .map(|_| "(key LIKE ? OR value LIKE ?)")
+            .map(|_| "(key LIKE ? ESCAPE '\\' OR value LIKE ? ESCAPE '\\')")
             .collect::<Vec<_>>()
             .join(" OR ");
         let sql = format!(
@@ -307,7 +307,7 @@ impl MemoryStore {
             .map_err(|e| RuntimeError::Store(e.to_string()))?;
         let mut bindings: Vec<String> = scopes.to_vec();
         for term in terms {
-            let pat = format!("%{term}%");
+            let pat = format!("%{}%", escape_like(term));
             bindings.push(pat.clone());
             bindings.push(pat);
         }
@@ -591,6 +591,14 @@ fn recency_importance_score(
     let age_days = now_ms.saturating_sub(updated_ms) as f64 / 86_400_000.0;
     let decay = 0.5_f64.powf(age_days / half_life_days.max(0.1));
     (0.05 + 0.95 * decay) * clamp01(importance)
+}
+
+/// Escape `%`, `_` and `\` so a query term cannot act as a LIKE pattern. Pairs with the
+/// `ESCAPE '\'` clause on every LIKE in `hybrid_recall`.
+fn escape_like(term: &str) -> String {
+    term.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn clamp01(v: f64) -> f64 {

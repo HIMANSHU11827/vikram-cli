@@ -225,6 +225,9 @@ pub enum Overlay {
         selected: usize,
     },
     RenameSession {
+        /// The session this rename targets — resolved when the panel opened, not at Enter,
+        /// so a session switch in between cannot redirect the rename.
+        session: SessionId,
         editor: Editor,
     },
     Autocomplete {
@@ -233,7 +236,9 @@ pub enum Overlay {
     },
     /// The skills the workspace carries. `scroll` is how many lines are above the top of the
     /// panel: the list is longer than any screen, so without it the footer never draws.
-    Skills { scroll: usize },
+    Skills {
+        scroll: usize,
+    },
     /// The searchable chooser that a `/` command opens instead of printing a list.
     Picker(crate::widgets::Picker),
     /// A panel of what the runtime already knows. Read-only on purpose: there is no choice to make,
@@ -483,7 +488,9 @@ pub enum UiCommand {
     /// Read the configured endpoint's own model list.
     /// Open one of the runtime-backed choosers. The panel is built where the runtime handle is,
     /// so a click can ask for it without carrying that handle through the view layer.
-    OpenPicker { kind: crate::widgets::PickerKind },
+    OpenPicker {
+        kind: crate::widgets::PickerKind,
+    },
     RefreshModels,
     /// Forget one saved allow-list rule, by its index in the list the operator was shown.
     Unallow {
@@ -810,11 +817,14 @@ impl SessionView {
         if let Some(started) = self.turn_started_ms.take() {
             self.turn_elapsed_ms = now_ms().saturating_sub(started);
             // Pin the duration to the message this turn ended with, so the receipt stays on the
-            // turn it belongs to once the next turn starts.
+            // turn it belongs to once the next turn starts. Only when the transcript's last
+            // message is the assistant's — a turn that ended without one (failed, cancelled,
+            // tool-only) must not overwrite the previous turn's receipt.
             if let Some(index) = self
                 .messages
-                .iter()
-                .rposition(|m| m.role == Role::Assistant)
+                .len()
+                .checked_sub(1)
+                .filter(|&i| self.messages[i].role == Role::Assistant)
             {
                 self.turn_times.insert(index, self.turn_elapsed_ms);
             }
@@ -840,6 +850,12 @@ impl SessionView {
         self.cwd = snapshot.cwd;
         self.model = snapshot.model;
         self.messages = snapshot.messages;
+        // Fold keys and turn receipts are message-indexed — a wholesale replacement (compaction,
+        // resync) shifts every index, so the old keys would attach to different blocks.
+        self.thought_folds.clear();
+        self.tool_folds.clear();
+        self.turn_times.clear();
+        self.selected_activity = None;
         self.turn = snapshot.turn;
         self.tokens = snapshot.tokens;
         self.updated_ms = snapshot.updated_ms;
@@ -1100,11 +1116,11 @@ impl App {
         }
     }
 
-    /// Copy the last assistant message in the active session to the clipboard. Returns `true` when
+    /// Copy the last assistant message in the displayed session to the clipboard. Returns `true` when
     /// there was something to copy.
     pub fn copy_last_assistant_message(&mut self) -> bool {
         let text = self
-            .active_session()
+            .display_session()
             .and_then(|session| {
                 session
                     .messages
@@ -1263,9 +1279,9 @@ impl App {
             self.overlay,
             Some(
                 Overlay::Help
-                | Overlay::Info { .. }
-                | Overlay::Inspector(_)
-                | Overlay::Skills { .. },
+                    | Overlay::Info { .. }
+                    | Overlay::Inspector(_)
+                    | Overlay::Skills { .. },
             )
         )
     }
@@ -1334,6 +1350,14 @@ impl App {
             return Some(view);
         }
         self.active_session()
+    }
+
+    /// The mutable view of the session shown in the conversation pane. Operator-facing paths —
+    /// the composer, scroll offsets, activity folds, copy — must land here, because the transcript
+    /// on screen is `display_session`, not necessarily the tab-active one.
+    pub fn display_session_mut(&mut self) -> Option<&mut SessionView> {
+        let id = self.display_session()?.id.clone();
+        self.sessions.iter_mut().find(|s| s.id == id)
     }
 
     pub fn active_session_mut(&mut self) -> Option<&mut SessionView> {
@@ -1440,7 +1464,11 @@ impl App {
             Some(index) => self.sessions[index].apply_snapshot(snapshot),
             None => {
                 self.sessions.push(SessionView::from_snapshot(snapshot));
-                self.active = self.sessions.len() - 1;
+                // A background/bot/hive session appearing must not yank the operator's tab —
+                // only the very first session takes focus.
+                if self.sessions.len() == 1 {
+                    self.active = 0;
+                }
             }
         }
     }
@@ -1654,9 +1682,13 @@ impl App {
             }
             RuntimeEvent::ApprovalRequested(prompt) => {
                 self.approvals.push(prompt);
-                self.overlay = Some(Overlay::Approvals);
-                self.approval_selection = 0;
-                self.approval_action = 0;
+                // Do not clobber an overlay the operator is mid-edit in — the approval is
+                // still listed; the Approvals panel opens on the next request or keypress.
+                if self.overlay.is_none() {
+                    self.overlay = Some(Overlay::Approvals);
+                    self.approval_selection = 0;
+                    self.approval_action = 0;
+                }
             }
             RuntimeEvent::ApprovalResolved { approval, allowed } => {
                 self.approvals.retain(|a| a.approval != approval);
@@ -1698,7 +1730,7 @@ impl App {
                 ..
             } => {
                 // A fold the operator cannot see is a fold they will not trust the answer after.
-                if self.active_session().map(|s| s.id.clone()).as_ref() == Some(&session) {
+                if self.display_session().map(|s| s.id.clone()).as_ref() == Some(&session) {
                     self.push_notice(
                         NoticeLevel::Info,
                         format!(
@@ -1715,7 +1747,7 @@ impl App {
                 replaced,
                 saved_tokens,
             } => {
-                if self.active_session().map(|s| s.id.clone()).as_ref() == Some(&session) {
+                if self.display_session().map(|s| s.id.clone()).as_ref() == Some(&session) {
                     self.push_notice(
                         NoticeLevel::Info,
                         format!("context pruned: {replaced} tool output(s) digested, {saved_tokens} tokens"),
@@ -1905,6 +1937,10 @@ impl App {
         if let Some(session) = self.sessions.get_mut(self.active) {
             session.unread = 0;
         }
+        // `display_session` prefers the selected bot's session — leaving it set would pin the
+        // transcript to the bot while the tab strip highlights the newly cycled session.
+        self.selected_bot = None;
+        self.selection = None;
         self.focus = Focus::Input;
     }
 
@@ -1918,14 +1954,14 @@ impl App {
     }
 
     pub fn scroll_up(&mut self, lines: usize) {
-        if let Some(view) = self.active_session_mut() {
+        if let Some(view) = self.display_session_mut() {
             view.scroll = view.scroll.saturating_add(lines);
             view.follow = false;
         }
     }
 
     pub fn scroll_down(&mut self, lines: usize) {
-        if let Some(view) = self.active_session_mut() {
+        if let Some(view) = self.display_session_mut() {
             view.scroll = view.scroll.saturating_sub(lines);
             if view.scroll == 0 {
                 view.follow = true;
@@ -1934,7 +1970,7 @@ impl App {
     }
 
     pub fn scroll_to_bottom(&mut self) {
-        if let Some(view) = self.active_session_mut() {
+        if let Some(view) = self.display_session_mut() {
             view.scroll = 0;
             view.follow = true;
         }

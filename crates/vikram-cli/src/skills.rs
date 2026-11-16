@@ -235,8 +235,8 @@ pub fn run(action: SkillsAction, config: &Config) -> Result<(), String> {
         } => create(&name, &description, from),
         SkillsAction::Edit { name, body } => edit(&name, body, config),
         SkillsAction::Delete { name, yes } => delete(&name, yes, config),
-        SkillsAction::Enable { name } => set_enabled(&name, true),
-        SkillsAction::Disable { name } => set_enabled(&name, false),
+        SkillsAction::Enable { name } => set_enabled(&name, true, config),
+        SkillsAction::Disable { name } => set_enabled(&name, false, config),
         SkillsAction::Duplicate { name, as_name } => duplicate(&name, &as_name),
         SkillsAction::Export { name, dest } => export(&name, &dest),
         SkillsAction::Import { path } => import(&path),
@@ -444,7 +444,11 @@ fn delete(name: &str, yes: bool, config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-fn set_enabled(name: &str, enabled: bool) -> Result<(), String> {
+fn set_enabled(name: &str, enabled: bool, config: &Config) -> Result<(), String> {
+    // Toggling a name that is not in the catalog writes a junk entry into disabled.json —
+    // it would silently disable a future skill of that name. Verify first.
+    let catalog = Catalog::discover(&discovery_options(config));
+    find(&catalog, name)?;
     let manager = Manager::new();
     if enabled {
         manager.enable(name).map_err(|err| err.to_string())?;

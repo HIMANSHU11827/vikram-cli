@@ -135,6 +135,19 @@ impl Installer {
             },
             None => checkout.clone(),
         };
+        // `resolve_within` is lexical — a symlink inside the clone can still point outside it.
+        // Canonicalize both sides and require the target to stay under the checkout.
+        if let (Ok(root_canon), Ok(checkout_canon)) = (
+            std::fs::canonicalize(&skill_root),
+            std::fs::canonicalize(&checkout),
+        ) && !root_canon.starts_with(&checkout_canon)
+        {
+            paths::remove_path(&staging);
+            return Err(SkillError::Install(format!(
+                "subdirectory `{}` resolves outside the repository",
+                subdir.unwrap_or("")
+            )));
+        }
 
         let outcome = self.install_tree(&skill_root, fallback, url.to_string(), resolved_rev);
         paths::remove_path(&staging);

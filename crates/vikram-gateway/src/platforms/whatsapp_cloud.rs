@@ -231,6 +231,12 @@ impl WhatsAppCloudAdapter {
 
     fn record_inbound(&self, chat_id: &str, message_id: &str) {
         if let Ok(mut map) = self.last_inbound.lock() {
+            // Bound the map: distinct senders must not grow it forever. Clearing is fine —
+            // the entry is only an optimization for the next read receipt.
+            const MAX_TRACKED_CHATS: usize = 4096;
+            if map.len() >= MAX_TRACKED_CHATS && !map.contains_key(chat_id) {
+                map.clear();
+            }
             map.insert(chat_id.to_string(), message_id.to_string());
         }
     }

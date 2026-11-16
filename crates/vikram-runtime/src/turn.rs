@@ -13,7 +13,7 @@ use tokio::sync::oneshot;
 use vikram_contracts::policy::Decision;
 use vikram_contracts::{
     ActionKind, ApprovalId, Block, Message, PermissionMode, PermissionRequest, RecordKind, Role,
-    ToolCall, ToolCallId, Trust, TurnId,
+    SideEffect, ToolCall, ToolCallId, Trust, TurnId,
 };
 
 use crate::bots::ManagedBot;
@@ -147,6 +147,17 @@ pub(crate) fn spawn_turn(
     message: Message,
     agent: Option<AgentRun>,
 ) {
+    // The claim is taken before the task exists, not inside it: `is_busy` and the spawn are
+    // separate steps, so two submits can both see an idle session. The loser queues its text —
+    // the same slot the queue drain claims through here — rather than starting a second turn.
+    if !session.claim_turn() {
+        let depth = session.enqueue(message.text_body());
+        inner.emit(RuntimeEvent::Notice {
+            level: NoticeLevel::Info,
+            text: format!("queued ({depth} waiting)"),
+        });
+        return;
+    }
     tokio::spawn(async move {
         run_turn(inner, session, message, agent).await;
     });
@@ -572,6 +583,12 @@ pub(crate) async fn run_turn(
         }
 
         if dropped_for_limit {
+            // The rejected stream may have produced partial text, reasoning or call fragments
+            // before the error arrived. Spend them now so the retried request cannot commit
+            // stale fragments alongside the fresh stream's output.
+            text_buffer.clear();
+            reasoning_buffer.clear();
+            calls.clear();
             // Nothing was produced; rebuild the request from the shortened transcript.
             continue;
         }
@@ -765,6 +782,14 @@ pub(crate) async fn run_turn(
             }
             break;
         }
+    }
+
+    // A steer that arrived after the last tool-call checkpoint has no safe point left in this
+    // turn. Leaving it pending would inject it into the *next* turn, landing after newer queued
+    // instructions the operator wrote later, so it is spent here: demoted to the back of the
+    // queue, where it runs as an ordinary follow-up in order.
+    if let Some(steer_text) = session.take_steer() {
+        session.enqueue(steer_text);
     }
 
     session.record_usage(reported_input, reported_output.or(Some(output_tokens)));
@@ -1023,10 +1048,14 @@ fn finish(
     inner.emit(RuntimeEvent::Status(inner.status()));
     inner.publish_metrics();
 
-    if outcome != TurnState::Cancelled
-        && !session.cancel_handle().is_cancelled()
-        && let Some(next) = session.dequeue()
-    {
+    // Pop the next follow-up while this turn still holds the claim, then hand the slot back:
+    // the spawned turn re-claims it inside `spawn_turn`, and a submit racing the gap queues
+    // behind the drain instead of running beside it. The queue drains on every outcome —
+    // including Cancelled and Failed — because a stranded queue is input the operator already
+    // sent and is still owed an answer.
+    let next = session.dequeue();
+    session.release_turn();
+    if let Some(next) = next {
         // A queued follow-up keeps the same agent (if any) but gets its own
         // background task id so progress and completion are tracked rather than
         // being silently dropped (the previous `String::new()` lost the task).
@@ -1112,6 +1141,18 @@ fn is_transient(content: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// Whether a failed call may be attempted again. Only a tool whose permission request declares
+/// `SideEffect::None` — a read, a listing, a search — is safe to retry: it cannot have half-applied
+/// a write, sent a message or spent money before the transport gave up. Anything with a side
+/// effect gets exactly one attempt, because a retry of a non-idempotent call duplicates it.
+fn retryable_on_transient(inner: &Arc<RuntimeInner>, call: &ToolCall) -> bool {
+    inner
+        .tools
+        .get(&call.name)
+        .and_then(|tool| tool.permission(&call.arguments).ok())
+        .is_some_and(|request| request.side_effect == SideEffect::None)
+}
+
 /// Run one call, giving a request that never completed up to three attempts. The retry lives here
 /// rather than in the turn loop so the model is never handed a failure that was only the network
 /// hiccuping — it would answer that with a promise instead of a result.
@@ -1123,10 +1164,16 @@ async fn run_tool(
     agent: &Option<AgentRun>,
     origin: Origin,
 ) -> (String, bool) {
+    let retryable = retryable_on_transient(inner, call);
     let mut attempt = 1;
     loop {
         let (content, ok) = run_tool_once(inner, session, call, cancel, agent, origin).await;
-        if ok || attempt >= TRANSIENT_ATTEMPTS || !is_transient(&content) || cancel.is_cancelled() {
+        if ok
+            || !retryable
+            || attempt >= TRANSIENT_ATTEMPTS
+            || !is_transient(&content)
+            || cancel.is_cancelled()
+        {
             return (content, ok);
         }
         attempt += 1;
@@ -1299,6 +1346,13 @@ async fn run_tool_once(
 
             let allowed = wait_for_approval(rx, cancel).await;
             if cancel.is_cancelled() {
+                // Drop the pending entry — a late answer must not resolve (or worse, persist an
+                // allow-rule for) a call that never ran.
+                inner
+                    .approvals
+                    .lock()
+                    .expect("approvals lock")
+                    .remove(&approval);
                 inner.emit(RuntimeEvent::ToolFinished {
                     session: session.id.clone(),
                     call: call.id.clone(),

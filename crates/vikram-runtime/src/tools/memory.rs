@@ -25,6 +25,31 @@ fn scope_for(ctx: &ToolContext, asked: Option<&str>) -> String {
 
 /// The scopes a lookup may read: the speaker's own first, then the shared `global` shelf. A bot is
 /// allowed to know what the operator told the machine; it is not allowed to know another bot's.
+/// The scope this caller owns: its bot scope, or `global` for the main agent. A model-supplied
+/// `scope` argument may only name this scope (writes) or this scope plus `global` (reads) —
+/// the memory store is shared across every user, session, and bot, so an unchecked scope would
+/// let one session read, overwrite, or delete another's notes.
+fn caller_scope(ctx: &ToolContext) -> String {
+    scope_for(ctx, None)
+}
+
+fn check_scope(ctx: &ToolContext, asked: Option<&str>, write: bool) -> Result<String, VikramError> {
+    let own = caller_scope(ctx);
+    match asked.map(str::trim) {
+        Some(scope) if !scope.is_empty() => {
+            let allowed = scope == own || (!write && scope == "global");
+            if allowed {
+                Ok(scope.to_owned())
+            } else {
+                Err(VikramError::Storage(format!(
+                    "memory scope `{scope}` is not available to this session"
+                )))
+            }
+        }
+        _ => Ok(own),
+    }
+}
+
 fn read_scopes(primary: &str) -> Vec<String> {
     if primary == "global" {
         vec!["global".to_owned()]
@@ -66,7 +91,7 @@ impl Tool for MemorySave {
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let key = arg_str(args, "key")?;
         let value = arg_str(args, "value")?;
-        let scope = scope_for(ctx, args.get("scope").and_then(Value::as_str));
+        let scope = check_scope(ctx, args.get("scope").and_then(Value::as_str), true)?;
         let store =
             MemoryStore::open(database_path()).map_err(|e| VikramError::Storage(e.to_string()))?;
         store
@@ -110,7 +135,7 @@ impl Tool for MemorySearch {
 
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let query = arg_str(args, "query")?;
-        let scope = scope_for(ctx, args.get("scope").and_then(Value::as_str));
+        let scope = check_scope(ctx, args.get("scope").and_then(Value::as_str), false)?;
         let scopes = read_scopes(&scope);
         let store =
             MemoryStore::open(database_path()).map_err(|e| VikramError::Storage(e.to_string()))?;
@@ -176,7 +201,7 @@ impl Tool for MemoryList {
     }
 
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
-        let scope = scope_for(ctx, args.get("scope").and_then(Value::as_str));
+        let scope = check_scope(ctx, args.get("scope").and_then(Value::as_str), false)?;
         let store =
             MemoryStore::open(database_path()).map_err(|e| VikramError::Storage(e.to_string()))?;
         let entries = store
@@ -231,7 +256,7 @@ impl Tool for MemoryDelete {
 
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let key = arg_str(args, "key")?;
-        let scope = scope_for(ctx, args.get("scope").and_then(Value::as_str));
+        let scope = check_scope(ctx, args.get("scope").and_then(Value::as_str), true)?;
         let store =
             MemoryStore::open(database_path()).map_err(|e| VikramError::Storage(e.to_string()))?;
         let deleted = store
@@ -290,7 +315,7 @@ impl Tool for MemoryConsolidate {
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         use crate::consolidation::{ConsolidationPolicy, ConsolidationStore, score};
         let action = args.get("action").and_then(Value::as_str).unwrap_or("run");
-        let scope = scope_for(ctx, args.get("scope").and_then(Value::as_str));
+        let scope = check_scope(ctx, args.get("scope").and_then(Value::as_str), false)?;
         let store = ConsolidationStore::open(crate::config::database_path())
             .map_err(|e| VikramError::Storage(e.to_string()))?;
         let policy = ConsolidationPolicy::default();

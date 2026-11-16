@@ -143,3 +143,54 @@ systemic zero-row Ok returns in vikram-store.
 - /a2a requires A2A_TOKEN bearer; session keys (platform,chat_id); ingress rejects truncated bodies + conflicting Content-Length; media_fetch no redirects (SSRF closed); registry connect fails on missing deps; turn() never sends partial reply; mcp serve evaluates PermissionRequest through policy (Deny + floor apply).
 - policy: deny-first real; metachar allow bypass closed; empty-root floor fails closed; within_root .. normalized.
 - Remaining LOW: DingTalk/A2A-task map bounds, access.rs dead field, unwired evolution scaffolding honesty (self_awareness/conversational/self_recovery fabricated content — decide wire-or-mark), store zero-row Ok systemic.
+
+## 2026-11-16 — batch 32 (local, uncommitted)
+
+- StoreError::NotFound added; delete_session/rename_session/set_session_title_status now error on zero affected rows instead of phantom Ok. Sweep continues — ~40 mutators remain.
+- Termux: TLS fully fixed (preconfigured rustls+ring+webpki, no platform-verifier JNI); aws-lc-rs out; android cfg gaps closed (doctor/proc/service/sandbox/hints); daemon tick-rate + $PREFIX zoneinfo + Windows-safe stop; kill_tree via libc; docs/install.md for 4 OSes. Committed+pushed through c80b326.
+
+## 2026-11-16 — batch 33 (local, uncommitted)
+
+- StoreError::NotFound sweep complete: ~30 keyed mutators now error on zero rows — all session setters, project/bot/user/profile/entity/hive/roster/ticket/assignment updates+deletes.
+- CLI guards: hive add-participant checks get_hive; tickets add-participant + assign check get_ticket (no more orphan rows); learning approve propagates skill-create errors and rejects non-pending proposals; select_project verifies session before creating project row.
+- Manager-level guards: TicketManager::add_participant/create_assignment and HiveManager::add_participant verify parent exists; set_session_workspace refuses orphan upserts.
+- HiveManager::append_message verifies hive exists; learning reject also requires pending status; workspace changes + files rm error on bogus ids.
+- tickets.rs create_assignment propagates set_ticket_status errors instead of swallowing.
+- daemon: heartbeat delivery records real outcome; prune_runs wired into settle (keep 200/job); claim_begin_run refuses overlap (one run per job); reflection jobs retry to 3 attempts before failing.
+- daemon: skip_run sets last_status='skipped' (both skip paths consistent); self_evaluation refuses all-zero benchmarks.
+- gateway: transport errors sanitized (no token/URL leak); Slack timestamp freshness; IRC CRLF injection blocked; A2A task store capped 1024; Discord chat_id encoded.
+- mcp visibility now enforced (Private blocks tools at registration + run); MCP server no-executor returns error not stub success.
+- skills: corrupt disabled.json/trust.json/visibility warn instead of silent reset; install_git subdir symlink escape blocked; frontmatter depth cap 32.
+- policy: tool_permissions matches tool family (terminal/process/task verbs); rules.json drops over-broad hand-edited allows.
+- codeindex: refs rebuild skipped when nothing changed.
+- mcp client: tools/resources/prompts list errors now fail the connection instead of reporting 0 items.
+- gateway: whatsapp/weixin/wecom per-chat maps capped at 4096.
+- shell.run: destructive-command heuristic marks SideEffect::Destructive (Smart no longer auto-allows rm -rf class commands).
+- slack streams map capped 1024; vikram-terminals dep dropped from runtime (dead); terminals/acp marked EXPERIMENTAL.
+- policy: verb_prefix now segment-boundary matched (fs.read no longer covers fs.readx); slack streams capped; dead crates marked EXPERIMENTAL + dep dropped.
+- sandbox: Landlock no longer selected (no enforcing wrapper — was silent pass-through claiming enforcement); bwrap gets --clearenv + env allowlist (provider keys no longer leak into sandboxed processes).
+- dingtalk_stream: sessionWebhook validated as dingtalk.com https before POST (forged-frame SSRF closed).
+
+## 2026-11-16 — batch 34 (local, uncommitted)
+
+- sandbox: Landlock silent pass-through fixed; bwrap --clearenv + env allowlist.
+- gateway: dingtalk sessionWebhook host-validated; mattermost/ntfy URL segments encoded.
+- store cascade audit (agent): delete_user bypasses entity cleanup, delete_hive misses tickets.hive_id, delete_ticket misses parent_ticket, delete_assignment no reparent, delete_session misses parent_session/forked_from, zero-row removes still Ok — ALL LOGGED, fixes pending.
+- daemon audit (agent): cron next_after can return instant <= after on DST fall-back (skip-loop ~1h/yr); job.skipped sticky warning; cancel.*/member.* state keys leak; append-only logs unbounded; DST double-fire hypothesis DISPROVEN.
+- gateway round-2 (agent): authorize_source bot-mentions arm doesn't verify mention; ntfy constant user_id; dingtalk endpoint trusted; bluebubbles password-in-URL; qqbot no timestamp freshness.
+- store: delete_hive NULLs tickets.hive_id; delete_ticket clears child parent_ticket + cross-ticket task_ref; delete_session clears parent_session/forked_from.
+- store: delete_assignment reparents children + detaches task_ref.
+- cli: skills enable/disable verify catalog membership first; skill_rename rolls back copy on delete failure.
+- audits queued: compaction off-by-one+lossy refold, memory scope isolation (cross-user leak), learning scope mismatch, reflection non-idempotent+bypasses policy, turn H1/H2, session picker rename targets wrong session.
+- compaction: replay off-by-one on re-folds fixed; operator bare ToolResult clears unanswered.
+- memory tools: scope confined to caller (writes own scope only, reads own+global) — cross-user leak closed.
+- evolution: run_reflection auto_apply_memory flag; learning passes policy gate (Disabled no longer bypassed).
+- daemon: cron next_after requires instant > after (DST fall-back skip-loop fixed).
+- tui: suggestions yield to overlays+modified chords; select() clears suggestions/selection; ApprovalRequested no longer clobbers dirty overlay; upsert_session doesn't steal active tab.
+- providers: UTF-8 split-chunk fix (both); anthropic invalid tool-arg JSON refused like openai.
+- session: move_queue can reach back position.
+- store: delete_user now detaches entity refs (hive_participants/ticket_participants/assignments/active_identity), entities.profile_id for shared entities, ticket_participants.user_id, and tickets.hive_id in both hive cascades.
+- daemon: broadcast Lagged no longer fatal in runner turn/wait_for; worker panic now reports Finished + frees slot.
+- store: delete_profile hive loop + all sid-loops get tickets.hive_id/lineage detaches (drift vs delete_user fixed).
+- learning: memory writes land in session scope (recallable + isolated); reflection proposal/memory keys deterministic per experience (retry-idempotent).
+- tui: Overlay::RenameSession carries target SessionId (picker rename can't hit wrong session); anthropic duplicate Finished removed.

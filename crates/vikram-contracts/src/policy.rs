@@ -354,12 +354,14 @@ fn normalize_lexical(path: &str) -> String {
 pub fn amendment_for(request: &PermissionRequest) -> String {
     let scope = match request.action {
         ActionKind::Execute => {
+            // The resource is the whole command line; the saved rule scopes to its executable —
+            // `cargo *`, not `cargo test *` — matching what approvals granted before resources
+            // carried the full command.
             let head = request
                 .resource
                 .split_whitespace()
-                .take(2)
-                .collect::<Vec<_>>()
-                .join(" ");
+                .next()
+                .unwrap_or("shell");
             format!("{head} *")
         }
         ActionKind::Read | ActionKind::Write => match request.resource.rfind('/') {

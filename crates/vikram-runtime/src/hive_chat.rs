@@ -92,6 +92,22 @@ impl HiveManager {
         role: &str,
         now_ms: u64,
     ) -> Result<(), String> {
+        if self
+            .store
+            .get_hive(hive)
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            return Err(format!("hive {} not found", hive.as_str()));
+        }
+        if self
+            .store
+            .get_entity(entity)
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            return Err(format!("entity {} not found", entity.as_str()));
+        }
         let row = HiveParticipantRow {
             hive: hive.clone(),
             entity: entity.clone(),
@@ -125,6 +141,14 @@ impl HiveManager {
         task_ref: Option<&str>,
         now_ms: u64,
     ) -> Result<HiveMessageRow, String> {
+        if self
+            .store
+            .get_hive(hive)
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            return Err(format!("hive {} not found", hive.as_str()));
+        }
         let row = HiveMessageRow {
             id: HiveMessageId::generate(),
             hive: hive.clone(),

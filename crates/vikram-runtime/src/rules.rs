@@ -40,7 +40,36 @@ impl RuleBook {
         let path = path.into();
         let (rules, error) = match std::fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<SavedRules>(&text) {
-                Ok(saved) => (saved.rules, None),
+                Ok(saved) => {
+                    // `parse_amendment` is the only sanctioned way a rule is written, and it
+                    // refuses `allow execute *`-shaped grants. A hand-edited file bypasses that
+                    // grammar entirely, so re-apply the same floor here: drop Allow rules that
+                    // reach outside the workspace on non-Read actions.
+                    let mut dropped = 0usize;
+                    let rules = saved
+                        .rules
+                        .into_iter()
+                        .filter(|rule| {
+                            let overbroad = rule.outcome == vikram_contracts::RuleOutcome::Allow
+                                && rule
+                                    .actions
+                                    .iter()
+                                    .any(|a| !matches!(a, vikram_contracts::ActionKind::Read))
+                                && matches!(rule.resource, vikram_policy::ResourcePattern::Any);
+                            if overbroad {
+                                dropped += 1;
+                            }
+                            !overbroad
+                        })
+                        .collect();
+                    let error = (dropped > 0).then(|| {
+                        format!(
+                            "{}: dropped {dropped} over-broad allow rule(s) (`*` on non-read actions)",
+                            path.display()
+                        )
+                    });
+                    (rules, error)
+                }
                 Err(err) => (
                     Vec::new(),
                     Some(format!(

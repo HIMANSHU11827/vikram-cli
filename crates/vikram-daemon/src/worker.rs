@@ -246,7 +246,12 @@ impl WorkerPool {
         let task_id = id.clone();
 
         let handle = tokio::spawn(async move {
-            let outcome = work.await;
+            // Run `work` in an inner task: a panic must still free the slot, drop the running
+            // entry, and report Finished — otherwise the pool leaks the id until restart.
+            let outcome = match tokio::spawn(work).await {
+                Ok(outcome) => outcome,
+                Err(err) => RunOutcome::failed(format!("worker task failed: {err}")),
+            };
             // Hold the permit until the work is done, then drop it so the class frees a slot.
             drop(permit);
             running.lock().expect("pool lock").remove(&task_id);

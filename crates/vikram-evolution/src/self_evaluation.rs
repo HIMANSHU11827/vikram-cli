@@ -423,7 +423,14 @@ impl SelfEvaluationEngine {
             ));
         }
 
-        let passed = score >= 0.6;
+        // An all-zero expectation is not a benchmark — every leg passes trivially and the
+        // evaluation would claim success against criteria nobody set.
+        let expected_is_empty = expected.task_completion_rate == 0.0
+            && expected.task_correctness == 0.0
+            && expected.tool_success_rate == 0.0
+            && expected.execution_time_ms == 0
+            && expected.token_consumption == 0;
+        let passed = !expected_is_empty && score >= 0.6;
         (passed, score, notes.join("; "))
     }
 

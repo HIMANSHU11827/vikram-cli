@@ -27,6 +27,8 @@ pub enum StoreError {
     Parse(String),
     #[error("contract: {0}")]
     Vikram(#[from] VikramError),
+    #[error("not found: {0}")]
+    NotFound(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -566,19 +568,31 @@ impl Store {
     /// Link a session to the user that owns it. Without this, deleting a user leaves orphaned
     /// sessions behind because the cascade has nothing to match.
     pub fn set_session_user(&self, session: &SessionId, user: &UserId) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE sessions SET user_id = ?2 WHERE id = ?1",
             params![session.as_str(), user.as_str()],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!(
+                "session {}",
+                session.as_str()
+            )));
+        }
         Ok(())
     }
 
     /// Link a session to a profile, e.g. when the operator switched profiles.
     pub fn set_session_profile(&self, session: &SessionId, profile: &ProfileId) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE sessions SET profile_id = ?2 WHERE id = ?1",
             params![session.as_str(), profile.as_str()],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!(
+                "session {}",
+                session.as_str()
+            )));
+        }
         Ok(())
     }
 
@@ -590,10 +604,16 @@ impl Store {
         parent: Option<&SessionId>,
         depth: u32,
     ) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE sessions SET parent_session = ?2, delegation_depth = ?3 WHERE id = ?1",
             params![session.as_str(), parent.map(|p| p.as_str()), depth as i64],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!(
+                "session {}",
+                session.as_str()
+            )));
+        }
         Ok(())
     }
 
@@ -799,10 +819,13 @@ impl Store {
     }
 
     pub fn set_session_status(&self, id: &SessionId, status: &str, now_ms: u64) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE sessions SET status = ?2, updated_ms = ?3 WHERE id = ?1",
             params![id.as_str(), status, now_ms as i64],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("session {}", id.as_str())));
+        }
         Ok(())
     }
 
@@ -812,7 +835,7 @@ impl Store {
         project: Option<&ProjectId>,
         now_ms: u64,
     ) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE sessions SET project_id = ?2, updated_ms = ?3 WHERE id = ?1",
             params![
                 id.as_str(),
@@ -820,6 +843,9 @@ impl Store {
                 now_ms as i64
             ],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("session {}", id.as_str())));
+        }
         Ok(())
     }
 
@@ -1110,10 +1136,13 @@ impl Store {
     /// The operator named this session. A manual title is the one thing automatic naming may never
     /// touch, so the provenance moves to `manual` here and stays there.
     pub fn rename_session(&self, id: &SessionId, title: &str, now_ms: u64) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE sessions SET title = ?2, updated_ms = ?3, title_source = 'manual', title_status = 'ready' WHERE id = ?1",
             params![id.as_str(), title, now_ms as i64],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("session {}", id.as_str())));
+        }
         Ok(())
     }
 
@@ -1131,20 +1160,26 @@ impl Store {
 
     /// Record how title derivation went without changing the name.
     pub fn set_session_title_status(&self, id: &SessionId, status: &str) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE sessions SET title_status = ?2 WHERE id = ?1",
             params![id.as_str(), status],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("session {}", id.as_str())));
+        }
         Ok(())
     }
 
     /// Mark a session as needing a derived name — how `/retitle` asks for a fresh one, and how a
     /// manual title can be handed back to the automatic path.
     pub fn mark_session_title_pending(&self, id: &SessionId, source: &str) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE sessions SET title_source = ?2, title_status = 'pending' WHERE id = ?1",
             params![id.as_str(), source],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("session {}", id.as_str())));
+        }
         Ok(())
     }
 
@@ -1154,10 +1189,13 @@ impl Store {
         model: Option<&str>,
         now_ms: u64,
     ) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE sessions SET model = ?2, updated_ms = ?3 WHERE id = ?1",
             params![id.as_str(), model, now_ms as i64],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("session {}", id.as_str())));
+        }
         Ok(())
     }
 
@@ -1179,7 +1217,7 @@ impl Store {
     }
 
     pub fn set_session_bot(&self, id: &SessionId, bot: Option<&BotId>, now_ms: u64) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE sessions SET bot_id = ?2, updated_ms = ?3 WHERE id = ?1",
             params![
                 id.as_str(),
@@ -1187,6 +1225,9 @@ impl Store {
                 now_ms as i64
             ],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("session {}", id.as_str())));
+        }
         Ok(())
     }
 
@@ -1235,7 +1276,18 @@ impl Store {
             "DELETE FROM session_fts WHERE session = ?1",
             params![id.as_str()],
         );
-        tx.execute("DELETE FROM sessions WHERE id = ?1", params![id.as_str()])?;
+        tx.execute(
+            "UPDATE sessions SET parent_session = NULL WHERE parent_session = ?1",
+            params![id.as_str()],
+        )?;
+        tx.execute(
+            "UPDATE sessions SET forked_from = NULL WHERE forked_from = ?1",
+            params![id.as_str()],
+        )?;
+        let deleted = tx.execute("DELETE FROM sessions WHERE id = ?1", params![id.as_str()])?;
+        if deleted == 0 {
+            return Err(StoreError::NotFound(format!("session {}", id.as_str())));
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1329,10 +1381,13 @@ impl Store {
     }
 
     pub fn set_project_status(&self, id: &ProjectId, status: &str, now_ms: u64) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE projects SET status = ?2, updated_ms = ?3 WHERE id = ?1",
             params![id.as_str(), status, now_ms as i64],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("project {}", id.as_str())));
+        }
         Ok(())
     }
 
@@ -1353,7 +1408,10 @@ impl Store {
             "UPDATE artifacts SET project_id = NULL WHERE project_id = ?1",
             params![id.as_str()],
         )?;
-        tx.execute("DELETE FROM projects WHERE id = ?1", params![id.as_str()])?;
+        let deleted = tx.execute("DELETE FROM projects WHERE id = ?1", params![id.as_str()])?;
+        if deleted == 0 {
+            return Err(StoreError::NotFound(format!("project {}", id.as_str())));
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1368,6 +1426,14 @@ impl Store {
         project_id: Option<&ProjectId>,
         now_ms: u64,
     ) -> Result<()> {
+        // The upsert would happily materialize a row for a session that does not exist —
+        // there are no foreign keys, so check first.
+        if self.get_session(session)?.is_none() {
+            return Err(StoreError::NotFound(format!(
+                "session {}",
+                session.as_str()
+            )));
+        }
         self.lock().execute(
             "INSERT INTO session_workspaces (session, mode, workspace_path, project_id, created_ms, updated_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)
@@ -1686,7 +1752,10 @@ impl Store {
             "DELETE FROM hive_roster_members WHERE bot = ?1",
             params![id.as_str()],
         )?;
-        tx.execute("DELETE FROM bots WHERE id = ?1", params![id.as_str()])?;
+        let deleted = tx.execute("DELETE FROM bots WHERE id = ?1", params![id.as_str()])?;
+        if deleted == 0 {
+            return Err(StoreError::NotFound(format!("bot {}", id.as_str())));
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1735,10 +1804,13 @@ impl Store {
     }
 
     pub fn rename_hive_roster(&self, id: &HiveRosterId, name: &str, now_ms: u64) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE hive_rosters SET name = ?2, updated_ms = ?3 WHERE id = ?1",
             params![id.as_str(), name, now_ms as i64],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("roster {}", id.as_str())));
+        }
         Ok(())
     }
 
@@ -1748,7 +1820,7 @@ impl Store {
         session: Option<&SessionId>,
         now_ms: u64,
     ) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE hive_rosters SET session_id = ?2, updated_ms = ?3 WHERE id = ?1",
             params![
                 id.as_str(),
@@ -1756,6 +1828,9 @@ impl Store {
                 now_ms as i64
             ],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("roster {}", id.as_str())));
+        }
         Ok(())
     }
 
@@ -1766,10 +1841,13 @@ impl Store {
             "DELETE FROM hive_roster_members WHERE roster = ?1",
             params![id.as_str()],
         )?;
-        tx.execute(
+        let deleted = tx.execute(
             "DELETE FROM hive_rosters WHERE id = ?1",
             params![id.as_str()],
         )?;
+        if deleted == 0 {
+            return Err(StoreError::NotFound(format!("roster {}", id.as_str())));
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1877,10 +1955,13 @@ impl Store {
     }
 
     pub fn update_user(&self, id: &UserId, name: &str, now_ms: u64) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE users SET name = ?2, updated_ms = ?3 WHERE id = ?1",
             params![id.as_str(), name, now_ms as i64],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("user {}", id.as_str())));
+        }
         Ok(())
     }
 
@@ -1925,6 +2006,14 @@ impl Store {
                 tx.execute("DELETE FROM usage WHERE session = ?1", params![sid])?;
                 // FTS5 is best-effort: the table may not exist where the virtual table is unavailable.
                 let _ = tx.execute("DELETE FROM session_fts WHERE session = ?1", params![sid]);
+                tx.execute(
+                    "UPDATE sessions SET parent_session = NULL WHERE parent_session = ?1",
+                    params![sid],
+                )?;
+                tx.execute(
+                    "UPDATE sessions SET forked_from = NULL WHERE forked_from = ?1",
+                    params![sid],
+                )?;
                 tx.execute("DELETE FROM sessions WHERE id = ?1", params![sid])?;
             }
             // Cascade hive sessions belonging to this profile.
@@ -1939,8 +2028,20 @@ impl Store {
                     "DELETE FROM hive_participants WHERE hive = ?1",
                     params![hid],
                 )?;
+                tx.execute(
+                    "UPDATE tickets SET hive_id = NULL WHERE hive_id = ?1",
+                    params![hid],
+                )?;
                 tx.execute("DELETE FROM hive_sessions WHERE id = ?1", params![hid])?;
             }
+            tx.execute(
+                "UPDATE entities SET profile_id = NULL WHERE profile_id = ?1",
+                params![pid],
+            )?;
+            tx.execute(
+                "UPDATE active_identity SET profile_id = NULL WHERE profile_id = ?1",
+                params![pid],
+            )?;
             tx.execute("DELETE FROM profiles WHERE id = ?1", params![pid])?;
         }
         // Hive sessions owned by this user
@@ -1956,9 +2057,37 @@ impl Store {
                 "DELETE FROM hive_participants WHERE hive = ?1",
                 params![hid],
             )?;
+            tx.execute(
+                "UPDATE tickets SET hive_id = NULL WHERE hive_id = ?1",
+                params![hid],
+            )?;
             tx.execute("DELETE FROM hive_sessions WHERE id = ?1", params![hid])?;
         }
-        // Entities owned by this user (keep shared ones with NULL owner)
+        // Entities owned by this user (keep shared ones with NULL owner). Their references in
+        // hives/tickets/assignments/active_identity must detach exactly like `delete_entity`.
+        let owned_entity_ids: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT id FROM entities WHERE owner_user = ?1")?;
+            stmt.query_map(params![id.as_str()], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for eid in &owned_entity_ids {
+            tx.execute(
+                "DELETE FROM hive_participants WHERE entity = ?1",
+                params![eid],
+            )?;
+            tx.execute(
+                "UPDATE ticket_participants SET entity_id = NULL WHERE entity_id = ?1",
+                params![eid],
+            )?;
+            tx.execute(
+                "UPDATE assignments SET entity_id = NULL WHERE entity_id = ?1",
+                params![eid],
+            )?;
+            tx.execute(
+                "UPDATE active_identity SET main_agent = NULL WHERE main_agent = ?1",
+                params![eid],
+            )?;
+        }
         tx.execute(
             "DELETE FROM entities WHERE owner_user = ?1",
             params![id.as_str()],
@@ -1993,14 +2122,24 @@ impl Store {
             tx.execute("DELETE FROM usage WHERE session = ?1", params![sid])?;
             // FTS5 is best-effort: the table may not exist where the virtual table is unavailable.
             let _ = tx.execute("DELETE FROM session_fts WHERE session = ?1", params![sid]);
+            tx.execute(
+                "UPDATE sessions SET parent_session = NULL WHERE parent_session = ?1",
+                params![sid],
+            )?;
+            tx.execute(
+                "UPDATE sessions SET forked_from = NULL WHERE forked_from = ?1",
+                params![sid],
+            )?;
             tx.execute("DELETE FROM sessions WHERE id = ?1", params![sid])?;
         }
-        // Entities owned by this user may own a profile link; detach before profile delete.
         tx.execute(
-            "UPDATE entities SET profile_id = NULL WHERE owner_user = ?1",
+            "UPDATE ticket_participants SET user_id = NULL WHERE user_id = ?1",
             params![id.as_str()],
         )?;
-        tx.execute("DELETE FROM users WHERE id = ?1", params![id.as_str()])?;
+        let deleted = tx.execute("DELETE FROM users WHERE id = ?1", params![id.as_str()])?;
+        if deleted == 0 {
+            return Err(StoreError::NotFound(format!("user {}", id.as_str())));
+        }
         // Fix active_identity if it pointed at this user
         tx.execute(
             "UPDATE active_identity SET user_id = NULL, profile_id = NULL, main_agent = NULL WHERE user_id = ?1",
@@ -2085,10 +2224,13 @@ impl Store {
     }
 
     pub fn update_profile(&self, id: &ProfileId, name: &str, now_ms: u64) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE profiles SET name = ?2, updated_ms = ?3 WHERE id = ?1",
             params![id.as_str(), name, now_ms as i64],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("profile {}", id.as_str())));
+        }
         Ok(())
     }
 
@@ -2125,6 +2267,14 @@ impl Store {
             tx.execute("DELETE FROM usage WHERE session = ?1", params![sid])?;
             // FTS5 is best-effort: the table may not exist where the virtual table is unavailable.
             let _ = tx.execute("DELETE FROM session_fts WHERE session = ?1", params![sid]);
+            tx.execute(
+                "UPDATE sessions SET parent_session = NULL WHERE parent_session = ?1",
+                params![sid],
+            )?;
+            tx.execute(
+                "UPDATE sessions SET forked_from = NULL WHERE forked_from = ?1",
+                params![sid],
+            )?;
             tx.execute("DELETE FROM sessions WHERE id = ?1", params![sid])?;
         }
         tx.execute(
@@ -2148,9 +2298,16 @@ impl Store {
                 "DELETE FROM hive_participants WHERE hive = ?1",
                 params![hid],
             )?;
+            tx.execute(
+                "UPDATE tickets SET hive_id = NULL WHERE hive_id = ?1",
+                params![hid],
+            )?;
             tx.execute("DELETE FROM hive_sessions WHERE id = ?1", params![hid])?;
         }
-        tx.execute("DELETE FROM profiles WHERE id = ?1", params![id.as_str()])?;
+        let deleted = tx.execute("DELETE FROM profiles WHERE id = ?1", params![id.as_str()])?;
+        if deleted == 0 {
+            return Err(StoreError::NotFound(format!("profile {}", id.as_str())));
+        }
         tx.commit()?;
         Ok(())
     }
@@ -2302,7 +2459,10 @@ impl Store {
             "UPDATE active_identity SET main_agent = NULL WHERE main_agent = ?1",
             params![id.as_str()],
         )?;
-        tx.execute("DELETE FROM entities WHERE id = ?1", params![id.as_str()])?;
+        let deleted = tx.execute("DELETE FROM entities WHERE id = ?1", params![id.as_str()])?;
+        if deleted == 0 {
+            return Err(StoreError::NotFound(format!("entity {}", id.as_str())));
+        }
         tx.commit()?;
         Ok(())
     }
@@ -2403,7 +2563,7 @@ impl Store {
     }
 
     pub fn update_hive(&self, row: &HiveRow) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE hive_sessions SET owner_user = ?2, profile_id = ?3, name = ?4, objective = ?5, session_id = ?6, state = ?7, policy = ?8, updated_ms = ?9 WHERE id = ?1",
             params![
                 row.id.as_str(),
@@ -2417,6 +2577,9 @@ impl Store {
                 row.updated_ms as i64,
             ],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("hive {}", row.id.as_str())));
+        }
         Ok(())
     }
 
@@ -2432,9 +2595,16 @@ impl Store {
             params![id.as_str()],
         )?;
         tx.execute(
+            "UPDATE tickets SET hive_id = NULL WHERE hive_id = ?1",
+            params![id.as_str()],
+        )?;
+        let deleted = tx.execute(
             "DELETE FROM hive_sessions WHERE id = ?1",
             params![id.as_str()],
         )?;
+        if deleted == 0 {
+            return Err(StoreError::NotFound(format!("hive {}", id.as_str())));
+        }
         tx.commit()?;
         Ok(())
     }
@@ -2445,7 +2615,7 @@ impl Store {
         session: Option<&SessionId>,
         now_ms: u64,
     ) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE hive_sessions SET session_id = ?2, updated_ms = ?3 WHERE id = ?1",
             params![
                 id.as_str(),
@@ -2453,6 +2623,9 @@ impl Store {
                 now_ms as i64
             ],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("hive {}", id.as_str())));
+        }
         Ok(())
     }
 
@@ -2664,7 +2837,7 @@ impl Store {
     }
 
     pub fn update_ticket(&self, row: &TicketRow) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE tickets SET owner_key = ?2, owner_kind = ?3, title = ?4, description = ?5, request = ?6, kind = ?7, status = ?8, parent_ticket = ?9, hive_id = ?10, session_id = ?11, strategy = ?12, result = ?13, failure_reason = ?14, updated_ms = ?15, closed_ms = ?16 WHERE id = ?1",
             params![
                 row.id.as_str(),
@@ -2685,6 +2858,9 @@ impl Store {
                 row.closed_ms.map(|c| c as i64),
             ],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("ticket {}", row.id.as_str())));
+        }
         Ok(())
     }
 
@@ -2694,42 +2870,57 @@ impl Store {
         } else {
             None
         };
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE tickets SET status = ?2, updated_ms = ?3, closed_ms = COALESCE(?4, closed_ms) WHERE id = ?1",
             params![id.as_str(), status, now_ms as i64, closed],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("ticket {}", id.as_str())));
+        }
         Ok(())
     }
 
     pub fn set_ticket_result(&self, id: &TicketId, result: &str, now_ms: u64) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE tickets SET result = ?2, updated_ms = ?3 WHERE id = ?1",
             params![id.as_str(), result, now_ms as i64],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("ticket {}", id.as_str())));
+        }
         Ok(())
     }
 
     pub fn set_ticket_failure(&self, id: &TicketId, reason: &str, now_ms: u64) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE tickets SET failure_reason = ?2, status = 'failed', updated_ms = ?3 WHERE id = ?1",
             params![id.as_str(), reason, now_ms as i64],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("ticket {}", id.as_str())));
+        }
         Ok(())
     }
 
     pub fn reopen_ticket(&self, id: &TicketId, now_ms: u64) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE tickets SET status = 'reopened', closed_ms = NULL, updated_ms = ?2 WHERE id = ?1",
             params![id.as_str(), now_ms as i64],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("ticket {}", id.as_str())));
+        }
         Ok(())
     }
 
     pub fn cancel_ticket(&self, id: &TicketId, now_ms: u64) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE tickets SET status = 'cancelled', closed_ms = ?2, updated_ms = ?2 WHERE id = ?1",
             params![id.as_str(), now_ms as i64],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("ticket {}", id.as_str())));
+        }
         Ok(())
     }
 
@@ -2749,10 +2940,21 @@ impl Store {
             params![id.as_str()],
         )?;
         tx.execute(
+            "UPDATE ticket_messages SET task_ref = NULL WHERE task_ref IN (SELECT id FROM assignments WHERE ticket = ?1)",
+            params![id.as_str()],
+        )?;
+        tx.execute(
             "DELETE FROM assignments WHERE ticket = ?1",
             params![id.as_str()],
         )?;
-        tx.execute("DELETE FROM tickets WHERE id = ?1", params![id.as_str()])?;
+        tx.execute(
+            "UPDATE tickets SET parent_ticket = NULL WHERE parent_ticket = ?1",
+            params![id.as_str()],
+        )?;
+        let deleted = tx.execute("DELETE FROM tickets WHERE id = ?1", params![id.as_str()])?;
+        if deleted == 0 {
+            return Err(StoreError::NotFound(format!("ticket {}", id.as_str())));
+        }
         tx.commit()?;
         Ok(())
     }
@@ -2950,7 +3152,7 @@ impl Store {
     }
 
     pub fn update_assignment(&self, row: &AssignmentRow) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE assignments SET ticket = ?2, parent_assignment = ?3, assignee_key = ?4, assignee_kind = ?5, entity_id = ?6, title = ?7, description = ?8, status = ?9, strategy = ?10, result = ?11, error = ?12, updated_ms = ?13, completed_ms = ?14 WHERE id = ?1",
             params![
                 row.id.as_str(),
@@ -2969,6 +3171,12 @@ impl Store {
                 row.completed_ms.map(|c| c as i64),
             ],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!(
+                "assignment {}",
+                row.id.as_str()
+            )));
+        }
         Ok(())
     }
 
@@ -2983,10 +3191,13 @@ impl Store {
         } else {
             None
         };
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE assignments SET status = ?2, updated_ms = ?3, completed_ms = COALESCE(?4, completed_ms) WHERE id = ?1",
             params![id.as_str(), status, now_ms as i64, completed],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("assignment {}", id.as_str())));
+        }
         Ok(())
     }
 
@@ -2996,26 +3207,47 @@ impl Store {
         result: &str,
         now_ms: u64,
     ) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE assignments SET result = ?2, status = 'completed', updated_ms = ?3, completed_ms = ?3 WHERE id = ?1",
             params![id.as_str(), result, now_ms as i64],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("assignment {}", id.as_str())));
+        }
         Ok(())
     }
 
     pub fn set_assignment_error(&self, id: &AssignmentId, error: &str, now_ms: u64) -> Result<()> {
-        self.lock().execute(
+        let changed = self.lock().execute(
             "UPDATE assignments SET error = ?2, status = 'failed', updated_ms = ?3, completed_ms = ?3 WHERE id = ?1",
             params![id.as_str(), error, now_ms as i64],
         )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("assignment {}", id.as_str())));
+        }
         Ok(())
     }
 
     pub fn delete_assignment(&self, id: &AssignmentId) -> Result<()> {
-        self.lock().execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        // Children reparent to this assignment's parent (or NULL for a root); message refs detach.
+        tx.execute(
+            "UPDATE assignments SET parent_assignment = (SELECT parent_assignment FROM assignments WHERE id = ?1) WHERE parent_assignment = ?1",
+            params![id.as_str()],
+        )?;
+        tx.execute(
+            "UPDATE ticket_messages SET task_ref = NULL WHERE task_ref = ?1",
+            params![id.as_str()],
+        )?;
+        let deleted = tx.execute(
             "DELETE FROM assignments WHERE id = ?1",
             params![id.as_str()],
         )?;
+        if deleted == 0 {
+            return Err(StoreError::NotFound(format!("assignment {}", id.as_str())));
+        }
+        tx.commit()?;
         Ok(())
     }
 

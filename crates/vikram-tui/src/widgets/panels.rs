@@ -241,8 +241,14 @@ pub fn bots_panel(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
 
     let focused = app.focus == Focus::Bots;
     let title = Line::from(Span::styled(
-        if focused { " BOTS · focused " } else { " BOTS " },
-        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        if focused {
+            " BOTS · focused "
+        } else {
+            " BOTS "
+        },
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
     ));
     let block = panel_frame(title, theme);
     let inner = block.inner(area);
@@ -367,8 +373,7 @@ pub fn bots_panel(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     // Wrapped, not dropped. A control the operator cannot see is a control they cannot press, and a
     // narrow panel used to lose `remove` and `mode` outright. Two rows at most: the list is what
     // this panel is for and the buttons are only the way into it.
-    let chip_width =
-        |label: &str| UnicodeWidthStr::width(format!(" {label} ").as_str()) as u16 + 1;
+    let chip_width = |label: &str| UnicodeWidthStr::width(format!(" {label} ").as_str()) as u16 + 1;
     let chips_total: u16 = chips.iter().map(|(label, _)| chip_width(label)).sum();
     // Pack the chips into as many rows as they actually need, up to the room the panel has. The
     // fixed one-or-two choice silently dropped the tail on a narrow sidebar — `[mode]` was never
@@ -431,12 +436,8 @@ pub fn bots_panel(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
             row += 1;
             x = inner.x;
         }
-        app.bot_hits.push((
-            inner.y + action_row + row,
-            x,
-            x + span_width,
-            click,
-        ));
+        app.bot_hits
+            .push((inner.y + action_row + row, x, x + span_width, click));
         // The same band the open tab wears: one filled rectangle, square corners, no brackets. A
         // bracketed label reads as text that happens to be clickable; a lit block reads as a button.
         spans.push(Span::styled(
@@ -477,7 +478,7 @@ pub fn plasma(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         theme.frame()
     };
 
-    let running_tool = app.active_session().and_then(|session| {
+    let running_tool = app.display_session().and_then(|session| {
         session
             .activity
             .iter()
@@ -495,7 +496,7 @@ pub fn plasma(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         // answer to why the clock is moving with nothing in the pane, and burying them under
         // "receiving" leaves the operator with no explanation at all.
         (notice.text.clone(), theme.notice_style(notice.level))
-    } else if app.active_session().is_some_and(|s| s.streaming.is_some()) {
+    } else if app.display_session().is_some_and(|s| s.streaming.is_some()) {
         (
             format!("{} receiving", app.thinking_frame()),
             Style::default().fg(theme.accent),
@@ -538,7 +539,7 @@ pub fn status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .metrics
         .model
         .clone()
-        .or_else(|| app.active_session().and_then(|s| s.model.clone()))
+        .or_else(|| app.display_session().and_then(|s| s.model.clone()))
         .unwrap_or_else(|| "unset".to_owned());
     // The whole identifier is shown wherever it fits: `nvidia/nemotron-3.5` is not the name of
     // anything, and the vendor prefix is the first thing an operator reads. The line as a whole is
@@ -1040,12 +1041,8 @@ pub fn overlay(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         for chip in &body.verbs {
             let y = inner.y + chip.line as u16;
             if y >= inner.y && y < inner.y + inner.height {
-                app.picker_verbs.push((
-                    y,
-                    inner.x + chip.start,
-                    inner.x + chip.end,
-                    chip.verb,
-                ));
+                app.picker_verbs
+                    .push((y, inner.x + chip.start, inner.x + chip.end, chip.verb));
             }
         }
         app.overlay_rect = Some((rect.x, rect.y, rect.width, rect.height));
@@ -1114,9 +1111,11 @@ pub fn overlay(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         }
         let y = inner.y + shifted as u16;
         if y >= inner.y && y < inner.y + inner.height {
-            let (start, end) = hit.columns.map_or((inner.x, inner.x + inner.width), |(s, e)| {
-                (inner.x + s, inner.x + e)
-            });
+            let (start, end) = hit
+                .columns
+                .map_or((inner.x, inner.x + inner.width), |(s, e)| {
+                    (inner.x + s, inner.x + e)
+                });
             app.overlay_clicks.push((y, start, end, hit.click));
         }
     }
@@ -1139,7 +1138,11 @@ fn overlay_content(
                     ])
                 })
                 .collect();
-            let clicks = push_chips(&mut lines, theme, &[("esc close", OverlayClick::PromptCancel)]);
+            let clicks = push_chips(
+                &mut lines,
+                theme,
+                &[("esc close", OverlayClick::PromptCancel)],
+            );
             ("Keys".to_owned(), lines, clicks)
         }
         Overlay::Approvals => {
@@ -1152,18 +1155,25 @@ fn overlay_content(
                     click: OverlayClick::ApprovalRequest(index),
                 })
                 .collect();
-            clicks.extend(action_rows.into_iter().enumerate().map(|(index, line)| {
-                OverlayHit {
-                    line,
-                    columns: None,
-                    click: OverlayClick::ApprovalAction(index),
-                }
-            }));
+            clicks.extend(
+                action_rows
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, line)| OverlayHit {
+                        line,
+                        columns: None,
+                        click: OverlayClick::ApprovalAction(index),
+                    }),
+            );
             (title, lines, clicks)
         }
         Overlay::Inspector(kind) => {
             let mut lines = inspector_lines(app, kind, theme);
-            let clicks = push_chips(&mut lines, theme, &[("esc close", OverlayClick::PromptCancel)]);
+            let clicks = push_chips(
+                &mut lines,
+                theme,
+                &[("esc close", OverlayClick::PromptCancel)],
+            );
             (inspector_title(kind).to_owned(), lines, clicks)
         }
         Overlay::AddBot { selected } => {
@@ -1185,7 +1195,7 @@ fn overlay_content(
             ));
             (title, lines, clicks)
         }
-        Overlay::RenameSession { editor } => {
+        Overlay::RenameSession { editor, .. } => {
             let (title, mut lines) = rename_lines(app, editor, theme);
             let clicks = push_chips(
                 &mut lines,
@@ -1248,7 +1258,11 @@ fn overlay_content(
         Overlay::Autocomplete { .. } => ("Autocomplete".to_owned(), vec![], Vec::new()),
         Overlay::Skills { .. } => {
             let (title, mut lines) = skills_lines(app, theme);
-            let clicks = push_chips(&mut lines, theme, &[("esc close", OverlayClick::PromptCancel)]);
+            let clicks = push_chips(
+                &mut lines,
+                theme,
+                &[("esc close", OverlayClick::PromptCancel)],
+            );
             (title, lines, clicks)
         }
         Overlay::Info { title, lines } => {
@@ -1412,12 +1426,7 @@ pub fn approval_panel_height(app: &App, theme: &Theme) -> u16 {
 
 /// The panel body plus the line each request header and answer button sits on, so a press can
 /// name either: a request row selects it, an answer row answers the selected request.
-type ApprovalBody = (
-    String,
-    Vec<Line<'static>>,
-    Vec<usize>,
-    Vec<(usize, usize)>,
-);
+type ApprovalBody = (String, Vec<Line<'static>>, Vec<usize>, Vec<(usize, usize)>);
 
 fn approval_lines(app: &App, theme: &Theme) -> ApprovalBody {
     let mut lines: Vec<Line> = Vec::new();
@@ -1586,7 +1595,7 @@ fn inspector_lines(app: &App, kind: &InspectorKind, theme: &Theme) -> Vec<Line<'
             let detail = app
                 .context_detail
                 .as_ref()
-                .filter(|(id, _)| app.active_session().is_some_and(|s| s.id == *id))
+                .filter(|(id, _)| app.display_session().is_some_and(|s| s.id == *id))
                 .cloned()
                 .map(|(_, meter)| meter);
             let (window, usable, used, measured, assumed) = match &detail {
@@ -1748,7 +1757,7 @@ fn rename_lines(
     theme: &Theme,
 ) -> (String, Vec<Line<'static>>) {
     let mut lines: Vec<Line> = Vec::new();
-    if let Some(session) = app.active_session() {
+    if let Some(session) = app.display_session() {
         lines.push(Line::styled(
             format!("  now: {}", clip(&session.title, 50, theme.ascii)),
             theme.muted(),
@@ -2133,8 +2142,7 @@ mod tests {
             .map(|agent| 1 + usize::from(agent.state != BotState::Idle))
             .sum();
         assert_eq!(
-            rows,
-            expected,
+            rows, expected,
             "every drawn line of a bot must select it: {:?}",
             app.bot_hits
         );
@@ -2146,7 +2154,9 @@ mod tests {
             BotClick::Mode,
         ] {
             assert!(
-                app.bot_hits.iter().any(|(_, _, _, click)| *click == expected),
+                app.bot_hits
+                    .iter()
+                    .any(|(_, _, _, click)| *click == expected),
                 "{expected:?} has no clickable area: {:?}",
                 app.bot_hits
             );
@@ -2364,7 +2374,10 @@ mod tests {
             ("Ctrl+C", "stop"),
         ] {
             assert!(rendered.contains(key), "missing `{key}` in {rendered}");
-            assert!(rendered.contains(action), "missing `{action}` in {rendered}");
+            assert!(
+                rendered.contains(action),
+                "missing `{action}` in {rendered}"
+            );
         }
     }
 
@@ -2554,6 +2567,7 @@ mod tests {
     fn rename_overlay_prefills_the_current_title() {
         let mut app = app_with_default_bots();
         app.overlay = Some(Overlay::RenameSession {
+            session: vikram_contracts::SessionId::generate(),
             editor: crate::editor::Editor::from_text("Renamed"),
         });
         let rendered = draw(80, 24, |frame| {
@@ -2570,7 +2584,9 @@ mod tests {
     fn ascii_mode_never_draws_wide_glyphs() {
         let mut app = app_with_default_bots();
         let theme = Theme::new(true);
-        let rendered = draw(40, 8, |frame| bots_panel(frame, frame.area(), &mut app, &theme));
+        let rendered = draw(40, 8, |frame| {
+            bots_panel(frame, frame.area(), &mut app, &theme)
+        });
         for glyph in ['●', '○', '…', '▸', '█', '░'] {
             assert!(
                 !rendered.contains(glyph),

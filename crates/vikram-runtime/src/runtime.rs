@@ -631,7 +631,7 @@ pub(crate) struct RuntimeInner {
     // `tickets` field lives above (grouped with hive/learning extraction);
     // removed duplicate declaration here.
     pub mcp: std::sync::Arc<std::sync::Mutex<McpRegistry>>,
-    pub mcp_visibility: std::sync::Mutex<VisibilityManager>,
+    pub mcp_visibility: std::sync::Arc<std::sync::Mutex<VisibilityManager>>,
     pub plugins: Mutex<PluginRegistry>,
     pub skills: std::sync::Mutex<SkillRegistry>,
     // `evolution` field moved into `LearningState` (see `learning` above).
@@ -2008,7 +2008,7 @@ impl Runtime {
             tasks: TaskManager::new(),
             rosters: HiveRosterManager::load(),
             mcp: Arc::new(Mutex::new(mcp)),
-            mcp_visibility: Mutex::new(mcp_visibility),
+            mcp_visibility: std::sync::Arc::new(Mutex::new(mcp_visibility)),
             plugins: Mutex::new(plugins),
             skills,
             workspace,
@@ -2041,7 +2041,17 @@ impl Runtime {
                 session.set_parent(Some(parent));
                 session.set_depth(depth);
             }
-            if let Ok(records) = inner.store.replay_messages(&session.id) {
+            let records = match inner.store.replay_messages(&session.id) {
+                Ok(records) => records,
+                Err(err) => {
+                    inner.emit(RuntimeEvent::Notice {
+                        level: NoticeLevel::Warn,
+                        text: format!("could not replay the transcript: {err}"),
+                    });
+                    Vec::new()
+                }
+            };
+            if !records.is_empty() {
                 let messages = crate::compaction::project_from_journal(
                     records
                         .into_iter()
@@ -2132,12 +2142,24 @@ impl Runtime {
                 }
             }
             for def in tool_defs {
+                // A server the operator marked Private keeps its tools out of the model's
+                // tool list entirely; `McpTool::run` re-checks so a mid-session toggle also
+                // takes effect.
+                let exposed = mcp_inner
+                    .mcp_visibility
+                    .lock()
+                    .map(|m| m.is_public(&def.server))
+                    .unwrap_or(false);
+                if !exposed {
+                    continue;
+                }
                 let mcp_tool = McpTool {
                     server: def.server,
                     tool: def.name,
                     description: def.description,
                     schema: def.input_schema,
                     registry: Arc::clone(&mcp_inner.mcp),
+                    visibility: std::sync::Arc::clone(&mcp_inner.mcp_visibility),
                 };
                 mcp_inner.tools.register(Box::new(mcp_tool));
             }
@@ -2271,8 +2293,17 @@ impl RuntimeHandle {
                 Ok(Some(provider)) => {
                     *provider_slot = Some(provider);
                 }
-                _ => {
+                Ok(None) => {
                     *provider_slot = None;
+                }
+                Err(err) => {
+                    // A bad key/endpoint must not silently drop the provider — the next turn
+                    // would fail with "no provider" and no hint why.
+                    *provider_slot = None;
+                    self.inner.emit(RuntimeEvent::Notice {
+                        level: NoticeLevel::Warn,
+                        text: format!("provider reload failed: {err}"),
+                    });
                 }
             }
         }
@@ -3050,7 +3081,17 @@ impl RuntimeHandle {
             live.set_parent(Some(parent));
             live.set_depth(depth);
         }
-        if let Ok(records) = self.inner.store.replay_messages(&live.id) {
+        let records = match self.inner.store.replay_messages(&live.id) {
+            Ok(records) => records,
+            Err(err) => {
+                self.inner.emit(RuntimeEvent::Notice {
+                    level: NoticeLevel::Warn,
+                    text: format!("could not replay the transcript: {err}"),
+                });
+                Vec::new()
+            }
+        };
+        if !records.is_empty() {
             let messages = crate::compaction::project_from_journal(
                 records
                     .into_iter()
@@ -3126,7 +3167,17 @@ impl RuntimeHandle {
             .map_err(|e| RuntimeError::Store(e.to_string()))?
             .ok_or_else(|| RuntimeError::SessionNotFound(fork.id.clone()))?;
         let live = Arc::new(SessionRuntime::from_row(row));
-        if let Ok(records) = self.inner.store.replay_messages(&live.id) {
+        let records = match self.inner.store.replay_messages(&live.id) {
+            Ok(records) => records,
+            Err(err) => {
+                self.inner.emit(RuntimeEvent::Notice {
+                    level: NoticeLevel::Warn,
+                    text: format!("could not replay the transcript: {err}"),
+                });
+                Vec::new()
+            }
+        };
+        if !records.is_empty() {
             let messages = crate::compaction::project_from_journal(
                 records
                     .into_iter()
@@ -3183,9 +3234,20 @@ impl RuntimeHandle {
             .map_err(|e| RuntimeError::Store(e.to_string()))?;
         // Rebuild the live transcript from the journal if this session is loaded, so the
         // recovery is visible immediately rather than on the next restart.
-        if let Some(live) = self.inner.session(session)
-            && let Ok(records) = self.inner.store.replay_messages(&live.id)
-        {
+        if let Some(live) = self.inner.session(session) {
+            let records = match self.inner.store.replay_messages(&live.id) {
+                Ok(records) => records,
+                Err(err) => {
+                    self.inner.emit(RuntimeEvent::Notice {
+                        level: NoticeLevel::Warn,
+                        text: format!("could not replay the transcript: {err}"),
+                    });
+                    Vec::new()
+                }
+            };
+            if records.is_empty() {
+                return Ok(answered);
+            }
             let messages = crate::compaction::project_from_journal(
                 records
                     .into_iter()
@@ -3644,7 +3706,10 @@ impl RuntimeHandle {
             .rosters
             .create(name.into())
             .map_err(RuntimeError::InvalidState)?;
-        let _ = self.inner.rosters.save();
+        self.inner
+            .rosters
+            .save()
+            .map_err(RuntimeError::InvalidState)?;
         Ok(())
     }
 
@@ -3665,7 +3730,10 @@ impl RuntimeHandle {
             .rosters
             .add_member(roster.into(), bot)
             .map_err(RuntimeError::InvalidState)?;
-        let _ = self.inner.rosters.save();
+        self.inner
+            .rosters
+            .save()
+            .map_err(RuntimeError::InvalidState)?;
         Ok(())
     }
 
@@ -3678,7 +3746,10 @@ impl RuntimeHandle {
             .rosters
             .remove_member(roster.into(), bot)
             .map_err(RuntimeError::InvalidState)?;
-        let _ = self.inner.rosters.save();
+        self.inner
+            .rosters
+            .save()
+            .map_err(RuntimeError::InvalidState)?;
         Ok(())
     }
 
@@ -3687,7 +3758,10 @@ impl RuntimeHandle {
             .rosters
             .delete(name.into())
             .map_err(RuntimeError::InvalidState)?;
-        let _ = self.inner.rosters.save();
+        self.inner
+            .rosters
+            .save()
+            .map_err(RuntimeError::InvalidState)?;
         Ok(())
     }
 
@@ -3701,7 +3775,10 @@ impl RuntimeHandle {
             .rosters
             .delegate_task(roster.into(), task.into(), assigned_to)
             .map_err(RuntimeError::InvalidState)?;
-        let _ = self.inner.rosters.save();
+        self.inner
+            .rosters
+            .save()
+            .map_err(RuntimeError::InvalidState)?;
         Ok(())
     }
 
@@ -4475,8 +4552,11 @@ impl RuntimeHandle {
         let mgr = vikram_skills::Manager::new();
         mgr.create_from(new_name, &dir)
             .map_err(|e| RuntimeError::Store(e.to_string()))?;
-        mgr.delete(name)
-            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        if let Err(e) = mgr.delete(name) {
+            // Roll back the copy so a failed rename does not leave a shadowing duplicate.
+            let _ = mgr.delete(new_name);
+            return Err(RuntimeError::Store(e.to_string()));
+        }
         self.rescan_skills();
         self.inner.emit(RuntimeEvent::SkillsChanged {
             discovered: self.skill_count(),

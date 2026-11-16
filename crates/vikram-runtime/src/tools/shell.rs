@@ -105,12 +105,20 @@ impl Tool for RunShell {
 
     fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
         let command = arg_str(args, "command")?;
-        let head = command.split_whitespace().next().unwrap_or("shell");
+        // The resource is the whole command, not its first word: policy segment analysis,
+        // saved allow rules, and the approval prompt all reason about what actually runs.
+        // A command that is plainly destructive anywhere in it is not a routine local mutation —
+        // `Smart` auto-allows Execute+LocalMutation, so the side effect has to say so.
+        let side_effect = if looks_destructive(&command) {
+            SideEffect::Destructive
+        } else {
+            SideEffect::LocalMutation
+        };
         Ok(PermissionRequest::new(
             ActionKind::Execute,
             "shell.run",
-            head,
-            SideEffect::LocalMutation,
+            command,
+            side_effect,
             Trust::Model,
         ))
     }
@@ -427,4 +435,35 @@ impl Tool for TestRun {
         };
         Ok(run_shell_command(&command, ctx, 120_000))
     }
+}
+
+/// Conservative destructive-command detector. Only fires on unambiguous patterns — a false
+/// positive costs one approval prompt, a false negative auto-runs `rm -rf` under `Smart`.
+fn looks_destructive(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    const PATTERNS: &[&str] = &[
+        "rm -rf",
+        "rm -fr",
+        "rm -r -f",
+        "rm --recursive",
+        "mkfs",
+        "dd if=",
+        ":(){",
+        "shutdown",
+        "reboot",
+        "poweroff",
+        "halt -f",
+        "chmod -r 777 /",
+        "chown -r",
+        "> /dev/sd",
+        "mv / /",
+        "wipefs",
+        "fdisk",
+        "parted",
+        "iptables -f",
+        "systemctl stop",
+        "kill -9 -1",
+        "killall -9",
+    ];
+    PATTERNS.iter().any(|p| lower.contains(p))
 }

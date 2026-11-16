@@ -352,7 +352,9 @@ impl CronExpr {
                 // The civil reading matches; the instant it names has to read back the same way,
                 // otherwise the reading fell in a daylight saving gap and this minute does not exist.
                 let instant = time::instant_of(zone.clone(), civil);
-                if time::civil_in(zone.clone(), instant) == civil {
+                // The instant must be strictly after `after`: on a fall-back day an ambiguous
+                // wall time resolves to its first occurrence, which can precede `after`.
+                if instant > after && time::civil_in(zone.clone(), instant) == civil {
                     return Some(instant);
                 }
                 advance_minute(&mut civil);

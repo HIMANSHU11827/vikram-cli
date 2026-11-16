@@ -69,9 +69,10 @@ impl Postbox {
     /// Deliver `text` into the conversation named by `wanted`.
     ///
     /// Returns the session it landed in and, when that is not the one asked for, a sentence saying
-    /// so. A session id the runtime does not hold is the ordinary case — the terminal's session is
-    /// in another process — so the report goes to the daemon's own conversation instead of being
-    /// dropped, and the detail travels with it.
+    /// so. `Runtime::start` rehydrates every session in the store, so an id the runtime does not
+    /// hold — or whose row was deleted after it was rehydrated — cannot be delivered into; the
+    /// report goes to the daemon's own conversation instead of being dropped, and the detail
+    /// travels with it.
     pub async fn post(
         &mut self,
         wanted: &str,
@@ -82,19 +83,25 @@ impl Postbox {
         let named = !wanted.is_empty() && !wanted.eq_ignore_ascii_case("reports");
         if named {
             let wanted_id = SessionId::new(wanted);
-            if handle.post_message(&wanted_id, text.to_string()).is_ok() {
+            // The runtime still holds a session deleted from the store, and posting into it would
+            // journal rows nothing reads, so the store gets the last word.
+            if self.store.session_exists(wanted)
+                && handle.post_message(&wanted_id, text.to_string()).is_ok()
+            {
                 return Ok((wanted.to_string(), None));
             }
         }
         let session = match &self.reports {
-            Some(id) => id.clone(),
-            None => {
+            Some(id) if self.store.session_exists(id.as_str()) => id.clone(),
+            _ => {
                 // A remembered conversation is reused when this runtime rehydrated it from the
                 // database; when it did not, a new one is opened and the memory is corrected, so a
                 // stale id cannot swallow the report.
                 if let Ok(Some(remembered)) = self.store.state(REPORTS_KEY) {
                     let id = SessionId::new(remembered);
-                    if handle.post_message(&id, text.to_string()).is_ok() {
+                    if self.store.session_exists(id.as_str())
+                        && handle.post_message(&id, text.to_string()).is_ok()
+                    {
                         self.reports = Some(id.clone());
                         return Ok((
                             id.to_string(),

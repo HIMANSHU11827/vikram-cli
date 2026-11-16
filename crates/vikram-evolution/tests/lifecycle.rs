@@ -28,7 +28,7 @@ fn experience_record_and_reflection() {
     assert_eq!(job.status, ReflectionJobStatus::Pending);
     let done = engine.reflection.process_pending().unwrap();
     assert_eq!(done, 1);
-    let proposals = engine.reflection.run_reflection(&exp.id).unwrap(); // already reflected but ok
+    let proposals = engine.reflection.run_reflection(&exp.id, true).unwrap(); // already reflected but ok
     // no panic; proposals may be empty or not
     let _ = proposals;
     let dash = engine.dashboard.snapshot().unwrap();
@@ -262,7 +262,7 @@ fn no_learning_noop() {
         metadata: serde_json::json!({}),
     };
     let exp = engine.experience.record(exp).unwrap();
-    let proposals = engine.reflection.run_reflection(&exp.id).unwrap();
+    let proposals = engine.reflection.run_reflection(&exp.id, true).unwrap();
     assert!(proposals.is_empty());
 }
 

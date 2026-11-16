@@ -238,6 +238,10 @@ impl WeComAdapter {
     /// Remember the inbound `req_id` so a later reply to this chat can answer in-stream.
     pub fn remember_req_id(&self, chat_id: &str, req_id: &str) {
         if let Ok(mut map) = self.last_req_ids.lock() {
+            const MAX_TRACKED_CHATS: usize = 4096;
+            if map.len() >= MAX_TRACKED_CHATS && !map.contains_key(chat_id) {
+                map.clear();
+            }
             map.insert(chat_id.to_string(), req_id.to_string());
         }
     }

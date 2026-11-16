@@ -242,8 +242,10 @@ impl MattermostAdapter {
         channel_id: &str,
         since_ms: u64,
     ) -> Result<Vec<MessageEvent>, String> {
-        let path =
-            format!("/channels/{channel_id}/posts?since={since_ms}&per_page={POLL_PAGE_SIZE}");
+        let path = format!(
+            "/channels/{}/posts?since={since_ms}&per_page={POLL_PAGE_SIZE}",
+            encode_segment(channel_id)
+        );
         let request = self.get(&path);
         let response = self
             .transport
@@ -788,6 +790,20 @@ impl PlatformAdapter for MattermostAdapter {
         ));
         let _ = self.transport.execute(request).await;
     }
+}
+
+/// Percent-encode a single URL path segment (unreserved chars kept verbatim).
+fn encode_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

@@ -200,6 +200,14 @@ impl TicketManager {
     // ---- participants ----------------------------------------------------
 
     pub fn add_participant(&self, row: &TicketParticipantRow) -> Result<(), String> {
+        if self
+            .store
+            .get_ticket(&row.ticket)
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            return Err(format!("ticket {} not found", row.ticket.as_str()));
+        }
         self.store
             .add_ticket_participant(row)
             .map_err(|e| e.to_string())?;
@@ -403,6 +411,14 @@ impl TicketManager {
         // Only admins/owner may create assignments.
         // (Caller identity is not passed here; enforcement happens at runtime layer.
         //  The store-level manager trusts the runtime to gate; we still record the event.)
+        if self
+            .store
+            .get_ticket(ticket)
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            return Err(format!("ticket {} not found", ticket.as_str()));
+        }
         let row = AssignmentRow {
             id: AssignmentId::generate(),
             ticket: ticket.clone(),
@@ -428,7 +444,9 @@ impl TicketManager {
         if let Ok(Some(t)) = self.store.get_ticket(ticket)
             && (t.status == "open" || t.status == "reopened")
         {
-            let _ = self.store.set_ticket_status(ticket, "in_progress", now_ms);
+            self.store
+                .set_ticket_status(ticket, "in_progress", now_ms)
+                .map_err(|e| e.to_string())?;
         }
         let _ = self.record_event(
             ticket,

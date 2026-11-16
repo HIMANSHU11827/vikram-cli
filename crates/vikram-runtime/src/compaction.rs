@@ -81,11 +81,58 @@ pub const COMPACTION_FOLDED_KEY: &str = "folded_messages";
 
 /// True when the front of a transcript is already a summary we wrote. Compacting a compacted
 /// session must replace that summary, never stack a summary of a summary.
+///
+/// The fold writes exactly one host-trusted text block whose first line has a fixed shape
+/// (`FoldNote::render`). A message that merely quotes the header — a report the postbox delivered,
+/// a delegation brief, a pasted transcript — is content, not a marker, and must not be folded
+/// away as one.
 pub fn is_compaction_summary(message: &Message) -> bool {
-    message.role == Role::System && message.text_body().starts_with(SUMMARY_HEADER)
+    if message.role != Role::System {
+        return false;
+    }
+    let [Block::Text { text, trust }] = message.blocks.as_slice() else {
+        return false;
+    };
+    if *trust != Trust::Host {
+        return false;
+    }
+    let Some(rest) = text.strip_prefix(SUMMARY_HEADER) else {
+        return false;
+    };
+    is_fold_header(rest)
 }
 
 const SUMMARY_HEADER: &str = "[VIKRAM context summary]";
+
+/// The sentence `FoldNote::render` writes after the header, with its three numbers:
+/// `" N earlier messages folded; the M most recent are verbatim below. Originals are durable in
+/// the journal through seq S and can be re-read."` Anything else is a quote, not a fold.
+fn is_fold_header(rest: &str) -> bool {
+    fn is_uint(text: &str) -> bool {
+        !text.is_empty() && text.chars().all(|c| c.is_ascii_digit())
+    }
+    let Some(rest) = rest.strip_prefix(' ') else {
+        return false;
+    };
+    let Some((folded, rest)) = rest.split_once(' ') else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix("earlier messages folded; the ") else {
+        return false;
+    };
+    let Some((kept, rest)) = rest.split_once(' ') else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix(
+        "most recent are verbatim below. Originals are durable in the journal through seq ",
+    ) else {
+        return false;
+    };
+    let Some((seq, rest)) = rest.split_once(' ') else {
+        return false;
+    };
+    is_uint(folded) && is_uint(kept) && is_uint(seq) && rest.starts_with("and can be re-read.")
+}
 
 /// Decide, from the current transcript, whether a fold is needed before the next request goes out.
 pub fn should_compact(
@@ -690,7 +737,11 @@ pub fn project_from_journal(
                 continue;
             }
             let _ = seq;
-            messages.drain(..folded);
+            // `folded` counts body messages only — a prior summary sitting at index 0 is
+            // displaced too, so it must be drained with them or one stale message survives.
+            let displaced = usize::from(messages.first().is_some_and(is_compaction_summary));
+            let drain_to = (folded + displaced).min(messages.len());
+            messages.drain(..drain_to);
             messages.insert(0, summary);
             continue;
         }
@@ -710,6 +761,17 @@ pub fn project_from_journal(
                 }
             }
             messages.push(message);
+            continue;
+        }
+        // Operator-issued calls journal a bare ToolResult (no "message" payload) — its "call"
+        // field still answers the pending ToolCall, or replay would append an orphan result.
+        if kind == RecordKind::ToolResult
+            && let Some(call) = payload
+                .get("call")
+                .and_then(|v| v.as_str())
+                .map(vikram_contracts::ToolCallId::new)
+        {
+            unanswered.retain(|pending| pending != &call);
             continue;
         }
         if kind == RecordKind::ToolCall
@@ -757,6 +819,16 @@ mod tests {
             },
             100,
             None,
+        )
+    }
+
+    /// Summary text in exactly the shape `FoldNote::render` emits, so journalled-marker fixtures
+    /// satisfy the tightened `is_compaction_summary` the way a real fold does.
+    fn fold_summary(folded: u64, kept: u64, seq: u64, tag: &str) -> String {
+        format!(
+            "[VIKRAM context summary] {folded} earlier messages folded; the {kept} most recent \
+             are verbatim below. Originals are durable in the journal through seq {seq} and can \
+             be re-read.\n\n### Live objective\n- {tag}\n"
         )
     }
 
@@ -894,6 +966,34 @@ mod tests {
     }
 
     #[test]
+    fn only_a_real_fold_summary_counts_as_a_marker() {
+        // A system message that merely opens with the header is content, not a fold.
+        let quoted = Message::text(
+            Role::System,
+            "[VIKRAM context summary] pasted into a report by the postbox",
+            Trust::Host,
+        );
+        assert!(!is_compaction_summary(&quoted));
+        // Even the canonical header sentence is a quote from the wrong role or trust.
+        let canonical = fold_summary(3, 0, 3, "quoted transcript");
+        assert!(!is_compaction_summary(&Message::user(canonical.clone())));
+        let external = Message {
+            role: Role::System,
+            blocks: vec![Block::Text {
+                text: canonical,
+                trust: Trust::External,
+            }],
+        };
+        assert!(!is_compaction_summary(&external));
+        // The shape the fold actually writes still counts.
+        assert!(is_compaction_summary(&Message::text(
+            Role::System,
+            fold_summary(3, 0, 3, "real"),
+            Trust::Host
+        )));
+    }
+
+    #[test]
     fn refuses_to_fold_a_transcript_too_short_to_bother_with() {
         let e = TokenEstimator::default();
         let msgs: Vec<Message> = (0..4).map(|i| Message::user(format!("m{i}"))).collect();
@@ -988,7 +1088,7 @@ mod tests {
         use serde_json::json;
         let summary = Message::text(
             Role::System,
-            "[VIKRAM context summary] folded 3 messages",
+            fold_summary(3, 0, 3, "tool history"),
             Trust::Host,
         );
         let records = vec![
@@ -1049,12 +1149,12 @@ mod tests {
         use serde_json::json;
         let first = Message::text(
             Role::System,
-            "[VIKRAM context summary] first fold",
+            fold_summary(2, 0, 3, "first fold"),
             Trust::Host,
         );
         let second = Message::text(
             Role::System,
-            "[VIKRAM context summary] second fold",
+            fold_summary(2, 0, 5, "second fold"),
             Trust::Host,
         );
         let records = vec![

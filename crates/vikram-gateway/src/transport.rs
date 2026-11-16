@@ -240,10 +240,11 @@ impl ReqwestTransport {
         if let Some(body) = request.body {
             builder = builder.body(body);
         }
-        builder
-            .send()
-            .await
-            .map_err(|err| TransportError::Request(err.to_string()))
+        builder.send().await.map_err(|err| {
+            // `err` carries the request URL — which for Telegram/DingTalk embeds the bot token.
+            // `without_url` keeps the failure reason and drops the credential.
+            TransportError::Request(err.without_url().to_string())
+        })
     }
 }
 
@@ -260,7 +261,7 @@ impl Transport for ReqwestTransport {
         let body = response
             .text()
             .await
-            .map_err(|err| TransportError::Request(err.to_string()))?;
+            .map_err(|err| TransportError::Request(err.without_url().to_string()))?;
         Ok(HttpResponse {
             status,
             body,
@@ -280,7 +281,7 @@ impl Transport for ReqwestTransport {
         let bytes = response
             .bytes()
             .await
-            .map_err(|err| TransportError::Request(err.to_string()))?;
+            .map_err(|err| TransportError::Request(err.without_url().to_string()))?;
         Ok(bytes.to_vec())
     }
 }

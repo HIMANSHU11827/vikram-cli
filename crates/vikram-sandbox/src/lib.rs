@@ -77,15 +77,22 @@ impl Sandbox {
         }
         // Android (Termux) shares the Linux kernel but has neither bwrap nor landlock in
         // practice — check anyway so a user who installed them isn't told otherwise.
-        let (mechanism, passthrough_reason) = if cfg!(any(target_os = "linux", target_os = "android")) {
+        let (mechanism, passthrough_reason) = if cfg!(any(
+            target_os = "linux",
+            target_os = "android"
+        )) {
             if bwrap_available() {
                 (SandboxMechanism::Bubblewrap, None)
-            } else if landlock_available() {
-                (SandboxMechanism::Landlock, None)
             } else {
+                // Landlock has no enforcing wrapper yet — `wrap_command` cannot apply it, so
+                // selecting it would run commands on the host while claiming a mechanism.
                 (
                     SandboxMechanism::PassThrough,
-                    Some("bubblewrap/landlock not installed; OS isolation inactive".into()),
+                    Some(
+                        "bubblewrap not installed and landlock has no enforcing wrapper; \
+                         OS isolation inactive"
+                            .into(),
+                    ),
                 )
             }
         } else if cfg!(target_os = "macos") {
@@ -268,6 +275,18 @@ impl Sandbox {
         }
         if !self.allow_network {
             args.push("--unshare-net".into());
+        }
+        // The child must not inherit provider keys, tokens, or SSH agent sockets — a sandboxed
+        // command with `env` or `/proc/self/environ` would exfiltrate them when network is on.
+        args.push("--clearenv".into());
+        for var in [
+            "PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "USER", "SHELL", "TZ",
+        ] {
+            if let Ok(value) = std::env::var(var) {
+                args.push("--setenv".into());
+                args.push(var.to_string());
+                args.push(value);
+            }
         }
         rewrap(cmd, "bwrap", args);
     }

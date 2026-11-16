@@ -1469,14 +1469,27 @@ impl DingTalkStreamClient {
     /// The `error_kind` classification is this port's: 429 `rate_limited` (retryable), 5xx
     /// `transient` (retryable), 401/403 `forbidden`, 404 `not_found`, anything else `unknown`.
     pub async fn send_to_webhook(&self, session_webhook: &str, body: &Value) -> SendResult {
-        if session_webhook.trim().is_empty() {
+        let webhook = session_webhook.trim();
+        if webhook.is_empty() {
             return SendResult::failed(
                 "dingtalk needs the callback's sessionWebhook to answer a conversation",
                 Some("bad_format"),
             );
         }
+        // The webhook arrives inside an inbound frame — validate it is a DingTalk https URL
+        // before POSTing, or a forged frame turns this into a blind request-anywhere primitive.
+        let is_dingtalk = webhook
+            .strip_prefix("https://")
+            .and_then(|rest| rest.split('/').next())
+            .is_some_and(|host| host == "dingtalk.com" || host.ends_with(".dingtalk.com"));
+        if !is_dingtalk {
+            return SendResult::failed(
+                "dingtalk sessionWebhook is not a dingtalk.com https URL",
+                Some("bad_format"),
+            );
+        }
         // `Accept: */*` is the header both library reply helpers send (`chatbot.py:621-624`).
-        let request = HttpRequest::json(session_webhook.trim(), body).header("Accept", "*/*");
+        let request = HttpRequest::json(webhook, body).header("Accept", "*/*");
         let response = match self.transport.execute(request).await {
             Ok(response) => response,
             Err(err) => {

@@ -129,10 +129,22 @@ impl SlackAdapter {
     }
 
     /// `X-Slack-Signature` = `v0=` + HMAC-SHA256(signing_secret, `v0:{timestamp}:{body}`).
+    /// Slack's scheme includes a ±5-minute timestamp tolerance precisely to bound replay — a
+    /// captured (body, timestamp, signature) triple must not verify forever.
     pub fn verify_webhook(&self, body: &[u8], timestamp: &str, signature: &str) -> bool {
         let Some(secret) = self.signing_secret.as_deref() else {
             return false;
         };
+        let Ok(ts) = timestamp.parse::<i64>() else {
+            return false;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if (now - ts).abs() > 300 {
+            return false;
+        }
         let mut base = Vec::with_capacity(body.len() + timestamp.len() + 4);
         base.extend_from_slice(b"v0:");
         base.extend_from_slice(timestamp.as_bytes());
@@ -900,13 +912,22 @@ impl PlatformAdapter for SlackAdapter {
         let Some(stream) = self.lock_streams().get(&key).cloned() else {
             return match self.start_stream_frame(chat_id, Some(&text)).await {
                 Ok(ts) => {
-                    self.lock_streams().insert(
-                        key,
-                        NativeStream {
-                            ts: ts.clone(),
-                            sent: text,
-                        },
-                    );
+                    {
+                        let mut streams = self.lock_streams();
+                        // Bound the map: a caller-supplied draft_id that never seals would
+                        // otherwise grow it forever. Clearing only splits a stream in two.
+                        const MAX_STREAMS: usize = 1024;
+                        if streams.len() >= MAX_STREAMS && !streams.contains_key(&key) {
+                            streams.clear();
+                        }
+                        streams.insert(
+                            key,
+                            NativeStream {
+                                ts: ts.clone(),
+                                sent: text,
+                            },
+                        );
+                    }
                     SendResult::ok(ts)
                 }
                 Err(failure) => self.stream_failure(failure),
@@ -3998,21 +4019,29 @@ mod webhook_tests {
     fn signatures_verify_and_tampering_fails() {
         let adapter = adapter();
         let body = br#"{"type":"event_callback"}"#;
-        let timestamp = "1700000000";
+        // The freshness window rejects stale timestamps, so sign with the current time.
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
         let signature = format!(
             "v0={}",
-            hmac_sha256_hex(b"secret", b"v0:1700000000:{\"type\":\"event_callback\"}")
+            hmac_sha256_hex(
+                b"secret",
+                format!("v0:{timestamp}:{{\"type\":\"event_callback\"}}").as_bytes()
+            )
         );
-        assert!(adapter.verify_webhook(body, timestamp, &signature));
+        assert!(adapter.verify_webhook(body, &timestamp, &signature));
         assert!(!adapter.verify_webhook(
             br#"{"type":"event_callback","x":1}"#,
-            timestamp,
+            &timestamp,
             &signature
         ));
         assert!(!adapter.verify_webhook(body, "1700000001", &signature));
 
         let unsigned = SlackAdapter::new(Arc::new(NoTransport) as SharedTransport, "x");
-        assert!(!unsigned.verify_webhook(body, timestamp, &signature));
+        assert!(!unsigned.verify_webhook(body, &timestamp, &signature));
     }
 
     #[test]

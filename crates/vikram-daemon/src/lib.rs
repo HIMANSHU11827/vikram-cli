@@ -7,15 +7,13 @@
 
 /// A rustls client config rooted at Mozilla's CAs via webpki anchors — bypasses
 /// `rustls-platform-verifier`, which panics on Android/Termux (it expects a JVM).
-pub(crate) fn tls_config() -> std::sync::Arc<rustls::ClientConfig> {
+pub(crate) fn tls_config() -> rustls::ClientConfig {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    std::sync::Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    )
+    rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth()
 }
 
 pub mod cli;

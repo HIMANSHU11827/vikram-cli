@@ -771,6 +771,10 @@ fn select(app: &mut App, id: &SessionId) {
         if let Some(session) = app.sessions.get_mut(index) {
             session.unread = 0;
         }
+        // A suggestion popup or drag selection belongs to the session it was built from —
+        // carrying it across would let `accept_suggestion` rewrite the new session's draft.
+        app.suggestions = None;
+        app.selection = None;
         app.focus = vikram_tui::app::Focus::Input;
     }
 }
@@ -813,7 +817,12 @@ fn open_command(
         if command.name == "rename" {
             let mut editor = vikram_tui::editor::Editor::new();
             editor.insert_str(args.trim());
-            app.overlay = Some(Overlay::RenameSession { editor });
+            if let Some(session) = app.active_session() {
+                app.overlay = Some(Overlay::RenameSession {
+                    session: session.id.clone(),
+                    editor,
+                });
+            }
             return;
         }
         match command.outcome {
@@ -1150,7 +1159,11 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                 } else {
                     format!("{} · {} · {}", skill.description, skill.scope, status)
                 };
-                items.push(PickerItem::new(skill.name.clone(), detail, skill.name.clone()));
+                items.push(PickerItem::new(
+                    skill.name.clone(),
+                    detail,
+                    skill.name.clone(),
+                ));
             }
             let note = if skills.is_empty() {
                 format!(
@@ -1912,11 +1925,14 @@ fn apply_act(
                 .map(|view| view.title.clone())
                 .unwrap_or_default();
             app.commands.push(UiCommand::SwitchSession {
-                session: SessionId::new(value),
+                session: SessionId::new(value.clone()),
             });
             let mut editor = vikram_tui::editor::Editor::new();
             editor.insert_str(&title);
-            app.overlay = Some(Overlay::RenameSession { editor });
+            app.overlay = Some(Overlay::RenameSession {
+                session: SessionId::new(value),
+                editor,
+            });
         }
         (PickerKind::Session, Verb::Close) => {
             let title = app
@@ -2576,7 +2592,10 @@ fn run_action(app: &mut App, session: &SessionId, name: &str) {
             // retyping, and the panel already knows how to commit the change.
             let mut editor = vikram_tui::editor::Editor::new();
             editor.insert_str(&title);
-            app.overlay = Some(Overlay::RenameSession { editor });
+            app.overlay = Some(Overlay::RenameSession {
+                session: session.clone(),
+                editor,
+            });
         }
         "close" => {
             if app.sessions.len() <= 1 {

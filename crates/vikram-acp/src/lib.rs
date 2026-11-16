@@ -1,5 +1,9 @@
 //! Agent Client Protocol (ACP) — client and server over JSON-RPC 2.0 on stdio.
 //!
+//! EXPERIMENTAL — no crate in the workspace depends on this yet. Known gaps before use:
+//! `send_request` has no timeout, `new_session` cannot pass `mcpServers`, and the server
+//! drops malformed requests without a `-32700` response.
+//!
 //! ACP connects a *client* (IDE/host) to an *agent* (Vikram or another compatible agent).
 //! It is distinct from MCP (agent↔tools) and A2A (agent↔agent).
 

@@ -33,7 +33,16 @@ impl TrustPolicy {
     }
 
     pub fn load_in(state_dir: &Path) -> TrustPolicy {
-        paths::read_json(&state_dir.join(TRUST_FILE)).unwrap_or_default()
+        let path = state_dir.join(TRUST_FILE);
+        match paths::read_json_strict(&path) {
+            Ok(policy) => policy.unwrap_or_default(),
+            // A corrupt trust file must not silently drop `deny` entries — warn loudly and
+            // keep the permissive default only because refusing to start is worse.
+            Err(reason) => {
+                eprintln!("vikram: ignoring unreadable {}: {reason}", path.display());
+                TrustPolicy::default()
+            }
+        }
     }
 
     pub fn save(&self) -> Result<()> {

@@ -162,12 +162,21 @@ impl PlatformAdapter for IrcAdapter {
         if content.trim().is_empty() {
             return SendResult::failed("empty message content", Some("bad_format"));
         }
+        // A newline in the target or body would inject arbitrary IRC commands onto the
+        // operator's connection — strip all line breaks before framing.
+        if target.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return SendResult::failed(
+                "irc target contains control characters",
+                Some("bad_format"),
+            );
+        }
         let chunks = truncate_message(content, IRC_MAX_MESSAGE_LENGTH, codepoint_len);
         for chunk in &chunks {
+            let safe = chunk.replace(['\r', '\n'], " ");
             // IRC has no message ids and no acknowledgement: a refused line is the only failure.
             if let Err(err) = self
                 .socket
-                .send_line(&format!("PRIVMSG {target} :{chunk}"))
+                .send_line(&format!("PRIVMSG {target} :{safe}"))
                 .await
             {
                 return SendResult::failed(format!("irc send failed: {err}"), Some("transient"))

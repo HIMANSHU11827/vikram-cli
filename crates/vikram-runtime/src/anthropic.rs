@@ -99,33 +99,74 @@ impl Provider for AnthropicProvider {
         let body = build_request_body(&request);
 
         tokio::spawn(async move {
-            let response = match client
-                .post(&endpoint)
-                .header("x-api-key", &api_key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&body)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(err) => {
-                    let _ = tx
-                        .send(Err(VikramError::ProviderTransient(format!(
-                            "cannot reach {endpoint}: {err}"
-                        ))))
-                        .await;
-                    return;
+            // The same retry policy `OpenAiProvider` runs: a transient status or a broken
+            // connection is put back on the wire with backoff, and only a real refusal ends
+            // the turn. `Retrying` events keep the wait visible instead of a frozen clock.
+            let mut attempt = 0u32;
+            let response = loop {
+                attempt += 1;
+                match client
+                    .post(&endpoint)
+                    .header("x-api-key", &api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .json(&body)
+                    .send()
+                    .await
+                {
+                    Ok(response) => {
+                        let status = response.status();
+                        if status.is_success() {
+                            break response;
+                        }
+                        let wait = crate::openai::retry_after(&response);
+                        let body = response.text().await.unwrap_or_default();
+                        match crate::openai::retry_decision(status, &body, wait, attempt) {
+                            crate::openai::Retry::After(delay) => {
+                                let _ = tx
+                                    .send(Ok(ProviderEvent::Retrying {
+                                        attempt,
+                                        of: crate::openai::MAX_ATTEMPTS,
+                                        wait_ms: delay.as_millis() as u64,
+                                        status: status.as_u16(),
+                                    }))
+                                    .await;
+                                tokio::time::sleep(delay).await;
+                                continue;
+                            }
+                            crate::openai::Retry::Never => {
+                                let _ = tx.send(Err(rejection(status, &body, &endpoint))).await;
+                                return;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        // A connection that failed before any bytes were sent is safe to retry:
+                        // the request never reached the model, so it cannot run twice.
+                        if attempt < crate::openai::MAX_ATTEMPTS
+                            && crate::openai::retryable_transport(&err)
+                        {
+                            let delay = crate::openai::jittered(crate::openai::backoff(attempt));
+                            let _ = tx
+                                .send(Ok(ProviderEvent::Retrying {
+                                    attempt,
+                                    of: crate::openai::MAX_ATTEMPTS,
+                                    wait_ms: delay.as_millis() as u64,
+                                    status: 0,
+                                }))
+                                .await;
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                        let text = crate::openai::explain_transport(&err, &endpoint, attempt);
+                        let _ = tx.send(Err(VikramError::ProviderTransient(text))).await;
+                        return;
+                    }
                 }
             };
-            let status = response.status();
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                let _ = tx.send(Err(rejection(status, &body, &endpoint))).await;
-                return;
-            }
 
             let mut stream = response.bytes_stream();
             let mut buffer = String::new();
+            let mut utf8_tail: Vec<u8> = Vec::new();
             let mut pending = StreamState::default();
             let mut finished = false;
 
@@ -142,7 +183,24 @@ impl Provider for AnthropicProvider {
                         return;
                     }
                 };
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                utf8_tail.extend_from_slice(&chunk);
+                // Decode only complete UTF-8: a multi-byte char split across chunks must not
+                // become U+FFFD. Incomplete trailing bytes wait for the next chunk.
+                match std::str::from_utf8(&utf8_tail) {
+                    Ok(text) => {
+                        buffer.push_str(text);
+                        utf8_tail.clear();
+                    }
+                    Err(err) if err.error_len().is_none() => {
+                        let valid = err.valid_up_to();
+                        buffer.push_str(std::str::from_utf8(&utf8_tail[..valid]).unwrap_or(""));
+                        utf8_tail.drain(..valid);
+                    }
+                    Err(_) => {
+                        buffer.push_str(&String::from_utf8_lossy(&utf8_tail));
+                        utf8_tail.clear();
+                    }
+                }
                 while let Some(index) = buffer.find('\n') {
                     let line = buffer[..index].trim_end_matches('\r').to_owned();
                     buffer.drain(..=index);
@@ -171,17 +229,13 @@ impl Provider for AnthropicProvider {
             }
 
             if !finished {
+                // `finish_pending` already ends with `Finished`; a second one would be a
+                // duplicate terminal event for any consumer that keeps reading.
                 for event in finish_pending(&mut pending) {
                     if tx.send(Ok(event)).await.is_err() {
                         return;
                     }
                 }
-                let _ = tx
-                    .send(Ok(ProviderEvent::Finished {
-                        input_tokens: None,
-                        output_tokens: None,
-                    }))
-                    .await;
             }
         });
 
@@ -200,6 +254,8 @@ struct StreamState {
     error: Option<String>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    /// `stop_reason` from `message_delta`: how the model says the answer ended.
+    stop_reason: Option<String>,
 }
 
 fn parse_sse_line(line: &str, pending: &mut StreamState) -> Option<Vec<ProviderEvent>> {
@@ -301,32 +357,53 @@ fn parse_sse_line(line: &str, pending: &mut StreamState) -> Option<Vec<ProviderE
         }
         "content_block_stop" => {
             if let Some((id, name, input)) = pending.tool.take() {
-                let arguments: Value = if input.trim().is_empty() {
+                pending.in_text = false;
+                // Truncated/invalid JSON must not become a runnable call with null arguments —
+                // same refusal OpenAI's assembler makes.
+                let arguments = if input.trim().is_empty() {
                     Value::Object(serde_json::Map::new())
                 } else {
-                    serde_json::from_str(&input).unwrap_or(Value::Null)
+                    match serde_json::from_str(&input) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return Some(vec![ProviderEvent::TextDelta(format!(
+                                "\n[tool call `{name}` had invalid JSON arguments]"
+                            ))]);
+                        }
+                    }
                 };
                 let call = ToolCall {
                     id: vikram_contracts::ToolCallId::new(id),
                     name: crate::openai::from_wire_name(&name),
                     arguments,
                 };
-                pending.in_text = false;
                 return Some(vec![ProviderEvent::ToolCall(call)]);
             }
             pending.in_text = false;
             Some(vec![])
         }
         "message_delta" => {
+            if let Some(delta) = value.get("delta")
+                && let Some(reason) = delta.get("stop_reason").and_then(Value::as_str)
+            {
+                pending.stop_reason = Some(reason.to_owned());
+            }
             if let Some(usage) = value.get("usage") {
                 pending.output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
             }
             Some(vec![])
         }
-        "message_stop" => Some(vec![ProviderEvent::Finished {
-            input_tokens: pending.input_tokens,
-            output_tokens: pending.output_tokens,
-        }]),
+        "message_stop" => {
+            let mut events = Vec::new();
+            if let Some(note) = stop_note(pending.stop_reason.as_deref()) {
+                events.push(ProviderEvent::TextDelta(note));
+            }
+            events.push(ProviderEvent::Finished {
+                input_tokens: pending.input_tokens,
+                output_tokens: pending.output_tokens,
+            });
+            Some(events)
+        }
         "error" => {
             let msg = value
                 .get("error")
@@ -341,19 +418,40 @@ fn parse_sse_line(line: &str, pending: &mut StreamState) -> Option<Vec<ProviderE
     }
 }
 
+/// A `stop_reason` that is not a clean end, in words. `max_tokens` means the answer was cut off
+/// mid-thought and `refusal` means the model declined; neither may read as an ordinary finish.
+fn stop_note(stop_reason: Option<&str>) -> Option<String> {
+    match stop_reason {
+        Some("max_tokens") => Some(
+            "\n[response truncated: the model reached its output-token limit (`max_tokens`)]"
+                .to_owned(),
+        ),
+        Some("refusal") => Some("\n[the model declined to answer (`refusal`)]".to_owned()),
+        _ => None,
+    }
+}
+
 fn finish_pending(pending: &mut StreamState) -> Vec<ProviderEvent> {
     let mut out = Vec::new();
+    if let Some(note) = stop_note(pending.stop_reason.as_deref()) {
+        out.push(ProviderEvent::TextDelta(note));
+    }
     if let Some((id, name, input)) = pending.tool.take() {
-        let arguments: Value = if input.trim().is_empty() {
-            Value::Object(serde_json::Map::new())
+        let arguments = if input.trim().is_empty() {
+            Some(Value::Object(serde_json::Map::new()))
         } else {
-            serde_json::from_str(&input).unwrap_or(Value::Null)
+            serde_json::from_str(&input).ok()
         };
-        out.push(ProviderEvent::ToolCall(ToolCall {
-            id: vikram_contracts::ToolCallId::new(id),
-            name: crate::openai::from_wire_name(&name),
-            arguments,
-        }));
+        match arguments {
+            Some(arguments) => out.push(ProviderEvent::ToolCall(ToolCall {
+                id: vikram_contracts::ToolCallId::new(id),
+                name: crate::openai::from_wire_name(&name),
+                arguments,
+            })),
+            None => out.push(ProviderEvent::TextDelta(format!(
+                "\n[tool call `{name}` had invalid JSON arguments]"
+            ))),
+        }
     }
     out.push(ProviderEvent::Finished {
         input_tokens: pending.input_tokens,
@@ -958,7 +1056,7 @@ mod tests {
         let events = feed(
             &mut pending,
             &[
-                r#"data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#,
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
                 r#"data: {"type":"message_stop"}"#,
             ],
         );
@@ -974,6 +1072,71 @@ mod tests {
     }
 
     #[test]
+    fn a_max_tokens_stop_is_announced_as_truncation_not_a_clean_finish() {
+        let mut pending = StreamState::default();
+        let events = feed(
+            &mut pending,
+            &[
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half an ans"}}"#,
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":4096}}"#,
+                r#"data: {"type":"message_stop"}"#,
+            ],
+        );
+
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert_eq!(events[0], ProviderEvent::TextDelta("half an ans".into()));
+        match &events[1] {
+            ProviderEvent::TextDelta(note) => {
+                assert!(note.contains("max_tokens"), "the cut must be named: {note}")
+            }
+            other => panic!("truncation must surface before Finished, got {other:?}"),
+        }
+        assert_eq!(
+            events[2],
+            ProviderEvent::Finished {
+                input_tokens: None,
+                output_tokens: Some(4096)
+            }
+        );
+    }
+
+    #[test]
+    fn a_refusal_stop_is_announced_as_a_declined_answer() {
+        let mut pending = StreamState::default();
+        let events = feed(
+            &mut pending,
+            &[
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"refusal"}}"#,
+                r#"data: {"type":"message_stop"}"#,
+            ],
+        );
+
+        assert_eq!(events.len(), 2, "{events:?}");
+        match &events[0] {
+            ProviderEvent::TextDelta(note) => assert!(note.contains("refusal"), "{note}"),
+            other => panic!("a refusal must not read as silence, got {other:?}"),
+        }
+        assert!(matches!(events[1], ProviderEvent::Finished { .. }));
+    }
+
+    #[test]
+    fn a_truncation_seen_before_an_early_disconnect_is_still_announced() {
+        let mut pending = StreamState::default();
+        feed(
+            &mut pending,
+            &[r#"data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#],
+        );
+
+        let flushed = finish_pending(&mut pending);
+
+        assert!(
+            matches!(&flushed[0], ProviderEvent::TextDelta(note) if note.contains("max_tokens")),
+            "{flushed:?}"
+        );
+        assert!(matches!(flushed[1], ProviderEvent::Finished { .. }));
+    }
+
+    #[test]
     fn invalid_tool_arguments_do_not_panic_the_stream() {
         let mut pending = StreamState::default();
         let events = feed(
@@ -986,10 +1149,9 @@ mod tests {
         );
 
         match &events[0] {
-            ProviderEvent::ToolCall(call) => assert_eq!(
-                call.arguments,
-                Value::Null,
-                "unparsable arguments arrive as null for the kernel to refuse, not as a panic"
+            ProviderEvent::TextDelta(note) => assert!(
+                note.contains("invalid JSON arguments"),
+                "unparsable arguments are refused with a note, never emitted as a runnable call"
             ),
             other => panic!("{other:?}"),
         }
@@ -1089,13 +1251,16 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// One-shot HTTP server on a loopback port: records the request head, then answers with
-    /// `body_pieces` written one at a time, so a frame can straddle two network reads. Nothing
-    /// here leaves the machine.
-    async fn loopback_server(
-        status: &'static str,
-        content_type: &'static str,
-        body_pieces: Vec<String>,
+    /// One canned reply: a status line, a content type and the body, written in `body_pieces`
+    /// one at a time so a frame can straddle two network reads.
+    type Canned = (&'static str, &'static str, Vec<String>);
+
+    /// One-shot-per-connection HTTP server on a loopback port: records the first request head,
+    /// then answers every connection with the canned replies in order, repeating the last one.
+    /// Retried requests each get their own connection, so a 503-then-200 sequence is expressible.
+    /// Nothing here leaves the machine.
+    async fn loopback_server_replies(
+        replies: Vec<Canned>,
     ) -> (u16, tokio::sync::oneshot::Receiver<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1104,45 +1269,69 @@ mod tests {
             .expect("bind a loopback port");
         let port = listener.local_addr().expect("loopback address").port();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let length: usize = body_pieces.iter().map(String::len).sum();
+        let replies = std::sync::Arc::new(replies);
 
         tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept the provider");
-            let mut received = Vec::new();
-            let mut chunk = [0u8; 2048];
-            let head = loop {
-                let read = socket.read(&mut chunk).await.expect("read the request");
-                if read == 0 {
-                    break String::new();
-                }
-                received.extend_from_slice(&chunk[..read]);
-                if let Some(end) = head_end(&received)
-                    && received.len() >= end + content_length(&received[..end])
-                {
-                    break String::from_utf8_lossy(&received[..end]).into_owned();
-                }
-            };
-            let _ = tx.send(head);
+            let mut record = Some(tx);
+            let mut index = 0usize;
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let (status, content_type, body_pieces) =
+                    replies[index.min(replies.len() - 1)].clone();
+                index += 1;
+                let recorded = record.take();
+                tokio::spawn(async move {
+                    let mut received = Vec::new();
+                    let mut chunk = [0u8; 2048];
+                    let head = loop {
+                        let read = socket.read(&mut chunk).await.expect("read the request");
+                        if read == 0 {
+                            break String::new();
+                        }
+                        received.extend_from_slice(&chunk[..read]);
+                        if let Some(end) = head_end(&received)
+                            && received.len() >= end + content_length(&received[..end])
+                        {
+                            break String::from_utf8_lossy(&received[..end]).into_owned();
+                        }
+                    };
+                    if let Some(tx) = recorded {
+                        let _ = tx.send(head);
+                    }
 
-            let response_head = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
-            );
-            socket
-                .write_all(response_head.as_bytes())
-                .await
-                .expect("write the response head");
-            for piece in body_pieces {
-                socket
-                    .write_all(piece.as_bytes())
-                    .await
-                    .expect("write a response piece");
-                socket.flush().await.expect("flush");
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                    let length: usize = body_pieces.iter().map(String::len).sum();
+                    let response_head = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                    );
+                    socket
+                        .write_all(response_head.as_bytes())
+                        .await
+                        .expect("write the response head");
+                    for piece in body_pieces {
+                        socket
+                            .write_all(piece.as_bytes())
+                            .await
+                            .expect("write a response piece");
+                        socket.flush().await.expect("flush");
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    let _ = socket.shutdown().await;
+                });
             }
-            let _ = socket.shutdown().await;
         });
 
         (port, rx)
+    }
+
+    async fn loopback_server(
+        status: &'static str,
+        content_type: &'static str,
+        body_pieces: Vec<String>,
+    ) -> (u16, tokio::sync::oneshot::Receiver<String>) {
+        loopback_server_replies(vec![(status, content_type, body_pieces)]).await
     }
 
     /// Drain a provider stream, so an assertion can see the whole answer.
@@ -1293,7 +1482,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rate_limited_reply_becomes_a_rejection_over_the_wire() {
+    async fn a_rate_limited_reply_is_retried_then_becomes_a_rejection_over_the_wire() {
         let (port, _recorded) = loopback_server(
             "429 Too Many Requests",
             "application/json",
@@ -1306,20 +1495,75 @@ mod tests {
         let provider = AnthropicProvider::new(format!("http://127.0.0.1:{port}"), MODEL, "k", None);
 
         let events = tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(15),
             collect(provider.stream(request(vec![Message::user("hi")]))),
         )
         .await
         .expect("the loopback server answers inside the timeout");
 
-        assert_eq!(events.len(), 1, "{events:?}");
-        match &events[0] {
+        assert_eq!(events.len(), 3, "{events:?}");
+        for event in &events[..2] {
+            match event {
+                Ok(ProviderEvent::Retrying {
+                    attempt, status, ..
+                }) => {
+                    assert_eq!(*status, 429, "the retry names the status that caused it");
+                    assert!(*attempt <= 2, "{event:?}");
+                }
+                other => panic!("a retried 429 must announce itself first, got {other:?}"),
+            }
+        }
+        match &events[2] {
             Err(VikramError::ProviderRejected(text)) => {
                 assert!(text.contains("429"), "{text}");
                 assert!(text.contains("slow down"), "{text}");
             }
             other => panic!("expected a final refusal, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_transient_status_is_retried_and_the_answer_still_arrives() {
+        let (port, _recorded) = loopback_server_replies(vec![
+            (
+                "503 Service Unavailable",
+                "application/json",
+                vec![r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#
+                    .to_owned()],
+            ),
+            ("200 OK", "text/event-stream", vec![sse(TEXT_ANSWER)]),
+            ("200 OK", "text/event-stream", vec![sse(TEXT_ANSWER)]),
+        ])
+        .await;
+        let provider = AnthropicProvider::new(format!("http://127.0.0.1:{port}"), MODEL, "k", None);
+
+        let events = tokio::time::timeout(
+            Duration::from_secs(15),
+            collect(provider.stream(request(vec![Message::user("hi")]))),
+        )
+        .await
+        .expect("the loopback server answers inside the timeout");
+
+        match &events[0] {
+            Ok(ProviderEvent::Retrying {
+                attempt,
+                of,
+                wait_ms,
+                status,
+            }) => {
+                assert_eq!((*attempt, *of, *status), (1, 3, 503), "{events:?}");
+                assert!(*wait_ms > 0 && *wait_ms <= 10_000, "{events:?}");
+            }
+            other => panic!("the 503 must be announced as a retry, got {other:?}"),
+        }
+        assert!(
+            matches!(&events[1], Ok(ProviderEvent::TextDelta(text)) if text == "Hello"),
+            "the retried request streams the real answer: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(Ok(ProviderEvent::Finished { .. }))),
+            "the stream still finishes: {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -1339,9 +1583,15 @@ mod tests {
         .await
         .expect("a refused connection must not hang the turn");
 
-        assert_eq!(events.len(), 1, "{events:?}");
-        match &events[0] {
-            Err(VikramError::ProviderTransient(text)) => {
+        assert!(events.len() >= 2, "{events:?}");
+        assert!(
+            events[..events.len() - 1]
+                .iter()
+                .all(|event| matches!(event, Ok(ProviderEvent::Retrying { status: 0, .. }))),
+            "a dead connection is retried before it is reported: {events:?}"
+        );
+        match events.last() {
+            Some(Err(VikramError::ProviderTransient(text))) => {
                 assert!(text.contains(&format!("127.0.0.1:{port}")), "{text}");
                 assert!(text.contains("cannot reach"), "{text}");
             }

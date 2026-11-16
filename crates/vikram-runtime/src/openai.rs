@@ -108,7 +108,7 @@ pub fn model_ids(body: &Value) -> Vec<String> {
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(10);
 
 /// How many times one request is put on the wire before the refusal is believed.
-const MAX_ATTEMPTS: u32 = 3;
+pub(crate) const MAX_ATTEMPTS: u32 = 3;
 
 /// Statuses a model endpoint asks us to try again on, rather than treat as a final refusal. Every
 /// 5xx qualifies, because gateways disagree about which of them are permanent (529 overloaded, for
@@ -118,16 +118,108 @@ fn retryable_status(status: reqwest::StatusCode) -> bool {
 }
 
 /// Exponential backoff with a ceiling: 0.5s, 1s, 2s, then 4s.
-fn backoff(attempt: u32) -> Duration {
+pub(crate) fn backoff(attempt: u32) -> Duration {
     let factor = 2u64.saturating_pow(attempt.saturating_sub(1)).min(8);
     Duration::from_millis(500 * factor)
 }
 
 /// `Retry-After` when the server names a delay; capped so a hostile header cannot stall a turn.
-fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+/// Both forms of the header are honoured: delta-seconds and an HTTP-date.
+pub(crate) fn retry_after(response: &reqwest::Response) -> Option<Duration> {
     let value = response.headers().get(reqwest::header::RETRY_AFTER)?;
-    let seconds = value.to_str().ok()?.trim().parse::<u64>().ok()?;
-    Some(Duration::from_secs(seconds.min(300)))
+    let text = value.to_str().ok()?.trim();
+    if let Ok(seconds) = text.parse::<u64>() {
+        return Some(Duration::from_secs(seconds.min(300)));
+    }
+    let at = http_date_epoch(text)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(Duration::from_secs(at.saturating_sub(now).min(300)))
+}
+
+/// An HTTP-date (IMF-fixdate, RFC 850 or asctime) as seconds since the epoch. `None` when the
+/// text is none of the three shapes — a `Retry-After` we cannot read is a header we ignore.
+fn http_date_epoch(text: &str) -> Option<u64> {
+    // IMF-fixdate and RFC 850 lead with a weekday and a comma; asctime has no comma at all.
+    let body = match text.split_once(',') {
+        Some((_, rest)) => rest.trim(),
+        None => text,
+    };
+    let tokens: Vec<&str> = body.split_whitespace().collect();
+    let (day, month, year, time): (&str, &str, i64, &str) = match tokens.as_slice() {
+        // "06 Nov 1994 08:49:37 GMT": five fields, the zone last.
+        [day, month, year, time, zone] if zone.eq_ignore_ascii_case("gmt") => {
+            (*day, *month, year.parse::<i64>().ok()?, *time)
+        }
+        // "Sunday, 06-Nov-94 08:49:37 GMT" arrives as "06-Nov-94 08:49:37 GMT". A two-digit
+        // year reads as 2000s below 70, matching every real deployment.
+        [date, time, ..] if date.contains('-') => {
+            let parts: Vec<&str> = date.split('-').collect();
+            if parts.len() != 3 {
+                return None;
+            }
+            let y = parts[2].parse::<u64>().ok()?;
+            let year = if parts[2].len() <= 2 {
+                if y < 70 { 2000 + y } else { 1900 + y }
+            } else {
+                y
+            } as i64;
+            (parts[0], parts[1], year, *time)
+        }
+        // asctime: "Sun Nov  6 08:49:37 1994" — weekday first, bare year last, no zone.
+        [weekday, month, day, time, year] if weekday.chars().all(|c| c.is_ascii_alphabetic()) => {
+            (*day, *month, year.parse::<i64>().ok()?, *time)
+        }
+        _ => return None,
+    };
+    let (hour, minute, second) = parse_hms(time)?;
+    let days = days_from_civil(year, month_number(month)?, day.parse::<u64>().ok()?);
+    let epoch = days * 86_400 + (hour * 3_600 + minute * 60 + second) as i64;
+    u64::try_from(epoch).ok()
+}
+
+fn parse_hms(time: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = time.split(':');
+    let hour = parts.next()?.parse::<u64>().ok()?;
+    let minute = parts.next()?.parse::<u64>().ok()?;
+    let second = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    Some((hour, minute, second))
+}
+
+fn month_number(name: &str) -> Option<u64> {
+    let lowered = name.to_ascii_lowercase();
+    let prefix = lowered.get(..3)?;
+    match prefix {
+        "jan" => Some(1),
+        "feb" => Some(2),
+        "mar" => Some(3),
+        "apr" => Some(4),
+        "may" => Some(5),
+        "jun" => Some(6),
+        "jul" => Some(7),
+        "aug" => Some(8),
+        "sep" => Some(9),
+        "oct" => Some(10),
+        "nov" => Some(11),
+        "dec" => Some(12),
+        _ => None,
+    }
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm).
+fn days_from_civil(year: i64, month: u64, day: u64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp as i64 + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// The reset time a rate-limit window carries, in either place providers put it: the
@@ -169,7 +261,7 @@ fn quota_window_exhausted(body: &str) -> bool {
 
 /// What a refusal deserves: another attempt after a wait, or an answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Retry {
+pub(crate) enum Retry {
     /// Try once more after this delay.
     After(Duration),
     /// Do not try again; the refusal is already in words.
@@ -188,7 +280,7 @@ fn until_reset(reset_epoch_secs: Option<u64>) -> Option<Duration> {
 
 /// Spread retries so parallel turns do not hammer a rate-limited endpoint in lockstep. `backoff`
 /// stays a pure function; the wobble is applied where the sleep happens.
-fn jittered(delay: Duration) -> Duration {
+pub(crate) fn jittered(delay: Duration) -> Duration {
     let millis = delay.as_millis() as u64;
     let spread = (millis / 5).max(1);
     let nanos = std::time::SystemTime::now()
@@ -201,7 +293,7 @@ fn jittered(delay: Duration) -> Duration {
 
 /// Retry, or stop. This is the whole policy in one place so the answer to "why did it try three
 /// times" is readable instead of spread through the loop.
-fn retry_decision(
+pub(crate) fn retry_decision(
     status: reqwest::StatusCode,
     body: &str,
     wait: Option<Duration>,
@@ -325,7 +417,7 @@ fn error_chain(err: &reqwest::Error) -> String {
     text
 }
 
-fn explain_transport(err: &reqwest::Error, endpoint: &str, attempts: u32) -> String {
+pub(crate) fn explain_transport(err: &reqwest::Error, endpoint: &str, attempts: u32) -> String {
     let text = error_chain(err).to_lowercase();
     if text.contains("dns") || text.contains("lookup address") {
         format!(
@@ -346,7 +438,7 @@ fn explain_transport(err: &reqwest::Error, endpoint: &str, attempts: u32) -> Str
 
 /// A transport error worth another attempt. A refusal by DNS or TLS will say the same thing every
 /// time, and retrying it only makes the operator wait longer for the same message.
-fn retryable_transport(err: &reqwest::Error) -> bool {
+pub(crate) fn retryable_transport(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect() || err.is_request()
 }
 
@@ -488,6 +580,7 @@ impl Provider for OpenAiProvider {
 
             let mut stream = response.bytes_stream();
             let mut buffer = String::new();
+            let mut utf8_tail: Vec<u8> = Vec::new();
             let mut pending = stream_state();
             let mut finished = false;
 
@@ -504,7 +597,24 @@ impl Provider for OpenAiProvider {
                         return;
                     }
                 };
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                utf8_tail.extend_from_slice(&chunk);
+                // Decode only complete UTF-8: a multi-byte char split across chunks must not
+                // become U+FFFD. Incomplete trailing bytes wait for the next chunk.
+                match std::str::from_utf8(&utf8_tail) {
+                    Ok(text) => {
+                        buffer.push_str(text);
+                        utf8_tail.clear();
+                    }
+                    Err(err) if err.error_len().is_none() => {
+                        let valid = err.valid_up_to();
+                        buffer.push_str(std::str::from_utf8(&utf8_tail[..valid]).unwrap_or(""));
+                        utf8_tail.drain(..valid);
+                    }
+                    Err(_) => {
+                        buffer.push_str(&String::from_utf8_lossy(&utf8_tail));
+                        utf8_tail.clear();
+                    }
+                }
 
                 while let Some(index) = buffer.find('\n') {
                     let line = buffer[..index].trim_end_matches('\r').to_owned();
@@ -740,6 +850,11 @@ struct StreamState {
     /// once the headers are out: the failure is in the body, and ignoring it turns a broken request
     /// into an empty answer.
     error: Option<String>,
+    /// `finish_reason` from the final choice. `length` means the answer was cut off at the
+    /// output-token limit and must not read as a clean finish.
+    finish_reason: Option<String>,
+    /// Set once the truncation note has been emitted, so `[DONE]` and end-of-stream cannot repeat it.
+    truncation_noted: bool,
 }
 
 fn stream_state() -> StreamState {
@@ -799,6 +914,9 @@ fn parse_sse_line(line: &str, state: &mut StreamState) -> Option<Vec<ProviderEve
         );
         return Some(Vec::new());
     }
+    if let Some(reason) = finish_reason {
+        state.finish_reason = Some(reason.to_owned());
+    }
 
     if let Some(usage) = value.get("usage").filter(|v| !v.is_null()) {
         let input = usage.get("prompt_tokens").and_then(Value::as_u64);
@@ -808,10 +926,15 @@ fn parse_sse_line(line: &str, state: &mut StreamState) -> Option<Vec<ProviderEve
                 state.finish = Some((input, output));
                 return None;
             }
-            return Some(vec![ProviderEvent::Finished {
+            let mut events = Vec::new();
+            if let Some(note) = truncation_note(state) {
+                events.push(note);
+            }
+            events.push(ProviderEvent::Finished {
                 input_tokens: input,
                 output_tokens: output,
-            }]);
+            });
+            return Some(events);
         }
     }
 
@@ -869,10 +992,25 @@ fn parse_sse_line(line: &str, state: &mut StreamState) -> Option<Vec<ProviderEve
     }
 }
 
+/// The note a `length` finish earns, once. Emitted before `Finished` wherever the finish is
+/// assembled — the same surfacing the Anthropic provider gives `stop_reason: max_tokens`.
+fn truncation_note(state: &mut StreamState) -> Option<ProviderEvent> {
+    if state.truncation_noted || state.finish_reason.as_deref() != Some("length") {
+        return None;
+    }
+    state.truncation_noted = true;
+    Some(ProviderEvent::TextDelta(
+        "\n[response truncated: the model reached its output-token limit (`length`)]".to_owned(),
+    ))
+}
+
 /// Flush what the stream holds: assembled tool calls first, then a `Finished` that was waiting
 /// for them.
 fn finish_pending(state: &mut StreamState) -> Vec<ProviderEvent> {
     let mut events = Vec::new();
+    if let Some(note) = truncation_note(state) {
+        events.push(note);
+    }
     for (_, entry) in std::mem::take(&mut state.calls) {
         let Some(name) = entry.name else { continue };
         let arguments = match serde_json::from_str::<Value>(&entry.arguments) {
@@ -1030,6 +1168,42 @@ mod tests {
         assert!(state.error.is_some(), "silence must not look like success");
     }
 
+    #[test]
+    fn a_length_finish_is_announced_as_truncation_before_finished() {
+        let mut state = stream_state();
+        parse_sse_line(
+            r#"data: {"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}"#,
+            &mut state,
+        );
+        // finish_reason arrives on the closing choice, usage after it, [DONE] last.
+        assert!(
+            parse_sse_line(
+                r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+                &mut state,
+            )
+            .is_none()
+        );
+        let events = parse_sse_line(
+            r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+            &mut state,
+        )
+        .expect("usage closes the stream");
+        assert!(
+            matches!(&events[0], ProviderEvent::TextDelta(note) if note.contains("length")),
+            "the cut must be named before the finish: {events:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(ProviderEvent::Finished { .. })
+        ));
+        // [DONE] must not repeat the note.
+        assert!(
+            parse_sse_line("data: [DONE]", &mut state)
+                .expect("done flushes")
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn a_host_that_cannot_be_resolved_is_named_as_dns() {
         let endpoint = "http://no-such-host-xyz.invalid/v1/chat/completions";
@@ -1049,6 +1223,30 @@ mod tests {
         assert_eq!(backoff(2), Duration::from_millis(1000));
         assert_eq!(backoff(3), Duration::from_millis(2000));
         assert_eq!(backoff(9), Duration::from_millis(4000));
+    }
+
+    #[test]
+    fn every_http_date_form_of_retry_after_parses_to_the_same_instant() {
+        // 1994-11-06 08:49:37 UTC is the RFC 7231 example, in all three legal spellings.
+        let expected = 784_111_777u64;
+        for text in [
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+            "Sunday, 06-Nov-94 08:49:37 GMT",
+            "Sun Nov  6 08:49:37 1994",
+        ] {
+            assert_eq!(
+                http_date_epoch(text),
+                Some(expected),
+                "{text} must read as the same instant"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_retry_after_is_none_rather_than_a_guess() {
+        for text in ["", "soon", "123abc", "32 Nov 1994 99:99:99 GMT"] {
+            assert_eq!(http_date_epoch(text), None, "{text}");
+        }
     }
 
     #[test]
