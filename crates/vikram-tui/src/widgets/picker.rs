@@ -982,7 +982,12 @@ mod tests {
             })
             .collect();
         assert!(text.contains("connection refused"), "got {text}");
-        assert!(text.contains("nothing to choose"), "got {text}");
+        // The note is the explanation, so the generic bullet must not trail it. Two sentences saying
+        // the list is short read as two separate complaints.
+        assert!(
+            !text.contains("nothing to choose"),
+            "the generic empty bullet repeated the note: {text}"
+        );
     }
 
     #[test]

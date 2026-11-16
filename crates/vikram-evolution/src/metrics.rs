@@ -357,7 +357,8 @@ impl EvolutionStore {
         let since = now.saturating_sub(window_ms);
         let all_time = self.outcome_counts(category, None)?;
         let recent = self.outcome_counts(category, Some(since))?;
-        let (first_timestamp_ms, last_timestamp_ms) = self.experience_time_bounds()?;
+        let (first_timestamp_ms, last_timestamp_ms) =
+            self.experience_time_bounds_for(category)?;
         Ok(ExperienceStats {
             window_ms,
             all_time,
@@ -382,11 +383,21 @@ impl EvolutionStore {
 
     /// Oldest and newest recorded experience timestamps, if any exist.
     pub fn experience_time_bounds(&self) -> Result<(Option<u64>, Option<u64>)> {
+        self.experience_time_bounds_for(None)
+    }
+
+    /// The same bounds restricted to one `task_category`, matching the filters the rest of
+    /// [`ExperienceStats`] applies — global bounds on a filtered stat would be wrong data.
+    pub fn experience_time_bounds_for(
+        &self,
+        category: Option<&str>,
+    ) -> Result<(Option<u64>, Option<u64>)> {
         self.with_conn(|conn| {
             let (min, max): (Option<i64>, Option<i64>) = conn
                 .query_row(
-                    "SELECT MIN(timestamp_ms), MAX(timestamp_ms) FROM experiences",
-                    [],
+                    "SELECT MIN(timestamp_ms), MAX(timestamp_ms) FROM experiences
+                     WHERE (?1 IS NULL OR task_category = ?1)",
+                    rusqlite::params![category],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .map_err(store_err)?;
