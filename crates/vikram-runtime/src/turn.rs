@@ -616,7 +616,10 @@ pub(crate) async fn run_turn(
         // a resource: reads, writes to different files, commands on different terminal or
         // browser sessions and different tools all proceed side by side, while calls that
         // could observe or overwrite each other keep their order inside one lane.
-        steps_used += calls.len() as u64;
+        // One provider round is one step, however many calls it asked for: counting `calls.len()`
+        // made a single step that emitted 30 parallel calls report "30 steps" and trip the budget
+        // notice on the first round.
+        steps_used += 1;
         if steps_used >= max_steps && !step_notice_sent {
             // A budget, not a wall. The operator can see the count and stop the turn
             // themselves; ending it here would throw away a turn that is still finding
@@ -1215,9 +1218,11 @@ async fn run_tool_once(
     }
 
     // A delegated session is one step further from the operator, and `max_delegation_depth` is only
-    // real if the gate can see that: a child may not keep spawning children.
-    let raw = inner.policy().evaluate_at_depth(&request, session.depth());
-    let decision = inner.judge(&request);
+    // real if the gate can see that: a child may not keep spawning children. The decision must be
+    // the depth-aware one — judging at depth 0 computed the veto and then ignored it.
+    let depth = session.depth();
+    let raw = inner.policy().evaluate_at_depth(&request, depth);
+    let decision = inner.judge_at_depth(&request, depth);
     let auto = PermissionMode::auto_resolved(&raw, &decision);
     inner.journal(
         &session.id,

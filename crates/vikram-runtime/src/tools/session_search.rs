@@ -54,14 +54,25 @@ impl Tool for SessionSearch {
             .search_session_text_filtered(&q, agent.as_ref(), project.as_ref(), since, limit)
             .map_err(|e| VikramError::Storage(e.to_string()))?;
         if hits.is_empty() {
-            // Fallback to LIKE-based search_sessions
+            // Fallback to LIKE-based search_sessions. It searches titles and journal payloads,
+            // not message bodies, and it knows nothing about the filters — so they are applied
+            // here, and an empty answer says so instead of returning "" with ok:true.
             let rows = store
                 .search_sessions(&q, true)
                 .map_err(|e| VikramError::Storage(e.to_string()))?;
             let out: Vec<String> = rows
                 .iter()
+                .filter(|r| agent.as_ref().is_none_or(|a| r.bot.as_ref() == Some(a)))
+                .filter(|r| project.as_ref().is_none_or(|p| r.project_id.as_ref() == Some(p)))
+                .filter(|r| r.updated_ms >= since)
                 .map(|r| format!("{}: {}", r.id, r.title))
                 .collect();
+            if out.is_empty() {
+                return Ok(ToolOutput {
+                    content: format!("no sessions match `{q}`"),
+                    ok: false,
+                });
+            }
             return Ok(ToolOutput {
                 content: out.join("\n"),
                 ok: true,

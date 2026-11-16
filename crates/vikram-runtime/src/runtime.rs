@@ -820,8 +820,15 @@ impl RuntimeInner {
     /// then the posture in force decides what to do with a prompt. Both entry points — the turn
     /// loop and the kernel dispatch — go through this, so a view cannot invent its own gate.
     pub fn judge(&self, request: &PermissionRequest) -> Decision {
+        self.judge_at_depth(request, 0)
+    }
+
+    /// The same decision, evaluated at a delegation depth. The mandatory floor's
+    /// `max_delegation_depth` veto only exists in the depth-aware path, so a session that is
+    /// already deep must be judged here — `judge` alone would let it keep delegating.
+    pub fn judge_at_depth(&self, request: &PermissionRequest, depth: u32) -> Decision {
         let policy = self.policy();
-        let raw = policy.evaluate(request);
+        let raw = policy.evaluate_at_depth(request, depth);
         let listed = policy.has_allow(request);
         let root = self.workspace_root.to_string_lossy().into_owned();
         self.mode().resolve(
