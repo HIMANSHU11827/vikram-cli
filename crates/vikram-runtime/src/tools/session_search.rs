@@ -63,7 +63,11 @@ impl Tool for SessionSearch {
             let out: Vec<String> = rows
                 .iter()
                 .filter(|r| agent.as_ref().is_none_or(|a| r.bot.as_ref() == Some(a)))
-                .filter(|r| project.as_ref().is_none_or(|p| r.project_id.as_ref() == Some(p)))
+                .filter(|r| {
+                    project
+                        .as_ref()
+                        .is_none_or(|p| r.project_id.as_ref() == Some(p))
+                })
                 .filter(|r| r.updated_ms >= since)
                 .map(|r| format!("{}: {}", r.id, r.title))
                 .collect();

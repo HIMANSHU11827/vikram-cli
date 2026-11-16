@@ -1802,6 +1802,19 @@ pub fn run_bot_click(app: &mut App, click: BotClick) {
         .get(app.bot_selection)
         .map(|agent| agent.profile.id.clone());
 
+    // Most of these chips act on the bot the pane has selected. With none selected the press used
+    // to return without a word — the same silence the empty panels had. It now names the chip, says
+    // what is missing, and points at the one chip that fixes it, so the answer is a next step.
+    if selected.is_none()
+        && let Some(chip) = chip_needs_bot(&click)
+    {
+        app.push_notice(
+            vikram_runtime::types::NoticeLevel::Warn,
+            format!("`{chip}` needs a bot — none is selected; `new bot` makes one"),
+        );
+        return;
+    }
+
     match click {
         // The row arm was answered by an early `if let` that returned before the match, which left
         // this arm as dead code that could never run. The body lives here now, where it is read.
@@ -1923,6 +1936,24 @@ pub fn run_bot_click(app: &mut App, click: BotClick) {
         BotClick::Mode => app
             .commands
             .push(UiCommand::OpenPicker { kind: PickerKind::Mode }),
+    }
+}
+
+/// The chips that cannot do anything without a selected bot.
+///
+/// `Row` names its own bot, `Spawn` and `NewBot` create one, and `Mode` is a setting, so none of
+/// those belongs here — a press on them is already meaningful with an empty pane.
+fn chip_needs_bot(click: &BotClick) -> Option<&'static str> {
+    match click {
+        BotClick::Rename => Some("rename"),
+        BotClick::Tag => Some("tag"),
+        BotClick::Soul => Some("soul"),
+        BotClick::NewChat => Some("new chat"),
+        BotClick::Pause => Some("pause"),
+        BotClick::Resume => Some("resume"),
+        BotClick::Stop => Some("stop"),
+        BotClick::Remove => Some("remove"),
+        BotClick::Row(_) | BotClick::Spawn | BotClick::NewBot | BotClick::Mode => None,
     }
 }
 

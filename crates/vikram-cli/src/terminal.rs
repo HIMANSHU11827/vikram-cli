@@ -1116,13 +1116,6 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
         PickerKind::HiveRoster => {
             let rosters = handle.hive_roster_list();
             let mut items = Vec::new();
-            if rosters.is_empty() {
-                items.push(PickerItem::new(
-                    "no hives yet".to_owned(),
-                    String::new(),
-                    "empty".to_owned(),
-                ));
-            }
             for roster in &rosters {
                 items.push(PickerItem::new(
                     roster.name.clone(),
@@ -1137,7 +1130,11 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                     ));
                 }
             }
-            app.open_picker(Picker::new(kind, "Hives", items));
+            // An empty list says so as a note, not as a row. The placeholder row it used to push
+            // counted as a selectable item — the counter read `1 of 1` over nothing, and pressing
+            // it would have acted on a hive that does not exist.
+            let picker = Picker::new(kind, "Hives", items).with_note("no hives yet");
+            app.open_picker(picker);
         }
         PickerKind::Skill => {
             let snapshot = handle.snapshot();

@@ -888,7 +888,9 @@ pub fn shortcuts(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     } else {
         &[
             ("Enter", "send"),
-            ("Tab", "queue"),
+            // Tab flips between queue and steer, so the action is the mode, not the queue. Printing
+            // `queue` promised a switch in one direction that the key does not make.
+            ("Tab", "mode"),
             ("Esc", "interrupt"),
             ("Ctrl+C", "stop"),
         ]
@@ -2357,7 +2359,7 @@ mod tests {
         // the button, not a space that happens to be there.
         for (key, action) in [
             ("Enter", "send"),
-            ("Tab", "queue"),
+            ("Tab", "mode"),
             ("Esc", "interrupt"),
             ("Ctrl+C", "stop"),
         ] {

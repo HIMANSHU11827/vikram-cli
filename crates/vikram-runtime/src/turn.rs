@@ -108,7 +108,9 @@ fn bot_preamble(profile: &crate::types::BotProfile) -> String {
     }
     let description = profile.description.trim();
     if !description.is_empty() {
-        text.push_str(&format!(" About you, in the operator's words: {description}"));
+        text.push_str(&format!(
+            " About you, in the operator's words: {description}"
+        ));
     }
     // The operator's standing instructions, if they wrote any. They are given the same weight as the
     // identity above: they are what the bot is supposed to do, every turn, without being asked again.
