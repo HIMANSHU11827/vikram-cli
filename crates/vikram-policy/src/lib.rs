@@ -215,13 +215,37 @@ impl Rule {
 
 /// The separate commands inside one shell string. Splitting is textual, not a shell parse: a
 /// command that merely contains one of these characters is over-split, and over-splitting only ever
-/// costs a prompt — an allow rule that does not match is a rule that asks.
+/// costs a prompt — an allow rule that does not match is a rule that asks. Redirection,
+/// substitution, and grouping operators split too: `cargo test > /etc/x` is two effects, not one
+/// approved word, and `cargo test $(id)` is not the command that was saved.
 pub fn command_segments(command: &str) -> Vec<&str> {
-    command
-        .split(['&', '|', ';', '\n'])
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
-        .collect()
+    let bytes = command.as_bytes();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        // `$(` and `((` are two-byte operators; every other delimiter is a single byte.
+        let pair = i + 1 < bytes.len() && bytes[i + 1] == b'(' && matches!(bytes[i], b'$' | b'(');
+        let single = matches!(
+            bytes[i],
+            b'&' | b'|' | b';' | b'\n' | b'>' | b'<' | b'`' | b'{' | b'}' | b'(' | b')'
+        );
+        if pair || single {
+            let segment = command[start..i].trim();
+            if !segment.is_empty() {
+                segments.push(segment);
+            }
+            i += if pair { 2 } else { 1 };
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    let segment = command[start..].trim();
+    if !segment.is_empty() {
+        segments.push(segment);
+    }
+    segments
 }
 
 /// Constraints no rule may relax.
@@ -283,11 +307,15 @@ impl MandatoryFloor {
             } else {
                 std::path::Path::new(root).join(&path)
             };
-            let within_root = canonical.starts_with(root) && !escapes_root(&canonical, root);
+            // A root that trims to nothing ("/" or "") confines nothing: `starts_with("")` would
+            // accept every path, so the floor fails closed and treats the request as outside.
+            let within_root =
+                !root.is_empty() && canonical.starts_with(root) && !escapes_root(&canonical, root);
             let within_extra = self.extra_write_roots.iter().any(|extra| {
                 let extra = extra.trim_end_matches('/');
-                canonical == std::path::Path::new(extra)
-                    || canonical.starts_with(extra) && !escapes_root(&canonical, extra)
+                !extra.is_empty()
+                    && (canonical == std::path::Path::new(extra)
+                        || canonical.starts_with(extra) && !escapes_root(&canonical, extra))
             });
             let outside = !within_root && !within_extra;
             if outside {
@@ -438,15 +466,30 @@ impl Policy {
             return Decision::Deny { reason };
         }
 
-        // Per-tool overrides are consulted before any rule: a deny wins over every allow.
+        // Deny is final across every source: a saved rule, a built-in default, or a config
+        // override. An allow from any of them cannot outvote a refusal.
+        if self
+            .tool_permissions
+            .get(&req.verb)
+            .is_some_and(|v| v == "deny")
+        {
+            return Decision::Deny {
+                reason: format!("tool `{}` is denied by config override", req.verb),
+            };
+        }
+
+        let rules_decision = Self::scan(&self.rules, &req);
+        let defaults_decision = Self::scan(&self.defaults, &req);
+        for decision in rules_decision.iter().chain(defaults_decision.iter()) {
+            if matches!(decision, Decision::Deny { .. }) {
+                return decision.clone();
+            }
+        }
+
+        // Overrides still outrank prompts and quiet allows, but never a deny.
         if let Some(override_value) = self.tool_permissions.get(&req.verb) {
             match override_value.as_str() {
                 "allow" => return Decision::Allow,
-                "deny" => {
-                    return Decision::Deny {
-                        reason: format!("tool `{}` is denied by config override", req.verb),
-                    };
-                }
                 "ask" => {
                     return Decision::RequireApproval {
                         reason: format!("tool `{}` requires approval by config override", req.verb),
@@ -457,11 +500,13 @@ impl Policy {
             }
         }
 
-        let decided = Self::scan(&self.rules, &req).or_else(|| Self::scan(&self.defaults, &req));
-
-        decided.unwrap_or_else(|| Decision::Deny {
-            reason: format!("no rule permits `{}` on `{}`", req.verb, req.resource),
-        })
+        // Operator rules decide before the defaults they were written against — an operator allow
+        // must be able to end a default's prompt. Denies were already settled above, in both tiers.
+        rules_decision
+            .or(defaults_decision)
+            .unwrap_or_else(|| Decision::Deny {
+                reason: format!("no rule permits `{}` on `{}`", req.verb, req.resource),
+            })
     }
 
     /// One tier: deny returns immediately, an `ask` outranks an `allow`, and matching nothing is not
@@ -1283,6 +1328,134 @@ mod tests {
             Trust::Model,
         );
         assert!(matches!(policy.evaluate(&req), Decision::Deny { .. }));
+    }
+
+    #[test]
+    fn an_allow_rule_does_not_cover_redirection_substitution_or_grouping() {
+        let policy = allowlist_policy();
+        for command in [
+            "cargo test > /tmp/x",
+            "cargo test >> /etc/cron.d/evil",
+            "cargo test < /etc/passwd",
+            "cargo test $(id)",
+            "cargo test `id`",
+            "cargo test { rm -rf /; }",
+            "cargo test ((id))",
+        ] {
+            assert!(
+                matches!(
+                    policy.evaluate(&shell(command)),
+                    Decision::RequireApproval { .. }
+                ),
+                "`{command}` smuggles an effect past `cargo test *`"
+            );
+        }
+        // The unsullied command still runs quietly.
+        assert!(policy.evaluate(&shell("cargo test -p x")).is_allowed());
+    }
+
+    #[test]
+    fn a_deny_in_either_rule_tier_outranks_an_allow_in_the_other() {
+        let policy = Policy::with_defaults(
+            vec![Rule::allow(ActionKind::Execute, ResourcePattern::Any)],
+            vec![Rule::deny(
+                ActionKind::Execute,
+                ResourcePattern::Any,
+                "defaults say no",
+            )],
+            MandatoryFloor::default(),
+        );
+        assert!(matches!(
+            policy.evaluate(&shell("cargo test")),
+            Decision::Deny { .. }
+        ));
+        // The same holds with the tiers swapped: an operator deny beats a default allow.
+        let swapped = Policy::with_defaults(
+            vec![Rule::deny(
+                ActionKind::Execute,
+                ResourcePattern::Any,
+                "operator said no",
+            )],
+            vec![Rule::allow(ActionKind::Execute, ResourcePattern::Any)],
+            MandatoryFloor::default(),
+        );
+        assert!(matches!(
+            swapped.evaluate(&shell("cargo test")),
+            Decision::Deny { .. }
+        ));
+        // And an operator ask still loses to a default deny.
+        let asked = Policy::with_defaults(
+            vec![Rule::ask(
+                ActionKind::Execute,
+                ResourcePattern::Any,
+                "review first",
+            )],
+            vec![Rule::deny(
+                ActionKind::Execute,
+                ResourcePattern::Any,
+                "defaults say no",
+            )],
+            MandatoryFloor::default(),
+        );
+        assert!(matches!(
+            asked.evaluate(&shell("cargo test")),
+            Decision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn a_tool_override_allow_cannot_bypass_a_deny_in_either_tier() {
+        let mut overrides = HashMap::new();
+        overrides.insert("shell.run".to_owned(), "allow".to_owned());
+        let saved_deny = Policy::with_defaults(
+            vec![Rule::deny(
+                ActionKind::Execute,
+                ResourcePattern::Any,
+                "operator said no",
+            )],
+            Vec::new(),
+            MandatoryFloor::default(),
+        )
+        .with_tool_permissions(overrides.clone());
+        assert!(matches!(
+            saved_deny.evaluate(&shell("cargo test")),
+            Decision::Deny { .. }
+        ));
+        let default_deny = Policy::with_defaults(
+            Vec::new(),
+            vec![Rule::deny(
+                ActionKind::Execute,
+                ResourcePattern::Any,
+                "defaults say no",
+            )],
+            MandatoryFloor::default(),
+        )
+        .with_tool_permissions(overrides);
+        assert!(matches!(
+            default_deny.evaluate(&shell("cargo test")),
+            Decision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn an_empty_or_filesystem_root_workspace_fails_closed() {
+        for root in ["", "/"] {
+            let floor = MandatoryFloor {
+                workspace_root: Some(root.into()),
+                ..Default::default()
+            };
+            let policy = Policy::new(
+                vec![Rule::allow(ActionKind::Write, ResourcePattern::Any)],
+                floor,
+            );
+            assert!(
+                matches!(
+                    policy.evaluate(&fs_write("/work/a.txt", Trust::Model)),
+                    Decision::Deny { .. }
+                ),
+                "workspace root `{root}` trims to nothing and must confine nothing"
+            );
+        }
     }
 
     #[test]

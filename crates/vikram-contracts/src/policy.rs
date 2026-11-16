@@ -312,14 +312,38 @@ impl std::fmt::Display for PermissionMode {
 }
 
 /// A resource is inside the root only as a path segment, never as a string prefix that happens to
-/// match — `/work/proj-evil` does not start with `/work/proj`.
+/// match — `/work/proj-evil` does not start with `/work/proj`. `.` and `..` components are resolved
+/// lexically first, so `/work/../etc/passwd` is `/etc/passwd` and not "inside `/work`".
 fn within_root(resource: &str, root: Option<&str>) -> bool {
     match root {
         None => false,
         Some(root) => {
             let root = root.trim_end_matches('/');
+            let resource = normalize_lexical(resource);
             resource == root || resource.starts_with(&format!("{root}/"))
         }
+    }
+}
+
+/// Resolve `.` and `..` components without touching the filesystem. A `..` that would climb past
+/// the start simply pops nothing, which can only ever make the result *less* inside a root.
+fn normalize_lexical(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    let joined = parts.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else {
+        joined
     }
 }
 
@@ -652,6 +676,37 @@ mod tests {
                 .resolve(prompt(), &req, posture(Some("/work/proj")))
                 .is_allowed()
         );
+    }
+
+    #[test]
+    fn a_parent_traversal_out_of_the_root_is_not_treated_as_inside() {
+        for resource in [
+            "/work/../etc/passwd",
+            "/work/sub/../../etc/passwd",
+            "/work/./../../etc/passwd",
+        ] {
+            let req = gated(ActionKind::Write, resource, SideEffect::LocalMutation);
+            for mode in [PermissionMode::AcceptEdits, PermissionMode::Smart] {
+                let after = mode.resolve(prompt(), &req, posture(Some("/work")));
+                assert!(
+                    matches!(after, Decision::RequireApproval { .. }),
+                    "`{resource}` climbs out of `/work` and must still ask under {mode}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dot_and_in_root_traversal_components_still_resolve_inside() {
+        for resource in ["/work/./a.txt", "/work/sub/../a.txt", "/work//a.txt"] {
+            let req = gated(ActionKind::Write, resource, SideEffect::LocalMutation);
+            assert!(
+                PermissionMode::AcceptEdits
+                    .resolve(prompt(), &req, posture(Some("/work")))
+                    .is_allowed(),
+                "`{resource}` stays inside `/work`"
+            );
+        }
     }
 
     #[test]
