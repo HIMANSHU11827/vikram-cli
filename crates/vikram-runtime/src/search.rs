@@ -379,6 +379,7 @@ fn encode(value: &str) -> String {
 pub fn client() -> Result<reqwest::blocking::Client, SearchError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     reqwest::blocking::Client::builder()
+        .use_preconfigured_tls(crate::tls_config())
         .user_agent(USER_AGENT)
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))

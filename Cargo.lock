@@ -3309,6 +3309,7 @@ dependencies = [
  "vikram-contracts",
  "vikram-runtime",
  "vikram-store",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
@@ -3373,6 +3374,7 @@ name = "vikram-runtime"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "libc",
  "percent-encoding",
  "portable-pty",
  "reqwest",
@@ -3394,6 +3396,7 @@ dependencies = [
  "vikram-skills",
  "vikram-store",
  "vikram-terminals",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]

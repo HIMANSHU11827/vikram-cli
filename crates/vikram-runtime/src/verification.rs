@@ -304,12 +304,12 @@ fn kill_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         let pid = child.id();
-        let _ = Command::new("kill")
-            .args(["-s", "KILL", &format!("-{pid}")])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        // Prefer the libc call: Termux has no `kill` binary on PATH (it's a shell builtin),
+        // so spawning it would silently leave the process group alive.
+        // SAFETY: kill(2) is always safe to call; a stale pgid just returns ESRCH.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
     }
     let _ = child.kill();
     let _ = child.wait();

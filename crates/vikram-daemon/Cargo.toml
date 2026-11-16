@@ -16,6 +16,7 @@ thiserror.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
+webpki-roots.workspace = true
 rusqlite.workspace = true
 libc = "0.2"
 

@@ -42,7 +42,8 @@ cargo build --release
 ./target/release/vikram
 ```
 
-Requires **Rust 1.89+**. SQLite is bundled (`rusqlite/bundled`) — no system dependencies.
+Requires **Rust 1.86+**. SQLite is bundled (`rusqlite/bundled`) — no system dependencies.
+Full per-OS install guide (Linux, macOS, Windows, Termux): [`docs/install.md`](docs/install.md)
 
 ```sh
 vikram                    # interactive TUI

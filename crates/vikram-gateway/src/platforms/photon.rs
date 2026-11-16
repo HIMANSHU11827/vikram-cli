@@ -600,6 +600,7 @@ impl ReqwestSse {
     pub fn connect(url: impl Into<String>, token: impl Into<String>) -> Result<Self, String> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::builder()
+            .use_preconfigured_tls(crate::tls_config())
             .build()
             .map_err(|err| format!("photon sse client: {err}"))?;
         Ok(Self {

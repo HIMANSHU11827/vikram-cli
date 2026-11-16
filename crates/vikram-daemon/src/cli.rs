@@ -210,7 +210,14 @@ pub fn stop() -> Result<String, String> {
         return Ok(format!("cleared stale lock from pid {pid}"));
     }
     // SIGTERM, so the supervisor finishes the tick it is in rather than dying mid-run.
+    #[cfg(unix)]
     let killed = unsafe { libc::kill(pid as i32, libc::SIGTERM) } == 0;
+    #[cfg(not(unix))]
+    let killed = {
+        // No POSIX signals off unix; a Windows daemon stop goes through the service control
+        // path instead of a raw kill.
+        false
+    };
     if !killed {
         return Err(format!(
             "could not signal pid {pid}: {}",

@@ -187,7 +187,11 @@ async fn post_webhook(url: &str, notice: &Notice) -> Report {
         "at_text": time::format_ms(Zone::Local, notice.at),
     });
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = match reqwest::Client::builder().timeout(WEBHOOK_TIMEOUT).build() {
+    let client = match reqwest::Client::builder()
+        .use_preconfigured_tls(crate::tls_config())
+        .timeout(WEBHOOK_TIMEOUT)
+        .build()
+    {
         Ok(client) => client,
         Err(err) => return Report::no(format!("client: {err}")),
     };

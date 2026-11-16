@@ -5,6 +5,19 @@
 //! workers do the work. Scheduling never executes, execution never notifies, and notification never
 //! pretends it succeeded.
 
+/// A rustls client config rooted at Mozilla's CAs via webpki anchors — bypasses
+/// `rustls-platform-verifier`, which panics on Android/Termux (it expects a JVM).
+pub(crate) fn tls_config() -> std::sync::Arc<rustls::ClientConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
 pub mod cli;
 pub mod cron;
 pub mod daemon;

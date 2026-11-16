@@ -202,6 +202,7 @@ impl ReqwestTransport {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let build = |redirects: bool| {
             let mut builder = reqwest::Client::builder()
+                .use_preconfigured_tls(crate::tls_config())
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .timeout(std::time::Duration::from_secs(60));
             if !redirects {

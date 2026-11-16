@@ -6,6 +6,20 @@
 //!
 //! Nothing here formats terminal output. The TUI is one subscriber among possible others.
 
+/// A rustls client config rooted at Mozilla's CAs via webpki anchors. Handed to reqwest through
+/// `use_preconfigured_tls`, it bypasses `rustls-platform-verifier` — which panics on
+/// Android/Termux because it expects a JVM — and behaves identically on every platform.
+pub(crate) fn tls_config() -> std::sync::Arc<rustls::ClientConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
 pub mod anthropic;
 pub mod bots;
 pub mod browser;

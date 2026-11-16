@@ -12,8 +12,11 @@ pkg install rust clang git
 pkg install chromium
 ```
 
-Rust 1.86+ is required. SQLite is bundled (`rusqlite/bundled`), so no system
-`libsqlite3` is needed.
+Rust 1.89+ is required (workspace `rust-version`). SQLite is bundled (`rusqlite/bundled`), so no
+system `libsqlite3` is needed.
+
+TLS uses rustls + ring with Mozilla webpki roots via a preconfigured client — no OpenSSL, no
+platform verifier (which would need a JVM Termux doesn't have).
 
 ## Build
 

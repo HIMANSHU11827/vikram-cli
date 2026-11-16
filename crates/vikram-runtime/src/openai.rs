@@ -54,6 +54,7 @@ impl OpenAiProvider {
     ) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::builder()
+            .use_preconfigured_tls(crate::tls_config())
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(600))
             .build()
@@ -357,6 +358,7 @@ pub async fn list_models(
 ) -> std::result::Result<Vec<String>, String> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
+        .use_preconfigured_tls(crate::tls_config())
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(20))
         .build()

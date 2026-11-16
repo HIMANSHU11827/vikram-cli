@@ -204,7 +204,15 @@ fn zone_file(name: &str) -> Option<Arc<ZoneFile>> {
     if let Some(hit) = cache.lock().expect("zone cache").get(name) {
         return hit.clone();
     }
-    let root = std::env::var("TZDIR").unwrap_or_else(|_| "/usr/share/zoneinfo".to_string());
+    // Termux keeps tzdata under $PREFIX, not /usr/share — check it before the FHS default.
+    let root = std::env::var("TZDIR")
+        .ok()
+        .or_else(|| {
+            std::env::var("PREFIX")
+                .ok()
+                .map(|prefix| format!("{prefix}/share/zoneinfo"))
+        })
+        .unwrap_or_else(|| "/usr/share/zoneinfo".to_string());
     let loaded = std::fs::read(Path::new(&root).join(name))
         .ok()
         .and_then(|bytes| parse_zone_file(&bytes))

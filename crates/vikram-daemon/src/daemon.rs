@@ -187,7 +187,22 @@ fn process_started_ms(pid: u32) -> Option<i64> {
         .parse()
         .ok()?;
     let boot_ms = time::now_ms() - (uptime * 1000.0) as i64;
-    Some(boot_ms + ticks * 1000 / 100)
+    // Clock ticks per second is a kernel constant that varies by device (100/250/300/1000);
+    // hardcoding 100 makes start times wrong on kernels that tick faster.
+    let ticks_per_sec = clock_ticks_per_sec();
+    Some(boot_ms + ticks * 1000 / ticks_per_sec)
+}
+
+#[cfg(unix)]
+fn clock_ticks_per_sec() -> i64 {
+    // SAFETY: sysconf has no preconditions and cannot fail for _SC_CLK_TCK on unix.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz > 0 { hz } else { 100 }
+}
+
+#[cfg(not(unix))]
+fn clock_ticks_per_sec() -> i64 {
+    100
 }
 
 struct Running {
