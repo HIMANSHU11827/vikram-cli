@@ -1027,6 +1027,9 @@ fn sessions(action: SessionsAction) -> std::process::ExitCode {
             }
             SessionsAction::Rename { id, title } => {
                 let id = vikram_contracts::SessionId::new(id);
+                if store.get_session(&id).map_err(|e| e.to_string())?.is_none() {
+                    return Err(format!("session {id} not found"));
+                }
                 store
                     .rename_session(&id, &title, now)
                     .map_err(|e| e.to_string())?;
@@ -1034,6 +1037,9 @@ fn sessions(action: SessionsAction) -> std::process::ExitCode {
             }
             SessionsAction::Archive { id } => {
                 let id = vikram_contracts::SessionId::new(id);
+                if store.get_session(&id).map_err(|e| e.to_string())?.is_none() {
+                    return Err(format!("session {id} not found"));
+                }
                 store
                     .set_session_status(&id, "archived", now)
                     .map_err(|e| e.to_string())?;
@@ -1116,6 +1122,9 @@ fn sessions(action: SessionsAction) -> std::process::ExitCode {
             }
             SessionsAction::Rm { id } => {
                 let id = vikram_contracts::SessionId::new(id);
+                if store.get_session(&id).map_err(|e| e.to_string())?.is_none() {
+                    return Err(format!("session {id} not found"));
+                }
                 store.delete_session(&id).map_err(|e| e.to_string())?;
                 // Remove VIKRAM's own managed folder for the session. Project files are never
                 // touched: they live outside the sessions root and are only referenced by id.
@@ -1362,6 +1371,14 @@ fn bots(action: BotsAction) -> std::process::ExitCode {
             }
             BotsAction::Rm { id } => {
                 let id = vikram_contracts::BotId::new(id);
+                if !store
+                    .list_bots()
+                    .map_err(|e| e.to_string())?
+                    .iter()
+                    .any(|b| b.id == id)
+                {
+                    return Err(format!("bot {id} not found"));
+                }
                 store.delete_bot(&id).map_err(|e| e.to_string())?;
                 println!("removed {id}");
             }
@@ -1391,6 +1408,9 @@ fn users(action: UsersAction) -> std::process::ExitCode {
             }
             UsersAction::Rename { id, name } => {
                 let id = vikram_contracts::UserId::new(id);
+                if store.get_user(&id).map_err(|e| e.to_string())?.is_none() {
+                    return Err(format!("user {id} not found"));
+                }
                 let now = vikram_runtime::types::now_ms();
                 store
                     .update_user(&id, &name, now)
@@ -1399,6 +1419,9 @@ fn users(action: UsersAction) -> std::process::ExitCode {
             }
             UsersAction::Rm { id } => {
                 let id = vikram_contracts::UserId::new(id);
+                if store.get_user(&id).map_err(|e| e.to_string())?.is_none() {
+                    return Err(format!("user {id} not found"));
+                }
                 store.delete_user(&id).map_err(|e| e.to_string())?;
                 println!("removed {id}");
             }
@@ -1439,6 +1462,9 @@ fn profiles(action: ProfilesAction) -> std::process::ExitCode {
             }
             ProfilesAction::Rename { id, name } => {
                 let id = vikram_contracts::ProfileId::new(id);
+                if store.get_profile(&id).map_err(|e| e.to_string())?.is_none() {
+                    return Err(format!("profile {id} not found"));
+                }
                 let now = vikram_runtime::types::now_ms();
                 store
                     .update_profile(&id, &name, now)
@@ -1447,6 +1473,9 @@ fn profiles(action: ProfilesAction) -> std::process::ExitCode {
             }
             ProfilesAction::Rm { id } => {
                 let id = vikram_contracts::ProfileId::new(id);
+                if store.get_profile(&id).map_err(|e| e.to_string())?.is_none() {
+                    return Err(format!("profile {id} not found"));
+                }
                 store.delete_profile(&id).map_err(|e| e.to_string())?;
                 println!("removed {id}");
             }
@@ -1532,6 +1561,9 @@ fn entities(action: EntitiesAction) -> std::process::ExitCode {
             }
             EntitiesAction::Rm { id } => {
                 let id = vikram_contracts::EntityId::new(id);
+                if store.get_entity(&id).map_err(|e| e.to_string())?.is_none() {
+                    return Err(format!("entity {id} not found"));
+                }
                 store.delete_entity(&id).map_err(|e| e.to_string())?;
                 println!("removed {id}");
             }
@@ -1655,6 +1687,17 @@ async fn hive(action: HiveAction) -> Result<(), String> {
         HiveAction::RemoveParticipant { hive, entity } => {
             let hid = vikram_contracts::HiveId::new(hive);
             let eid = vikram_contracts::EntityId::new(entity);
+            if store.get_hive(&hid).map_err(|e| e.to_string())?.is_none() {
+                return Err("hive not found".to_owned());
+            }
+            let participant = store
+                .list_hive_participants(&hid)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .any(|p| p.entity == eid);
+            if !participant {
+                return Err(format!("entity {eid} is not a participant of hive {hid}"));
+            }
             store
                 .remove_hive_participant(&hid, &eid)
                 .map_err(|e| e.to_string())?;
@@ -1702,6 +1745,9 @@ async fn hive(action: HiveAction) -> Result<(), String> {
         }
         HiveAction::Rm { id } => {
             let hid = vikram_contracts::HiveId::new(id);
+            if store.get_hive(&hid).map_err(|e| e.to_string())?.is_none() {
+                return Err("hive not found".to_owned());
+            }
             store.delete_hive(&hid).map_err(|e| e.to_string())?;
             println!("removed {hid}");
         }
@@ -1891,6 +1937,13 @@ fn tickets(action: TicketsAction) -> std::process::ExitCode {
             }
             TicketsAction::Complete { assignment, result } => {
                 let aid = vikram_contracts::AssignmentId::new(assignment);
+                if store
+                    .get_assignment(&aid)
+                    .map_err(|e| e.to_string())?
+                    .is_none()
+                {
+                    return Err(format!("assignment {aid} not found"));
+                }
                 store
                     .set_assignment_result(&aid, &result, now)
                     .map_err(|e| e.to_string())?;
@@ -1898,6 +1951,9 @@ fn tickets(action: TicketsAction) -> std::process::ExitCode {
             }
             TicketsAction::Close { id } => {
                 let tid = vikram_contracts::TicketId::new(id);
+                if store.get_ticket(&tid).map_err(|e| e.to_string())?.is_none() {
+                    return Err(format!("ticket {tid} not found"));
+                }
                 store
                     .set_ticket_status(&tid, "completed", now)
                     .map_err(|e| e.to_string())?;
@@ -1905,11 +1961,17 @@ fn tickets(action: TicketsAction) -> std::process::ExitCode {
             }
             TicketsAction::Reopen { id } => {
                 let tid = vikram_contracts::TicketId::new(id);
+                if store.get_ticket(&tid).map_err(|e| e.to_string())?.is_none() {
+                    return Err(format!("ticket {tid} not found"));
+                }
                 store.reopen_ticket(&tid, now).map_err(|e| e.to_string())?;
                 println!("reopened");
             }
             TicketsAction::Rm { id } => {
                 let tid = vikram_contracts::TicketId::new(id);
+                if store.get_ticket(&tid).map_err(|e| e.to_string())?.is_none() {
+                    return Err(format!("ticket {tid} not found"));
+                }
                 store.delete_ticket(&tid).map_err(|e| e.to_string())?;
                 println!("removed");
             }
@@ -2579,6 +2641,16 @@ fn config_command(action: ConfigAction, mut config: Config) -> std::process::Exi
                     .map_err(|_| "expected true or false"),
                 "mode" => match vikram_contracts::PermissionMode::parse(&value) {
                     Some(mode) => {
+                        if let Some((rule, layer)) =
+                            vikram_runtime::config::ModeAvailability::resolve(&config.security)
+                                .refusal(mode)
+                        {
+                            eprintln!(
+                                "vikram: mode `{}` is refused by {layer}: {rule}",
+                                mode.as_str()
+                            );
+                            return std::process::ExitCode::FAILURE;
+                        }
                         config.mode = mode;
                         Ok(())
                     }
@@ -2833,6 +2905,9 @@ fn add_job(args: &JobArgs) -> Result<String, String> {
 }
 
 fn edit_job(id: &str, changes: &JobChanges) -> Result<String, String> {
+    if changes.enable && changes.disable {
+        return Err("--enable and --disable cannot be used together".to_owned());
+    }
     let draft = draft_of(changes, None, None);
     vikram_daemon::cli::cron_edit(id, &draft)
 }

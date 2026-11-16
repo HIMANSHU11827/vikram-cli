@@ -119,9 +119,7 @@ async fn event_loop(
         for command in app.take_commands() {
             // Repainting needs the terminal handle, which the command dispatcher does not hold.
             if matches!(command, UiCommand::Redraw) {
-                terminal
-                    .clear()
-                    .map_err(|err| format!("clear: {err}"))?;
+                terminal.clear().map_err(|err| format!("clear: {err}"))?;
                 continue;
             }
             execute(handle, app, command);
@@ -1607,7 +1605,11 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                 PickerItem::new("Ctrl+Tab", "next session", "ctrl_tab".to_owned()),
                 PickerItem::new("Ctrl+B", "toggle the BOTS panel", "ctrl_b".to_owned()),
                 PickerItem::new("Ctrl+O", "approvals", "ctrl_o".to_owned()),
-                PickerItem::new("Ctrl+R", "reverse search input history", "ctrl_r".to_owned()),
+                PickerItem::new(
+                    "Ctrl+R",
+                    "reverse search input history",
+                    "ctrl_r".to_owned(),
+                ),
                 PickerItem::new("r", "resume selected bot", "r".to_owned()),
                 PickerItem::new("F2", "background tasks", "f2".to_owned()),
                 PickerItem::new("F3", "MCP servers", "f3".to_owned()),
@@ -2192,7 +2194,12 @@ fn apply_act(
                 for member in &roster.members {
                     lines.push(format!("  {member}"));
                 }
-                if let Some(task) = roster.task.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                if let Some(task) = roster
+                    .task
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                {
                     lines.push(format!("task: {task}"));
                 }
                 app.open_info(format!("Hive · {name}"), lines);

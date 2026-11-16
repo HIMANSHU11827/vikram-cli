@@ -219,9 +219,10 @@ fn open_session(handle: &RuntimeHandle, message: &str, fresh: bool) -> Result<Se
     } else {
         snapshot
             .sessions
-            .first()
+            .iter()
+            .max_by_key(|s| s.updated_ms)
             .map(|s| s.id.clone())
-            .ok_or_else(|| "no session available".to_owned())
+            .ok_or_else(|| "no session available; pass --fresh to start one".to_owned())
     }
 }
 
