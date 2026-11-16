@@ -1721,6 +1721,9 @@ async fn hive(action: HiveAction) -> Result<(), String> {
             content,
         } => {
             let hid = vikram_contracts::HiveId::new(hive);
+            if store.get_hive(&hid).map_err(|e| e.to_string())?.is_none() {
+                return Err(format!("hive {hid} not found"));
+            }
             let now = vikram_runtime::types::now_ms();
             let msg = vikram_store::HiveMessageRow {
                 id: vikram_contracts::HiveMessageId::generate(),
@@ -1905,6 +1908,9 @@ fn tickets(action: TicketsAction) -> std::process::ExitCode {
                 visibility,
             } => {
                 let tid = vikram_contracts::TicketId::new(ticket);
+                if store.get_ticket(&tid).map_err(|e| e.to_string())?.is_none() {
+                    return Err(format!("ticket {tid} not found"));
+                }
                 let msg = vikram_store::TicketMessageRow {
                     id: vikram_contracts::TicketMessageId::generate(),
                     ticket: tid,
