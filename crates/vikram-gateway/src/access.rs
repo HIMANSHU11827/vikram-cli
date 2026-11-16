@@ -569,8 +569,14 @@ fn principal_matches(
         "buzz" => {
             let expanded: HashSet<String> =
                 allowed_ids.iter().map(|e| normalize_nostr(e)).collect();
+            // Keep the raw entries too, like the whatsapp arm: an entry differing only by case
+            // must not silently stop matching.
             allowed_expanded = expanded;
+            allowed_expanded.extend(allowed_ids.iter().cloned());
             check_ids.insert(normalize_nostr(user_id));
+            if let Some(alt) = user_id_alt {
+                check_ids.insert(normalize_nostr(alt));
+            }
         }
         "simplex" => {
             // Only the numeric contactId is trusted; display names are attacker-controlled.
