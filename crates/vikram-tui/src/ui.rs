@@ -21,6 +21,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.tab_hits.clear();
     app.new_session_x = None;
     app.picker_rows.clear();
+    app.suggestion_rows.clear();
     app.picker_x = None;
     app.picker_verbs.clear();
     app.overlay_clicks.clear();

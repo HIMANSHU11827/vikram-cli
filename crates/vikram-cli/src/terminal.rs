@@ -304,6 +304,16 @@ fn apply_terminal_event(app: &mut App, event: Event) {
                     }
                     return;
                 }
+                // A press on a suggestion row accepts it — the popup draws a selected marker, so
+                // an unclickable row would be a lie the same way a dead chip is.
+                if app.overlay.is_none() {
+                    for (row, start, end, index) in app.suggestion_rows.clone() {
+                        if mouse.row == row && x >= start && x < end {
+                            vikram_tui::input::accept_suggestion_at(app, index);
+                            return;
+                        }
+                    }
+                }
                 // A press inside a pane hands it the keyboard — checked last so chips, rows,
                 // tabs and fold headers keep winning. The bots pane's documented keys and the
                 // transcript's pane keys were unreachable because nothing ever set those focuses.

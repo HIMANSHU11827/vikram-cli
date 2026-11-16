@@ -737,11 +737,15 @@ fn context_bar(ratio: f32, width: usize, theme: &Theme) -> String {
     out
 }
 
-pub fn suggestions_popup(frame: &mut Frame, anchor: Rect, app: &App, theme: &Theme) {
-    let Some(popup) = app.suggestions.as_ref() else {
+pub fn suggestions_popup(frame: &mut Frame, anchor: Rect, app: &mut App, theme: &Theme) {
+    // The rows are recorded for the mouse, so the popup's items are cloned up front: borrowing
+    // `app.suggestions` through the draw loop would hold an immutable borrow over the writes.
+    let Some(popup) = app.suggestions.clone() else {
         return;
     };
-    if popup.items.is_empty() || anchor.width < 20 || anchor.y < 5 {
+    let items = popup.items;
+    let selected = popup.selected;
+    if items.is_empty() || anchor.width < 20 || anchor.y < 5 {
         return;
     }
 
@@ -749,7 +753,7 @@ pub fn suggestions_popup(frame: &mut Frame, anchor: Rect, app: &App, theme: &The
     // never opens over the box it is filling in: the input keeps its own rows whatever the list
     // length. A footer is drawn only when there is a row to spare for it.
     let space = anchor.y.saturating_sub(1);
-    let wanted = popup.items.len() as u16 + 2;
+    let wanted = items.len() as u16 + 2;
     let footer = wanted < 12 && wanted < space;
     let height = (if footer { wanted + 1 } else { wanted })
         .min(12)
@@ -766,7 +770,7 @@ pub fn suggestions_popup(frame: &mut Frame, anchor: Rect, app: &App, theme: &The
 
     // Same ring, same body and same title-on-the-edge as every other panel, so the list an operator
     // types into reads as a surface of the interface rather than as a second, thinner vocabulary.
-    let title = match popup.items.first().map(|item| item.category.as_str()) {
+    let title = match items.first().map(|item| item.category.as_str()) {
         Some("command") => " commands ",
         Some("shell") => " shell ",
         _ => " files ",
@@ -797,12 +801,12 @@ pub fn suggestions_popup(frame: &mut Frame, anchor: Rect, app: &App, theme: &The
 
     // The cursor row stays on screen when the list is longer than the popup: the window scrolls
     // under the selection instead of running off the bottom of it.
-    let offset = popup.selected.saturating_sub(rows.saturating_sub(1));
+    let offset = selected.saturating_sub(rows.saturating_sub(1));
     let name_col = (inner.width.saturating_sub(14) as usize).clamp(10, 26);
 
-    for (row, item) in popup.items.iter().skip(offset).take(rows).enumerate() {
-        let selected = offset + row == popup.selected;
-        let marker = if selected {
+    for (row, item) in items.iter().skip(offset).take(rows).enumerate() {
+        let is_selected = offset + row == selected;
+        let marker = if is_selected {
             if theme.ascii { ">" } else { "›" }
         } else {
             " "
@@ -813,7 +817,7 @@ pub fn suggestions_popup(frame: &mut Frame, anchor: Rect, app: &App, theme: &The
         let line = Line::from(vec![
             Span::styled(
                 format!(" {marker} "),
-                if selected {
+                if is_selected {
                     Style::default().fg(theme.accent)
                 } else {
                     theme.muted()
@@ -821,7 +825,7 @@ pub fn suggestions_popup(frame: &mut Frame, anchor: Rect, app: &App, theme: &The
             ),
             Span::styled(
                 format!("{name}{pad}"),
-                if selected {
+                if is_selected {
                     Style::default()
                         .fg(theme.accent)
                         .add_modifier(Modifier::BOLD)
@@ -835,13 +839,15 @@ pub fn suggestions_popup(frame: &mut Frame, anchor: Rect, app: &App, theme: &The
                 theme.muted(),
             ),
         ]);
-        let style = if selected {
+        let style = if is_selected {
             theme.selected()
         } else {
             Style::default()
         };
         let area = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
         frame.render_widget(Paragraph::new(line).style(style), area);
+        app.suggestion_rows
+            .push((area.y, area.x, area.x + area.width, offset + row));
     }
 
     if footer {

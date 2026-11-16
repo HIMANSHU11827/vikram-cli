@@ -918,6 +918,9 @@ pub struct App {
     /// Where each picker row was drawn, as `(y, visible position)`, and the panel's x range. The
     /// draw writes it and the mouse reads it, which is the only way a click can name a row.
     pub picker_rows: Vec<(u16, usize)>,
+    /// Suggestion-popup rows as drawn: `(y, x_start, x_end, item_index)`. A press on one accepts
+    /// that suggestion, the same thing Tab does for the highlighted row.
+    pub suggestion_rows: Vec<(u16, u16, u16, usize)>,
     pub picker_x: Option<(u16, u16)>,
     /// Where each footer button of the open chooser was drawn, as `(y, x_start, x_end, verb)`.
     pub picker_verbs: Vec<(u16, u16, u16, crate::widgets::Verb)>,
@@ -986,6 +989,7 @@ impl App {
             models_loading: false,
             pending_bot: None,
             picker_rows: Vec::new(),
+            suggestion_rows: Vec::new(),
             picker_x: None,
             picker_verbs: Vec::new(),
             overlay_clicks: Vec::new(),

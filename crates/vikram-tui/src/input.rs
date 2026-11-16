@@ -866,6 +866,19 @@ fn refresh_suggestions(app: &mut App) {
     }
 }
 
+/// Accept the suggestion at `index` — what a click on a popup row does. Out-of-range clicks are
+/// ignored rather than clamped, so a press beside the list cannot pick a row nobody saw.
+pub fn accept_suggestion_at(app: &mut App, index: usize) {
+    let Some(popup) = app.suggestions.as_mut() else {
+        return;
+    };
+    if index >= popup.items.len() {
+        return;
+    }
+    popup.selected = index;
+    accept_suggestion(app);
+}
+
 fn accept_suggestion(app: &mut App) {
     let Some(popup) = app.suggestions.take() else {
         return;
