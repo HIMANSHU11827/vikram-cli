@@ -746,6 +746,14 @@ fn open_command(
     // An inline argument is an instruction that needs no panel: `/mode plan` sets the posture,
     // `/model gpt-5.2` switches. The panel exists for when the operator has not decided yet.
     if !args.trim().is_empty() {
+        // `/rename <name>` is the rename panel with the answer already typed; before this the
+        // argument was dropped and the panel opened on the old title instead.
+        if command.name == "rename" {
+            let mut editor = vikram_tui::editor::Editor::new();
+            editor.insert_str(args.trim());
+            app.overlay = Some(Overlay::RenameSession { editor });
+            return;
+        }
         match command.outcome {
             Outcome::Picker(PickerKind::Model) => {
                 if let Err(err) = handle.set_model(session, args.trim().to_owned()) {
@@ -1954,8 +1962,13 @@ fn apply_act(
             }
         }
         (PickerKind::Bot, Verb::Choose) => {
-            app.selected_bot = Some(BotId::new(value));
-            app.push_notice(NoticeLevel::Info, "showing that bot's conversation");
+            // Same door the mouse row uses: open (or create) the chat the bot owns. Setting
+            // `selected_bot` alone only worked for a bot that had already chatted — for one that
+            // had not, the pane silently kept showing the active session while the notice claimed
+            // otherwise.
+            app.commands.push(UiCommand::OpenBotChat {
+                bot: BotId::new(value),
+            });
         }
         (PickerKind::Pending, Verb::Prompt) => app.open_prompt(
             "Edit pending message",
@@ -2484,10 +2497,6 @@ fn run_action(app: &mut App, session: &SessionId, name: &str) {
             app.overlay = Some(Overlay::RenameSession { editor });
         }
         "close" => {
-            let title = app
-                .session_by_id_mut(session)
-                .map(|view| view.title.clone())
-                .unwrap_or_default();
             if app.sessions.len() <= 1 {
                 app.push_notice(
                     NoticeLevel::Warn,
@@ -2495,13 +2504,12 @@ fn run_action(app: &mut App, session: &SessionId, name: &str) {
                 );
                 return;
             }
+            // No notice here: the command has not run yet, and execute() already says "closed"
+            // on success or reports the failure. Announcing it twice — once before it ran and
+            // once after — is how a failed close still claimed to have happened.
             app.commands.push(UiCommand::CloseSession {
                 session: session.clone(),
             });
-            app.push_notice(
-                NoticeLevel::Info,
-                format!("closed {title}; it stays in the store and will not reopen on its own"),
-            );
         }
         "keys" => app.overlay = Some(Overlay::Help),
         "copy" => {
