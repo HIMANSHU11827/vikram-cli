@@ -136,3 +136,10 @@ systemic zero-row Ok returns in vikram-store.
 - redact.rs "sk-" over-matches task-/risk- (fail-safe, LOW).
 - optimization.rs pareto fallback ignores `passed`; propose_candidate unscrubbed fields (LOW, unwired).
 - store.rs zero-row Ok systemic remains the big one.
+
+## 2026-11-16 — batch 31 (commits fa90b29…HEAD)
+
+- CRITICAL gateway: authorize_source wired into inbound path (was dead code — any sender could drive the agent); default-deny, escape hatches documented. BREAKING: no-allowlist deployments must set GATEWAY_ALLOW_ALL_USERS=true.
+- /a2a requires A2A_TOKEN bearer; session keys (platform,chat_id); ingress rejects truncated bodies + conflicting Content-Length; media_fetch no redirects (SSRF closed); registry connect fails on missing deps; turn() never sends partial reply; mcp serve evaluates PermissionRequest through policy (Deny + floor apply).
+- policy: deny-first real; metachar allow bypass closed; empty-root floor fails closed; within_root .. normalized.
+- Remaining LOW: DingTalk/A2A-task map bounds, access.rs dead field, unwired evolution scaffolding honesty (self_awareness/conversational/self_recovery fabricated content — decide wire-or-mark), store zero-row Ok systemic.
