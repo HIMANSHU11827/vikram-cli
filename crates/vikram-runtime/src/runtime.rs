@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, oneshot};
 use vikram_contracts::journal::JournalSink;
@@ -84,6 +84,14 @@ fn pending_index(target: &str) -> Option<PendingTarget> {
         .and_then(|rest| rest.parse::<usize>().ok())
         .map(PendingTarget::Queue)
 }
+
+/// How often the runtime re-checks its own evolution store. Each tick runs only the
+/// read-only `mapek.monitor()`/`analyze()` probes; the mutating plan/execute half of
+/// MAPE-K stays operator-driven.
+const SELF_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// Self-check ticks between improvement-opportunity scans — roughly daily at the
+/// hourly cadence.
+const SELF_CHECK_OPPORTUNITY_EVERY: u64 = 24;
 
 /// Hive group-chat concerns (canonical: `hive_chat::HiveManager` over
 /// `vikram-store`). Extracted from the god struct so hive construction
@@ -670,6 +678,11 @@ pub(crate) struct RuntimeInner {
     /// Learning reviews this runtime has started and not finished. A one-shot process that exits
     /// without waiting for these drops a review it already paid for.
     pub review_tasks: Arc<AtomicU64>,
+    /// Set once the periodic self-check task is spawned; a second
+    /// [`RuntimeInner::spawn_self_check`] call is refused so the check can never double-schedule.
+    pub self_check_scheduled: AtomicBool,
+    /// Self-check ticks completed, for tests and diagnostics.
+    pub self_check_ticks: AtomicU64,
     /// Monotonic sequence for `RuntimeEvent::Activity`; ids derive from it so a consumer can order
     /// the stream without relying on arrival order.
     pub activity_seq: AtomicU64,
@@ -1980,7 +1993,170 @@ pub struct Runtime {
     handle: RuntimeHandle,
 }
 
+/// What one self-check found. Carried out of the blocking store read so the
+/// notices are emitted on the async side.
+pub(crate) struct SelfCheckReport {
+    pub status: vikram_evolution::HealthStatus,
+    pub issues: Vec<vikram_evolution::mapek::Issue>,
+    pub opportunities: Vec<vikram_evolution::self_improvement::ImprovementOpportunity>,
+    /// Why the opportunity scan returned what it did (empty evidence, or a
+    /// summary of the evidence used). `None` when no scan ran.
+    pub opportunity_note: Option<String>,
+}
+
 impl RuntimeInner {
+    /// Boot the periodic self-check: one task, one interval, findings surface as
+    /// [`RuntimeEvent::Notice`]s. The first tick fires immediately. Returns `false`
+    /// when a check is already scheduled, so callers cannot double-schedule it.
+    pub(crate) fn spawn_self_check(self: &Arc<Self>, interval: std::time::Duration) -> bool {
+        if self.self_check_scheduled.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        let inner = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut tick: u64 = 0;
+            loop {
+                ticker.tick().await;
+                tick += 1;
+                inner.self_check_ticks.fetch_add(1, Ordering::SeqCst);
+                inner
+                    .self_check_tick(tick.is_multiple_of(SELF_CHECK_OPPORTUNITY_EVERY))
+                    .await;
+            }
+        });
+        true
+    }
+
+    async fn self_check_tick(self: &Arc<Self>, scan_opportunities: bool) {
+        match self.run_self_check(scan_opportunities).await {
+            Ok(report) => self.emit_self_check(report),
+            Err(err) => self.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!("evolution self-check failed: {err}"),
+            }),
+        }
+    }
+
+    /// One self-check: `mapek.monitor()` + `mapek.analyze()` are read-only probes
+    /// over the store and `self_improvement.identify_improvement_opportunities()`
+    /// is a scan that stores nothing — it only reports. The mutating
+    /// `plan`/`execute`/`run_cycle` half of MAPE-K is deliberately not run on a
+    /// timer. All of it is synchronous store work, so it runs on the blocking
+    /// pool like the boot recovery drain.
+    pub(crate) async fn run_self_check(
+        self: &Arc<Self>,
+        scan_opportunities: bool,
+    ) -> std::result::Result<SelfCheckReport, String> {
+        let worker = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let mut engine = worker
+                .learning
+                .evolution
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let data = engine.mapek.monitor().map_err(|e| e.to_string())?;
+            let analysis = engine.mapek.analyze(&data).map_err(|e| e.to_string())?;
+            let opportunities = if scan_opportunities {
+                engine
+                    .self_improvement
+                    .identify_improvement_opportunities()
+                    .map_err(|e| e.to_string())?
+            } else {
+                Vec::new()
+            };
+            let opportunity_note = if scan_opportunities {
+                engine
+                    .self_improvement
+                    .last_opportunity_note()
+                    .map(str::to_owned)
+            } else {
+                None
+            };
+            // A durable trail for `vikram evolution`; telemetry must not fail the check.
+            let _ = engine.store.save_event(&vikram_evolution::LearningEvent {
+                id: vikram_evolution::gen_id("selfcheck"),
+                timestamp_ms: vikram_evolution::now_ms(),
+                agent_id: "self-check".to_owned(),
+                kind: "self_check".to_owned(),
+                summary: format!(
+                    "self-check: health {:?}, {} issue(s), {} opportunity scan result(s)",
+                    data.runtime_health.overall_status,
+                    analysis.issues.len(),
+                    opportunities.len()
+                ),
+                payload: serde_json::json!({
+                    "status": format!("{:?}", data.runtime_health.overall_status),
+                    "issues": analysis
+                        .issues
+                        .iter()
+                        .map(|i| format!("{}: {}", i.component, i.description))
+                        .collect::<Vec<_>>(),
+                    "opportunities": opportunities.len(),
+                }),
+            });
+            Ok(SelfCheckReport {
+                status: data.runtime_health.overall_status,
+                issues: analysis.issues,
+                opportunities,
+                opportunity_note,
+            })
+        })
+        .await
+        .map_err(|e| format!("self-check task failed: {e}"))?
+    }
+
+    fn emit_self_check(&self, report: SelfCheckReport) {
+        match report.status {
+            vikram_evolution::HealthStatus::Unhealthy
+            | vikram_evolution::HealthStatus::Critical => {
+                let detail = report
+                    .issues
+                    .iter()
+                    .take(3)
+                    .map(|i| format!("{}: {}", i.component, i.description))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                self.emit(RuntimeEvent::Notice {
+                    level: NoticeLevel::Warn,
+                    text: format!(
+                        "evolution self-check: runtime health {:?} — {detail}",
+                        report.status
+                    ),
+                });
+            }
+            vikram_evolution::HealthStatus::Degraded => self.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Info,
+                text: "evolution self-check: runtime health degraded".to_owned(),
+            }),
+            // Healthy needs no announcement; Unknown means the store has too
+            // little recorded activity to judge — unverified, not well.
+            vikram_evolution::HealthStatus::Healthy | vikram_evolution::HealthStatus::Unknown => {}
+        }
+        if !report.opportunities.is_empty() {
+            let top = &report.opportunities[0];
+            self.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Info,
+                text: format!(
+                    "evolution self-check: {} improvement opportunit{} — top: {}",
+                    report.opportunities.len(),
+                    if report.opportunities.len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    },
+                    top.description
+                ),
+            });
+        } else if let Some(note) = &report.opportunity_note {
+            self.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Info,
+                text: format!("evolution self-check: {note}"),
+            });
+        }
+    }
+
     /// The paid half of the growth pipeline: ask the model what in this conversation is worth
     /// keeping, then hand every answer to the same gate a heuristic proposal goes through. A
     /// model's output is content, never a decision — it cannot widen a permission, and a disabled
@@ -2267,7 +2443,7 @@ impl RuntimeInner {
 
 impl Runtime {
     pub async fn start(config: Config) -> Result<Self> {
-        Self::boot(config, None).await
+        Self::boot(config, None, SELF_CHECK_INTERVAL).await
     }
 
     /// Boot with a provider the caller supplies instead of the one configuration builds. Only the
@@ -2278,10 +2454,23 @@ impl Runtime {
         config: Config,
         provider: Arc<dyn Provider>,
     ) -> Result<Self> {
-        Self::boot(config, Some(provider)).await
+        Self::boot(config, Some(provider), SELF_CHECK_INTERVAL).await
     }
 
-    async fn boot(config: Config, provider_override: Option<Arc<dyn Provider>>) -> Result<Self> {
+    /// Boot with a self-check interval short enough for a test to observe ticks.
+    #[cfg(test)]
+    pub(crate) async fn start_with_self_check_interval(
+        config: Config,
+        interval: std::time::Duration,
+    ) -> Result<Self> {
+        Self::boot(config, None, interval).await
+    }
+
+    async fn boot(
+        config: Config,
+        provider_override: Option<Arc<dyn Provider>>,
+        self_check_interval: std::time::Duration,
+    ) -> Result<Self> {
         ensure_home()?;
         let store =
             Store::open(&database_path()).map_err(|e| RuntimeError::Store(e.to_string()))?;
@@ -2424,6 +2613,8 @@ impl Runtime {
             last_turn_ms: Mutex::new(None),
             last_tokens_per_sec: Mutex::new(None),
             review_tasks: Arc::new(AtomicU64::new(0)),
+            self_check_scheduled: AtomicBool::new(false),
+            self_check_ticks: AtomicU64::new(0),
             activity_seq: AtomicU64::new(0),
         });
 
@@ -2577,6 +2768,10 @@ impl Runtime {
                 }),
             }
         });
+
+        // The periodic self-check watches the same store the turn-end pipeline writes; it only
+        // ever reads (monitor/analyze/opportunity scan) and reports findings as Notices.
+        inner.spawn_self_check(self_check_interval);
 
         // MCP probing and plugin discovery are independent of the UI's first frame.
         let mcp_inner = Arc::clone(&inner);
@@ -7292,5 +7487,168 @@ mod tests {
             .retrieved_memory(&session)
             .expect("the in-memory engine still answers recall");
         assert!(block.contains("always run migrations before deploy"));
+    }
+
+    fn failing_experience(i: usize) -> vikram_evolution::Experience {
+        vikram_evolution::Experience {
+            id: String::new(),
+            timestamp_ms: 0,
+            agent_id: "main".to_owned(),
+            project_id: None,
+            task_category: "build".to_owned(),
+            user_request: format!("failing request {i}"),
+            outcome: vikram_evolution::ExperienceOutcome::Failure,
+            tools_used: vec!["shell".to_owned()],
+            errors: vec!["boom".to_owned()],
+            corrections: Vec::new(),
+            feedback: None,
+            reusable: false,
+            sensitivity: vikram_evolution::Sensitivity::Private,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn self_check_reports_unverified_health_on_a_fresh_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+
+        let report = handle
+            .inner
+            .run_self_check(true)
+            .await
+            .expect("a fresh store still answers the read-only probes");
+        assert_eq!(report.status, vikram_evolution::HealthStatus::Unknown);
+        assert!(
+            report.opportunities.is_empty(),
+            "no fabricated opportunities on an empty store"
+        );
+        assert!(
+            report
+                .opportunity_note
+                .as_deref()
+                .is_some_and(|n| n.contains("no improvement opportunities")),
+            "the scan explains why the list is empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_check_surfaces_recorded_failures_as_a_warn_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        {
+            let engine = handle.evolution();
+            for i in 0..vikram_evolution::MIN_SAMPLE {
+                engine
+                    .experience
+                    .record(failing_experience(i))
+                    .expect("experience records");
+            }
+        }
+        let mut events = handle.events();
+
+        let report = handle
+            .inner
+            .run_self_check(true)
+            .await
+            .expect("recorded failures are still readable");
+        assert_eq!(report.status, vikram_evolution::HealthStatus::Unhealthy);
+        assert!(
+            !report.opportunities.is_empty(),
+            "failing 'build' experiences must produce an opportunity"
+        );
+
+        handle.inner.emit_self_check(report);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut warn = None;
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Ok(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), events.recv()).await
+            else {
+                continue;
+            };
+            if let RuntimeEvent::Notice { level, text } = event
+                && level == NoticeLevel::Warn
+                && text.contains("self-check")
+            {
+                warn = Some(text);
+                break;
+            }
+        }
+        assert!(
+            warn.is_some(),
+            "unhealthy findings must surface as a Warn notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_check_interval_fires_and_cannot_be_scheduled_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start_with_self_check_interval(
+            config_for(dir.path()),
+            std::time::Duration::from_millis(15),
+        )
+        .await
+        .unwrap();
+        let handle = runtime.handle();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while handle.inner.self_check_ticks.load(Ordering::SeqCst) < 3 {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the self-check interval never fired");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            !handle
+                .inner
+                .spawn_self_check(std::time::Duration::from_millis(1)),
+            "boot already scheduled the check; a second spawn must be refused"
+        );
+
+        // The durable trail proves a tick actually ran the store probes, not just the counter.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let events = handle
+                .evolution()
+                .store
+                .list_events(Some("self-check"), 10)
+                .unwrap_or_default();
+            if events.iter().any(|e| e.kind == "self_check") {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("no self_check event reached the evolution store");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn self_check_recovers_a_poisoned_evolution_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = handle.evolution();
+            panic!("poison the evolution lock on purpose");
+        }))
+        .is_err();
+        assert!(poisoned, "the test must actually poison the mutex");
+
+        let report = handle
+            .inner
+            .run_self_check(false)
+            .await
+            .expect("a poisoned lock is recovered, not a check failure");
+        assert_eq!(report.status, vikram_evolution::HealthStatus::Unknown);
+        assert!(report.opportunity_note.is_none(), "no scan was asked for");
     }
 }
