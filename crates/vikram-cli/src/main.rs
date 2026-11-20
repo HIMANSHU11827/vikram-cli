@@ -5,6 +5,7 @@
 
 mod archive;
 mod chat;
+mod dist;
 mod doctor;
 mod gateway;
 mod gateway_config;
@@ -208,6 +209,11 @@ enum Command {
     Gateway {
         #[command(subcommand)]
         action: Option<gateway_config::GatewayAction>,
+    },
+    /// Export and import bundles of user-modifiable state.
+    Dist {
+        #[command(subcommand)]
+        action: dist::DistAction,
     },
 }
 
@@ -904,6 +910,7 @@ fn main() -> std::process::ExitCode {
             Some(action) => exit(gateway_config::run(action)),
             None => run_async(gateway::run(config)),
         },
+        Command::Dist { action } => exit(dist::run(action)),
     }
 }
 

@@ -2854,6 +2854,53 @@ impl StageHandler for DefaultTurnEnd {
     }
 }
 
+struct DefaultSessionLifecycle;
+
+impl StageHandler for DefaultSessionLifecycle {
+    fn name(&self) -> &'static str {
+        "builtin:session_lifecycle"
+    }
+
+    fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+        Box::pin(async move {
+            if !matches!(ctx.payload, StagePayload::SessionLifecycle(_)) {
+                return Err(StageError::new(
+                    ctx.point,
+                    self.name(),
+                    "session_lifecycle stage received a different payload",
+                ));
+            }
+            // Pass-through: the store operation the call site is running is the stage's whole
+            // context — `create` may still be vetoed by the outcome at the call site, and every
+            // other operation only observes.
+            Ok(StageOutcome::Done)
+        })
+    }
+}
+
+struct DefaultAgentLifecycle;
+
+impl StageHandler for DefaultAgentLifecycle {
+    fn name(&self) -> &'static str {
+        "builtin:agent_lifecycle"
+    }
+
+    fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+        Box::pin(async move {
+            if !matches!(ctx.payload, StagePayload::AgentLifecycle(_)) {
+                return Err(StageError::new(
+                    ctx.point,
+                    self.name(),
+                    "agent_lifecycle stage received a different payload",
+                ));
+            }
+            // Pass-through: the spawn and the delivery already happened; there is nothing for
+            // the stage to do but observe.
+            Ok(StageOutcome::Done)
+        })
+    }
+}
+
 /// The builtin handler for `point`. Called by [`crate::pipeline::StageRegistry::run`] whenever
 /// nothing is registered for the point.
 pub(crate) fn default_stage_handler(point: StagePoint) -> Option<Arc<dyn StageHandler>> {
@@ -2866,6 +2913,8 @@ pub(crate) fn default_stage_handler(point: StagePoint) -> Option<Arc<dyn StageHa
         StagePoint::UserInput => Arc::new(DefaultUserInput),
         StagePoint::ResponseCommit => Arc::new(DefaultResponseCommit),
         StagePoint::TurnEnd => Arc::new(DefaultTurnEnd),
+        StagePoint::SessionLifecycle => Arc::new(DefaultSessionLifecycle),
+        StagePoint::AgentLifecycle => Arc::new(DefaultAgentLifecycle),
     })
 }
 

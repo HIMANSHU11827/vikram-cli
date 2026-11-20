@@ -354,7 +354,7 @@ impl GatewayConfig {
             .insert(name.to_string(), PlatformToggle { enabled });
     }
 
-    fn save(&self) -> Result<(), String> {
+    pub(crate) fn save(&self) -> Result<(), String> {
         ensure_home().map_err(|err| err.to_string())?;
         let path = config_path();
         let body = serde_json::to_string_pretty(self).expect("gateway config is serializable");

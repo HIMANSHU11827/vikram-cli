@@ -26,7 +26,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use serde_json::{Value, json};
-use vikram_contracts::{CancellationToken, Message, ToolCall, ToolCallId, TurnId};
+use vikram_contracts::{
+    BotId, CancellationToken, Message, SessionId, ToolCall, ToolCallId, TurnId,
+};
 
 use crate::hooks::{HookContext, HookEffect, HookPoint};
 use crate::plugins::{
@@ -74,6 +76,15 @@ pub enum StagePoint {
     /// publishes `TurnFinished`. The outcome is already decided, so the stage observes rather
     /// than refuses.
     TurnEnd,
+    /// Session lifecycle: create, open, close, delete and boot-time load run on synchronous
+    /// store paths with no turn and no async boundary, so this point dispatches through
+    /// [`StageRegistry::run_blocking`] rather than [`StageRegistry::run`]. Of the operations
+    /// only `create` may be vetoed; the rest observe.
+    SessionLifecycle,
+    /// Agent lifecycle: a delegated run's spawn and the delivery of its bounded answer back to
+    /// the session that asked. Observe-only, dispatched through
+    /// [`StageRegistry::run_blocking`].
+    AgentLifecycle,
 }
 
 impl StagePoint {
@@ -87,6 +98,8 @@ impl StagePoint {
             StagePoint::UserInput => "user_input",
             StagePoint::ResponseCommit => "response_commit",
             StagePoint::TurnEnd => "turn_end",
+            StagePoint::SessionLifecycle => "session_lifecycle",
+            StagePoint::AgentLifecycle => "agent_lifecycle",
         }
     }
 
@@ -104,6 +117,8 @@ impl StagePoint {
                 Some(StagePoint::ResponseCommit)
             }
             "turn_end" | "turn" => Some(StagePoint::TurnEnd),
+            "session_lifecycle" | "session" => Some(StagePoint::SessionLifecycle),
+            "agent_lifecycle" | "agent" | "delegation" => Some(StagePoint::AgentLifecycle),
             _ => None,
         }
     }
@@ -120,6 +135,8 @@ impl StagePoint {
             StagePoint::UserInput => HookPoint::UserInput,
             StagePoint::ResponseCommit => HookPoint::ResponseDelivery,
             StagePoint::TurnEnd => HookPoint::TurnEnd,
+            StagePoint::SessionLifecycle => HookPoint::SessionStart,
+            StagePoint::AgentLifecycle => HookPoint::DelegationStart,
         }
     }
 }
@@ -212,6 +229,68 @@ pub struct TurnEndPayload {
     pub output_tokens: u64,
 }
 
+/// The lifecycle operation a `session_lifecycle` dispatch reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLifecycleOp {
+    /// A session row was created and is about to go live. The dispatch runs after the row and
+    /// its [`SessionRuntime`] exist but before the session joins the live set, so a
+    /// [`StageOutcome::Refused`] closes the row exactly like a `session_start` hook denial.
+    /// This is the only lifecycle operation a stage may veto.
+    Create,
+    /// A stored session was brought back into the live set by [`RuntimeHandle::open_session`].
+    ///
+    /// [`RuntimeHandle::open_session`]: crate::runtime::RuntimeHandle::open_session
+    Open,
+    /// A live session was closed; its transcript stays in the store. Observe-only.
+    Close,
+    /// A session was destroyed — live or stored-only. Observe-only.
+    Delete,
+    /// Boot rehydration loaded a stored session into the live set. Observe-only.
+    Load,
+    /// A session was forked from another — new row, copied journal, loaded live. Observe-only.
+    Fork,
+}
+
+/// What the `session_lifecycle` stage is given.
+pub struct SessionLifecyclePayload {
+    /// Which lifecycle operation this dispatch reports.
+    pub op: SessionLifecycleOp,
+    /// The session the operation acts on.
+    pub session: SessionId,
+    /// The session's title at dispatch time.
+    pub title: String,
+}
+
+/// The lifecycle operation an `agent_lifecycle` dispatch reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLifecycleOp {
+    /// A delegated run was spawned: its session exists and its first turn is starting.
+    Spawn,
+    /// A delegated run finished and its bounded answer was (or was not) handed back to the
+    /// session that asked.
+    Deliver,
+}
+
+/// What the `agent_lifecycle` stage is given. Observe-only: the spawn and the delivery are
+/// already decided store operations by the time the stage runs.
+pub struct AgentLifecyclePayload {
+    /// Which lifecycle operation this dispatch reports.
+    pub op: AgentLifecycleOp,
+    /// The bot that owns the run; `None` for a forked session, which carries a parent but no
+    /// bot.
+    pub agent: Option<BotId>,
+    /// The session the work was delegated from.
+    pub parent: SessionId,
+    /// The session the agent works in.
+    pub session: SessionId,
+    /// The delegated task, on `spawn`.
+    pub task: String,
+    /// `deliver` only: whether the bounded answer reached the parent session.
+    pub delivered: bool,
+}
+
 /// The per-point input/output carrier. Exactly one variant is live per dispatch, matching the
 /// [`StagePoint`] the registry was called with.
 pub enum StagePayload {
@@ -223,6 +302,8 @@ pub enum StagePayload {
     UserInput(UserInputPayload),
     ResponseCommit(ResponseCommitPayload),
     TurnEnd(TurnEndPayload),
+    SessionLifecycle(SessionLifecyclePayload),
+    AgentLifecycle(AgentLifecyclePayload),
 }
 
 impl StagePayload {
@@ -236,6 +317,8 @@ impl StagePayload {
             StagePayload::UserInput(_) => StagePoint::UserInput,
             StagePayload::ResponseCommit(_) => StagePoint::ResponseCommit,
             StagePayload::TurnEnd(_) => StagePoint::TurnEnd,
+            StagePayload::SessionLifecycle(_) => StagePoint::SessionLifecycle,
+            StagePayload::AgentLifecycle(_) => StagePoint::AgentLifecycle,
         }
     }
 }
@@ -505,6 +588,19 @@ fn stage_payload_details(payload: &StagePayload) -> Value {
             "steps": payload.steps,
             "output_tokens": payload.output_tokens,
         }),
+        StagePayload::SessionLifecycle(payload) => json!({
+            "op": payload.op,
+            "session": payload.session,
+            "title": payload.title,
+        }),
+        StagePayload::AgentLifecycle(payload) => json!({
+            "op": payload.op,
+            "agent": payload.agent,
+            "parent": payload.parent,
+            "session": payload.session,
+            "task": payload.task,
+            "delivered": payload.delivered,
+        }),
     }
 }
 
@@ -616,7 +712,9 @@ fn apply_stage_effect(
                 payload.text.push_str(text);
             }
         }
-        StagePayload::TurnEnd(_) => {}
+        StagePayload::TurnEnd(_)
+        | StagePayload::SessionLifecycle(_)
+        | StagePayload::AgentLifecycle(_) => {}
     }
     Ok(StageOutcome::Done)
 }
@@ -802,6 +900,38 @@ impl StageRegistry {
             .is_some_and(|entries| !entries.is_empty())
     }
 
+    /// The handler `point` dispatches to — the highest-priority registration, or the builtin
+    /// default — plus the name errors are attributed to.
+    fn winning_handler(
+        &self,
+        point: StagePoint,
+    ) -> Result<(Arc<dyn StageHandler>, String), StageError> {
+        let selected = {
+            let registrations = self.registrations.read().unwrap_or_else(|e| e.into_inner());
+            registrations
+                .get(&point)
+                .and_then(|entries| entries.first())
+                .map(|entry| (Arc::clone(&entry.handler), entry.name.clone()))
+        };
+        match selected {
+            Some(selected) => Ok(selected),
+            None => match crate::turn::default_stage_handler(point) {
+                Some(handler) => {
+                    let name = handler.name().to_owned();
+                    Ok((handler, name))
+                }
+                None => Err(StageError::new(
+                    point,
+                    "registry",
+                    format!(
+                        "no handler registered for stage `{}` and no builtin default exists",
+                        point.as_str()
+                    ),
+                )),
+            },
+        }
+    }
+
     /// Dispatch `point` to its winning handler — a registration if any, else the builtin
     /// default — and return its outcome. A handler error is attributed and propagated: the stage
     /// fails, it does not silently fall back.
@@ -821,37 +951,77 @@ impl StageRegistry {
                 ),
             ));
         }
-        let selected = {
-            let registrations = self.registrations.read().unwrap_or_else(|e| e.into_inner());
-            registrations
-                .get(&point)
-                .and_then(|entries| entries.first())
-                .map(|entry| (Arc::clone(&entry.handler), entry.name.clone()))
-        };
-        let (handler, name) = match selected {
-            Some(selected) => selected,
-            None => match crate::turn::default_stage_handler(point) {
-                Some(handler) => {
-                    let name = handler.name().to_owned();
-                    (handler, name)
-                }
-                None => {
-                    return Err(StageError::new(
-                        point,
-                        "registry",
-                        format!(
-                            "no handler registered for stage `{}` and no builtin default exists",
-                            point.as_str()
-                        ),
-                    ));
-                }
-            },
-        };
+        let (handler, name) = self.winning_handler(point)?;
         handler
             .handle(ctx)
             .await
             .map_err(|err| StageError::new(point, name, err.message))
     }
+
+    /// Dispatch `point` from synchronous code — the session and agent lifecycle call sites run
+    /// on store paths with no async boundary to `.await` on.
+    ///
+    /// The handler's future is still a [`StageFuture`], so it is driven to completion on a
+    /// scoped helper thread through `executor`'s [`tokio::runtime::Handle::block_on`]. That is
+    /// the honest minimal bridge: `Handle::block_on` panics on a thread that already has a
+    /// runtime context, and `block_in_place` does not exist on a current-thread runtime, so the
+    /// helper thread is the only form that works from every caller — runtime worker, blocking
+    /// thread or plain CLI thread — while a handler's own `spawn_blocking` still lands on the
+    /// runtime's blocking pool. The cost is one short-lived thread per lifecycle dispatch;
+    /// these operations are rare enough that it is noise.
+    ///
+    /// A panic inside the handler surfaces as a [`StageError`], matching the fail-stage policy
+    /// of [`Self::run`].
+    pub fn run_blocking(
+        &self,
+        point: StagePoint,
+        ctx: &mut StageContext,
+        executor: &tokio::runtime::Handle,
+    ) -> Result<StageOutcome, StageError> {
+        if ctx.point != point {
+            return Err(StageError::new(
+                point,
+                "registry",
+                format!(
+                    "context carries `{}` but the registry dispatched `{}`",
+                    ctx.point.as_str(),
+                    point.as_str()
+                ),
+            ));
+        }
+        let (handler, name) = self.winning_handler(point)?;
+        let future = handler.handle(ctx);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| executor.block_on(future))
+                .join()
+                .unwrap_or_else(|_| {
+                    Err(StageError::new(
+                        point,
+                        name.clone(),
+                        "stage handler thread panicked".to_owned(),
+                    ))
+                })
+        })
+        .map_err(|err| StageError::new(point, name, err.message))
+    }
+}
+
+/// Dispatch a lifecycle [`StagePoint`] — [`StagePoint::SessionLifecycle`] or
+/// [`StagePoint::AgentLifecycle`] — from synchronous runtime code. The stage still runs through
+/// the registry, on a helper thread via [`StageRegistry::run_blocking`]; only the boundary
+/// between the sync store path and the async handler trait lives here.
+pub(crate) fn run_lifecycle_stage(
+    inner: &Arc<RuntimeInner>,
+    point: StagePoint,
+    session: &Arc<SessionRuntime>,
+    request_text: &str,
+    payload: StagePayload,
+) -> Result<StageOutcome, StageError> {
+    let mut ctx = StageContext::new(inner, session, &TurnId::generate(), request_text, payload);
+    inner
+        .stages()
+        .run_blocking(point, &mut ctx, &inner.executor)
 }
 
 impl Default for StageRegistry {
@@ -1613,5 +1783,252 @@ mod tests {
                 .any(|message| message.text_body() == "native"),
             "the native marker is what the stage produced"
         );
+    }
+
+    /// Records every `session_lifecycle` dispatch as `(op, session, title)`.
+    struct LifecycleSpy {
+        seen: Arc<Mutex<Vec<(SessionLifecycleOp, SessionId, String)>>>,
+    }
+
+    impl StageHandler for LifecycleSpy {
+        fn name(&self) -> &'static str {
+            "test.lifecycle_spy"
+        }
+
+        fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+            Box::pin(async move {
+                if let StagePayload::SessionLifecycle(payload) = &ctx.payload {
+                    self.seen.lock().expect("seen lock").push((
+                        payload.op,
+                        payload.session.clone(),
+                        payload.title.clone(),
+                    ));
+                }
+                Ok(StageOutcome::Done)
+            })
+        }
+    }
+
+    /// Refuses `create` and passes every other lifecycle operation.
+    struct RefuseCreate;
+
+    impl StageHandler for RefuseCreate {
+        fn name(&self) -> &'static str {
+            "test.refuse_create"
+        }
+
+        fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+            Box::pin(async move {
+                if matches!(
+                    &ctx.payload,
+                    StagePayload::SessionLifecycle(SessionLifecyclePayload {
+                        op: SessionLifecycleOp::Create,
+                        ..
+                    })
+                ) {
+                    return Ok(StageOutcome::Refused("the stage says no".to_owned()));
+                }
+                Ok(StageOutcome::Done)
+            })
+        }
+    }
+
+    /// Refuses every lifecycle operation; only `create` is allowed to honor that.
+    struct RefuseAll;
+
+    impl StageHandler for RefuseAll {
+        fn name(&self) -> &'static str {
+            "test.refuse_all"
+        }
+
+        fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+            Box::pin(async move {
+                if matches!(ctx.payload, StagePayload::SessionLifecycle(_)) {
+                    return Ok(StageOutcome::Refused("observe-only".to_owned()));
+                }
+                Ok(StageOutcome::Done)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle_stage_fires_on_create_open_close_and_delete() {
+        let (_dir, _home, runtime, _session, _live) = runtime_and_session().await;
+        let handle = runtime.handle();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        handle.register_stage(
+            StagePoint::SessionLifecycle,
+            Arc::new(LifecycleSpy {
+                seen: Arc::clone(&seen),
+            }),
+            10,
+        );
+
+        let created = handle
+            .create_session(Some("lifecycle".into()))
+            .expect("create");
+        handle.close_session(&created).expect("close");
+        handle.open_session(&created).expect("open");
+        handle.delete_session(&created).expect("delete");
+
+        let seen = seen.lock().expect("seen lock");
+        let ops: Vec<SessionLifecycleOp> = seen.iter().map(|(op, _, _)| *op).collect();
+        assert_eq!(
+            ops,
+            vec![
+                SessionLifecycleOp::Create,
+                SessionLifecycleOp::Close,
+                SessionLifecycleOp::Open,
+                SessionLifecycleOp::Delete,
+            ]
+        );
+        for (_, session, title) in seen.iter() {
+            assert_eq!(
+                session, &created,
+                "every dispatch names the operated session"
+            );
+            assert_eq!(title, "lifecycle");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_lifecycle_stage_can_veto_create() {
+        let (_dir, _home, runtime, _session, _live) = runtime_and_session().await;
+        let handle = runtime.handle();
+        let live_before = handle.snapshot().sessions.len();
+        handle.register_stage(StagePoint::SessionLifecycle, Arc::new(RefuseCreate), 10);
+
+        let err = handle
+            .create_session(Some("vetoed".into()))
+            .expect_err("the stage vetoes the create");
+        assert!(
+            err.to_string().contains("a stage refused this session"),
+            "{err}"
+        );
+        assert_eq!(
+            handle.snapshot().sessions.len(),
+            live_before,
+            "the vetoed session never went live"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_on_an_observe_only_operation_does_not_block_it() {
+        let (_dir, _home, runtime, session, _live) = runtime_and_session().await;
+        let handle = runtime.handle();
+        handle.register_stage(StagePoint::SessionLifecycle, Arc::new(RefuseAll), 10);
+
+        handle.close_session(&session).expect("close proceeds");
+        handle.open_session(&session).expect("open proceeds");
+        handle.delete_session(&session).expect("delete proceeds");
+    }
+
+    /// One recorded `agent_lifecycle` dispatch: `(op, agent, parent, session, task, delivered)`.
+    type AgentDispatch = (
+        AgentLifecycleOp,
+        Option<BotId>,
+        SessionId,
+        SessionId,
+        String,
+        bool,
+    );
+
+    /// Records every `agent_lifecycle` dispatch.
+    struct AgentSpy {
+        seen: Arc<Mutex<Vec<AgentDispatch>>>,
+    }
+
+    impl StageHandler for AgentSpy {
+        fn name(&self) -> &'static str {
+            "test.agent_spy"
+        }
+
+        fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+            Box::pin(async move {
+                if let StagePayload::AgentLifecycle(payload) = &ctx.payload {
+                    self.seen.lock().expect("seen lock").push((
+                        payload.op,
+                        payload.agent.clone(),
+                        payload.parent.clone(),
+                        payload.session.clone(),
+                        payload.task.clone(),
+                        payload.delivered,
+                    ));
+                }
+                Ok(StageOutcome::Done)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_lifecycle_stage_observes_spawn_and_deliver() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::new(RecordingProvider {
+                requests: Mutex::new(Vec::new()),
+            }) as Arc<dyn Provider>,
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        let parent = handle.snapshot().sessions[0].id.clone();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        handle.register_stage(
+            StagePoint::AgentLifecycle,
+            Arc::new(AgentSpy {
+                seen: Arc::clone(&seen),
+            }),
+            10,
+        );
+        let bot = handle
+            .bot_create("Spybot", "tester", "watches things")
+            .expect("bot created");
+        handle
+            .spawn_agent(bot.clone(), "audit the code".into(), parent.clone())
+            .expect("spawn");
+
+        // Spawn is synchronous: it is already recorded.
+        {
+            let seen = seen.lock().expect("seen lock");
+            assert_eq!(seen.len(), 1, "spawn dispatched once");
+            let (op, agent, seen_parent, _child, task, delivered) = &seen[0];
+            assert_eq!(*op, AgentLifecycleOp::Spawn);
+            assert_eq!(agent.as_ref(), Some(&bot));
+            assert_eq!(seen_parent, &parent);
+            assert_eq!(task.as_str(), "audit the code");
+            assert!(!*delivered);
+        }
+
+        // Deliver lands when the delegated turn finishes; RecordingProvider answers in one
+        // round, so this is a poll, not a wait on anything slow.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if seen
+                .lock()
+                .expect("seen lock")
+                .iter()
+                .any(|(op, ..)| *op == AgentLifecycleOp::Deliver)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the deliver dispatch never arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let seen = seen.lock().expect("seen lock");
+        let deliver = seen
+            .iter()
+            .find(|(op, ..)| *op == AgentLifecycleOp::Deliver)
+            .expect("deliver recorded");
+        let (_, agent, seen_parent, child, _, delivered) = deliver;
+        assert_eq!(agent.as_ref(), Some(&bot));
+        assert_eq!(seen_parent, &parent);
+        assert!(*delivered, "the answer reached the live parent");
+        let spawn_child = seen[0].3.clone();
+        assert_eq!(child, &spawn_child, "deliver names the spawned session");
     }
 }

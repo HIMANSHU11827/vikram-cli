@@ -643,6 +643,10 @@ pub(crate) struct RuntimeInner {
     /// dispatches through. Every [`crate::pipeline::StagePoint`] has a builtin default; a
     /// `register_stage` call adds or overrides a native handler by priority.
     pub stages: std::sync::Arc<crate::pipeline::StageRegistry>,
+    /// The runtime's executor handle, captured at boot. Lifecycle stage dispatch is synchronous
+    /// and drives handler futures through it on a helper thread — see
+    /// [`crate::pipeline::StageRegistry::run_blocking`].
+    pub executor: tokio::runtime::Handle,
     pub skills: std::sync::Mutex<SkillRegistry>,
     // `evolution` field moved into `LearningState` (see `learning` above).
     pub workspace: WorkspaceManager,
@@ -753,6 +757,43 @@ impl RuntimeInner {
         let outcome = self.dispatch_hook(ctx);
         self.journal_hook(session, &point, &outcome);
         outcome
+    }
+}
+
+/// Run one lifecycle stage from a synchronous store path and apply the v1 veto policy.
+///
+/// Lifecycle stages observe store operations that already have honest failure semantics, so a
+/// handler error is published as an event and never fails the operation. [`StageOutcome::Refused`]
+/// vetoes only where `vetoable` — today that is `session_lifecycle`/`create` alone; everywhere
+/// else a refusal is surfaced as a warning and the operation proceeds unchanged. `Err(reason)`
+/// is returned only for an honored veto.
+fn dispatch_lifecycle_stage(
+    inner: &Arc<RuntimeInner>,
+    point: crate::pipeline::StagePoint,
+    session: &Arc<SessionRuntime>,
+    request_text: &str,
+    payload: crate::pipeline::StagePayload,
+    vetoable: bool,
+) -> std::result::Result<(), String> {
+    match crate::pipeline::run_lifecycle_stage(inner, point, session, request_text, payload) {
+        Ok(crate::pipeline::StageOutcome::Done) => Ok(()),
+        Ok(crate::pipeline::StageOutcome::Refused(reason)) if vetoable => Err(reason),
+        Ok(crate::pipeline::StageOutcome::Refused(reason)) => {
+            inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!(
+                    "the `{}` stage refused, but this operation only observes: {reason}",
+                    point.as_str()
+                ),
+            });
+            Ok(())
+        }
+        Err(err) => {
+            inner.emit(RuntimeEvent::Error {
+                text: err.to_string(),
+            });
+            Ok(())
+        }
     }
 }
 
@@ -1559,7 +1600,13 @@ impl RuntimeInner {
     ///
     /// The child's transcript stays its own; what the parent receives is the final statement, fitted
     /// to `context.delegation_budget_tokens` and journaled so it survives a restart of either session.
-    pub fn deliver_delegation(&self, parent: &SessionId, child: &SessionRuntime) {
+    /// `self: &Arc<Self>` because the `agent_lifecycle` stage's context holds the runtime as
+    /// an `Arc`; the turn loop already calls through one.
+    pub fn deliver_delegation(self: &Arc<Self>, parent: &SessionId, child: &SessionRuntime) {
+        // The child's live `Arc` is captured before the reap below can drop it from the live
+        // set; the `agent_lifecycle` stage observes through it at the end.
+        let child_live = self.session(&child.id);
+        let mut delivered = false;
         if let Some(parent_session) = self.session(parent) {
             let budget = self
                 .config
@@ -1602,6 +1649,7 @@ impl RuntimeInner {
                     true,
                 );
                 self.publish_metrics();
+                delivered = true;
             }
         }
         // A delegated session is one-shot: its answer has been handed over (or there was no
@@ -1639,6 +1687,28 @@ impl RuntimeInner {
                     "bot": child.bot().map(|bot| bot.to_string()),
                 })),
         );
+        // Stage: agent_lifecycle — observe-only. The answer is already durable in the parent's
+        // transcript (or there was none to deliver); the reap above may have dropped the child
+        // from the live set, which is why its `Arc` was captured at entry.
+        if let Some(child_live) = child_live {
+            let _ = dispatch_lifecycle_stage(
+                self,
+                crate::pipeline::StagePoint::AgentLifecycle,
+                &child_live,
+                &child.title(),
+                crate::pipeline::StagePayload::AgentLifecycle(
+                    crate::pipeline::AgentLifecyclePayload {
+                        op: crate::pipeline::AgentLifecycleOp::Deliver,
+                        agent: child.bot(),
+                        parent: parent.clone(),
+                        session: child.id.clone(),
+                        task: String::new(),
+                        delivered,
+                    },
+                ),
+                false,
+            );
+        }
     }
 
     /// Digest a result the transcript cannot carry, keeping the full text addressable.
@@ -1675,7 +1745,9 @@ impl RuntimeInner {
         &self.tools
     }
 
-    pub fn create_session(&self, title: Option<String>) -> Result<Arc<SessionRuntime>> {
+    /// `self: &Arc<Self>` because the `session_lifecycle` stage's context holds the runtime as
+    /// an `Arc`; every caller already has one.
+    pub fn create_session(self: &Arc<Self>, title: Option<String>) -> Result<Arc<SessionRuntime>> {
         let now = now_ms();
         // A session starts life named only when the caller actually named it. Otherwise it carries
         // the placeholder and stays `pending`, which is what lets the first real message earn it a
@@ -1730,6 +1802,28 @@ impl RuntimeInner {
             let _ = self.store.set_session_status(&session.id, "closed", now);
             return Err(RuntimeError::InvalidState(format!(
                 "a plugin refused this session: {reason}"
+            )));
+        }
+        // Stage: session_lifecycle — `create` is the one lifecycle operation a stage may veto.
+        // The dispatch runs after the row and its runtime exist but before the session joins
+        // the live set, so a refusal closes the row exactly like the hook denial above.
+        if let Err(reason) = dispatch_lifecycle_stage(
+            self,
+            crate::pipeline::StagePoint::SessionLifecycle,
+            &session,
+            &session.title(),
+            crate::pipeline::StagePayload::SessionLifecycle(
+                crate::pipeline::SessionLifecyclePayload {
+                    op: crate::pipeline::SessionLifecycleOp::Create,
+                    session: session.id.clone(),
+                    title: session.title(),
+                },
+            ),
+            true,
+        ) {
+            let _ = self.store.set_session_status(&session.id, "closed", now);
+            return Err(RuntimeError::InvalidState(format!(
+                "a stage refused this session: {reason}"
             )));
         }
         self.sessions
@@ -2241,6 +2335,7 @@ impl Runtime {
             plugins: Mutex::new(plugins),
             hooks,
             stages,
+            executor: tokio::runtime::Handle::current(),
             skills,
             workspace,
             approvals: Mutex::new(HashMap::new()),
@@ -2314,7 +2409,23 @@ impl Runtime {
                     eprintln!("vikram: runtime sessions lock mutex poisoned; recovering");
                     e.into_inner()
                 })
-                .push(session);
+                .push(Arc::clone(&session));
+            // Stage: session_lifecycle — boot rehydration is the `load` operation. Observe-only:
+            // a stage failure is reported, never allowed to keep a stored session from loading.
+            let _ = dispatch_lifecycle_stage(
+                &inner,
+                crate::pipeline::StagePoint::SessionLifecycle,
+                &session,
+                &session.title(),
+                crate::pipeline::StagePayload::SessionLifecycle(
+                    crate::pipeline::SessionLifecyclePayload {
+                        op: crate::pipeline::SessionLifecycleOp::Load,
+                        session: session.id.clone(),
+                        title: session.title(),
+                    },
+                ),
+                false,
+            );
         }
 
         // Bootstrap a default user/profile/identity if none exist, so multi-user isolation has a
@@ -3287,6 +3398,22 @@ impl RuntimeHandle {
         let Some(session) = self.inner.session(session) else {
             return Err(RuntimeError::SessionNotFound(session.clone()));
         };
+        // Stage: session_lifecycle — close observes while the session is still live; the
+        // transcript stays in the store either way, so a refusal cannot veto this.
+        let _ = dispatch_lifecycle_stage(
+            &self.inner,
+            crate::pipeline::StagePoint::SessionLifecycle,
+            &session,
+            &session.title(),
+            crate::pipeline::StagePayload::SessionLifecycle(
+                crate::pipeline::SessionLifecyclePayload {
+                    op: crate::pipeline::SessionLifecycleOp::Close,
+                    session: session.id.clone(),
+                    title: session.title(),
+                },
+            ),
+            false,
+        );
         session.cancel_handle().cancel();
         self.inner
             .sessions
@@ -3347,6 +3474,32 @@ impl RuntimeHandle {
             .session(session)
             .map(|live| live.messages())
             .unwrap_or_default();
+        // Stage: session_lifecycle — delete observes before the store row goes. A stored-only
+        // session gets a runtime built from its row for the context; it is never pushed live.
+        let lifecycle_session = self.inner.session(session).or_else(|| {
+            self.inner
+                .store
+                .get_session(session)
+                .ok()
+                .flatten()
+                .map(|row| Arc::new(SessionRuntime::from_row(row)))
+        });
+        if let Some(lifecycle_session) = lifecycle_session {
+            let _ = dispatch_lifecycle_stage(
+                &self.inner,
+                crate::pipeline::StagePoint::SessionLifecycle,
+                &lifecycle_session,
+                &lifecycle_session.title(),
+                crate::pipeline::StagePayload::SessionLifecycle(
+                    crate::pipeline::SessionLifecyclePayload {
+                        op: crate::pipeline::SessionLifecycleOp::Delete,
+                        session: session.clone(),
+                        title: lifecycle_session.title(),
+                    },
+                ),
+                false,
+            );
+        }
         self.inner
             .store
             .delete_session(session)
@@ -3432,6 +3585,21 @@ impl RuntimeHandle {
             .initialize_all(live.id.as_str());
         self.inner
             .emit(RuntimeEvent::SessionUpdated(live.snapshot()));
+        // Stage: session_lifecycle — open observes the session now live; nothing left to veto.
+        let _ = dispatch_lifecycle_stage(
+            &self.inner,
+            crate::pipeline::StagePoint::SessionLifecycle,
+            &live,
+            &live.title(),
+            crate::pipeline::StagePayload::SessionLifecycle(
+                crate::pipeline::SessionLifecyclePayload {
+                    op: crate::pipeline::SessionLifecycleOp::Open,
+                    session: live.id.clone(),
+                    title: live.title(),
+                },
+            ),
+            false,
+        );
         self.inner.publish_metrics();
         Ok(live.id.clone())
     }
@@ -3518,6 +3686,22 @@ impl RuntimeHandle {
             .push(Arc::clone(&live));
         self.inner
             .emit(RuntimeEvent::SessionCreated(live.snapshot()));
+        // Stage: session_lifecycle — a fork is a create the operator named differently; the
+        // stage observes it like `open`, with no veto.
+        let _ = dispatch_lifecycle_stage(
+            &self.inner,
+            crate::pipeline::StagePoint::SessionLifecycle,
+            &live,
+            &live.title(),
+            crate::pipeline::StagePayload::SessionLifecycle(
+                crate::pipeline::SessionLifecyclePayload {
+                    op: crate::pipeline::SessionLifecycleOp::Fork,
+                    session: live.id.clone(),
+                    title: live.title(),
+                },
+            ),
+            false,
+        );
         self.inner.publish_metrics();
         Ok(live.id.clone())
     }
@@ -3714,6 +3898,24 @@ impl RuntimeHandle {
             true,
         );
         self.inner.publish_metrics();
+
+        // Stage: agent_lifecycle — the spawn is already durable (session, lineage, bot state);
+        // the stage observes it as the delegated turn is about to start.
+        let _ = dispatch_lifecycle_stage(
+            &self.inner,
+            crate::pipeline::StagePoint::AgentLifecycle,
+            &agent_session,
+            &task,
+            crate::pipeline::StagePayload::AgentLifecycle(crate::pipeline::AgentLifecyclePayload {
+                op: crate::pipeline::AgentLifecycleOp::Spawn,
+                agent: Some(profile.clone()),
+                parent: parent.id.clone(),
+                session: agent_session.id.clone(),
+                task: task.clone(),
+                delivered: false,
+            }),
+            false,
+        );
 
         crate::turn::spawn_turn(
             Arc::clone(&self.inner),
