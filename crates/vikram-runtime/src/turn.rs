@@ -19,9 +19,9 @@ use vikram_contracts::{
 use crate::bots::ManagedBot;
 use crate::learning::TurnGrowth;
 use crate::pipeline::{
-    ContextBuildPayload, MemoryRecallPayload, ProviderRequestPayload, ResultCommitPayload,
-    StageContext, StageError, StageFuture, StageHandler, StageOutcome, StagePayload, StagePoint,
-    ToolDispatchPayload,
+    ContextBuildPayload, MemoryRecallPayload, ProviderRequestPayload, ResponseCommitPayload,
+    ResultCommitPayload, StageContext, StageError, StageFuture, StageHandler, StageOutcome,
+    StagePayload, StagePoint, ToolDispatchPayload, TurnEndPayload, UserInputPayload,
 };
 use crate::provider::{CompletionRequest, ProviderEvent};
 use crate::runtime::{PendingApproval, RuntimeInner};
@@ -179,7 +179,7 @@ pub(crate) fn spawn_turn(
 pub(crate) async fn run_turn(
     inner: Arc<RuntimeInner>,
     session: Arc<SessionRuntime>,
-    mut message: Message,
+    message: Message,
     agent: Option<AgentRun>,
 ) {
     let turn = TurnId::generate();
@@ -200,58 +200,8 @@ pub(crate) async fn run_turn(
         armed: std::cell::Cell::new(true),
     };
 
-    // A user-input hook sees the message before it is durable: it may refuse it or rewrite the
-    // prose the model will read. A rewrite lands in the journaled message itself, so what the
-    // plugin changed is what the transcript and the model both carry.
-    let user_input = run_hook(
-        &inner,
-        &session,
-        crate::hooks::HookContext::new(crate::hooks::HookPoint::UserInput)
-            .with_session(session.id.as_str())
-            .with_turn(turn.as_str())
-            .with_workspace(inner.workspace_root.display().to_string())
-            .with_model(inner.model())
-            .with_text(message.text_body()),
-    )
-    .await;
-    if user_input.effect.deny.is_none()
-        && let Some(text) = user_input.effect.text.clone()
-    {
-        rewrite_message_text(&mut message, text);
-    }
-
-    // The user's message is durable before any model work begins.
-    let request_text = message.text_body();
-    session.push_message(message.clone(), now_ms());
-    inner.journal(
-        &session.id,
-        RecordKind::Message,
-        serde_json::json!({"message": message}),
-    );
-    inner.emit(RuntimeEvent::UserMessage {
-        session: session.id.clone(),
-        turn: turn.clone(),
-        text: request_text.clone(),
-    });
-    inner.touch(&session);
-    // The conversation now has something to be named after. Naming runs in the background and is
-    // gated to one attempt per session, so this costs nothing on the turn the operator is waiting for.
-    inner.maybe_title_session(&session);
-
-    session.begin_turn(now_ms());
     // What this turn actually did, collected as it happens and handed to the growth pipeline.
     let mut growth = TurnGrowth::default();
-    inner.emit(RuntimeEvent::StreamStarted {
-        session: session.id.clone(),
-        turn: turn.clone(),
-    });
-    if let Some(run) = &agent {
-        run.agent.set_state(BotState::Thinking);
-        inner.publish_bot(&run.agent);
-    }
-    inner.emit(RuntimeEvent::Status(inner.status()));
-    inner.publish_metrics();
-
     let mut outcome = TurnState::Idle;
     let mut output_tokens = 0u64;
     let mut reported_output: Option<u64> = None;
@@ -272,11 +222,77 @@ pub(crate) async fn run_turn(
     let mut step_notice_sent = false;
     let mut live_metrics = Instant::now();
 
-    if let Some(reason) = &user_input.effect.deny {
+    // Stage: user_input — accept, normalize and journal the operator's message before any model
+    // work begins. The `user_input` hooks run inside the builtin; a native module can replace
+    // the whole accept path — rewriting the message or refusing the input outright.
+    let submitted_text = message.text_body();
+    let mut input_ctx = StageContext::new(
+        &inner,
+        &session,
+        &turn,
+        &submitted_text,
+        StagePayload::UserInput(UserInputPayload {
+            message,
+            deny: None,
+            prepend: Vec::new(),
+            append: Vec::new(),
+        }),
+    );
+    if run_stage(
+        &inner,
+        &session,
+        &agent,
+        &turn,
+        &submitted_text,
+        &growth,
+        started,
+        output_tokens,
+        steps_used,
+        StagePoint::UserInput,
+        &mut input_ctx,
+    )
+    .await
+    {
+        claim_guard.disarm();
+        return;
+    }
+    let (request_text, input_deny, input_prepend, input_append) = match input_ctx.payload {
+        StagePayload::UserInput(payload) => (
+            payload.message.text_body(),
+            payload.deny,
+            payload.prepend,
+            payload.append,
+        ),
+        _ => (submitted_text, None, Vec::new(), Vec::new()),
+    };
+
+    session.begin_turn(now_ms());
+    inner.emit(RuntimeEvent::StreamStarted {
+        session: session.id.clone(),
+        turn: turn.clone(),
+    });
+    if let Some(run) = &agent {
+        run.agent.set_state(BotState::Thinking);
+        inner.publish_bot(&run.agent);
+    }
+    inner.emit(RuntimeEvent::Status(inner.status()));
+    inner.publish_metrics();
+
+    if let Some(reason) = &input_deny {
         inner.emit(RuntimeEvent::Error {
             text: format!("a plugin refused this input: {reason}"),
         });
         turn_end_hook(&inner, &session, &turn, TurnState::Failed, 0, output_tokens).await;
+        turn_end_stage(
+            &inner,
+            &session,
+            &turn,
+            &request_text,
+            TurnState::Failed,
+            0,
+            output_tokens,
+        )
+        .await;
         finish(
             &inner,
             &session,
@@ -312,6 +328,16 @@ pub(crate) async fn run_turn(
             text: format!("a plugin refused this turn: {reason}"),
         });
         turn_end_hook(&inner, &session, &turn, TurnState::Failed, 0, output_tokens).await;
+        turn_end_stage(
+            &inner,
+            &session,
+            &turn,
+            &request_text,
+            TurnState::Failed,
+            0,
+            output_tokens,
+        )
+        .await;
         finish(
             &inner,
             &session,
@@ -334,6 +360,16 @@ pub(crate) async fn run_turn(
             text: "no model configured: set `model` and the API key named by `api_key_env`".into(),
         });
         turn_end_hook(&inner, &session, &turn, TurnState::Failed, 0, output_tokens).await;
+        turn_end_stage(
+            &inner,
+            &session,
+            &turn,
+            &request_text,
+            TurnState::Failed,
+            0,
+            output_tokens,
+        )
+        .await;
         finish(
             &inner,
             &session,
@@ -396,8 +432,8 @@ pub(crate) async fn run_turn(
 
         // What the input and turn-start hooks asked to add goes in front of everything the host
         // assembled, in the order the hooks ran.
-        let mut hook_injected: Vec<String> = user_input.effect.prepend.clone();
-        hook_injected.extend(user_input.effect.append.iter().cloned());
+        let mut hook_injected: Vec<String> = input_prepend.clone();
+        hook_injected.extend(input_append.iter().cloned());
         hook_injected.extend(turn_start.effect.prepend.iter().cloned());
         hook_injected.extend(turn_start.effect.append.iter().cloned());
         // Who is speaking. A bot carries its own identity — the profile's name, tags and
@@ -548,6 +584,16 @@ pub(crate) async fn run_turn(
                 &inner,
                 &session,
                 &turn,
+                TurnState::Failed,
+                steps_used,
+                output_tokens,
+            )
+            .await;
+            turn_end_stage(
+                &inner,
+                &session,
+                &turn,
+                &request_text,
                 TurnState::Failed,
                 steps_used,
                 output_tokens,
@@ -745,35 +791,53 @@ pub(crate) async fn run_turn(
             continue;
         }
         if cancel.is_cancelled() {
-            if !text_buffer.is_empty() {
-                commit_assistant(
+            if !text_buffer.is_empty()
+                && commit_assistant(
                     &inner,
                     &session,
+                    &agent,
                     &turn,
+                    &request_text,
+                    &growth,
+                    started,
+                    output_tokens,
+                    steps_used,
                     &text_buffer,
                     &reasoning_buffer,
                     &[],
                 )
-                .await;
-                reasoning_buffer.clear();
+                .await
+            {
+                claim_guard.disarm();
+                return;
             }
+            reasoning_buffer.clear();
             outcome = TurnState::Cancelled;
             break;
         }
         if stream_failed {
-            if !text_buffer.is_empty() || !reasoning_buffer.is_empty() {
-                commit_assistant(
+            if (!text_buffer.is_empty() || !reasoning_buffer.is_empty())
+                && commit_assistant(
                     &inner,
                     &session,
+                    &agent,
                     &turn,
+                    &request_text,
+                    &growth,
+                    started,
+                    output_tokens,
+                    steps_used,
                     &text_buffer,
                     &reasoning_buffer,
                     &[],
                 )
-                .await;
-                text_buffer.clear();
-                reasoning_buffer.clear();
+                .await
+            {
+                claim_guard.disarm();
+                return;
             }
+            text_buffer.clear();
+            reasoning_buffer.clear();
             outcome = TurnState::Failed;
             break;
         }
@@ -787,19 +851,28 @@ pub(crate) async fn run_turn(
         // assistant turn that asked for it carries the `tool_calls` it answers. Without them the
         // transcript says "assistant said nothing" followed by an unexplained result, and a model
         // that cannot see its own call runs the same tool again under a new name.
-        if !text_buffer.is_empty() || !reasoning_buffer.is_empty() || !calls.is_empty() {
-            commit_assistant(
+        if (!text_buffer.is_empty() || !reasoning_buffer.is_empty() || !calls.is_empty())
+            && commit_assistant(
                 &inner,
                 &session,
+                &agent,
                 &turn,
+                &request_text,
+                &growth,
+                started,
+                output_tokens,
+                steps_used,
                 &text_buffer,
                 &reasoning_buffer,
                 &calls,
             )
-            .await;
-            text_buffer.clear();
-            reasoning_buffer.clear();
+            .await
+        {
+            claim_guard.disarm();
+            return;
         }
+        text_buffer.clear();
+        reasoning_buffer.clear();
 
         if calls.is_empty() {
             break;
@@ -880,6 +953,16 @@ pub(crate) async fn run_turn(
                 &inner,
                 &session,
                 &turn,
+                TurnState::Failed,
+                steps_used,
+                output_tokens,
+            )
+            .await;
+            turn_end_stage(
+                &inner,
+                &session,
+                &turn,
+                &request_text,
                 TurnState::Failed,
                 steps_used,
                 output_tokens,
@@ -1027,6 +1110,16 @@ pub(crate) async fn run_turn(
         });
     }
     turn_end_hook(&inner, &session, &turn, outcome, steps_used, output_tokens).await;
+    turn_end_stage(
+        &inner,
+        &session,
+        &turn,
+        &request_text,
+        outcome,
+        steps_used,
+        output_tokens,
+    )
+    .await;
     finish(
         &inner,
         &session,
@@ -1181,10 +1274,55 @@ fn rewrite_message_text(message: &mut Message, text: String) {
     message.blocks = blocks;
 }
 
-/// Commit one assistant message after `response_delivery` hooks have seen the prose. A denial
-/// withholds the text but never the reasoning or tool calls it announced — dropping those would
-/// orphan the results that follow. A `text` effect rewrites what lands.
+/// Dispatch the `response_commit` stage for one assistant message. Returns `true` when the
+/// stage refused the turn or its handler failed — the turn is already ended honestly and the
+/// caller only unwinds.
+#[allow(clippy::too_many_arguments)]
 async fn commit_assistant(
+    inner: &Arc<RuntimeInner>,
+    session: &Arc<SessionRuntime>,
+    agent: &Option<AgentRun>,
+    turn: &TurnId,
+    request_text: &str,
+    growth: &TurnGrowth,
+    started: Instant,
+    output_tokens: u64,
+    steps_used: u64,
+    text: &str,
+    reasoning: &str,
+    calls: &[ToolCall],
+) -> bool {
+    let mut ctx = StageContext::new(
+        inner,
+        session,
+        turn,
+        request_text,
+        StagePayload::ResponseCommit(ResponseCommitPayload {
+            text: text.to_owned(),
+            reasoning: reasoning.to_owned(),
+            calls: calls.to_vec(),
+        }),
+    );
+    run_stage(
+        inner,
+        session,
+        agent,
+        turn,
+        request_text,
+        growth,
+        started,
+        output_tokens,
+        steps_used,
+        StagePoint::ResponseCommit,
+        &mut ctx,
+    )
+    .await
+}
+
+/// The `response_commit` stage's builtin body: `response_delivery` hooks see the prose — a
+/// denial withholds the text but never the reasoning or tool calls it announced, and a `text`
+/// effect rewrites what lands — then the message commits to transcript, journal and events.
+async fn deliver_assistant_message(
     inner: &Arc<RuntimeInner>,
     session: &Arc<SessionRuntime>,
     turn: &TurnId,
@@ -1243,6 +1381,37 @@ async fn turn_end_hook(
             })),
     )
     .await;
+}
+
+/// The `turn_end` stage dispatch: native observers see the decided outcome, step count and
+/// token figures. The builtin default is a pass-through — the `turn_end` hooks dispatched just
+/// before already carry every effect — and the outcome is already decided, so a stage failure
+/// is reported rather than allowed to fail a turn that has already ended.
+async fn turn_end_stage(
+    inner: &Arc<RuntimeInner>,
+    session: &Arc<SessionRuntime>,
+    turn: &TurnId,
+    request_text: &str,
+    outcome: TurnState,
+    steps: u64,
+    output_tokens: u64,
+) {
+    let mut ctx = StageContext::new(
+        inner,
+        session,
+        turn,
+        request_text,
+        StagePayload::TurnEnd(TurnEndPayload {
+            outcome,
+            steps,
+            output_tokens,
+        }),
+    );
+    if let Err(err) = inner.stages().run(StagePoint::TurnEnd, &mut ctx).await {
+        inner.emit(RuntimeEvent::Error {
+            text: err.to_string(),
+        });
+    }
 }
 
 /// Which memory-scoped point a tool call belongs to, when it is one at all. Reads recall,
@@ -2060,6 +2229,7 @@ fn stage_refusal(point: StagePoint, reason: &str) -> String {
     match point {
         StagePoint::ContextBuild => format!("a plugin refused this turn's context: {reason}"),
         StagePoint::ProviderRequest => format!("a plugin refused the model request: {reason}"),
+        StagePoint::UserInput => format!("a plugin refused this input: {reason}"),
         _ => format!("the `{}` stage refused: {reason}", point.as_str()),
     }
 }
@@ -2092,6 +2262,16 @@ async fn run_stage(
         inner,
         session,
         turn,
+        TurnState::Failed,
+        steps_used,
+        output_tokens,
+    )
+    .await;
+    turn_end_stage(
+        inner,
+        session,
+        turn,
+        request_text,
         TurnState::Failed,
         steps_used,
         output_tokens,
@@ -2556,6 +2736,124 @@ impl StageHandler for DefaultResultCommit {
     }
 }
 
+struct DefaultUserInput;
+
+impl StageHandler for DefaultUserInput {
+    fn name(&self) -> &'static str {
+        "builtin:user_input"
+    }
+
+    fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+        Box::pin(async move {
+            let StagePayload::UserInput(payload) = &mut ctx.payload else {
+                return Err(StageError::new(
+                    ctx.point,
+                    self.name(),
+                    "user_input stage received a different payload",
+                ));
+            };
+            // A user-input hook sees the message before it is durable: it may refuse it or
+            // rewrite the prose the model will read. A rewrite lands in the journaled message
+            // itself, so what the plugin changed is what the transcript and the model carry.
+            let hook = run_hook(
+                &ctx.inner,
+                &ctx.session,
+                crate::hooks::HookContext::new(crate::hooks::HookPoint::UserInput)
+                    .with_session(ctx.session.id.as_str())
+                    .with_turn(ctx.turn.as_str())
+                    .with_workspace(ctx.inner.workspace_root.display().to_string())
+                    .with_model(ctx.inner.model())
+                    .with_text(payload.message.text_body()),
+            )
+            .await;
+            if hook.effect.deny.is_none()
+                && let Some(text) = hook.effect.text.clone()
+            {
+                rewrite_message_text(&mut payload.message, text);
+            }
+            // The user's message is durable before any model work begins.
+            let message = payload.message.clone();
+            let request_text = message.text_body();
+            ctx.session.push_message(message.clone(), now_ms());
+            ctx.inner.journal(
+                &ctx.session.id,
+                RecordKind::Message,
+                serde_json::json!({"message": message}),
+            );
+            ctx.inner.emit(RuntimeEvent::UserMessage {
+                session: ctx.session.id.clone(),
+                turn: ctx.turn.clone(),
+                text: request_text,
+            });
+            ctx.inner.touch(&ctx.session);
+            // The conversation now has something to be named after. Naming runs in the
+            // background and is gated to one attempt per session, so this costs nothing on the
+            // turn the operator is waiting for.
+            ctx.inner.maybe_title_session(&ctx.session);
+            payload.deny = hook.effect.deny;
+            payload.prepend = hook.effect.prepend;
+            payload.append = hook.effect.append;
+            Ok(StageOutcome::Done)
+        })
+    }
+}
+
+struct DefaultResponseCommit;
+
+impl StageHandler for DefaultResponseCommit {
+    fn name(&self) -> &'static str {
+        "builtin:response_commit"
+    }
+
+    fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+        Box::pin(async move {
+            let StagePayload::ResponseCommit(payload) = &mut ctx.payload else {
+                return Err(StageError::new(
+                    ctx.point,
+                    self.name(),
+                    "response_commit stage received a different payload",
+                ));
+            };
+            let text = std::mem::take(&mut payload.text);
+            let reasoning = std::mem::take(&mut payload.reasoning);
+            let calls = std::mem::take(&mut payload.calls);
+            deliver_assistant_message(
+                &ctx.inner,
+                &ctx.session,
+                &ctx.turn,
+                &text,
+                &reasoning,
+                &calls,
+            )
+            .await;
+            Ok(StageOutcome::Done)
+        })
+    }
+}
+
+struct DefaultTurnEnd;
+
+impl StageHandler for DefaultTurnEnd {
+    fn name(&self) -> &'static str {
+        "builtin:turn_end"
+    }
+
+    fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+        Box::pin(async move {
+            if !matches!(ctx.payload, StagePayload::TurnEnd(_)) {
+                return Err(StageError::new(
+                    ctx.point,
+                    self.name(),
+                    "turn_end stage received a different payload",
+                ));
+            }
+            // Pass-through: the `turn_end` hooks dispatched alongside already carry every
+            // effect, and the outcome is decided — there is nothing left for the stage to do.
+            Ok(StageOutcome::Done)
+        })
+    }
+}
+
 /// The builtin handler for `point`. Called by [`crate::pipeline::StageRegistry::run`] whenever
 /// nothing is registered for the point.
 pub(crate) fn default_stage_handler(point: StagePoint) -> Option<Arc<dyn StageHandler>> {
@@ -2565,6 +2863,9 @@ pub(crate) fn default_stage_handler(point: StagePoint) -> Option<Arc<dyn StageHa
         StagePoint::ProviderRequest => Arc::new(DefaultProviderRequest),
         StagePoint::ToolDispatch => Arc::new(DefaultToolDispatch),
         StagePoint::ResultCommit => Arc::new(DefaultResultCommit),
+        StagePoint::UserInput => Arc::new(DefaultUserInput),
+        StagePoint::ResponseCommit => Arc::new(DefaultResponseCommit),
+        StagePoint::TurnEnd => Arc::new(DefaultTurnEnd),
     })
 }
 

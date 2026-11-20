@@ -7,6 +7,7 @@ mod chat;
 mod doctor;
 mod gateway;
 mod gateway_config;
+mod module_sdk;
 mod modules;
 mod plugins;
 mod skills;
@@ -146,6 +147,11 @@ enum Command {
     Modules {
         #[command(subcommand)]
         action: Option<modules::ModulesAction>,
+    },
+    /// Scaffold, validate, and pack module/plugin projects (the authoring SDK).
+    Module {
+        #[command(subcommand)]
+        action: module_sdk::ModuleAction,
     },
     /// Manage users.
     Users {
@@ -880,6 +886,7 @@ fn main() -> std::process::ExitCode {
             let action = action.unwrap_or(modules::ModulesAction::List { from: None });
             exit(modules::run(action))
         }
+        Command::Module { action } => exit(module_sdk::run(action)),
         Command::Users { action } => users(action),
         Command::Profiles { action } => profiles(action),
         Command::Entities { action } => entities(action),

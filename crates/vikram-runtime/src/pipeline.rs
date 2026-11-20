@@ -28,7 +28,7 @@ use crate::provider::CompletionRequest;
 use crate::runtime::RuntimeInner;
 use crate::session::SessionRuntime;
 use crate::turn::AgentRun;
-use crate::types::BotProfile;
+use crate::types::{BotProfile, TurnState};
 
 /// The boxed future a [`StageHandler`] returns. Boxed because the trait must be object-safe.
 pub type StageFuture<'a> =
@@ -53,6 +53,18 @@ pub enum StagePoint {
     ToolDispatch,
     /// Commit tool results to the transcript, journal and event stream.
     ResultCommit,
+    /// Accept, normalize and journal the operator's message before any model work begins —
+    /// the point the `user_input` hooks already meet. The stage may rewrite the message or
+    /// refuse the input outright.
+    UserInput,
+    /// Commit one assistant message — text, reasoning and the tool calls it announced — to the
+    /// transcript, journal and event stream. Distinct from [`StagePoint::ResultCommit`], which
+    /// commits tool results.
+    ResponseCommit,
+    /// Report the turn's decided outcome, step count and token figures before `finish`
+    /// publishes `TurnFinished`. The outcome is already decided, so the stage observes rather
+    /// than refuses.
+    TurnEnd,
 }
 
 impl StagePoint {
@@ -63,6 +75,9 @@ impl StagePoint {
             StagePoint::ProviderRequest => "provider_request",
             StagePoint::ToolDispatch => "tool_dispatch",
             StagePoint::ResultCommit => "result_commit",
+            StagePoint::UserInput => "user_input",
+            StagePoint::ResponseCommit => "response_commit",
+            StagePoint::TurnEnd => "turn_end",
         }
     }
 
@@ -75,6 +90,11 @@ impl StagePoint {
             "provider_request" | "model_request" | "model" => Some(StagePoint::ProviderRequest),
             "tool_dispatch" | "tool_call" => Some(StagePoint::ToolDispatch),
             "result_commit" | "tool_result" => Some(StagePoint::ResultCommit),
+            "user_input" | "input" => Some(StagePoint::UserInput),
+            "response_commit" | "response_delivery" | "assistant_commit" => {
+                Some(StagePoint::ResponseCommit)
+            }
+            "turn_end" | "turn" => Some(StagePoint::TurnEnd),
             _ => None,
         }
     }
@@ -131,6 +151,43 @@ pub struct ResultCommitPayload {
     pub results: Vec<(ToolCallId, String, bool)>,
 }
 
+/// What the `user_input` stage is given and what it leaves behind.
+pub struct UserInputPayload {
+    /// The operator's message. Written by the stage — the `user_input` hooks may have rewritten
+    /// its prose — and what the turn journals and the model reads.
+    pub message: Message,
+    /// The `user_input` hook's refusal reason, when it denied the input. Carried rather than
+    /// surfaced as [`StageOutcome::Refused`] so the turn keeps its existing deny path: the
+    /// message is still durable before the turn reports the refusal.
+    pub deny: Option<String>,
+    /// Context fragments the `user_input` hook asked to place ahead of the assembled prefix.
+    /// Written by the stage.
+    pub prepend: Vec<String>,
+    /// Context fragments the `user_input` hook asked to place behind the assembled prefix.
+    /// Written by the stage.
+    pub append: Vec<String>,
+}
+
+/// What the `response_commit` stage is given and what it leaves behind.
+pub struct ResponseCommitPayload {
+    /// The assistant prose for this commit, before the `response_delivery` hooks see it.
+    pub text: String,
+    /// The assistant reasoning for this commit.
+    pub reasoning: String,
+    /// The tool calls this assistant message announces.
+    pub calls: Vec<ToolCall>,
+}
+
+/// What the `turn_end` stage is given.
+pub struct TurnEndPayload {
+    /// How the turn ended. Already decided — the stage observes, it does not choose.
+    pub outcome: TurnState,
+    /// Provider rounds the turn spent.
+    pub steps: u64,
+    /// Output tokens the turn produced, as counted so far.
+    pub output_tokens: u64,
+}
+
 /// The per-point input/output carrier. Exactly one variant is live per dispatch, matching the
 /// [`StagePoint`] the registry was called with.
 pub enum StagePayload {
@@ -139,6 +196,9 @@ pub enum StagePayload {
     ProviderRequest(ProviderRequestPayload),
     ToolDispatch(ToolDispatchPayload),
     ResultCommit(ResultCommitPayload),
+    UserInput(UserInputPayload),
+    ResponseCommit(ResponseCommitPayload),
+    TurnEnd(TurnEndPayload),
 }
 
 impl StagePayload {
@@ -149,6 +209,9 @@ impl StagePayload {
             StagePayload::ProviderRequest(_) => StagePoint::ProviderRequest,
             StagePayload::ToolDispatch(_) => StagePoint::ToolDispatch,
             StagePayload::ResultCommit(_) => StagePoint::ResultCommit,
+            StagePayload::UserInput(_) => StagePoint::UserInput,
+            StagePayload::ResponseCommit(_) => StagePoint::ResponseCommit,
+            StagePayload::TurnEnd(_) => StagePoint::TurnEnd,
         }
     }
 }
@@ -676,5 +739,217 @@ mod tests {
             })
         });
         assert!(marker, "the stage's prefix reached the provider request");
+    }
+
+    /// A `user_input` stage that rewrites the message, then hands it to the builtin so the
+    /// durable commit — push, journal, `UserMessage` — still runs exactly as it does by default.
+    struct RewriteInput {
+        text: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl StageHandler for RewriteInput {
+        fn name(&self) -> &'static str {
+            "test.rewrite_input"
+        }
+
+        fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if let StagePayload::UserInput(payload) = &mut ctx.payload {
+                    payload.message = Message::user(self.text);
+                }
+                let default = crate::turn::default_stage_handler(StagePoint::UserInput)
+                    .expect("the builtin user_input handler exists");
+                default.handle(ctx).await
+            })
+        }
+    }
+
+    /// Counts dispatches at whichever point it is registered for, without touching the payload.
+    struct Counting {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl StageHandler for Counting {
+        fn name(&self) -> &'static str {
+            "test.counting"
+        }
+
+        fn handle<'a>(&'a self, _ctx: &'a mut StageContext) -> StageFuture<'a> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(StageOutcome::Done)
+            })
+        }
+    }
+
+    /// Records the outcome figures the `turn_end` stage is shown.
+    struct TurnEndSpy {
+        seen: Arc<Mutex<Vec<(crate::types::TurnState, u64, u64)>>>,
+    }
+
+    impl StageHandler for TurnEndSpy {
+        fn name(&self) -> &'static str {
+            "test.turn_end_spy"
+        }
+
+        fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+            Box::pin(async move {
+                if let StagePayload::TurnEnd(payload) = &ctx.payload {
+                    self.seen.lock().expect("seen lock").push((
+                        payload.outcome,
+                        payload.steps,
+                        payload.output_tokens,
+                    ));
+                }
+                Ok(StageOutcome::Done)
+            })
+        }
+    }
+
+    /// Runs one submitted turn to `TurnFinished` and returns the state it finished with.
+    async fn run_one_turn(
+        handle: &crate::runtime::RuntimeHandle,
+        session: &vikram_contracts::SessionId,
+        text: &str,
+    ) -> crate::types::TurnState {
+        let mut events = handle.events();
+        handle
+            .submit(session, text.into())
+            .expect("the turn is accepted");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the turn never finished"
+            );
+            let Ok(Ok(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), events.recv()).await
+            else {
+                continue;
+            };
+            if let RuntimeEvent::TurnFinished { state, .. } = event {
+                return state;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registered_user_input_stage_rewrites_what_is_journaled_and_sent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let recorder = Arc::new(RecordingProvider {
+            requests: Mutex::new(Vec::new()),
+        });
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::clone(&recorder) as Arc<dyn Provider>,
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        let session = handle.snapshot().sessions[0].id.clone();
+        handle
+            .rename_session(&session, "stage test".into())
+            .expect("name the session");
+        let calls = Arc::new(AtomicUsize::new(0));
+        handle.register_stage(
+            StagePoint::UserInput,
+            Arc::new(RewriteInput {
+                text: "STAGE-REWRITE",
+                calls: Arc::clone(&calls),
+            }),
+            10,
+        );
+
+        run_one_turn(&handle, &session, "original words").await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the stage ran once");
+        let requests = recorder.requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 1, "exactly one provider round ran");
+        let rewritten = requests[0]
+            .iter()
+            .any(|message| message.text_body().contains("STAGE-REWRITE"));
+        assert!(
+            rewritten,
+            "the rewritten input reached the provider request"
+        );
+        let original = requests[0]
+            .iter()
+            .any(|message| message.text_body().contains("original words"));
+        assert!(!original, "the pre-stage text never reached the provider");
+    }
+
+    #[tokio::test]
+    async fn user_input_response_commit_and_turn_end_stages_fire_at_their_sites() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::new(RecordingProvider {
+                requests: Mutex::new(Vec::new()),
+            }) as Arc<dyn Provider>,
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        let session = handle.snapshot().sessions[0].id.clone();
+        handle
+            .rename_session(&session, "stage test".into())
+            .expect("name the session");
+
+        let user_calls = Arc::new(AtomicUsize::new(0));
+        let response_calls = Arc::new(AtomicUsize::new(0));
+        let turn_end_seen = Arc::new(Mutex::new(Vec::new()));
+        handle.register_stage(
+            StagePoint::UserInput,
+            Arc::new(RewriteInput {
+                text: "stage input",
+                calls: Arc::clone(&user_calls),
+            }),
+            10,
+        );
+        handle.register_stage(
+            StagePoint::ResponseCommit,
+            Arc::new(Counting {
+                calls: Arc::clone(&response_calls),
+            }),
+            10,
+        );
+        handle.register_stage(
+            StagePoint::TurnEnd,
+            Arc::new(TurnEndSpy {
+                seen: Arc::clone(&turn_end_seen),
+            }),
+            10,
+        );
+
+        let finished = run_one_turn(&handle, &session, "hello").await;
+
+        assert_eq!(user_calls.load(Ordering::SeqCst), 1, "user_input ran once");
+        assert_eq!(
+            response_calls.load(Ordering::SeqCst),
+            1,
+            "response_commit ran once for the one assistant message"
+        );
+        let seen = turn_end_seen.lock().expect("seen lock");
+        assert_eq!(seen.len(), 1, "turn_end ran once");
+        assert_eq!(
+            seen[0].0, finished,
+            "the stage saw the outcome the turn finished with"
+        );
+    }
+
+    #[test]
+    fn stage_point_parse_and_names_cover_the_turn_level_points() {
+        for (raw, point) in [
+            ("user-input", StagePoint::UserInput),
+            ("response.commit", StagePoint::ResponseCommit),
+            ("turn_end", StagePoint::TurnEnd),
+        ] {
+            assert_eq!(StagePoint::parse(raw), Some(point));
+            assert_eq!(StagePoint::parse(point.as_str()), Some(point));
+        }
     }
 }
