@@ -1,0 +1,24 @@
+{
+  "id": "model-reminder-no-fabrication",
+  "name": "Model: no fabricated results",
+  "version": "1.0.0",
+  "description": "Reminds the model not to claim checks it did not run.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 70,
+  "components": {
+    "hooks": [
+      "model_request"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "model_request",
+      "append": "Never claim a test, build or command passed unless its output is in this conversation."
+    }
+  ]
+}

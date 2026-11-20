@@ -1,0 +1,24 @@
+{
+  "id": "ctx-deny-first",
+  "name": "Context: deny-first permissions",
+  "version": "1.0.0",
+  "description": "Adds a standing instruction to every turn: deny-first permissions.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 60,
+  "components": {
+    "hooks": [
+      "context_build"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "context_build",
+      "append": "Permission checks are deny-first; never add a path that widens the mandatory floor."
+    }
+  ]
+}

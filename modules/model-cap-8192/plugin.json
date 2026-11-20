@@ -1,0 +1,24 @@
+{
+  "id": "model-cap-8192",
+  "name": "Model: cap output at 8192 tokens",
+  "version": "1.0.0",
+  "description": "Caps every completion at 8192 output tokens.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 69,
+  "components": {
+    "hooks": [
+      "model_request"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "model_request",
+      "max_output_tokens": 8192
+    }
+  ]
+}

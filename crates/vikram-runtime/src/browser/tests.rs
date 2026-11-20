@@ -124,6 +124,81 @@ fn headless_flags_are_shared_and_the_url_comes_last() {
     assert_eq!(args.last().unwrap(), "https://example.com");
 }
 
+// --- URL validation ------------------------------------------------------------------------
+
+#[test]
+fn only_web_urls_and_about_blank_may_be_loaded() {
+    for url in [
+        "http://example.com",
+        "https://example.com/a?b=c",
+        "HTTP://EXAMPLE.COM",
+        "about:blank",
+        "ABOUT:BLANK",
+    ] {
+        assert!(validate_url(url).is_ok(), "{url} must be allowed");
+    }
+    for url in [
+        "file:///etc/passwd",
+        "file://localhost/etc/passwd",
+        "chrome://settings",
+        "chrome-extension://abc/page.html",
+        "data:text/html,<p>x</p>",
+        "javascript:alert(1)",
+        "ftp://example.com/x",
+        "view-source:https://example.com",
+        "",
+        "   ",
+        "example.com",
+    ] {
+        let err = validate_url(url).unwrap_err();
+        assert!(
+            err.contains("not a URL the browser may load"),
+            "{url}: {err}"
+        );
+    }
+}
+
+#[test]
+fn a_refused_url_never_reaches_the_browser_binary() {
+    // `/nonexistent` cannot start, so "cannot start" would mean validation did not run first.
+    for url in [
+        "file:///etc/passwd",
+        "data:text/html,x",
+        "javascript:alert(1)",
+    ] {
+        let err = navigate_with(Path::new("/nonexistent/vikram-chromium"), url, 500).unwrap_err();
+        assert!(
+            err.contains("not a URL the browser may load"),
+            "{url}: {err}"
+        );
+        let err = screenshot_with(
+            Path::new("/nonexistent/vikram-chromium"),
+            url,
+            Path::new("/tmp/vikram-shot.png"),
+            64,
+            64,
+            500,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("not a URL the browser may load"),
+            "{url}: {err}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_browser_that_writes_without_end_is_stopped_at_the_output_cap() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let fake = dir.path().join("fake-chromium");
+    std::fs::write(&fake, "#!/bin/sh\nhead -c 9000000 /dev/zero\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let err = navigate_with(&fake, "https://example.com", 10_000).unwrap_err();
+    assert!(err.contains("more than"), "{err}");
+}
+
 // --- text extraction ---------------------------------------------------------------------
 
 #[test]

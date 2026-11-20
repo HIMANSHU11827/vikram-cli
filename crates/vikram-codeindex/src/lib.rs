@@ -22,6 +22,10 @@ pub enum IndexError {
 
 pub type Result<T> = std::result::Result<T, IndexError>;
 
+/// Upper bound on ref edges recorded per symbol name; a common name like `new`
+/// would otherwise appear in nearly every file.
+const MAX_REFS_PER_SYMBOL: usize = 256;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SymbolKind {
     Function,
@@ -162,16 +166,17 @@ impl CodeIndex {
                 .to_string_lossy()
                 .to_string();
 
-            // Check if unchanged.
-            let stored_mtime: Option<i64> = self
+            // Check if unchanged: mtime alone misses same-mtime rewrites, so the
+            // stored size must match too.
+            let stored: Option<(i64, i64)> = self
                 .conn
                 .query_row(
-                    "SELECT mtime_ms FROM files WHERE path = ?1",
+                    "SELECT mtime_ms, size FROM files WHERE path = ?1",
                     params![rel],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .ok();
-            if stored_mtime == Some(mtime_ms) {
+            if stored == Some((mtime_ms, size as i64)) {
                 stats.unchanged += 1;
                 continue;
             }
@@ -202,42 +207,52 @@ impl CodeIndex {
             stats.symbols += symbols.len();
         }
 
-        // Build reference edges (simple name-based). This is O(files × symbols) substring
-        // scans — skip it entirely when nothing changed, which is the common case.
+        // Build reference edges by token match. Each file is tokenized once and
+        // looked up in the symbol-name set, which is O(file bytes) rather than
+        // files × symbols substring scans; the transaction, edge dedup and
+        // per-symbol cap keep the refs table bounded. Files are streamed one at
+        // a time instead of holding every file's contents in memory.
         if stats.indexed > 0 || stats.removed > 0 {
-            self.conn.execute("DELETE FROM refs", [])?;
-            // For each symbol name, find files containing it as a token.
-            let all_symbols: Vec<(String, String)> = {
-                let mut stmt = self.conn.prepare("SELECT file, name FROM symbols")?;
-                let rows = stmt.query_map([], |r| {
-                    let f: String = r.get(0)?;
-                    let n: String = r.get(1)?;
-                    Ok((f, n))
-                })?;
+            let symbol_names: BTreeSet<String> = {
+                let mut stmt = self.conn.prepare("SELECT DISTINCT name FROM symbols")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
                 rows.filter_map(|r| r.ok()).collect()
             };
-            let file_contents: HashMap<String, String> = current
-                .iter()
-                .filter_map(|p| {
-                    let rel = p
-                        .strip_prefix(&self.root)
-                        .unwrap_or(p)
-                        .to_string_lossy()
-                        .to_string();
-                    fs::read_to_string(p).ok().map(|c| (rel, c))
-                })
-                .collect();
-            for (from_file, content) in &file_contents {
-                for (_, sym) in &all_symbols {
-                    if content.contains(sym.as_str()) {
-                        // crude: record edge if the symbol name appears in this file and isn't defined here
-                        self.conn.execute(
-                            "INSERT INTO refs(from_file, to_symbol) VALUES (?1,?2)",
-                            params![from_file, sym],
-                        )?;
+            let tx = self.conn.transaction()?;
+            tx.execute("DELETE FROM refs", [])?;
+            let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
+            let mut per_symbol: HashMap<String, usize> = HashMap::new();
+            for path in &current {
+                let Ok(content) = fs::read_to_string(path) else {
+                    continue;
+                };
+                let rel = path
+                    .strip_prefix(&self.root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string();
+                let mut matched: BTreeSet<&str> = BTreeSet::new();
+                for token in identifier_tokens(&content) {
+                    if symbol_names.contains(token) {
+                        matched.insert(token);
+                    }
+                }
+                for name in matched {
+                    if per_symbol.get(name).copied().unwrap_or(0) >= MAX_REFS_PER_SYMBOL {
+                        continue;
+                    }
+                    if edges.insert((rel.clone(), name.to_string())) {
+                        *per_symbol.entry(name.to_string()).or_insert(0) += 1;
                     }
                 }
             }
+            for (from_file, to_symbol) in &edges {
+                tx.execute(
+                    "INSERT INTO refs(from_file, to_symbol) VALUES (?1,?2)",
+                    params![from_file, to_symbol],
+                )?;
+            }
+            tx.commit()?;
         }
 
         Ok(stats)
@@ -300,9 +315,13 @@ impl CodeIndex {
 
     pub fn search_symbols(&self, query: &str, limit: usize) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
-            "SELECT file, name, kind, start_line, end_line, signature FROM symbols WHERE name LIKE ?1 LIMIT ?2",
+            "SELECT file, name, kind, start_line, end_line, signature FROM symbols WHERE name LIKE ?1 ESCAPE '\\' LIMIT ?2",
         )?;
-        let pattern = format!("%{query}%");
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
         let rows = stmt.query_map(params![pattern, limit as i64], |r| {
             Ok(Symbol {
                 file: PathBuf::from(r.get::<_, String>(0)?),
@@ -383,9 +402,26 @@ pub struct IndexStats {
 }
 
 fn is_excluded(path: &Path, root: &Path, exclude: &[&str]) -> bool {
-    let s = path.to_string_lossy();
+    // Exclude entries match whole path components (or component sequences for
+    // entries containing a separator), never substrings: `my-targets` is not
+    // excluded by `target`.
+    let components: Vec<String> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
     for e in exclude {
-        if s.contains(e) {
+        let parts: Vec<&str> = e
+            .split(['/', '\\'])
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.is_empty() {
+            continue;
+        }
+        if components.len() >= parts.len()
+            && components
+                .windows(parts.len())
+                .any(|window| window.iter().map(String::as_str).eq(parts.iter().copied()))
+        {
             return true;
         }
     }
@@ -398,6 +434,15 @@ fn is_excluded(path: &Path, root: &Path, exclude: &[&str]) -> bool {
         }
     }
     false
+}
+
+/// Splits source text into identifier-ish tokens: maximal runs of alphanumerics
+/// and `_`. A symbol name "appears as a token" only when bounded by
+/// non-identifier characters, so `foo` does not match inside `foobar`.
+fn identifier_tokens(content: &str) -> impl Iterator<Item = &str> {
+    content
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|t| !t.is_empty())
 }
 
 fn is_source(path: &Path) -> bool {
@@ -737,5 +782,134 @@ mod tests {
         let stats2 = idx.index(&[]).unwrap();
         assert_eq!(stats2.indexed, 0);
         assert!(stats2.unchanged >= 1);
+    }
+
+    #[test]
+    fn refs_match_symbol_names_as_tokens_not_substrings() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.rs"), "fn foo() {}\n").unwrap();
+        // `foo` only appears inside larger identifiers here; a substring scan
+        // would record edges, token matching must not.
+        fs::write(
+            root.join("b.rs"),
+            "fn foobar() {}\nfn food() {}\nlet x = foo_bar;\n",
+        )
+        .unwrap();
+        fs::write(root.join("c.py"), "def foo():\n    pass\nfoo()\n").unwrap();
+        let db = root.join("idx.db");
+        let mut idx = CodeIndex::open(root, &db).unwrap();
+        idx.index(&[]).unwrap();
+        let mut refs = idx.references_of("foo").unwrap();
+        refs.sort();
+        assert_eq!(refs, vec!["a.rs".to_string(), "c.py".to_string()]);
+        // `foo` occurs twice in c.py but dedups to a single edge.
+        let n: i64 = idx
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM refs WHERE to_symbol = 'foo' AND from_file = 'c.py'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn refs_per_symbol_are_capped() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.rs"), "fn common() {}\n").unwrap();
+        for i in 0..(MAX_REFS_PER_SYMBOL + 10) {
+            fs::write(
+                root.join(format!("f{i:03}.rs")),
+                "fn main() {}\n// common\n",
+            )
+            .unwrap();
+        }
+        let db = root.join("idx.db");
+        let mut idx = CodeIndex::open(root, &db).unwrap();
+        idx.index(&[]).unwrap();
+        let n: i64 = idx
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM refs WHERE to_symbol = 'common'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n as usize, MAX_REFS_PER_SYMBOL);
+    }
+
+    #[test]
+    fn a_size_change_reindexes_even_when_mtime_is_unchanged() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.rs"), "fn foo() {}\n").unwrap();
+        let db = root.join("idx.db");
+        let mut idx = CodeIndex::open(root, &db).unwrap();
+        idx.index(&[]).unwrap();
+        idx.conn
+            .execute("UPDATE files SET size = size + 1 WHERE path = 'a.rs'", [])
+            .unwrap();
+        let stats = idx.index(&[]).unwrap();
+        assert_eq!(stats.indexed, 1);
+        assert_eq!(stats.unchanged, 0);
+    }
+
+    #[test]
+    fn exclusions_match_path_components_not_substrings() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("my-targets")).unwrap();
+        fs::create_dir_all(root.join("mybuild")).unwrap();
+        fs::create_dir_all(root.join("build")).unwrap();
+        fs::write(root.join("my-targets/a.rs"), "fn foo() {}\n").unwrap();
+        fs::write(root.join("mybuild/b.rs"), "fn bar() {}\n").unwrap();
+        fs::write(root.join("build/c.rs"), "fn baz() {}\n").unwrap();
+        let db = root.join("idx.db");
+        let mut idx = CodeIndex::open(root, &db).unwrap();
+        idx.index(&["build"]).unwrap();
+        let mut paths: Vec<String> = {
+            let mut stmt = idx
+                .conn
+                .prepare("SELECT path FROM files ORDER BY path")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        paths.sort();
+        assert!(paths.iter().any(|p| p.contains("my-targets")));
+        assert!(paths.iter().any(|p| p.contains("mybuild")));
+        assert!(!paths.iter().any(|p| p.starts_with("build/")));
+    }
+
+    #[test]
+    fn symbol_search_treats_like_wildcards_literally() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("a.py"),
+            "def a_b():\n    pass\ndef axb():\n    pass\ndef pct():\n    pass\n",
+        )
+        .unwrap();
+        let db = root.join("idx.db");
+        let mut idx = CodeIndex::open(root, &db).unwrap();
+        idx.index(&[]).unwrap();
+        // Unescaped, `a_b` would also match `axb`.
+        let names: Vec<String> = idx
+            .search_symbols("a_b", 10)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec!["a_b".to_string()]);
+        let names: Vec<String> = idx
+            .search_symbols("%", 10)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(names.is_empty());
     }
 }

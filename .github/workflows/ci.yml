@@ -138,11 +138,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Every crate pins rust-version = "1.86"; this job proves the declared
-      # MSRV still compiles (check only, no tests/clippy on the old toolchain).
+      # Every crate inherits rust-version = "1.89" from [workspace.package]; this
+      # job proves the declared MSRV still compiles (check only, no tests/clippy
+      # on the old toolchain).
       - uses: dtolnay/rust-toolchain@master
         with:
-          channel: "1.86"
+          channel: "1.89"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
 

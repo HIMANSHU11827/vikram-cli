@@ -1,0 +1,118 @@
+# VIKRAM background daemon — system unit.
+#
+# Install location: /etc/systemd/system/vikram.service
+# Use install.sh (repo root) or `systemd-tmpfiles --create /etc/tmpfiles.d/vikram.conf`.
+#
+# Why the daemon and not the TUI:
+#   `vikram` with no subcommand starts the ratatui interface, which refuses to run without
+#   a real terminal — crates/vikram-cli/src/terminal.rs:66-69 returns
+#   "TUI requires a real terminal (not a pipe/redirect)" when stdin is not a TTY. A service
+#   has no TTY by definition, so ExecStart runs the headless daemon instead. Interactive
+#   use stays on your own terminal (`vikram`), and one-off headless turns use
+#   `vikram chat "<prompt>"`.
+#
+# This is the *system* unit. `vikram daemon install` is a different thing: it writes a
+# per-user unit at ~/.config/systemd/user/vikram-daemon.service
+# (crates/vikram-daemon/src/service.rs:127). Do not run both against the same
+# VIKRAM_HOME — two daemons would fight over the same SQLite store and lock file.
+
+[Unit]
+Description=VIKRAM daemon (headless agent runtime)
+After=network-online.target
+Wants=network-online.target
+# A crash loop is a bug to look at, not something to hide with endless restarts.
+# Five restarts in five minutes, then systemd gives up and leaves it failed.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=vikram
+Group=vikram
+
+# StateDirectory creates /var/lib/vikram owned by vikram:vikram and implicitly whitelists it
+# for writing, which is what keeps ProtectSystem=strict usable. It holds vikram.db (SQLite,
+# WAL mode), config.json, .env, sessions/, skills/, plugins/ and the daemon lock.
+StateDirectory=vikram
+StateDirectoryMode=0700
+
+Environment=VIKRAM_HOME=/var/lib/vikram
+# HOME must be writable and must not be /home: ProtectHome=read-only makes /home read-only,
+# and the config loader falls back to $HOME when VIKRAM_HOME is unset in a child process.
+Environment=HOME=/var/lib/vikram
+Environment=RUST_BACKTRACE=1
+
+# Provider keys (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...) and anything else the operator
+# wants. The leading '-' means "start anyway if the file is missing": the daemon comes up
+# without model credentials, it just cannot answer a turn until one is configured.
+# Placed last so an operator value here wins over the Environment= lines above.
+EnvironmentFile=-/etc/vikram/vikram.env
+
+# The working directory is also the default workspace root: config.rs workspace_root()
+# falls back to the process current directory when none is configured. Keep it inside
+# StateDirectory so the agent can actually write files.
+#
+# To work in a real project tree, point WorkingDirectory= at it AND add the same path to
+# ReadWritePaths= below — ProtectSystem=strict makes everything outside the unit's write
+# whitelist read-only, and the daemon would fail on its first write with EROFS.
+WorkingDirectory=/var/lib/vikram
+
+ExecStart=/usr/local/bin/vikram daemon start --foreground
+
+Restart=on-failure
+# Transient provider 5xx / network blips recover in seconds; a genuinely broken unit still
+# hits StartLimitBurst above rather than spinning. 5s matches what `vikram daemon install`
+# writes for the user unit, so both variants behave the same under failure.
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+# Default KillMode=control-group: SIGTERM goes to the daemon and every shell/PTY/bubblewrap
+# child it spawned, then SIGKILL after TimeoutStopSec. Left at the default deliberately —
+# orphaned tool subprocesses are worse than a slightly slower stop.
+
+# ---------------------------------------------------------------- hardening
+NoNewPrivileges=true
+# Entire filesystem read-only except StateDirectory=, PrivateTmp= and ReadWritePaths=.
+ProtectSystem=strict
+# /home, /root and /run/user stay visible but read-only. Deliberate: the service has no
+# business writing into a human's home directory, and the agent workspace lives under
+# /var/lib/vikram. If your workspace must stay under /home, this unit is the wrong shape:
+# set ProtectHome=false and accept that the daemon can then read and write all of /home.
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+
+# No capabilities at all. The daemon is an unprivileged user process; sandboxing uses
+# Landlock (the default feature of vikram-sandbox) and unprivileged bubblewrap user
+# namespaces, neither of which requires a capability. Note that NoNewPrivileges=true also
+# neuters a setuid bwrap binary, so bubblewrap fails closed here and Landlock carries the
+# sandbox — which is the intended behaviour, not a bug.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Provider APIs need AF_INET/AF_INET6, local IPC needs AF_UNIX, interface enumeration needs
+# AF_NETLINK. AF_PACKET (raw sockets) is not granted.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+# Deliberately NOT set, each for a concrete reason:
+#   RestrictNamespaces=  bubblewrap needs user AND mount namespaces; any value here breaks
+#                        the sandbox.
+#   MemoryDenyWriteExecute=  no JIT is expected today, but a tool-loaded .so would die with
+#                        SIGSEGV instead of a legible error.
+#   PrivateDevices=      PTY-backed terminal tools and any /dev access they need; systemd's
+#                        private /dev does not include a devpts instance.
+#   SystemCallFilter=    a curated allow-list would need re-validation on every new tool;
+#                        left for a follow-up once the syscall surface is known.
+#   ReadWritePaths=      nothing outside StateDirectory is writable today. Add project trees
+#                        here if you move WorkingDirectory out of /var/lib/vikram.
+
+[Install]
+WantedBy=multi-user.target

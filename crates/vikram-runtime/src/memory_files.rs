@@ -90,7 +90,12 @@ impl MemoryFile {
             return Ok(());
         }
         let current = Self::entries_len(&entries);
-        let new_count = current + entry.chars().count() + ENTRY_DELIM.len();
+        let delimiter = if entries.is_empty() {
+            0
+        } else {
+            ENTRY_DELIM.len()
+        };
+        let new_count = current + entry.chars().count() + delimiter;
         if new_count > self.budget {
             return Err(format!(
                 "memory file full ({}/{} chars); remove an entry first",
@@ -144,6 +149,15 @@ mod tests {
         let entries = f.load();
         assert_eq!(entries.len(), 1);
         assert!(entries[0].contains("Rust"));
+    }
+    #[test]
+    fn first_entry_is_charged_its_own_length_not_a_leading_delimiter() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let entry = "exactly fits";
+        let mut f = MemoryFile::new(home.join("memories").join("M.md"), entry.chars().count());
+        f.add(entry).unwrap();
+        assert_eq!(f.load(), vec![entry.to_owned()]);
     }
     #[test]
     fn budget_enforced() {

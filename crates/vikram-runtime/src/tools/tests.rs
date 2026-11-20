@@ -325,7 +325,9 @@ fn shell_declares_an_execute_side_effect() {
         .unwrap();
     assert_eq!(req.action, ActionKind::Execute);
     assert_eq!(req.verb, "shell.run");
-    assert_eq!(req.side_effect, SideEffect::LocalMutation);
+    // Shell commands are unbounded, so Smart must not auto-allow them as routine
+    // local mutations; a destructive one escalates one tier further.
+    assert_eq!(req.side_effect, SideEffect::ExternalChange);
 }
 
 #[test]
@@ -527,6 +529,28 @@ fn process_declares_execute_permission() {
     assert_eq!(req.action, ActionKind::Execute);
     assert_eq!(req.verb, "process.run");
     assert_eq!(req.side_effect, SideEffect::LocalMutation);
+}
+
+#[test]
+fn process_kill_is_destructive_and_refuses_own_pid() {
+    // A pid that cannot be this process, its group, or an ancestor.
+    let req = Process
+        .permission(&json!({"action": "kill", "pid": 999_999}))
+        .unwrap();
+    assert_eq!(req.side_effect, SideEffect::Destructive);
+    assert_eq!(req.resource, "process kill pid=999999");
+    let own = std::process::id() as i64;
+    assert!(
+        Process
+            .permission(&json!({"action": "kill", "pid": own}))
+            .is_err(),
+        "killing the runtime itself must be refused before any prompt"
+    );
+    let (_dir, ctx) = ctx();
+    let out = Process
+        .run(&json!({"action": "kill", "pid": own}), &ctx)
+        .unwrap_err();
+    assert!(matches!(out, VikramError::ProviderRejected(_)));
 }
 
 #[test]

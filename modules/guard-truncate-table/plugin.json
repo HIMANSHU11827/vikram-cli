@@ -1,0 +1,26 @@
+{
+  "id": "guard-truncate-table",
+  "name": "Guard: TRUNCATE TABLE",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: truncate table.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "shell.run",
+      "arguments_contain": "truncate table",
+      "deny": "truncating a table is destructive and irreversible here"
+    }
+  ]
+}

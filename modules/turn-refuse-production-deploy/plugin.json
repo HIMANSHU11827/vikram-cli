@@ -1,0 +1,25 @@
+{
+  "id": "turn-refuse-production-deploy",
+  "name": "Turn: refuse a production deploy",
+  "version": "1.0.0",
+  "description": "Refuses a turn that asks to deploy to production.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 80,
+  "components": {
+    "hooks": [
+      "turn_start"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "turn_start",
+      "text_contain": "deploy to production",
+      "deny": "production deploys are an operator action, not a turn"
+    }
+  ]
+}

@@ -1,0 +1,82 @@
+# VIKRAM gateway — system unit.
+#
+# Install location: /etc/systemd/system/vikram-gateway.service
+#
+# The gateway bridges chat platforms (Telegram, Slack, Discord, Feishu, LINE, Buzz, ...) to
+# the agent runtime. It is headless by construction: `vikram gateway` never touches the TUI,
+# so it is safe to run with no terminal attached. Same reasoning as vikram.service — see the
+# long comment there for why the TUI cannot be an ExecStart.
+
+[Unit]
+Description=VIKRAM gateway (chat platform bridge)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=vikram
+Group=vikram
+
+StateDirectory=vikram
+StateDirectoryMode=0700
+
+Environment=VIKRAM_HOME=/var/lib/vikram
+Environment=HOME=/var/lib/vikram
+Environment=RUST_BACKTRACE=1
+
+# Shared operator settings (provider keys, VIKRAM_HOST, ...). Absent file is not an error.
+EnvironmentFile=-/etc/vikram/vikram.env
+
+# Gateway-specific file: GATEWAY_WEBHOOK_BIND, platform tokens and signing secrets.
+#
+# GATEWAY_WEBHOOK_BIND=host:port is the ONLY thing that makes this unit listen on a socket.
+# crates/vikram-cli/src/gateway.rs:622 reads it and only spawns the HTTP server when it is
+# present; with the variable unset the gateway runs outbound pollers only and opens no port,
+# so no firewall change is needed. Setting it while no webhook platform has credentials is
+# not fatal — the gateway logs "GATEWAY_WEBHOOK_BIND is set but no webhook platform is
+# configured" (:1105-1110) and serves nothing.
+#
+# Declared after the shared file so an operator can override VIKRAM_HOME or a token here.
+# Keep this file 0640 root:vikram — it holds bearer tokens.
+EnvironmentFile=-/etc/vikram/gateway.env
+
+WorkingDirectory=/var/lib/vikram
+ExecStart=/usr/local/bin/vikram gateway
+
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# ---------------------------------------------------------------- hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+# See vikram.service for why RestrictNamespaces=, PrivateDevices= and SystemCallFilter= are
+# left unset. Same reasons apply here: the gateway hands turns to the same runtime and the
+# same bubblewrap/Landlock sandbox.
+
+# ---------------------------------------------------------------- network
+# The gateway is reachable from the network only through the port given in
+# GATEWAY_WEBHOOK_BIND. Nothing here opens a port. If you publish it beyond localhost, put a
+# TLS-terminating proxy in front — the webhook server speaks plain HTTP, and every platform
+# adapter verifies its own signature, but signatures alone do not encrypt tokens.
+
+[Install]
+WantedBy=multi-user.target

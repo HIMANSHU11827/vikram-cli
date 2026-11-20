@@ -102,12 +102,19 @@ macro_rules! cmd_check_tool {
                     .unwrap_or($default);
                 // The resource is what the approval prompt and the journal show. Recording only
                 // the first word (`test_run cargo`) hid the rest of an arbitrary `sh -c` string —
-                // the operator approved a description narrower than the command that ran.
+                // the operator approved a description narrower than the command that ran. Like
+                // `shell.run`, an arbitrary command is never a routine local mutation: `Smart`
+                // must not auto-allow it.
+                let side_effect = if looks_destructive(command) {
+                    SideEffect::Destructive
+                } else {
+                    SideEffect::ExternalChange
+                };
                 Ok(PermissionRequest::new(
                     ActionKind::Execute,
                     $verb,
                     command,
-                    SideEffect::LocalMutation,
+                    side_effect,
                     Trust::Model,
                 ))
             }
@@ -132,6 +139,7 @@ macro_rules! cmd_check_tool {
                 let output = match crate::verification::wait_with_timeout(
                     &mut cmd,
                     Duration::from_millis(timeout_ms),
+                    ctx.cancel.as_ref(),
                 ) {
                     Ok(Some(output)) => output,
                     Ok(None) => {
@@ -289,7 +297,7 @@ mod cmd_check_tests {
             .unwrap();
         assert_eq!(req.action, ActionKind::Execute);
         assert_eq!(req.verb, "test_run");
-        assert_eq!(req.side_effect, SideEffect::LocalMutation);
+        assert_eq!(req.side_effect, SideEffect::ExternalChange);
     }
 
     #[test]
@@ -299,7 +307,7 @@ mod cmd_check_tests {
             .unwrap();
         assert_eq!(req.action, ActionKind::Execute);
         assert_eq!(req.verb, "build_check");
-        assert_eq!(req.side_effect, SideEffect::LocalMutation);
+        assert_eq!(req.side_effect, SideEffect::ExternalChange);
     }
 
     #[test]

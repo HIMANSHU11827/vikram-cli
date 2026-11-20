@@ -1,0 +1,24 @@
+{
+  "id": "ctx-no-network-tests",
+  "name": "Context: no network in tests",
+  "version": "1.0.0",
+  "description": "Adds a standing instruction to every turn: no network in tests.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 60,
+  "components": {
+    "hooks": [
+      "context_build"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "context_build",
+      "append": "Do not add network calls to tests; stub the boundary instead."
+    }
+  ]
+}

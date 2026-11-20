@@ -105,10 +105,35 @@ impl TicketManager {
         self.store.search_tickets(query).map_err(|e| e.to_string())
     }
 
+    /// Wholesale row update for descriptive fields only. Identity, ownership,
+    /// kind, links, status and timestamps are owned by the lifecycle methods
+    /// (`create`, `set_status`, `close`, `reopen`, `cancel`, `set_result`,
+    /// `set_failure`) and are restored from the stored row here, so a caller
+    /// cannot reassign a ticket or forge a terminal state through `update`.
     pub fn update(&self, row: &TicketRow) -> Result<(), String> {
-        self.store.update_ticket(row).map_err(|e| e.to_string())
+        let stored = self
+            .store
+            .get_ticket(&row.id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("ticket {} not found", row.id.as_str()))?;
+        let mut merged = row.clone();
+        merged.owner_key = stored.owner_key;
+        merged.owner_kind = stored.owner_kind;
+        merged.kind = stored.kind;
+        merged.status = stored.status;
+        merged.parent_ticket = stored.parent_ticket;
+        merged.hive_id = stored.hive_id;
+        merged.session_id = stored.session_id;
+        merged.created_ms = stored.created_ms;
+        merged.closed_ms = stored.closed_ms;
+        self.store.update_ticket(&merged).map_err(|e| e.to_string())
     }
 
+    /// Non-terminal statuses that carry no `closed_ms` semantics. Terminal
+    /// transitions (`completed`, `failed`, `cancelled`) and `reopened` go
+    /// through `close`/`set_failure`/`cancel`/`reopen`, which also record the
+    /// matching lifecycle event — setting them here would split the event log
+    /// from the row state.
     pub fn set_status(
         &self,
         id: &TicketId,
@@ -116,6 +141,11 @@ impl TicketManager {
         actor: &str,
         now_ms: u64,
     ) -> Result<(), String> {
+        if !matches!(status, "open" | "in_progress") {
+            return Err(format!(
+                "ticket status `{status}` must go through close/cancel/set_failure/reopen"
+            ));
+        }
         self.store
             .set_ticket_status(id, status, now_ms)
             .map_err(|e| e.to_string())?;
@@ -353,6 +383,28 @@ impl TicketManager {
 
     /// Returns messages the viewer is allowed to see, applying visibility rules.
     pub fn messages_for(
+        &self,
+        ticket: &TicketId,
+        viewer_key: &str,
+    ) -> Result<Vec<TicketMessageRow>, String> {
+        self.visible_messages(ticket, viewer_key)
+    }
+
+    /// One page of [`Self::messages_for`]. Visibility is still resolved over the
+    /// full history (the store query has no `LIMIT`), but only `limit` rows are
+    /// returned, bounding what callers hold in memory.
+    pub fn messages_for_page(
+        &self,
+        ticket: &TicketId,
+        viewer_key: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<TicketMessageRow>, String> {
+        let all = self.visible_messages(ticket, viewer_key)?;
+        Ok(all.into_iter().skip(offset).take(limit).collect())
+    }
+
+    fn visible_messages(
         &self,
         ticket: &TicketId,
         viewer_key: &str,
@@ -783,5 +835,93 @@ mod tests {
         let msgs = m.messages_for(&ticket.id, "viewer").unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "hello");
+    }
+
+    #[test]
+    fn set_status_rejects_lifecycle_and_unknown_statuses() {
+        let m = manager();
+        let ticket = m
+            .create(
+                "owner", "user", "general", "T", "req", "", None, None, None, None, 1,
+            )
+            .unwrap();
+        assert!(m.set_status(&ticket.id, "completed", "owner", 2).is_err());
+        assert!(m.set_status(&ticket.id, "failed", "owner", 2).is_err());
+        assert!(m.set_status(&ticket.id, "cancelled", "owner", 2).is_err());
+        assert!(m.set_status(&ticket.id, "reopened", "owner", 2).is_err());
+        assert!(m.set_status(&ticket.id, "bogus", "owner", 2).is_err());
+        // Rejected transitions leave the row untouched.
+        let row = m.get(&ticket.id).unwrap().unwrap();
+        assert_eq!(row.status, "open");
+        assert!(row.closed_ms.is_none());
+        m.set_status(&ticket.id, "in_progress", "owner", 2).unwrap();
+        assert_eq!(m.get(&ticket.id).unwrap().unwrap().status, "in_progress");
+    }
+
+    #[test]
+    fn update_cannot_rewrite_identity_or_lifecycle_fields() {
+        let m = manager();
+        let ticket = m
+            .create(
+                "owner", "user", "general", "T", "req", "", None, None, None, None, 1,
+            )
+            .unwrap();
+        m.close(&ticket.id, "owner", 2).unwrap();
+        let mut forged = m.get(&ticket.id).unwrap().unwrap();
+        forged.owner_key = "mallory".to_owned();
+        forged.status = "open".to_owned();
+        forged.closed_ms = None;
+        forged.title = "renamed".to_owned();
+        forged.request = "new request".to_owned();
+        m.update(&forged).unwrap();
+        let row = m.get(&ticket.id).unwrap().unwrap();
+        assert_eq!(row.owner_key, "owner");
+        assert_eq!(row.status, "completed");
+        assert!(row.closed_ms.is_some());
+        assert_eq!(row.title, "renamed");
+        assert_eq!(row.request, "new request");
+        // Updating a missing ticket is an error, not a silent insert.
+        let mut ghost = forged;
+        ghost.id = TicketId::generate();
+        assert!(m.update(&ghost).is_err());
+    }
+
+    #[test]
+    fn messages_for_page_returns_only_the_requested_window() {
+        let m = manager();
+        let ticket = m
+            .create(
+                "owner", "user", "general", "T", "req", "", None, None, None, None, 1,
+            )
+            .unwrap();
+        for i in 0..5 {
+            m.post_message(
+                &ticket.id,
+                "owner",
+                "user",
+                &format!("m{i}"),
+                "shared",
+                None,
+                10 + i,
+            )
+            .unwrap();
+        }
+        let page = m.messages_for_page(&ticket.id, "owner", 2, 1).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].content, "m1");
+        assert_eq!(page[1].content, "m2");
+        assert_eq!(
+            m.messages_for_page(&ticket.id, "owner", 10, 4)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            m.messages_for_page(&ticket.id, "owner", 2, 5)
+                .unwrap()
+                .is_empty()
+        );
+        // Permission checks still apply to paged reads.
+        assert!(m.messages_for_page(&ticket.id, "outsider", 2, 0).is_err());
     }
 }

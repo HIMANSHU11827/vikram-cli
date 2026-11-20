@@ -1,0 +1,24 @@
+{
+  "id": "turn-note-no-push",
+  "name": "Turn: no push or deploy",
+  "version": "1.0.0",
+  "description": "Forbids pushing or deploying from the turn.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 80,
+  "components": {
+    "hooks": [
+      "turn_start"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "turn_start",
+      "append": "Do not push, publish or deploy; leave that to the operator."
+    }
+  ]
+}

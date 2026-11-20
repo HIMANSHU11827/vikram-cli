@@ -64,8 +64,19 @@ fn walk(dir: &Path, query: &str, hits: &mut Vec<String>, depth: usize) {
         if name == ".git" || name == "target" || name == "node_modules" {
             continue;
         }
-        if path.is_dir() {
+        // `file_type` does not follow symlinks, so a link planted inside the workspace cannot
+        // smuggle `read_dir`/`read_to_string` outside the root the caller confined.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             walk(&path, query, hits, depth + 1);
+            continue;
+        }
+        if !file_type.is_file() {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
@@ -83,5 +94,42 @@ fn walk(dir: &Path, query: &str, hits: &mut Vec<String>, depth: usize) {
                 hits.push(format!("{}:{}: {}", path.display(), idx + 1, line.trim()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workspace_ctx(dir: &Path) -> ToolContext {
+        ToolContext {
+            workspace_root: dir.to_path_buf(),
+            ..ToolContext::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_does_not_follow_symlinks_out_of_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secrets.txt"), "needle-outside\n").unwrap();
+        std::fs::write(workspace.path().join("real.txt"), "needle-inside\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("dir-link")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secrets.txt"),
+            workspace.path().join("file-link.txt"),
+        )
+        .unwrap();
+        let ctx = workspace_ctx(workspace.path());
+        let out = SearchText
+            .run(&json!({"query": "needle-outside"}), &ctx)
+            .unwrap();
+        assert!(out.ok, "{}", out.content);
+        assert!(out.content.contains("no matches"), "{}", out.content);
+        let out = SearchText
+            .run(&json!({"query": "needle-inside"}), &ctx)
+            .unwrap();
+        assert!(out.content.contains("real.txt"), "{}", out.content);
     }
 }

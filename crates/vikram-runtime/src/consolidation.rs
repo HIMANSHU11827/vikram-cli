@@ -374,9 +374,10 @@ impl ConsolidationStore {
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
-        self.conn
-            .lock()
-            .expect("consolidation store mutex not poisoned")
+        self.conn.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: consolidation store mutex poisoned; recovering");
+            e.into_inner()
+        })
     }
 
     /// Capture a new observation (staged). Provenance is mandatory.
@@ -741,6 +742,20 @@ mod tests {
         let loser = out.iter().find(|o| o.value == "vim").unwrap();
         assert_eq!(loser.status, ObservationStatus::Superseded);
         assert!(loser.superseded_by.is_some());
+    }
+
+    #[test]
+    fn a_poisoned_lock_recovers_instead_of_panicking() {
+        let store = ConsolidationStore::open_in_memory().unwrap();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.conn.lock().unwrap();
+            panic!("poison the consolidation mutex");
+        }));
+        assert!(poisoned.is_err());
+        store
+            .capture("k", "v", "global", "unit-test", 0.5, 0.5)
+            .unwrap();
+        assert_eq!(store.load_all().unwrap().len(), 1);
     }
 
     #[test]

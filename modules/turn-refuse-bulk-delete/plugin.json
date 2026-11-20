@@ -1,0 +1,25 @@
+{
+  "id": "turn-refuse-bulk-delete",
+  "name": "Turn: refuse deleting every session",
+  "version": "1.0.0",
+  "description": "Refuses a turn that asks to delete all sessions.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 80,
+  "components": {
+    "hooks": [
+      "turn_start"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "turn_start",
+      "text_contain": "delete all sessions",
+      "deny": "bulk deletion of durable state needs an operator"
+    }
+  ]
+}

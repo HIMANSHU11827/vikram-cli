@@ -1,0 +1,24 @@
+{
+  "id": "ctx-no-secrets",
+  "name": "Context: no secrets in output",
+  "version": "1.0.0",
+  "description": "Adds a standing instruction to every turn: no secrets in output.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 60,
+  "components": {
+    "hooks": [
+      "context_build"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "context_build",
+      "append": "Never print, echo or commit secrets; refer to environment variable names only."
+    }
+  ]
+}

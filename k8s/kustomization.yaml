@@ -1,0 +1,26 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# `namespace:` rewrites metadata.namespace on every namespaced resource, so the files keep their
+# explicit `namespace: vikram` for plain `kubectl apply -f` use and kustomize stays consistent.
+namespace: vikram
+
+resources:
+  - namespace.yaml
+  - pvc.yaml
+  - configmap.yaml
+  # Placeholder only — see the header of secret.yaml. Remove this line once you manage the Secret
+  # with Sealed Secrets / SOPS / External Secrets, or the placeholder gets re-applied on every
+  # `kubectl apply -k` and silently overwrites a real key someone created out of band.
+  - secret.yaml
+  - deployment.yaml
+  # Inert unless the workload runs `vikram gateway`; safe to leave in, safe to delete.
+  - service.yaml
+
+# No `images:` transformer yet: the manifests reference `vikram:latest`. To deploy from a registry
+# without editing deployment.yaml, add:
+#
+# images:
+#   - name: vikram
+#     newName: registry.example.com/vikram
+#     newTag: 0.1.0

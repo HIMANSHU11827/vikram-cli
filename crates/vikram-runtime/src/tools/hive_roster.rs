@@ -158,6 +158,11 @@ impl Tool for HiveShow {
     }
 }
 
+/// One `hive.delegate` call may start at most this many child runs. Each target becomes a
+/// delegated session and a full agent turn, so an unbounded roster is unbounded model spend;
+/// members past the cap are reported as skipped rather than silently dropped.
+const MAX_DELEGATION_TARGETS: usize = 8;
+
 pub(crate) struct HiveDelegate;
 
 impl Tool for HiveDelegate {
@@ -232,7 +237,12 @@ impl Tool for HiveDelegate {
         };
         let mut lines = vec![format!("delegated task to hive `{hive}`")];
         let mut started = 0usize;
-        for target in &targets {
+        let mut skipped = 0usize;
+        for (index, target) in targets.iter().enumerate() {
+            if index >= MAX_DELEGATION_TARGETS {
+                skipped += 1;
+                continue;
+            }
             match handle.spawn_agent(target.clone(), task.clone(), parent.clone()) {
                 Ok(()) => {
                     started += 1;
@@ -240,6 +250,11 @@ impl Tool for HiveDelegate {
                 }
                 Err(e) => lines.push(format!("- {target}: {e}")),
             }
+        }
+        if skipped > 0 {
+            lines.push(format!(
+                "- {skipped} member(s) skipped: delegation fan-out is capped at {MAX_DELEGATION_TARGETS} per call"
+            ));
         }
         Ok(ToolOutput {
             content: truncated(lines.join("\n")),

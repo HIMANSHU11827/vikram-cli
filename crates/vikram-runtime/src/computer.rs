@@ -739,6 +739,17 @@ pub fn status() -> String {
     out
 }
 
+/// The approval prompt prints the resource verbatim, so `computer.type` must show a preview of
+/// the text it would inject — a bare "keyboard" would have the user approve blind keystrokes.
+/// Kept to one line of roughly 120 characters, whitespace flattened.
+fn type_preview(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = flat.chars();
+    let head: String = chars.by_ref().take(120).collect();
+    let ellipsis = if chars.next().is_some() { "…" } else { "" };
+    format!("type \"{head}{ellipsis}\"")
+}
+
 /// Tool output is unbounded from a busy desktop; cut it rather than flood the conversation.
 fn truncated(mut text: String) -> String {
     const LIMIT: usize = 20_000;
@@ -851,10 +862,15 @@ impl Tool for Click {
     fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
         let x = arg_int(args, "x")?;
         let y = arg_int(args, "y")?;
+        let button = args
+            .get("button")
+            .and_then(Value::as_i64)
+            .unwrap_or(1)
+            .clamp(0, u8::MAX as i64);
         Ok(PermissionRequest::new(
             ActionKind::Execute,
             "computer.click",
-            format!("{x},{y}"),
+            format!("{x},{y} button={button}"),
             SideEffect::LocalMutation,
             Trust::Model,
         ))
@@ -890,11 +906,11 @@ impl Tool for TypeText {
     }
 
     fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
-        let _ = arg_str(args, "text")?;
+        let text = arg_str(args, "text")?;
         Ok(PermissionRequest::new(
             ActionKind::Execute,
             "computer.type",
-            "keyboard",
+            type_preview(&text),
             SideEffect::LocalMutation,
             Trust::Model,
         ))
@@ -961,10 +977,11 @@ impl Tool for Scroll {
 
     fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
         let direction = arg_str(args, "direction")?;
+        let amount = args.get("amount").and_then(Value::as_u64).unwrap_or(3);
         Ok(PermissionRequest::new(
             ActionKind::Execute,
             "computer.scroll",
-            direction,
+            format!("{direction} amount={amount}"),
             SideEffect::LocalMutation,
             Trust::Model,
         ))
@@ -1620,5 +1637,55 @@ mod tests {
             .permission(&json!({"path": "shots/a.png"}))
             .unwrap();
         assert_eq!(req.resource, "shots/a.png");
+    }
+
+    #[test]
+    fn type_permission_shows_a_preview_of_the_text() {
+        // Approving blind keystroke injection is the failure this guards against.
+        let registry = ToolRegistry::with_builtins();
+        let req = registry
+            .get("computer.type")
+            .unwrap()
+            .permission(&json!({"text": "echo pwned > /tmp/x"}))
+            .unwrap();
+        assert!(req.resource.contains("echo pwned"), "{}", req.resource);
+
+        let long = format!("type this: {}", "x".repeat(500));
+        let req = registry
+            .get("computer.type")
+            .unwrap()
+            .permission(&json!({"text": long}))
+            .unwrap();
+        assert!(req.resource.contains('…'), "{}", req.resource);
+        assert!(req.resource.chars().count() < 160, "{}", req.resource);
+    }
+
+    #[test]
+    fn click_and_scroll_permissions_name_the_button_and_amount() {
+        let registry = ToolRegistry::with_builtins();
+        let req = registry
+            .get("computer.click")
+            .unwrap()
+            .permission(&json!({"x": 10, "y": 20, "button": 3}))
+            .unwrap();
+        assert!(req.resource.contains("button=3"), "{}", req.resource);
+        let req = registry
+            .get("computer.click")
+            .unwrap()
+            .permission(&json!({"x": 10, "y": 20}))
+            .unwrap();
+        assert!(req.resource.contains("button=1"), "{}", req.resource);
+        let req = registry
+            .get("computer.scroll")
+            .unwrap()
+            .permission(&json!({"direction": "down", "amount": 7}))
+            .unwrap();
+        assert!(req.resource.contains("amount=7"), "{}", req.resource);
+        let req = registry
+            .get("computer.scroll")
+            .unwrap()
+            .permission(&json!({"direction": "up"}))
+            .unwrap();
+        assert!(req.resource.contains("amount=3"), "{}", req.resource);
     }
 }

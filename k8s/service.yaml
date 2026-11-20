@@ -1,0 +1,44 @@
+# ---------------------------------------------------------------------------
+# This Service is INERT with the default Deployment and that is not a bug.
+#
+# The daemon (`vikram daemon start --foreground`) opens no socket: it only makes
+# outbound calls. Nothing can connect to it, so a Service in front of it would
+# resolve to a pod with no listening port.
+#
+# Network ingress exists only through `vikram gateway`, and only when BOTH of
+# these are true:
+#
+#   1. the workload runs the gateway subcommand, not the daemon
+#      (deployment.yaml `command:` -> ["/usr/bin/tini","--","vikram","gateway"])
+#   2. GATEWAY_WEBHOOK_BIND is set to the same host:port as targetPort below, AND
+#      at least one webhook platform's credentials are configured
+#      (crates/vikram-cli/src/gateway.rs:1105-1119 — with the bind var set but no
+#      platform configured, it logs a warning and still binds nothing)
+#
+# Because the gateway and the daemon are different subcommands of one binary,
+# enabling this normally means a SECOND Deployment running `vikram gateway`
+# alongside the daemon -- both mounting `vikram-data`, which is why the daemon
+# holds an exclusive lock and the gateway only reads. Keep two replicas of that
+# gateway Deployment at most, and prefer one.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: vikram
+  namespace: vikram
+  labels:
+    app.kubernetes.io/name: vikram
+    app.kubernetes.io/component: gateway
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: vikram
+    app.kubernetes.io/component: daemon
+  ports:
+    - name: http
+      port: 8080
+      protocol: TCP
+      # Numeric on purpose. A named targetPort only resolves if the container declares a port with
+      # that name, and the daemon container declares none. Once you uncomment the `ports: http: 8080`
+      # block in deployment.yaml you can switch this to `targetPort: http`.
+      targetPort: 8080

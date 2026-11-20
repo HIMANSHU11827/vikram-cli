@@ -1,0 +1,24 @@
+{
+  "id": "ctx-iso-dates",
+  "name": "Context: ISO-8601 dates",
+  "version": "1.0.0",
+  "description": "Adds a standing instruction to every turn: iso-8601 dates.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 60,
+  "components": {
+    "hooks": [
+      "context_build"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "context_build",
+      "append": "Prefer ISO-8601 dates (YYYY-MM-DD) in code, filenames and reports."
+    }
+  ]
+}

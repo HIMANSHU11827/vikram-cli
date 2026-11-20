@@ -3,6 +3,11 @@ use crate::store::EvolutionStore;
 use crate::types::{SkillVersion, now_ms};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Disambiguates temp files for [`SkillEvolution::write_skill_file`] so
+/// concurrent writers to different skills (or retries) never collide.
+static SKILL_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub struct SkillEvolution {
     store: EvolutionStore,
@@ -33,6 +38,47 @@ impl SkillEvolution {
     }
     fn skill_file(&self, name: &str) -> Result<PathBuf> {
         Ok(self.skill_dir(name)?.join("SKILL.md"))
+    }
+
+    /// Record `v` in the version table, then materialize `SKILL.md`.
+    ///
+    /// The DB row is written first because it carries the full content —
+    /// it is the durable record of intent and `SKILL.md` is derived from
+    /// it. If materialization fails the intent row is removed so the two
+    /// never disagree after a *handled* error. A hard crash between the
+    /// two leaves the DB ahead, which is the recoverable direction: the
+    /// row holds the exact content needed to rewrite `SKILL.md`, whereas
+    /// the old file-first order could leave file content missing from the
+    /// version history permanently.
+    fn commit_version(&self, v: &SkillVersion) -> Result<()> {
+        self.store.save_skill_version(v)?;
+        if let Err(e) = self.write_skill_file(&v.skill_name, &v.content) {
+            // Best-effort compensation; if even this fails the DB stays
+            // ahead — still recoverable, since the row has the content.
+            let _ = self.store.delete_skill_version(&v.skill_name, v.version);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Write `content` as the skill's `SKILL.md`.
+    ///
+    /// Goes through a sibling temp file + rename so a failed write never
+    /// leaves a truncated `SKILL.md` behind (rename is atomic on the same
+    /// filesystem), which is what makes [`Self::commit_version`]'s
+    /// compensation honest.
+    fn write_skill_file(&self, name: &str, content: &str) -> Result<()> {
+        let dir = self.skill_dir(name)?;
+        fs::create_dir_all(&dir).map_err(|e| EvolutionError::Io(e.to_string()))?;
+        let target = dir.join("SKILL.md");
+        let seq = SKILL_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!(".SKILL.md.tmp-{}-{seq}", std::process::id()));
+        fs::write(&tmp, content).map_err(|e| EvolutionError::Io(e.to_string()))?;
+        if let Err(e) = fs::rename(&tmp, &target) {
+            let _ = fs::remove_file(&tmp);
+            return Err(EvolutionError::Io(e.to_string()));
+        }
+        Ok(())
     }
 
     pub fn discover(&self) -> Vec<String> {
@@ -89,9 +135,7 @@ impl SkillEvolution {
             parent_version: if next == 1 { None } else { Some(next - 1) },
             change_description: change_desc.to_string(),
         };
-        fs::write(self.skill_file(name)?, content)
-            .map_err(|e| EvolutionError::Io(e.to_string()))?;
-        self.store.save_skill_version(&v)?;
+        self.commit_version(&v)?;
         Ok(v)
     }
 
@@ -119,9 +163,7 @@ impl SkillEvolution {
             parent_version: if current == 0 { None } else { Some(current) },
             change_description: change_desc.to_string(),
         };
-        fs::write(self.skill_file(name)?, new_content)
-            .map_err(|e| EvolutionError::Io(e.to_string()))?;
-        self.store.save_skill_version(&v)?;
+        self.commit_version(&v)?;
         Ok(v)
     }
 
@@ -143,8 +185,6 @@ impl SkillEvolution {
             .cloned()
             .ok_or_else(|| EvolutionError::NotFound(format!("version {version}")))?;
         let current = versions.iter().map(|x| x.version).max().unwrap_or(version);
-        fs::write(self.skill_file(name)?, &target.content)
-            .map_err(|e| EvolutionError::Io(e.to_string()))?;
         if current != version {
             let restored = SkillVersion {
                 skill_name: name.to_string(),
@@ -154,12 +194,12 @@ impl SkillEvolution {
                 parent_version: Some(current),
                 change_description: format!("rollback to v{version}"),
             };
-            self.store.save_skill_version(&restored)?;
-            // Keep the on-disk file in sync with the new head version.
-            fs::write(self.skill_file(name)?, &restored.content)
-                .map_err(|e| EvolutionError::Io(e.to_string()))?;
+            // Records the rollback as a new head version and materializes
+            // SKILL.md with that version's content in one commit.
+            self.commit_version(&restored)?;
             Ok(restored)
         } else {
+            self.write_skill_file(name, &target.content)?;
             Ok(target)
         }
     }
@@ -197,4 +237,71 @@ pub fn validate_skill_name(name: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn engine() -> (SkillEvolution, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        fs::create_dir_all(&root).unwrap();
+        (
+            SkillEvolution::new(EvolutionStore::open_in_memory().unwrap(), root),
+            tmp,
+        )
+    }
+
+    #[test]
+    fn create_improve_rollback_roundtrip() {
+        let (engine, _tmp) = engine();
+        let v1 = engine.create_skill("demo", "step1", "init").unwrap();
+        assert_eq!(v1.version, 1);
+        assert_eq!(engine.read_skill("demo").unwrap(), "step1");
+
+        let v2 = engine
+            .improve_skill("demo", "step1\nstep2", "add step")
+            .unwrap();
+        assert_eq!(v2.version, 2);
+        assert_eq!(engine.read_skill("demo").unwrap(), "step1\nstep2");
+
+        let restored = engine.rollback("demo", 1).unwrap();
+        assert_eq!(restored.version, 3);
+        assert_eq!(engine.read_skill("demo").unwrap(), "step1");
+        assert_eq!(engine.list_versions("demo").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn failed_file_write_leaves_no_version_row() {
+        let (engine, _tmp) = engine();
+        // A directory where SKILL.md should be makes the atomic rename
+        // fail *after* the version row is recorded — the compensation must
+        // remove that row so DB and disk never disagree.
+        let blocked = engine.skills_root().join("blocked");
+        fs::create_dir_all(blocked.join("SKILL.md")).unwrap();
+
+        assert!(engine.create_skill("blocked", "content", "init").is_err());
+        assert!(
+            engine.list_versions("blocked").unwrap().is_empty(),
+            "failed materialization must not leave a version row"
+        );
+
+        // Same for improve_skill on an existing skill.
+        engine.create_skill("demo", "v1", "init").unwrap();
+        let demo_md = engine.skills_root().join("demo").join("SKILL.md");
+        fs::remove_file(&demo_md).unwrap();
+        fs::create_dir_all(&demo_md).unwrap();
+        assert!(engine.improve_skill("demo", "v2", "bump").is_err());
+        assert_eq!(
+            engine
+                .list_versions("demo")
+                .unwrap()
+                .iter()
+                .map(|v| v.version)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "only the original version survives a failed write"
+        );
+    }
 }

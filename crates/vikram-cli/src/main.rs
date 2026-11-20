@@ -6,6 +6,7 @@
 mod chat;
 mod doctor;
 mod gateway;
+mod modules;
 mod plugins;
 mod skills;
 mod terminal;
@@ -133,6 +134,11 @@ enum Command {
     Plugins {
         #[command(subcommand)]
         action: Option<plugins::PluginsAction>,
+    },
+    /// Browse and install the bundled hook-module catalog.
+    Modules {
+        #[command(subcommand)]
+        action: Option<modules::ModulesAction>,
     },
     /// Manage users.
     Users {
@@ -855,6 +861,10 @@ fn main() -> std::process::ExitCode {
         Command::Plugins { action } => {
             let action = action.unwrap_or(plugins::PluginsAction::List);
             exit(plugins::run(action))
+        }
+        Command::Modules { action } => {
+            let action = action.unwrap_or(modules::ModulesAction::List { from: None });
+            exit(modules::run(action))
         }
         Command::Users { action } => users(action),
         Command::Profiles { action } => profiles(action),

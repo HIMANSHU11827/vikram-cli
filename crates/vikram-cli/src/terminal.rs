@@ -126,6 +126,7 @@ async fn event_loop(
         }
         for (request_id, answer) in app.take_answers() {
             if let Err(err) = handle.answer_question(&request_id, answer) {
+                app.answer_rejected(&request_id);
                 report(app, err);
             }
         }
@@ -592,35 +593,25 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
             }
         }
         UiCommand::CloseSession { session } => {
-            let was_active = app.session_index(&session) == Some(app.active);
-            let title = app
-                .sessions
-                .iter()
-                .find(|view| view.id == session)
-                .map(|view| view.title.clone());
-            if let Err(err) = handle.close_session(&session) {
-                report(app, err);
-            } else {
-                // The tab is gone, and it stays gone: the transcript is kept in the store and the
-                // next launch no longer reopens it. Saying so once, here, keeps a close from
-                // reading as a delete.
-                let name = title.unwrap_or_else(|| "session".to_owned());
-                app.push_notice(
-                    NoticeLevel::Info,
-                    format!("closed {name} — it will not reopen on the next launch"),
-                );
-                if app.sessions.is_empty() {
-                    match handle.create_session(Some("Session".into())) {
-                        Ok(id) => select(app, &id),
-                        Err(err) => report(app, err),
-                    }
-                } else if was_active && let Some(first) = app.sessions.first().map(|s| s.id.clone())
-                {
-                    select(app, &first);
+            // Queued follow-ups and a pending steer live only in memory; closing drops them
+            // silently, so the operator confirms once before they are lost.
+            match handle.pending_list(&session) {
+                Ok(pending) if !pending.is_empty() => {
+                    let waiting = pending.len();
+                    app.open_confirm(
+                        "Close a conversation",
+                        vec![
+                            format!("{waiting} message(s) are still waiting and will be lost"),
+                            "the transcript stays in the store; only the pending input is dropped"
+                                .to_owned(),
+                        ],
+                        UiCommand::CloseSessionConfirmed { session },
+                    );
                 }
-                app.sync_snapshot(handle.snapshot());
+                _ => close_session_tab(handle, app, session),
             }
         }
+        UiCommand::CloseSessionConfirmed { session } => close_session_tab(handle, app, session),
         UiCommand::RunShell { session, command } => {
             // The runtime gates it: same evaluator, same floor, same approval prompt and journal as
             // a model-issued tool call, with the operator's provenance instead of the model's.
@@ -698,8 +689,7 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
         } => apply_act(handle, app, &session, kind, verb, value),
         UiCommand::Clear { session } => {
             if let Some(view) = app.session_by_id_mut(&session) {
-                view.messages.clear();
-                view.follow = true;
+                view.clear_transcript();
             }
         }
         UiCommand::ForgetMemory { scope, key } => match handle.memory_delete(&key, &scope) {
@@ -733,6 +723,7 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
                 report(app, err);
             }
         }
+        UiCommand::DismissQuestion { request_id } => handle.dismiss_question(&request_id),
         UiCommand::SpawnAgent {
             profile,
             task,
@@ -763,6 +754,36 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
             app.should_quit = true;
         }
     }
+}
+
+fn close_session_tab(handle: &RuntimeHandle, app: &mut App, session: SessionId) {
+    let was_active = app.session_index(&session) == Some(app.active);
+    let title = app
+        .sessions
+        .iter()
+        .find(|view| view.id == session)
+        .map(|view| view.title.clone());
+    if let Err(err) = handle.close_session(&session) {
+        report(app, err);
+        return;
+    }
+    // The tab is gone, and it stays gone: the transcript is kept in the store and the
+    // next launch no longer reopens it. Saying so once, here, keeps a close from
+    // reading as a delete.
+    let name = title.unwrap_or_else(|| "session".to_owned());
+    app.push_notice(
+        NoticeLevel::Info,
+        format!("closed {name} — it will not reopen on the next launch"),
+    );
+    if app.sessions.is_empty() {
+        match handle.create_session(Some("Session".into())) {
+            Ok(id) => select(app, &id),
+            Err(err) => report(app, err),
+        }
+    } else if was_active && let Some(first) = app.sessions.first().map(|s| s.id.clone()) {
+        select(app, &first);
+    }
+    app.sync_snapshot(handle.snapshot());
 }
 
 fn select(app: &mut App, id: &SessionId) {
@@ -817,9 +838,11 @@ fn open_command(
         if command.name == "rename" {
             let mut editor = vikram_tui::editor::Editor::new();
             editor.insert_str(args.trim());
-            if let Some(session) = app.active_session() {
+            // The command was typed against `session` — the one on screen — so the panel must
+            // carry that id, not whichever tab happens to be active.
+            if app.sessions.iter().any(|view| view.id == *session) {
                 app.overlay = Some(Overlay::RenameSession {
-                    session: session.id.clone(),
+                    session: session.clone(),
                     editor,
                 });
             }
@@ -1037,7 +1060,9 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
             });
         }
         PickerKind::Pending => {
-            let Some(view) = app.active_session() else {
+            // The list and the verbs must name the same session: the pane on screen is the
+            // display session (a bot's chat included), which is not always the active tab.
+            let Some(view) = app.display_session() else {
                 app.push_notice(NoticeLevel::Warn, "no session is active");
                 return;
             };
@@ -1741,7 +1766,7 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
         }
         PickerKind::RenameSession => {
             let title = app
-                .active_session()
+                .display_session()
                 .map(|view| view.title.clone())
                 .unwrap_or_else(|| "no session".to_owned());
             let items = vec![PickerItem::new(
@@ -1753,7 +1778,7 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
         }
         PickerKind::CloseSession => {
             let title = app
-                .active_session()
+                .display_session()
                 .map(|view| view.title.clone())
                 .unwrap_or_else(|| "no session".to_owned());
             if app.sessions.len() <= 1 {
@@ -2533,7 +2558,9 @@ fn apply_act(
             other => app.push_notice(NoticeLevel::Warn, format!("no setting `{other}`")),
         },
         (PickerKind::File, _) => {
-            if let Some(view) = app.active_session_mut() {
+            // The picker listed the display session's files, so the reference lands in that
+            // session's draft — not the active tab's.
+            if let Some(view) = app.session_by_id_mut(session) {
                 view.editor.insert_str(&format!("@{value} "));
             }
             app.focus = Focus::Input;

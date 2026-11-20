@@ -267,6 +267,12 @@ impl ReflectionEngine {
                 }
             }
         }
+        // Bound history: without this every experience/event/job row is
+        // kept forever. Best-effort like the daemon's prune_runs — a
+        // failed prune must not fail job processing.
+        let _ = self
+            .store
+            .prune_older_than(crate::store::DEFAULT_RETENTION_MS);
         Ok(done)
     }
 }

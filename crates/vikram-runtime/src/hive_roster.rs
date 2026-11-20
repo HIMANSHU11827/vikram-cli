@@ -124,7 +124,14 @@ impl HiveRosterManager {
         let rosters = self.rosters.lock().expect("rosters lock").clone();
         let data = serde_json::to_string_pretty(&rosters)
             .map_err(|e| format!("serialize rosters: {e}"))?;
-        fs::write(path, data).map_err(|e| format!("write rosters: {e}"))?;
+        // Sibling temp file + rename, so a crash mid-save cannot leave a
+        // half-written roster file (same pattern as rules.rs).
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, data).map_err(|e| format!("write rosters: {e}"))?;
+        if let Err(e) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(format!("write rosters: {e}"));
+        }
         Ok(())
     }
 
@@ -330,5 +337,21 @@ mod tests {
         let t = mgr2.get("alpha").unwrap();
         assert_eq!(t.members.len(), 1);
         assert_eq!(t.task, Some("task".to_string()));
+    }
+
+    #[test]
+    fn save_leaves_no_temp_file_and_valid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hive-roster.json");
+        let mgr = HiveRosterManager::load_from(path.clone());
+        mgr.create("alpha").unwrap();
+        mgr.add_member("alpha", BotId::new("a1")).unwrap();
+        // The atomic write goes through a sibling temp name; it must be gone
+        // after the rename and the target must hold complete JSON.
+        assert!(!dir.path().join("hive-roster.json.tmp").exists());
+        let raw = fs::read_to_string(&path).unwrap();
+        let parsed: Vec<HiveRoster> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].members, vec![BotId::new("a1")]);
     }
 }

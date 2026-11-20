@@ -546,13 +546,22 @@ impl SessionRuntime {
         }
     }
 
-    pub fn enqueue(&self, text: String) -> usize {
+    /// How many follow-ups may wait behind a running turn. The queue is drained only when a turn
+    /// ends, so an unbounded one is memory the operator typed but the runtime will never catch up
+    /// to; past the cap a submit is refused instead of growing forever.
+    pub const MAX_QUEUED_FOLLOW_UPS: usize = 32;
+
+    /// Enqueue a follow-up, returning the new depth, or `None` when the queue is at the cap.
+    pub fn enqueue(&self, text: String) -> Option<usize> {
         let mut queue = self.queue.lock().unwrap_or_else(|e| {
             eprintln!("vikram: session queue lock mutex poisoned; recovering");
             e.into_inner()
         });
+        if queue.len() >= Self::MAX_QUEUED_FOLLOW_UPS {
+            return None;
+        }
         queue.push_back(text);
-        queue.len()
+        Some(queue.len())
     }
 
     pub fn dequeue(&self) -> Option<String> {
@@ -642,10 +651,13 @@ impl SessionRuntime {
         }) = None;
     }
 
-    /// Demote a pending steer to an ordinary queued follow-up.
+    /// Demote a pending steer to an ordinary queued follow-up. A full queue keeps it a steer:
+    /// dropping the text would lose an instruction the operator already sent.
     pub fn steer_to_queue(&self) {
-        if let Some(text) = self.take_steer() {
-            self.enqueue(text);
+        if let Some(text) = self.take_steer()
+            && self.enqueue(text.clone()).is_none()
+        {
+            self.steer(text);
         }
     }
 
@@ -656,7 +668,8 @@ impl SessionRuntime {
             return false;
         };
         if let Some(old) = self.take_steer() {
-            self.enqueue(old);
+            // The promoted row just left the queue, so there is always room for the old steer.
+            let _ = self.enqueue(old);
         }
         self.steer(text);
         true
@@ -848,8 +861,8 @@ mod tests {
     #[test]
     fn queue_preserves_order_and_reports_depth() {
         let s = session();
-        assert_eq!(s.enqueue("a".into()), 1);
-        assert_eq!(s.enqueue("b".into()), 2);
+        assert_eq!(s.enqueue("a".into()), Some(1));
+        assert_eq!(s.enqueue("b".into()), Some(2));
         assert_eq!(s.dequeue().as_deref(), Some("a"));
         assert_eq!(s.queue_len(), 1);
     }
@@ -889,6 +902,20 @@ mod tests {
         s.clear_steer();
         assert!(s.pending_steer().is_none());
         assert_eq!(s.queue_items(), vec!["second!", "third"]);
+    }
+
+    #[test]
+    fn the_queue_refuses_past_its_cap_instead_of_growing_forever() {
+        let s = session();
+        for index in 0..SessionRuntime::MAX_QUEUED_FOLLOW_UPS {
+            assert_eq!(s.enqueue(format!("m{index}")), Some(index + 1));
+        }
+        assert_eq!(s.enqueue("one too many".into()), None);
+        assert_eq!(s.queue_len(), SessionRuntime::MAX_QUEUED_FOLLOW_UPS);
+        // Demoting a steer onto a full queue keeps the steer rather than losing the text.
+        s.steer("still steering".into());
+        s.steer_to_queue();
+        assert_eq!(s.pending_steer().as_deref(), Some("still steering"));
     }
 
     #[test]

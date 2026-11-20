@@ -2,3 +2,10 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: vikram
+  labels:
+    app.kubernetes.io/name: vikram
+    # Pod Security Admission: the pod already satisfies the "restricted" profile (non-root,
+    # no privilege escalation, all capabilities dropped, seccomp RuntimeDefault), so enforce it
+    # rather than merely warning. Remove these two lines if you deploy other pods here.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest

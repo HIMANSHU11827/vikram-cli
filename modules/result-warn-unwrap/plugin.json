@@ -1,0 +1,25 @@
+{
+  "id": "result-warn-unwrap",
+  "name": "Result: an unwrap in added code",
+  "version": "1.0.0",
+  "description": "Inspects tool output for an unwrap in added code.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 40,
+  "components": {
+    "hooks": [
+      "tool_result"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_result",
+      "result_contain": ".unwrap()",
+      "append_result": "[plugin] Added code unwraps. Confirm the value cannot be absent, or return an error."
+    }
+  ]
+}

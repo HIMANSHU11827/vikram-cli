@@ -3,18 +3,51 @@ kind: ConfigMap
 metadata:
   name: vikram-config
   namespace: vikram
+  labels:
+    app.kubernetes.io/name: vikram
+    app.kubernetes.io/component: daemon
 data:
-  # Minimal config; secrets (API key) go in the Secret below.
+  # Every key below exists on `Config` in crates/vikram-runtime/src/config.rs:15-79 and is spelled
+  # exactly as that struct's serde name. Things worth knowing before editing:
+  #
+  #  * The struct is `#[serde(default)]` without `deny_unknown_fields`, so a misspelled key is
+  #    silently ignored and the default quietly applies. `"max_step"` looks fine and does nothing.
+  #  * `mode` is deserialised from the snake_case Rust variant name (policy.rs:99-100), NOT from the
+  #    short form the CLI and journal use. Valid here: ask, accept_edits, plan, smart, unattended,
+  #    yolo, allow_list. Writing "edit-ok" or "allow-list" fails to parse.
+  #  * "ask" is correct even for a headless pod: the daemon raises a job session from Ask to
+  #    Unattended by itself (crates/vikram-daemon/src/runner.rs:151-153), so nothing waits on a
+  #    human who is not there. Do not "fix" this to unattended.
+  #  * This file is not read from the ConfigMap directly. The init container copies it once to
+  #    $VIKRAM_HOME/config.json on the PVC, because the runtime rewrites that file when a mode or
+  #    model changes. Re-applying this ConfigMap does not touch a running pod; see k8s/README.md.
+  #
+  # The API key is not here. `api_key_env` names the variable, and the value comes from the Secret.
   config.json: |
     {
-      "model": "gpt-4o-mini",
+      "provider": "openai",
       "base_url": "https://api.openai.com/v1",
+      "model": "gpt-4o-mini",
       "api_key_env": "OPENAI_API_KEY",
       "context_window": 128000,
       "max_steps": 24,
       "max_output_tokens": 4096,
+      "stream_silence_secs": 60,
+      "workspace_root": "/data/vikram/workspace",
       "ascii_fallback": true,
       "thinking": false,
       "mode": "ask",
-      "security": { "disable_yolo": true, "disable_auto_approve": false, "disable_always_allow": false }
+      "security": {
+        "disable_yolo": true,
+        "disable_auto_approve": false,
+        "disable_always_allow": false
+      }
     }
+  # Notes on the block above:
+  #  * `workspace_root` is inside the volume. Left unset it defaults to the process working
+  #    directory (/workspace in the image), which is read-only here, so every tool write would fail.
+  #  * `security.disable_yolo: true` matters more in a cluster than on a laptop: nobody is watching
+  #    the pod, so a posture that auto-approves is a posture nobody can intervene in.
+  #  * The OS sandbox (`security.sandbox`, enabled by default) silently degrades to pass-through
+  #    because the image has no `bwrap` (crates/vikram-sandbox/src/lib.rs:84-93). The container
+  #    boundary is the sandbox in this deployment; do not assume bwrap containment.

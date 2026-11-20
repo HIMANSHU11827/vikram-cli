@@ -1,0 +1,25 @@
+{
+  "id": "turn-refuse-env-dump",
+  "name": "Turn: refuse dumping .env",
+  "version": "1.0.0",
+  "description": "Refuses a turn that asks to dump the environment file.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 80,
+  "components": {
+    "hooks": [
+      "turn_start"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "turn_start",
+      "text_contain": "dump the .env",
+      "deny": "dumping .env would put credentials into the transcript"
+    }
+  ]
+}

@@ -3,8 +3,22 @@ kind: PersistentVolumeClaim
 metadata:
   name: vikram-data
   namespace: vikram
+  labels:
+    app.kubernetes.io/name: vikram
+    app.kubernetes.io/component: daemon
 spec:
-  accessModes: [ "ReadWriteOnce" ]
+  # ReadWriteOnce, single writer. This volume holds vikram.db (SQLite), config.json, .env and the
+  # daemon lock, so it must be a real filesystem with working POSIX locks.
+  #
+  # Do NOT point this at NFS/CephFS/EFS (ReadWriteMany): SQLite on a network filesystem is the
+  # classic way to corrupt a database, and the daemon lock in daemon.rs assumes local semantics.
+  # A network-attached block device (EBS, GCE PD, Ceph RBD) is fine.
+  #
+  # `metadata.name` is deliberately omitted: leaving it unset uses the cluster default class. If
+  # you run more than one cluster, pin it explicitly:
+  #   storageClassName: gp3
+  accessModes:
+    - ReadWriteOnce
   resources:
     requests:
       storage: 5Gi

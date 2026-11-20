@@ -5,6 +5,8 @@
 //! folded away. Nothing is destroyed. A compacted session can still be asked for the original tool
 //! output, and a restart replays the same projection rather than reloading the whole transcript.
 
+use std::collections::HashSet;
+
 use vikram_contracts::{Block, Message, RecordKind, Role, Trust};
 
 use crate::context_engine::{ContextBudget, TokenEstimator};
@@ -145,11 +147,10 @@ pub fn should_compact(
     if messages.len() < policy.keep_recent + policy.min_fold {
         return false;
     }
-    // A prompt and tool set that already fill the window leaves the transcript no room at all.
-    // Folding is the only move left that can shrink the request, so zero budget is a trigger, not
-    // a reason to stay quiet.
+    // Zero usable budget means the prompt and tool set alone fill the window: no transcript,
+    // folded or not, can fit, so folding cannot help and would only thrash the journal.
     if usable == 0 {
-        return true;
+        return false;
     }
     let used = active_context_tokens(estimator, messages, budget);
     match policy.absolute_limit {
@@ -499,6 +500,7 @@ struct FoldNote {
     completed: Vec<String>,
     pending: Vec<String>,
     files: Vec<String>,
+    files_seen: HashSet<String>,
     errors: Vec<String>,
     tool_count: usize,
     duplicate_tools: usize,
@@ -531,7 +533,7 @@ static ERROR_MARKERS: &[&str] = &[
 
 impl FoldNote {
     fn collect(&mut self, old: &[Message], estimator: &TokenEstimator) {
-        let mut seen_results: Vec<String> = Vec::new();
+        let mut seen_results: HashSet<String> = HashSet::new();
         for message in old {
             match message.role {
                 Role::User => {
@@ -574,7 +576,7 @@ impl FoldNote {
                                 self.duplicate_tools += 1;
                                 continue;
                             }
-                            seen_results.push(key);
+                            seen_results.insert(key);
                             let lower = content.to_lowercase();
                             if !*ok || ERROR_MARKERS.iter().any(|m| lower.contains(m)) {
                                 // Keep the failure whole: an unresolved error is the most
@@ -606,7 +608,7 @@ impl FoldNote {
                         .rsplit('.')
                         .next()
                         .is_some_and(|ext| ext.len() <= 5 && !ext.contains(' '));
-            if looks_like_path && !self.files.iter().any(|f| f == candidate) {
+            if looks_like_path && self.files_seen.insert(candidate.to_string()) {
                 self.files.push(candidate.to_string());
             }
         }
@@ -888,10 +890,10 @@ mod tests {
     }
 
     #[test]
-    fn a_transcript_with_no_room_at_all_still_folds() {
+    fn a_transcript_with_no_room_at_all_is_not_folded_endlessly() {
         let e = TokenEstimator::default();
         // The prompt and tool schemas alone fill the window, so the transcript has zero budget.
-        // That is the moment folding matters most, not a reason to leave the request oversized.
+        // No fold can make that request fit, so compaction stays quiet instead of thrashing.
         let b = ContextBudget::new(
             ModelLimits {
                 context_window: 2_000,
@@ -905,7 +907,8 @@ mod tests {
         assert_eq!(b.usable_input(), 0);
         let p = policy();
         let msgs = long_transcript();
-        assert!(should_compact(&e, &msgs, &b, &p));
+        assert!(!should_compact(&e, &msgs, &b, &p));
+        // compact() itself still works if a caller asks for it directly.
         let (out, report) = compact(&e, &msgs, &b, &p, 90).unwrap();
         assert!(report.after_tokens < report.before_tokens);
         assert!(pairing_is_consistent(&out));

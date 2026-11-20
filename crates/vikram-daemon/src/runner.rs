@@ -849,20 +849,68 @@ fn answer_text(messages: &[Message]) -> Option<String> {
     })
 }
 
+/// A command line handed to the host shell: `cmd /C` on Windows, `$SHELL -c` elsewhere.
+fn shell_command(command: &str) -> tokio::process::Command {
+    #[cfg(windows)]
+    {
+        let comspec = std::env::var("COMSPEC")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "cmd".to_owned());
+        let mut cmd = tokio::process::Command::new(comspec);
+        cmd.args(["/C", command]);
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        let shell = std::env::var("SHELL")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "sh".to_owned());
+        let mut cmd = tokio::process::Command::new(shell);
+        cmd.args(["-c", command]);
+        cmd
+    }
+}
+
 /// Run one shell command. No model, no session, no tokens.
 ///
-/// `sh -c` rather than a parsed argv, because the operator writes the command the way they would
-/// type it, and a scheduled command that cannot use a pipe or a redirect is not worth scheduling.
+/// A shell string rather than a parsed argv, because the operator writes the command the way they
+/// would type it, and a scheduled command that cannot use a pipe or a redirect is not worth
+/// scheduling. The shell is `$SHELL`/`sh` on unix and `%COMSPEC%`/`cmd` on Windows.
 pub async fn run_script(command: &str, cwd: Option<&Path>, timeout: Duration) -> RunOutcome {
-    let mut child = tokio::process::Command::new("sh");
-    child.arg("-c").arg(command).kill_on_drop(true);
+    let mut child = shell_command(command);
+    child.kill_on_drop(true);
+    child
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     if let Some(cwd) = cwd {
         child.current_dir(cwd);
     }
+    let mut child = match child.spawn() {
+        Ok(child) => child,
+        Err(err) => return RunOutcome::failed(format!("could not run the script: {err}")),
+    };
 
-    let output = match tokio::time::timeout(timeout, child.output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(err)) => return RunOutcome::failed(format!("could not run the script: {err}")),
+    // `output()` buffers everything the job prints before OUTPUT_CAP ever applies, so a runaway
+    // job could grow the daemon without bound. Reading the pipes directly keeps at most the cap
+    // per stream and drains the rest.
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let finished = tokio::time::timeout(timeout, async {
+        let (status, out, err) = tokio::join!(
+            child.wait(),
+            read_capped(&mut stdout, OUTPUT_CAP),
+            read_capped(&mut stderr, OUTPUT_CAP),
+        );
+        (status, out, err)
+    })
+    .await;
+
+    let (status, stdout, stderr) = match finished {
+        Ok(inner) => inner,
         Err(_) => {
             return RunOutcome::failed(format!(
                 "timed out after {}",
@@ -870,9 +918,13 @@ pub async fn run_script(command: &str, cwd: Option<&Path>, timeout: Duration) ->
             ));
         }
     };
+    let status = match status {
+        Ok(status) => status,
+        Err(err) => return RunOutcome::failed(format!("could not run the script: {err}")),
+    };
 
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut text = String::from_utf8_lossy(&stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr);
     if !stderr.trim().is_empty() {
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
@@ -880,10 +932,10 @@ pub async fn run_script(command: &str, cwd: Option<&Path>, timeout: Duration) ->
         text.push_str(&stderr);
     }
 
-    match output.status.success() {
+    match status.success() {
         true => RunOutcome::finished(text, None),
         false => {
-            let mut outcome = RunOutcome::failed(match output.status.code() {
+            let mut outcome = RunOutcome::failed(match status.code() {
                 Some(code) => format!("exit status {code}"),
                 None => "killed by a signal".to_string(),
             });
@@ -891,6 +943,27 @@ pub async fn run_script(command: &str, cwd: Option<&Path>, timeout: Duration) ->
             outcome
         }
     }
+}
+
+/// Drain a pipe to EOF but keep at most `cap` bytes: whatever does not fit is read and dropped,
+/// so the child never blocks on a full pipe and the daemon never holds the overflow.
+async fn read_capped<R>(reader: &mut R, cap: usize) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut kept = Vec::new();
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let room = cap.saturating_sub(kept.len());
+                kept.extend_from_slice(&buf[..n.min(room)]);
+            }
+        }
+    }
+    kept
 }
 
 /// A session title taken from the work itself, clipped on a word boundary.
@@ -969,6 +1042,38 @@ mod tests {
         assert!(
             outcome.output.contains("broken"),
             "stderr is part of the record"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_script_that_prints_more_than_the_cap_is_clipped_not_buffered() {
+        let outcome = run_script(
+            "head -c 200000 /dev/zero | tr '\\0' 'x'; echo done >&2",
+            None,
+            seconds(10),
+        )
+        .await;
+        assert!(outcome.ok, "{outcome:?}");
+        assert!(
+            outcome.output.len() <= OUTPUT_CAP + 64,
+            "the stored result stays capped: {} bytes",
+            outcome.output.len()
+        );
+        assert!(
+            outcome.output.contains("output clipped"),
+            "the clip marker says the output was cut"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pipe_reader_keeps_the_cap_and_drains_the_rest() {
+        let data = vec![b'y'; OUTPUT_CAP * 4];
+        let mut slice: &[u8] = &data;
+        let kept = read_capped(&mut slice, OUTPUT_CAP).await;
+        assert_eq!(kept.len(), OUTPUT_CAP);
+        assert!(
+            slice.is_empty(),
+            "the overflow was drained, not left behind"
         );
     }
 

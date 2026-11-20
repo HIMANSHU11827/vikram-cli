@@ -808,6 +808,38 @@ impl ScheduleStore {
         Ok(rows)
     }
 
+    /// Every run still marked `running`, whoever owns it. The supervisor's own in-flight work and
+    /// a run whose Finished was lost look the same from here; the caller tells them apart by age.
+    pub fn running_runs(&self) -> Result<Vec<Run>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RUN_COLUMNS} FROM daemon_runs WHERE status = 'running' ORDER BY started_ms"
+        ))?;
+        let runs = stmt
+            .query_map([], row_to_run)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(runs)
+    }
+
+    /// Close a run this process watched but never heard the end of — the Finished was lost, so
+    /// like `adopt_orphans` the honest record is `unknown` rather than failed.
+    pub fn expire_run(&self, run: &Run, now: Millis) -> Result<(), StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE daemon_runs SET status = 'unknown', finished_ms = ?2,
+                 error = CASE WHEN error = '' THEN 'the run never reported back' ELSE error END
+             WHERE id = ?1",
+            params![run.id, now],
+        )?;
+        tx.execute(
+            "UPDATE daemon_jobs SET last_status = ?2 WHERE id = ?1",
+            params![run.job_id, RunStatus::Unknown.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Keep history bounded: the newest `keep` runs of a job survive, older ones go.
     pub fn prune_runs(&self, job_id: &str, keep: usize) -> Result<usize, StoreError> {
         let conn = self.lock();

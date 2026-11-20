@@ -3,35 +3,172 @@ kind: Deployment
 metadata:
   name: vikram
   namespace: vikram
+  labels:
+    app.kubernetes.io/name: vikram
+    app.kubernetes.io/component: daemon
 spec:
+  # Exactly one writer. VIKRAM keeps its state in SQLite at $VIKRAM_HOME/vikram.db and the daemon
+  # claims $VIKRAM_HOME/daemon/daemon.lock for its whole life, so a second replica would be a second
+  # writer on the same file. Scaling this number up does not add throughput; it adds corruption.
   replicas: 1
+  # Recreate, not RollingUpdate. The volume is ReadWriteOnce: a rolling update would start the new
+  # pod while the old one still holds the volume, and the new pod would sit in ContainerCreating
+  # until the rollout times out. Recreate stops the writer first, which is also what SQLite needs.
+  strategy:
+    type: Recreate
+  revisionHistoryLimit: 3
   selector:
-    matchLabels: { app: vikram }
+    matchLabels:
+      app.kubernetes.io/name: vikram
+      app.kubernetes.io/component: daemon
   template:
     metadata:
-      labels: { app: vikram }
+      labels:
+        app.kubernetes.io/name: vikram
+        app.kubernetes.io/component: daemon
+      annotations:
+        # Bump to force a rollout after editing the ConfigMap. The config is copied into the PVC by
+        # the init container, so a ConfigMap change alone does not reach a running pod.
+        vikram.dev/config-revision: "1"
     spec:
-      containers:
-        - name: vikram
+      # No Kubernetes API access is needed or wanted.
+      automountServiceAccountToken: false
+      # The daemon shuts down cleanly on SIGTERM; give it room to finish the current tick.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        # Owns the PVC so uid 1000 can write the SQLite database and .env without a chown dance.
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+
+      initContainers:
+        # config.json has to be writable: the runtime calls Config::save() when a mode, model or
+        # endpoint is changed live (crates/vikram-runtime/src/runtime.rs:2407-2426, 2619, 2705), and
+        # a ConfigMap mount via subPath is read-only. So the ConfigMap is the *source*, and the PVC
+        # holds the working copy. Seeding only when absent keeps those operator choices across
+        # restarts instead of clobbering them on every boot.
+        - name: seed-config
           image: vikram:latest
           imagePullPolicy: IfNotPresent
-          # Interactive TUI; for a non-interactive pod use: ["vikram", "chat", "hello"]
-          command: ["vikram"]
-          stdin: true
-          tty: true
+          command:
+            - /bin/sh
+            - -ceu
+            - |
+              if [ -f "${VIKRAM_HOME}/config.json" ]; then
+                echo "seed-config: ${VIKRAM_HOME}/config.json already exists; leaving it alone"
+              else
+                cp /config/config.json "${VIKRAM_HOME}/config.json"
+                chmod 0600 "${VIKRAM_HOME}/config.json"
+                echo "seed-config: wrote ${VIKRAM_HOME}/config.json from ConfigMap vikram-config"
+              fi
           env:
             - name: VIKRAM_HOME
               value: /data/vikram
-            - name: OPENAI_API_KEY
-              valueFrom: { secretKeyRef: { name: vikram-secrets, key: OPENAI_API_KEY } }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           volumeMounts:
             - name: data
               mountPath: /data/vikram
             - name: config
-              mountPath: /data/vikram/config.json
-              subPath: config.json
+              mountPath: /config
+              readOnly: true
+
+      containers:
+        - name: vikram
+          image: vikram:latest
+          imagePullPolicy: IfNotPresent
+          # The image ENTRYPOINT is ["/usr/bin/tini","--","vikram"] with an empty CMD, which with no
+          # arguments launches the TUI. The TUI refuses to start without a real terminal
+          # (crates/vikram-cli/src/terminal.rs:66-69), so a bare `vikram` here crash-loops. Any
+          # headless subcommand works instead:
+          #
+          #   daemon  (this one)     ["/usr/bin/tini","--","vikram","daemon","start","--foreground"]
+          #   gateway                ["/usr/bin/tini","--","vikram","gateway"]        # needs a platform configured
+          #   one-shot chat          ["/usr/bin/tini","--","vikram","chat","<prompt>"]  # exits, so use a Job
+          #   scheduler jobs         `vikram cron add ...` against this running daemon
+          #
+          # Keep tini in front: it stays PID 1 and forwards SIGTERM, which is how the daemon gets to
+          # release its lock and close SQLite. `--foreground` is required; without it `daemon start`
+          # detaches and PID 1 exits, and the pod restart-loops.
+          command: ["/usr/bin/tini", "--", "vikram", "daemon", "start", "--foreground"]
+          env:
+            - name: VIKRAM_HOME
+              value: /data/vikram
+            # HOME is moved off /home/vikram because the root filesystem is read-only below.
+            # Anything that writes to ~ lands on the volume instead of failing with EROFS.
+            - name: HOME
+              value: /data/vikram
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vikram-secrets
+                  key: OPENAI_API_KEY
+            # Optional: serve the webhook ingress. No port is open unless this is set, and even then
+            # only if a webhook platform's credentials are also configured (see gateway.rs:1105-1119).
+            # It applies to `vikram gateway`, not to the daemon, so an HTTP probe stays wrong here.
+            # - name: GATEWAY_WEBHOOK_BIND
+            #   value: "0.0.0.0:8080"
+          # No containerPort: the daemon is outbound-only. Uncomment together with the bind var if
+          # this workload is switched to `vikram gateway`.
+          # ports:
+          #   - name: http
+          #     containerPort: 8080
+          #     protocol: TCP
+          #
+          # Both probes exec the binary, because there is no socket to knock on and an httpGet probe
+          # would report a healthy pod as dead. `vikram --version` proves the binary is loadable and
+          # runnable as uid 1000; it deliberately does not prove a model endpoint is reachable,
+          # since a provider outage must not restart a pod that is otherwise fine.
+          livenessProbe:
+            exec:
+              command: ["vikram", "--version"]
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["vikram", "--version"]
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            # Starting point, not a measurement. The binary idles small; the ceiling covers a
+            # context window plus SQLite writes. Measure with `kubectl top pod` before trusting it.
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data/vikram
+            # readOnlyRootFilesystem leaves nothing writable for temp files or build scratch.
+            - name: tmp
+              mountPath: /tmp
+
       volumes:
         - name: data
-          persistentVolumeClaim: { claimName: vikram-data }
+          persistentVolumeClaim:
+            claimName: vikram-data
+        # Source of truth for config. Never mounted by the main container on purpose: the working
+        # copy lives on the PVC so Config::save() can succeed.
         - name: config
-          configMap: { name: vikram-config }
+          configMap:
+            name: vikram-config
+        - name: tmp
+          emptyDir: {}

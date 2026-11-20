@@ -1,0 +1,26 @@
+{
+  "id": "guard-crontab",
+  "name": "Guard: edit crontab",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: edit crontab.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "shell.run",
+      "arguments_contain": "crontab -e",
+      "deny": "scheduling host jobs is outside a coding turn"
+    }
+  ]
+}

@@ -455,6 +455,13 @@ impl DialecticEngine {
         &self.config
     }
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, DialecticState> {
+        self.state.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: dialectic state mutex poisoned; recovering");
+            e.into_inner()
+        })
+    }
+
     /// Whether extraction runs on this turn number (1-based user turns).
     pub fn should_run(&self, turn_number: u64) -> bool {
         self.config.enabled
@@ -469,7 +476,7 @@ impl DialecticEngine {
         if !self.config.enabled {
             return Vec::new();
         }
-        let mut state = self.state.lock().expect("dialectic state lock");
+        let mut state = self.lock();
         state.turn_count += 1;
         let turn_number = state.turn_count;
         state.history.push_back(user_text.to_owned());
@@ -490,7 +497,7 @@ impl DialecticEngine {
         if !self.config.enabled {
             return Vec::new();
         }
-        let mut state = self.state.lock().expect("dialectic state lock");
+        let mut state = self.lock();
         state.turn_count += 1;
         state.history.push_back(user_text.to_owned());
         while state.history.len() > self.config.depth.max(1) {
@@ -521,14 +528,14 @@ impl DialecticEngine {
 
     /// All currently held insights, deterministically sorted (confidence desc).
     pub fn insights(&self) -> Vec<Insight> {
-        let state = self.state.lock().expect("dialectic state lock");
+        let state = self.lock();
         let mut all: Vec<Insight> = state.insights.values().cloned().collect();
         sort_insights(&mut all);
         all
     }
 
     pub fn turn_count(&self) -> u64 {
-        self.state.lock().expect("dialectic state lock").turn_count
+        self.lock().turn_count
     }
 
     /// The supplement for the next turn's prefix (layer 2), or `None`.
@@ -570,7 +577,7 @@ impl DialecticEngine {
         let Ok(entries) = store.list(DIALECTIC_SCOPE) else {
             return 0;
         };
-        let mut state = self.state.lock().expect("dialectic state lock");
+        let mut state = self.lock();
         let mut loaded = 0usize;
         for (_key, value) in entries {
             let Ok(insight) = serde_json::from_str::<Insight>(&value) else {
@@ -689,6 +696,19 @@ mod tests {
         assert!(render_supplement(&engine.insights(), 1).is_none());
         let capped = render_supplement(&engine.insights(), 60).expect("fits something");
         assert!(capped.len() <= full.len());
+    }
+
+    #[test]
+    fn a_poisoned_state_lock_recovers_instead_of_panicking() {
+        let engine = engine();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = engine.state.lock().unwrap();
+            panic!("poison the dialectic mutex");
+        }));
+        assert!(poisoned.is_err());
+        assert_eq!(engine.turn_count(), 0);
+        assert!(engine.insights().is_empty());
+        assert!(!engine.observe_turn("I prefer tabs").is_empty());
     }
 
     #[test]

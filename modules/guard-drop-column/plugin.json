@@ -1,0 +1,26 @@
+{
+  "id": "guard-drop-column",
+  "name": "Guard: DROP COLUMN",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: drop column.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "shell.run",
+      "arguments_contain": "drop column",
+      "deny": "dropping a column loses data no migration can recover"
+    }
+  ]
+}

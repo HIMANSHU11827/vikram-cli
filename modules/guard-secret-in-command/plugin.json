@@ -1,0 +1,26 @@
+{
+  "id": "guard-secret-in-command",
+  "name": "Guard: API key on the command line",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: api key on the command line.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "shell.run",
+      "arguments_contain": "api_key=",
+      "deny": "secrets must not be placed on a command line"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "id": "guard-drop-database",
+  "name": "Guard: DROP DATABASE",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: drop database.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "*",
+      "arguments_contain": "drop database",
+      "deny": "dropping a database is destructive and irreversible here"
+    }
+  ]
+}

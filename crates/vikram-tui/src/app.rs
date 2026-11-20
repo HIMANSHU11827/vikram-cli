@@ -462,10 +462,20 @@ pub enum UiCommand {
     CloseSession {
         session: SessionId,
     },
+    /// The operator confirmed closing a session that still had queued or steering messages; skips
+    /// the pending-count check [`UiCommand::CloseSession`] performs first.
+    CloseSessionConfirmed {
+        session: SessionId,
+    },
     AnswerApproval {
         approval: ApprovalId,
         allow: bool,
         persist: bool,
+    },
+    /// Drop a pending `ask_user` question on the runtime side; the turn it blocked resolves as
+    /// cancelled rather than waiting forever.
+    DismissQuestion {
+        request_id: String,
     },
     SpawnAgent {
         profile: BotId,
@@ -640,7 +650,6 @@ pub struct SessionView {
     /// The newest queued follow-up, previewed by the input box title.
     pub queue_text: Option<String>,
     pub activity: Vec<Activity>,
-    pub expanded_activities: std::collections::HashSet<usize>,
     pub selected_activity: Option<usize>,
     pub expanded_thought: bool,
     /// Folds the operator set by clicking a header, keyed by block. `expanded_thought` stays the
@@ -690,7 +699,6 @@ impl SessionView {
             steer_text: snapshot.steer_text,
             queue_text: snapshot.queue_text,
             activity,
-            expanded_activities: std::collections::HashSet::new(),
             selected_activity: None,
             expanded_thought: false,
             thought_folds: HashMap::new(),
@@ -766,12 +774,26 @@ impl SessionView {
         if self.activity.len() > CAP {
             let drop = self.activity.len() - CAP;
             self.activity.drain(0..drop);
-            // Keep expanded/selection indices aligned with the retained slice.
-            self.expanded_activities = self
-                .expanded_activities
-                .iter()
-                .filter_map(|i| i.checked_sub(drop))
-                .filter(|i| *i < self.activity.len())
+            // Tool and section folds are keyed by activity position, so they slide with the
+            // drain — otherwise a folded row re-binds to a different call. A section key packs
+            // `position * 8 + index`, so it slides by `drop * 8`; every other key space is
+            // untouched.
+            self.tool_folds = std::mem::take(&mut self.tool_folds)
+                .into_iter()
+                .filter_map(|((kind, second), open)| {
+                    let shifted = if kind == crate::widgets::conversation::ACTIVITY_TOOL {
+                        second.checked_sub(drop)
+                    } else if kind == crate::widgets::payload::ACTIVITY_SECTION {
+                        second.checked_sub(drop.saturating_mul(8))
+                    } else {
+                        Some(second)
+                    };
+                    shifted.map(|second| ((kind, second), open))
+                })
+                .filter(|((kind, second), _)| {
+                    *kind != crate::widgets::conversation::ACTIVITY_TOOL
+                        || *second < self.activity.len()
+                })
                 .collect();
             if let Some(sel) = self.selected_activity {
                 if sel < drop {
@@ -844,18 +866,49 @@ impl SessionView {
         }
     }
 
+    /// Drop everything the transcript drew — messages, activity rows, folds, receipts, the live
+    /// stream — back to the state an empty session shows. Runtime-owned state (queue, turn,
+    /// tokens, the draft) is left alone: the next snapshot restores whatever the store still
+    /// holds, which is what "cleared this view" means.
+    pub fn clear_transcript(&mut self) {
+        self.messages.clear();
+        self.activity.clear();
+        self.payloads.clear();
+        self.streaming = None;
+        self.streaming_thought = None;
+        self.selected_activity = None;
+        self.expanded_thought = false;
+        self.thought_folds.clear();
+        self.tool_folds.clear();
+        self.turn_started_ms = None;
+        self.turn_elapsed_ms = 0;
+        self.turn_times.clear();
+        self.scroll = 0;
+        self.follow = true;
+        self.unread = 0;
+    }
+
     pub fn apply_snapshot(&mut self, snapshot: SessionSnapshot) {
         let was_working = self.working();
+        // Fold keys and turn receipts are message-indexed. A pure append keeps every existing
+        // index valid, so folds and "Worked · Ns" receipts survive queueing a message; only a
+        // rewrite that shifts indices — compaction, resync — invalidates them.
+        let append_only = snapshot.messages.len() >= self.messages.len()
+            && self
+                .messages
+                .iter()
+                .zip(snapshot.messages.iter())
+                .all(|(old, new)| old == new);
         self.title = snapshot.title;
         self.cwd = snapshot.cwd;
         self.model = snapshot.model;
         self.messages = snapshot.messages;
-        // Fold keys and turn receipts are message-indexed — a wholesale replacement (compaction,
-        // resync) shifts every index, so the old keys would attach to different blocks.
-        self.thought_folds.clear();
-        self.tool_folds.clear();
-        self.turn_times.clear();
-        self.selected_activity = None;
+        if !append_only {
+            self.thought_folds.clear();
+            self.tool_folds.clear();
+            self.turn_times.clear();
+            self.selected_activity = None;
+        }
         self.turn = snapshot.turn;
         self.tokens = snapshot.tokens;
         self.updated_ms = snapshot.updated_ms;
@@ -920,6 +973,9 @@ pub struct App {
     pub bot_selection: usize,
     /// The question the runtime is currently blocked on, if any.
     pub pending_question: Option<PendingQuestion>,
+    /// An answer already handed to the runtime, held until `UserAnswerResolved` confirms it. If
+    /// the host reports the answer was refused, the prompt comes back with the typed text intact.
+    pub in_flight_question: Option<PendingQuestion>,
     /// Answers typed here and not yet handed to the runtime, as `(request_id, answer)`.
     pub pending_answers: Vec<(String, String)>,
     pub commands: Vec<UiCommand>,
@@ -1003,6 +1059,7 @@ impl App {
             approval_action: 0,
             bot_selection: 0,
             pending_question: None,
+            in_flight_question: None,
             pending_answers: Vec::new(),
             commands: Vec::new(),
             models: Vec::new(),
@@ -1378,21 +1435,48 @@ impl App {
         std::mem::take(&mut self.pending_answers)
     }
 
-    /// Accept the typed text as the answer to the pending question. The question is cleared here,
-    /// so a single question can only be answered once; the runtime resolves the wait when the host
-    /// drains the queue.
+    /// Accept the typed text as the answer to the pending question. The prompt is freed for the
+    /// keyboard at once, but the question is held in `in_flight_question` until the runtime
+    /// confirms with `UserAnswerResolved` — a refused answer re-presents the prompt through
+    /// [`App::answer_rejected`] instead of stranding a blocked turn.
     pub fn submit_answer(&mut self, answer: String) -> bool {
-        let Some(pending) = self.pending_question.take() else {
+        let Some(mut pending) = self.pending_question.take() else {
             return false;
         };
-        self.pending_answers.push((pending.request_id, answer));
+        pending.input = answer.clone();
+        let request_id = pending.request_id.clone();
+        self.in_flight_question = Some(pending);
+        self.pending_answers.push((request_id, answer));
         true
     }
 
-    /// Abandon a pending question locally. The turn keeps waiting until it is cancelled or the
-    /// prompt is shown again; nothing is invented on the model's behalf.
+    /// The host could not deliver an answer (the question was already gone). Put the prompt back
+    /// with the typed text still in the field so the operator can edit and resend, rather than
+    /// leaving the turn blocked with nothing on screen.
+    pub fn answer_rejected(&mut self, request_id: &str) {
+        if self
+            .in_flight_question
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == request_id)
+        {
+            self.pending_question = self.in_flight_question.take();
+            self.push_notice(
+                NoticeLevel::Warn,
+                "the answer was not accepted — the question is still open",
+            );
+        }
+    }
+
+    /// Abandon a pending question. The runtime is told through [`UiCommand::DismissQuestion`] so
+    /// the waiting turn resolves as cancelled instead of blocking on an answer nobody will give.
     pub fn dismiss_question(&mut self) -> bool {
-        self.pending_question.take().is_some()
+        let Some(pending) = self.pending_question.take() else {
+            return false;
+        };
+        self.commands.push(UiCommand::DismissQuestion {
+            request_id: pending.request_id,
+        });
+        true
     }
 
     /// Whether keyboard input belongs to the question prompt rather than the draft.
@@ -1805,7 +1889,36 @@ impl App {
             RuntimeEvent::Shutdown => {
                 self.should_quit = true;
             }
-            RuntimeEvent::Activity(_) => {}
+            RuntimeEvent::Activity(activity) => {
+                // The event names its session, so the row lands in that transcript whether or not
+                // it is the one on screen — delegated work is otherwise invisible to the parent.
+                let agent = activity.bot.as_ref().and_then(|id| {
+                    self.bots
+                        .iter()
+                        .find(|bot| &bot.profile.id == id)
+                        .map(|bot| bot.profile.name.clone())
+                });
+                if let Some(view) = self.session_by_id(&activity.session) {
+                    let kind = match activity.kind {
+                        vikram_runtime::types::ActivityKind::Delegated
+                        | vikram_runtime::types::ActivityKind::Skill
+                        | vikram_runtime::types::ActivityKind::Mcp
+                        | vikram_runtime::types::ActivityKind::Plugin => ActivityKind::Agent,
+                        _ => ActivityKind::Notice,
+                    };
+                    let mut text = format!("{} · {}", activity.kind.label(), activity.summary);
+                    if let Some(name) = agent {
+                        text = format!("{name} — {text}");
+                    }
+                    view.push_activity(Activity {
+                        kind,
+                        text,
+                        call: activity.call,
+                        ok: Some(activity.ok),
+                        expanded: false,
+                    });
+                }
+            }
             RuntimeEvent::UserQuestion {
                 question,
                 choices,
@@ -1833,6 +1946,13 @@ impl App {
                     .is_some_and(|pending| pending.request_id == request_id)
                 {
                     self.pending_question = None;
+                }
+                if self
+                    .in_flight_question
+                    .as_ref()
+                    .is_some_and(|pending| pending.request_id == request_id)
+                {
+                    self.in_flight_question = None;
                 }
                 self.push_notice(NoticeLevel::Info, format!("Answered: {answer}"));
             }
@@ -2273,5 +2393,187 @@ mod selection_and_folds {
             !session.thought_expanded((2, 1)),
             "the other block is untouched"
         );
+    }
+
+    fn snapshot(messages: Vec<Message>) -> SessionSnapshot {
+        SessionSnapshot {
+            id: SessionId::generate(),
+            title: "s".to_owned(),
+            cwd: PathBuf::from("/"),
+            model: None,
+            messages,
+            turn: TurnState::Idle,
+            tokens: Default::default(),
+            created_ms: 0,
+            updated_ms: 0,
+            bot: None,
+            queued: 0,
+            queue: Vec::new(),
+            steer_text: None,
+            queue_text: None,
+            project_id: None,
+            status: "active".to_owned(),
+            title_source: "generic".to_owned(),
+            title_status: "pending".to_owned(),
+        }
+    }
+
+    fn user(text: &str) -> Message {
+        Message::user(text)
+    }
+
+    #[test]
+    fn a_snapshot_that_only_appends_keeps_folds_and_turn_receipts() {
+        let mut session = SessionView::from_snapshot(snapshot(vec![user("one")]));
+        session.thought_folds.insert((0, 0), true);
+        session.turn_times.insert(0, 4_200);
+
+        let mut snap = snapshot(vec![user("one"), user("two")]);
+        snap.id = session.id.clone();
+        session.apply_snapshot(snap);
+
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(
+            session.thought_folds.get(&(0, 0)),
+            Some(&true),
+            "an append shifts no index, so the fold still names its block"
+        );
+        assert_eq!(session.turn_times.get(&0), Some(&4_200));
+    }
+
+    #[test]
+    fn a_snapshot_that_rewrites_the_transcript_clears_index_keyed_state() {
+        let mut session = SessionView::from_snapshot(snapshot(vec![user("one"), user("two")]));
+        session.thought_folds.insert((1, 0), true);
+        session.turn_times.insert(1, 9_000);
+
+        // Compaction: fewer messages, different content — every index now names something else.
+        let mut snap = snapshot(vec![user("summary")]);
+        snap.id = session.id.clone();
+        session.apply_snapshot(snap);
+
+        assert!(session.thought_folds.is_empty());
+        assert!(session.turn_times.is_empty());
+    }
+
+    #[test]
+    fn an_identical_snapshot_keeps_folds_too() {
+        let mut session = SessionView::from_snapshot(snapshot(vec![user("one")]));
+        session.thought_folds.insert((0, 0), false);
+        let mut snap = snapshot(vec![user("one")]);
+        snap.id = session.id.clone();
+        session.apply_snapshot(snap);
+        assert_eq!(session.thought_folds.get(&(0, 0)), Some(&false));
+    }
+
+    #[test]
+    fn draining_the_activity_cap_slides_tool_folds_with_their_rows() {
+        let mut session = SessionView::from_snapshot(snapshot(Vec::new()));
+        for i in 0..70 {
+            session.push_activity(Activity {
+                kind: ActivityKind::Tool,
+                text: format!("call {i}"),
+                call: None,
+                ok: Some(true),
+                expanded: false,
+            });
+        }
+        assert_eq!(session.activity.len(), 64);
+        assert_eq!(
+            session.activity[0].text, "call 6",
+            "six rows already drained"
+        );
+        // The last retained row is `call 69` at position 63.
+        session
+            .tool_folds
+            .insert((crate::widgets::conversation::ACTIVITY_TOOL, 63), true);
+        session.push_activity(Activity {
+            kind: ActivityKind::Tool,
+            text: "call 70".to_owned(),
+            call: None,
+            ok: Some(true),
+            expanded: false,
+        });
+        // One more drain: `call 69` moved from position 63 to 62, and its fold moved with it.
+        assert_eq!(session.activity[62].text, "call 69");
+        assert_eq!(
+            session
+                .tool_folds
+                .get(&(crate::widgets::conversation::ACTIVITY_TOOL, 62)),
+            Some(&true),
+            "the fold followed its row instead of re-binding to call 68"
+        );
+        assert!(
+            !session
+                .tool_folds
+                .contains_key(&(crate::widgets::conversation::ACTIVITY_TOOL, 63)),
+            "no fold is left pointing past the row it named"
+        );
+        // A section fold packs `position * 8 + index`; it slides by the same drain.
+        session.tool_folds.insert(
+            (crate::widgets::payload::ACTIVITY_SECTION, 62 * 8 + 2),
+            true,
+        );
+        session.push_activity(Activity {
+            kind: ActivityKind::Tool,
+            text: "call 71".to_owned(),
+            call: None,
+            ok: Some(true),
+            expanded: false,
+        });
+        assert_eq!(
+            session
+                .tool_folds
+                .get(&(crate::widgets::payload::ACTIVITY_SECTION, 61 * 8 + 2)),
+            Some(&true),
+            "the nested fold followed its row too"
+        );
+        // A fold on a drained position is gone, not remapped onto a live row.
+        session
+            .tool_folds
+            .insert((crate::widgets::payload::ACTIVITY_SECTION, 3), true);
+        session.push_activity(Activity {
+            kind: ActivityKind::Tool,
+            text: "call 72".to_owned(),
+            call: None,
+            ok: Some(true),
+            expanded: false,
+        });
+        assert!(
+            !session
+                .tool_folds
+                .contains_key(&(crate::widgets::payload::ACTIVITY_SECTION, 3)),
+            "a section fold on a drained row must not survive onto another call"
+        );
+    }
+
+    #[test]
+    fn clear_transcript_empties_the_view_but_keeps_the_session() {
+        let mut session = SessionView::from_snapshot(snapshot(vec![user("one")]));
+        session.push_activity(Activity {
+            kind: ActivityKind::Tool,
+            text: "call".to_owned(),
+            call: None,
+            ok: Some(true),
+            expanded: false,
+        });
+        session.thought_folds.insert((0, 0), true);
+        session.turn_times.insert(0, 1_000);
+        session.streaming = Some(Streaming {
+            turn: TurnId::generate(),
+            text: "partial".to_owned(),
+        });
+        let id = session.id.clone();
+        session.clear_transcript();
+
+        assert!(session.messages.is_empty());
+        assert!(session.activity.is_empty());
+        assert!(session.payloads.is_empty());
+        assert!(session.streaming.is_none());
+        assert!(session.thought_folds.is_empty());
+        assert!(session.tool_folds.is_empty());
+        assert!(session.turn_times.is_empty());
+        assert!(session.follow);
+        assert_eq!(session.id, id, "clearing a view is not closing the session");
     }
 }

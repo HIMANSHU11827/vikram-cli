@@ -1,0 +1,26 @@
+{
+  "id": "guard-curl-pipe-sh",
+  "name": "Guard: pipe to sh",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: pipe to sh.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "shell.run",
+      "arguments_contain": "| sh",
+      "deny": "piping a download into a shell executes unaudited code"
+    }
+  ]
+}

@@ -135,6 +135,13 @@ pub fn unit_path(platform: Platform, home: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Escape the characters that would break out of an XML text node: `&` first, then the brackets.
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// The unit file's text. Pure, so what gets installed can be read and tested.
 pub fn unit_text(platform: Platform, spec: &Spec) -> Result<String, ServiceError> {
     match platform {
@@ -179,9 +186,9 @@ pub fn unit_text(platform: Platform, spec: &Spec) -> Result<String, ServiceError
             args = spec
                 .args
                 .iter()
-                .map(|arg| format!("    <string>{}</string>\n", arg.replace('&', "&amp;")))
+                .map(|arg| format!("    <string>{}</string>\n", xml_escape(arg)))
                 .collect::<String>(),
-            home = spec.home.display()
+            home = xml_escape(&spec.home.to_string_lossy())
         )),
         Platform::ScheduledTask => Ok(format!(
             "<Task version=\"1.2\">\n\
@@ -190,11 +197,11 @@ pub fn unit_text(platform: Platform, spec: &Spec) -> Result<String, ServiceError
              \x20 <Actions><Exec><Command>{exec}</Command>{args}</Exec></Actions>\n\
              \x20 <Triggers><LogonTrigger/></Triggers>\n\
              </Task>\n",
-            exec = spec.exec.display(),
+            exec = xml_escape(&spec.exec.to_string_lossy()),
             args = spec
                 .args
                 .iter()
-                .map(|arg| format!("<Arguments>{arg}</Arguments>"))
+                .map(|arg| format!("<Arguments>{}</Arguments>", xml_escape(arg)))
                 .collect::<String>()
         )),
         Platform::Unsupported => Err(ServiceError::Unsupported {
@@ -378,6 +385,33 @@ mod tests {
         let text = unit_text(Platform::ScheduledTask, &spec(home.path())).unwrap();
         assert!(text.contains("<LogonTrigger/>"));
         assert!(text.contains("IgnoreNew"));
+    }
+
+    #[test]
+    fn xml_metacharacters_in_paths_and_args_are_escaped() {
+        let spec = Spec {
+            exec: PathBuf::from("/opt/vikram & <bin>/vikram"),
+            home: PathBuf::from("/home/user & <vikram>"),
+            args: vec!["daemon".into(), "--flag=<x&y>".into()],
+        };
+        let plist = unit_text(Platform::Launchd, &spec).unwrap();
+        assert!(
+            plist.contains("/home/user &amp; &lt;vikram&gt;"),
+            "the home path must not break out of its <string>: {plist}"
+        );
+        assert!(
+            plist.contains("--flag=&lt;x&amp;y&gt;"),
+            "arguments are XML too: {plist}"
+        );
+        let task = unit_text(Platform::ScheduledTask, &spec).unwrap();
+        assert!(
+            task.contains("/opt/vikram &amp; &lt;bin&gt;/vikram"),
+            "the command must not break out of <Command>: {task}"
+        );
+        assert!(
+            task.contains("<Arguments>--flag=&lt;x&amp;y&gt;</Arguments>"),
+            "arguments are XML too: {task}"
+        );
     }
 
     #[test]

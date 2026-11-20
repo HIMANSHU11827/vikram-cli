@@ -460,6 +460,11 @@ pub struct TicketEventRow {
     pub payload: serde_json::Value,
 }
 
+/// Recommended retention window for append-only side tables (hive messages, ticket events, usage,
+/// file changes). The journal is exempt: `read_after` cursors and crash recovery depend on
+/// contiguous seqs, so it is never pruned.
+pub const RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
 /// One connection guarded by a mutex. The runtime is single-process; contention is limited to
 /// journal appends and the occasional metadata write, both sub-millisecond.
 #[derive(Clone)]
@@ -495,13 +500,20 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         migrate(&conn)?;
-        Ok(Self {
+        let store = Self {
             conn: Arc::new(Mutex::new(conn)),
-        })
+        };
+        // Retention is best-effort at open: a failed prune must never keep the store from booting.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let _ = store.prune_retention(now_ms, RETENTION_MS);
+        Ok(store)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().expect("store mutex not poisoned")
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn journal(&self) -> SqliteJournal {
@@ -3064,24 +3076,43 @@ impl Store {
     }
 
     pub fn list_ticket_messages(&self, ticket: &TicketId) -> Result<Vec<TicketMessageRow>> {
+        self.list_ticket_messages_page(ticket, None, 0)
+    }
+
+    /// Bounded variant of [`Self::list_ticket_messages`]: `limit`/`offset` map to SQL
+    /// `LIMIT`/`OFFSET`, so a caller paging a long ticket never materializes the full history.
+    /// `None` for `limit` reads the whole ticket, same as [`Self::list_ticket_messages`].
+    pub fn list_ticket_messages_page(
+        &self,
+        ticket: &TicketId,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<TicketMessageRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, ticket, author_key, author_kind, content, visibility, ts_ms, task_ref
-             FROM ticket_messages WHERE ticket = ?1 ORDER BY ts_ms ASC",
+             FROM ticket_messages WHERE ticket = ?1 ORDER BY ts_ms ASC LIMIT ?2 OFFSET ?3",
         )?;
         let rows = stmt
-            .query_map(params![ticket.as_str()], |r| {
-                Ok(TicketMessageRow {
-                    id: TicketMessageId::new(r.get::<_, String>(0)?),
-                    ticket: TicketId::new(r.get::<_, String>(1)?),
-                    author_key: r.get(2)?,
-                    author_kind: r.get(3)?,
-                    content: r.get(4)?,
-                    visibility: r.get(5)?,
-                    ts_ms: r.get::<_, i64>(6)? as u64,
-                    task_ref: r.get(7)?,
-                })
-            })?
+            .query_map(
+                params![
+                    ticket.as_str(),
+                    limit.map(|l| l.min(i64::MAX as usize) as i64).unwrap_or(-1),
+                    offset.min(i64::MAX as usize) as i64,
+                ],
+                |r| {
+                    Ok(TicketMessageRow {
+                        id: TicketMessageId::new(r.get::<_, String>(0)?),
+                        ticket: TicketId::new(r.get::<_, String>(1)?),
+                        author_key: r.get(2)?,
+                        author_kind: r.get(3)?,
+                        content: r.get(4)?,
+                        visibility: r.get(5)?,
+                        ts_ms: r.get::<_, i64>(6)? as u64,
+                        task_ref: r.get(7)?,
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -3275,27 +3306,29 @@ impl Store {
         )?;
         let rows = stmt
             .query_map(params![ticket.as_str()], |r| {
-                let payload_str: String = r.get(5)?;
-                let event_id: String = r.get(0)?;
-                Ok(TicketEventRow {
-                    id: TicketEventId::new(r.get::<_, String>(0)?),
-                    ticket: TicketId::new(r.get::<_, String>(1)?),
-                    ts_ms: r.get::<_, i64>(2)? as u64,
-                    kind: r.get(3)?,
-                    actor_key: r.get(4)?,
-                    payload: serde_json::from_str(&payload_str).map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            5,
-                            rusqlite::types::Type::Text,
-                            Box::new(StoreError::Parse(format!(
-                                "ticket event {event_id} payload: {e}",
-                            ))),
-                        )
-                    })?,
-                })
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, ticket, ts_ms, kind, actor_key, payload)| {
+                Some(TicketEventRow {
+                    id: TicketEventId::new(id),
+                    ticket: TicketId::new(ticket),
+                    ts_ms: ts_ms as u64,
+                    kind,
+                    actor_key,
+                    payload: serde_json::from_str(&payload).ok()?,
+                })
+            })
+            .collect())
     }
 
     // ---- journal helpers ------------------------------------------------
@@ -3310,33 +3343,22 @@ impl Store {
         )?;
         let rows = stmt
             .query_map(params![session.as_str()], |row| {
-                let kind: String = row.get(3)?;
-                let payload: String = row.get(5)?;
-                let sess_str: String = row.get(1)?;
-                let seq_val: i64 = row.get(0)?;
-                Ok(JournalRecord {
-                    seq: row.get::<_, i64>(0)? as u64,
-                    session: SessionId::new(row.get::<_, String>(1)?),
-                    ts_ms: row.get::<_, i64>(2)? as u64,
-                    kind: RecordKind::Message,
-                    effect: row.get::<_, Option<String>>(4)?.map(EffectId::new),
-                    payload: serde_json::from_str(&payload).map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            5,
-                            rusqlite::types::Type::Text,
-                            Box::new(StoreError::Parse(format!(
-                                "journal payload for session {sess_str} seq {seq_val}: {e}",
-                            ))),
-                        )
-                    })?,
-                })
-                .map(|mut record| {
-                    record.kind = kind_from_str(&kind);
-                    record
-                })
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        Ok(rows
+            .into_iter()
+            .filter_map(|(seq, session, ts_ms, kind, effect, payload)| {
+                journal_record_from_raw(seq, session, ts_ms, kind, effect, payload)
+            })
+            .collect())
     }
 
     pub fn session_count(&self) -> Result<u64> {
@@ -3344,6 +3366,31 @@ impl Store {
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
         Ok(count as u64)
     }
+
+    // ---- retention --------------------------------------------------------
+
+    /// Delete rows older than `max_age_ms` before `now_ms` from the append-only side tables
+    /// (`hive_messages`, `ticket_events`, `usage`, `file_changes`). All four are timestamped by
+    /// `ts_ms`; nothing they feed depends on rows surviving past their usefulness window. The
+    /// `journal` is never touched — replay and recovery need contiguous seqs. Returns the total
+    /// number of rows deleted.
+    pub fn prune_retention(&self, now_ms: u64, max_age_ms: u64) -> Result<u64> {
+        let cutoff = now_ms.saturating_sub(max_age_ms) as i64;
+        let conn = self.lock();
+        let mut deleted = 0u64;
+        for table in ["hive_messages", "ticket_events", "usage", "file_changes"] {
+            deleted += delete_before(&conn, table, cutoff)?;
+        }
+        Ok(deleted)
+    }
+}
+
+fn delete_before(conn: &Connection, table: &str, cutoff_ms: i64) -> Result<u64> {
+    let deleted = conn.execute(
+        &format!("DELETE FROM {table} WHERE ts_ms < ?1"),
+        params![cutoff_ms],
+    )?;
+    Ok(deleted as u64)
 }
 
 fn parse_entity_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntityRow> {
@@ -3437,6 +3484,7 @@ fn kind_from_str(value: &str) -> RecordKind {
         "compaction" => RecordKind::Compaction,
         "cancellation" => RecordKind::Cancellation,
         "activity" => RecordKind::Activity,
+        "hook" => RecordKind::Hook,
         _ => RecordKind::Status,
     }
 }
@@ -3452,7 +3500,28 @@ fn kind_to_str(kind: RecordKind) -> &'static str {
         RecordKind::Compaction => "compaction",
         RecordKind::Cancellation => "cancellation",
         RecordKind::Activity => "activity",
+        RecordKind::Hook => "hook",
     }
+}
+
+/// Build a [`JournalRecord`] from raw column values. Payload deserialization happens here, in
+/// Rust, so one corrupt row yields `None` and is skipped instead of failing the whole read.
+fn journal_record_from_raw(
+    seq: i64,
+    session: String,
+    ts_ms: i64,
+    kind: String,
+    effect: Option<String>,
+    payload: String,
+) -> Option<JournalRecord> {
+    Some(JournalRecord {
+        seq: seq as u64,
+        session: SessionId::new(session),
+        ts_ms: ts_ms as u64,
+        kind: kind_from_str(&kind),
+        effect: effect.map(EffectId::new),
+        payload: serde_json::from_str(&payload).ok()?,
+    })
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -3957,7 +4026,7 @@ pub struct SqliteJournal {
 
 impl SqliteJournal {
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().expect("store mutex not poisoned")
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -4049,6 +4118,17 @@ fn render_session_markdown(export: &SessionExport) -> String {
             | RecordKind::Approval
             | RecordKind::Cancellation
             | RecordKind::Activity => {}
+            RecordKind::Hook => {
+                let point = record
+                    .payload
+                    .get("point")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                out.push_str(&format!(
+                    "_plugin hooks decided at `{point}` (seq {})_\n\n",
+                    record.seq
+                ));
+            }
         }
     }
     if !export.usage.is_empty() {
@@ -4166,32 +4246,25 @@ impl JournalSink for SqliteJournal {
             .query_map(
                 params![session.as_str(), after as i64, limit as i64],
                 |row| {
-                    let kind: String = row.get(3)?;
-                    let payload: String = row.get(5)?;
-                    let sess_str: String = row.get(1)?;
-                    let seq_val: i64 = row.get(0)?;
-                    Ok(JournalRecord {
-                        seq: row.get::<_, i64>(0)? as u64,
-                        session: SessionId::new(row.get::<_, String>(1)?),
-                        ts_ms: row.get::<_, i64>(2)? as u64,
-                        kind: kind_from_str(&kind),
-                        effect: row.get::<_, Option<String>>(4)?.map(EffectId::new),
-                        payload: serde_json::from_str(&payload).map_err(|e| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                5,
-                                rusqlite::types::Type::Text,
-                                Box::new(StoreError::Parse(format!(
-                                    "journal payload for session {sess_str} seq {seq_val}: {e}",
-                                ))),
-                            )
-                        })?,
-                    })
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
                 },
             )
             .map_err(storage)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(storage)?;
-        Ok(rows)
+        Ok(rows
+            .into_iter()
+            .filter_map(|(seq, session, ts_ms, kind, effect, payload)| {
+                journal_record_from_raw(seq, session, ts_ms, kind, effect, payload)
+            })
+            .collect())
     }
 
     fn last_seq(&self, session: &SessionId) -> ContractResult<Option<u64>> {
@@ -4359,6 +4432,48 @@ mod tests {
         );
         assert_eq!(journal.last_seq(&a).unwrap(), Some(2));
         assert_eq!(journal.read_after(&a, 1, 10).unwrap()[0].seq, 2);
+    }
+
+    #[test]
+    fn a_corrupt_journal_payload_does_not_fail_reads() {
+        let store = Store::open_in_memory().unwrap();
+        let session = SessionId::generate();
+        let journal = store.journal();
+        journal
+            .append(&NewRecord::new(
+                session.clone(),
+                RecordKind::Message,
+                serde_json::json!({"text": "before"}),
+            ))
+            .unwrap();
+        // Written past the sink so the append path cannot produce it: one row whose payload is
+        // not JSON at all.
+        store
+            .lock()
+            .execute(
+                "INSERT INTO journal (session, seq, ts_ms, kind, effect, payload)
+                 VALUES (?1, 2, 1, 'message', NULL, 'not-json{')",
+                params![session.as_str()],
+            )
+            .unwrap();
+        journal
+            .append(&NewRecord::new(
+                session.clone(),
+                RecordKind::Status,
+                serde_json::json!({"ok": true}),
+            ))
+            .unwrap();
+
+        let rows = journal.read_after(&session, 0, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].seq, 1);
+        assert_eq!(rows[1].seq, 3);
+        assert_eq!(journal.last_seq(&session).unwrap(), Some(3));
+
+        let replayed = store.replay_messages(&session).unwrap();
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[0].seq, 1);
+        assert_eq!(replayed[1].seq, 3);
     }
 
     #[test]
@@ -4703,5 +4818,152 @@ mod tests {
             UsageTotals::default()
         );
         assert_eq!(store.usage_grand_totals().unwrap(), UsageTotals::default());
+    }
+
+    fn usage_row(session: &SessionId, ts_ms: u64) -> UsageRow {
+        UsageRow {
+            id: 0,
+            session: session.clone(),
+            ts_ms,
+            model: "m".into(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+            measured: true,
+        }
+    }
+
+    fn file_change(session: &SessionId, ts_ms: u64) -> FileChangeRow {
+        FileChangeRow {
+            id: format!("fc-{ts_ms}"),
+            session: session.clone(),
+            bot: None,
+            path: PathBuf::from("/w/file"),
+            operation: "modify".into(),
+            checksum_before: None,
+            checksum_after: None,
+            size: None,
+            checkpoint_path: None,
+            ts_ms,
+        }
+    }
+
+    fn ticket_event(ticket: &TicketId, ts_ms: u64) -> TicketEventRow {
+        TicketEventRow {
+            id: TicketEventId::generate(),
+            ticket: ticket.clone(),
+            ts_ms,
+            kind: "note".into(),
+            actor_key: None,
+            payload: serde_json::json!({}),
+        }
+    }
+
+    fn hive_message(hive: &HiveId, ts_ms: u64) -> HiveMessageRow {
+        HiveMessageRow {
+            id: HiveMessageId::generate(),
+            hive: hive.clone(),
+            sender: "u".into(),
+            sender_kind: "user".into(),
+            content: "hi".into(),
+            task_ref: None,
+            ts_ms,
+        }
+    }
+
+    fn seed_retention_rows(store: &Store) -> (SessionId, TicketId, HiveId) {
+        let sess = store
+            .create_session("s", Path::new("/w"), None, 1)
+            .unwrap()
+            .id;
+        let ticket = TicketId::generate();
+        let hive = HiveId::generate();
+        let now = 1_000_000u64;
+        store.record_usage(&usage_row(&sess, 100)).unwrap();
+        store.record_usage(&usage_row(&sess, now)).unwrap();
+        store.record_file_change(&file_change(&sess, 100)).unwrap();
+        store.record_file_change(&file_change(&sess, now)).unwrap();
+        store
+            .append_ticket_event(&ticket_event(&ticket, 100))
+            .unwrap();
+        store
+            .append_ticket_event(&ticket_event(&ticket, now))
+            .unwrap();
+        store
+            .append_hive_message(&hive_message(&hive, 100))
+            .unwrap();
+        store
+            .append_hive_message(&hive_message(&hive, now))
+            .unwrap();
+        (sess, ticket, hive)
+    }
+
+    #[test]
+    fn prune_retention_drops_old_rows_and_keeps_recent_ones() {
+        let store = Store::open_in_memory().unwrap();
+        let (sess, ticket, hive) = seed_retention_rows(&store);
+        let now = 1_000_000u64;
+
+        let deleted = store.prune_retention(now, 10_000).unwrap();
+        assert_eq!(deleted, 4, "one stale row per side table");
+        assert_eq!(store.list_usage(&sess).unwrap().len(), 1);
+        assert_eq!(store.list_usage(&sess).unwrap()[0].ts_ms, now);
+        assert_eq!(store.list_file_changes(&sess).unwrap().len(), 1);
+        assert_eq!(store.list_ticket_events(&ticket).unwrap().len(), 1);
+        assert_eq!(store.list_hive_messages(&hive).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prune_retention_leaves_everything_when_nothing_is_old() {
+        let store = Store::open_in_memory().unwrap();
+        seed_retention_rows(&store);
+        assert_eq!(store.prune_retention(1_000_000, RETENTION_MS).unwrap(), 0);
+    }
+
+    #[test]
+    fn ticket_message_page_applies_limit_and_offset() {
+        let store = Store::open_in_memory().unwrap();
+        let ticket = TicketId::generate();
+        for i in 0..5u64 {
+            store
+                .append_ticket_message(&TicketMessageRow {
+                    id: TicketMessageId::generate(),
+                    ticket: ticket.clone(),
+                    author_key: "u".into(),
+                    author_kind: "user".into(),
+                    content: format!("m{i}"),
+                    visibility: "shared".into(),
+                    ts_ms: 100 + i,
+                    task_ref: None,
+                })
+                .unwrap();
+        }
+
+        let all = store.list_ticket_messages(&ticket).unwrap();
+        assert_eq!(all.len(), 5);
+        let page = store
+            .list_ticket_messages_page(&ticket, Some(2), 1)
+            .unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].content, "m1");
+        assert_eq!(page[1].content, "m2");
+        let tail = store
+            .list_ticket_messages_page(&ticket, Some(10), 4)
+            .unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].content, "m4");
+        assert!(
+            store
+                .list_ticket_messages_page(&ticket, Some(2), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .list_ticket_messages_page(&ticket, None, 0)
+                .unwrap()
+                .len(),
+            5
+        );
     }
 }

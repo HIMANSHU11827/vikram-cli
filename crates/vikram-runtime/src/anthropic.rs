@@ -6,6 +6,7 @@
 //! blocks are translated into the same `ProviderEvent`s the OpenAI provider emits.
 
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::time::Duration;
 use vikram_contracts::{Block, Role, ToolCall, VikramError};
 
@@ -57,12 +58,20 @@ impl AnthropicProvider {
         context_window: Option<u64>,
     ) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = reqwest::Client::builder()
+        // `.timeout()` bounds the whole request including the body stream. The turn's silence
+        // watchdog is the real hang guard, so the ceiling only needs to outlast a long answer.
+        let client = match reqwest::Client::builder()
             .use_preconfigured_tls(crate::tls_config())
             .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(600))
+            .timeout(Duration::from_secs(1800))
             .build()
-            .unwrap_or_default();
+        {
+            Ok(client) => client,
+            Err(err) => {
+                eprintln!("vikram: http client failed to build ({err}); using a plain client");
+                reqwest::Client::new()
+            }
+        };
         Self {
             client,
             base_url: base_url.into().trim_end_matches('/').to_owned(),
@@ -134,7 +143,25 @@ impl Provider for AnthropicProvider {
                                 continue;
                             }
                             crate::openai::Retry::Never => {
-                                let _ = tx.send(Err(rejection(status, &body, &endpoint))).await;
+                                let mut err = rejection(status, &body, &endpoint);
+                                // A server-directed wait past the cap is a refusal with a time
+                                // on it; the operator deserves to know how long it asked for.
+                                if let Some(wait) =
+                                    wait.filter(|wait| *wait > crate::openai::MAX_RETRY_WAIT)
+                                {
+                                    let note = format!(
+                                        " The endpoint asked for a wait of at least {}.",
+                                        crate::openai::human_gap(wait)
+                                    );
+                                    match &mut err {
+                                        VikramError::ProviderRejected(text)
+                                        | VikramError::ProviderTransient(text) => {
+                                            text.push_str(&note);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                let _ = tx.send(Err(err)).await;
                                 return;
                             }
                         }
@@ -209,21 +236,29 @@ impl Provider for AnthropicProvider {
                             let _ = tx.send(Err(VikramError::ProviderRejected(text))).await;
                             return;
                         }
-                        for event in events {
-                            match event {
-                                ProviderEvent::Finished { .. } => {
-                                    if tx.send(Ok(event)).await.is_err() {
-                                        return;
-                                    }
-                                    finished = true;
-                                }
-                                other => {
-                                    if tx.send(Ok(other)).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            }
+                        if !crate::openai::deliver_events(&tx, events, &mut finished).await {
+                            return;
                         }
+                    }
+                }
+            }
+
+            // The last `data:` frame can arrive without its trailing newline; the line loop only
+            // fires on '\n', so whatever remains is parsed once here before the stream is flushed.
+            if !utf8_tail.is_empty() {
+                buffer.push_str(&String::from_utf8_lossy(&utf8_tail));
+                utf8_tail.clear();
+            }
+            if !buffer.trim().is_empty() {
+                let line = buffer.trim_end().to_owned();
+                buffer.clear();
+                if let Some(events) = parse_sse_line(&line, &mut pending) {
+                    if let Some(text) = pending.error.take() {
+                        let _ = tx.send(Err(VikramError::ProviderRejected(text))).await;
+                        return;
+                    }
+                    if !crate::openai::deliver_events(&tx, events, &mut finished).await {
+                        return;
                     }
                 }
             }
@@ -247,8 +282,10 @@ impl Provider for AnthropicProvider {
 
 #[derive(Default)]
 struct StreamState {
-    /// Tool use currently being streamed: (id, name, accumulated input json).
-    tool: Option<(String, String, String)>,
+    /// Tool use blocks being streamed, keyed by content-block `index`: (id, name, accumulated
+    /// input json). Blocks can interleave, so a single pending slot would let one call's deltas
+    /// land in another's arguments.
+    tools: BTreeMap<u64, (String, String, String)>,
     /// Whether we are inside a text block.
     in_text: bool,
     error: Option<String>,
@@ -298,6 +335,10 @@ fn parse_sse_line(line: &str, pending: &mut StreamState) -> Option<Vec<ProviderE
                     Some(vec![])
                 }
                 "tool_use" => {
+                    let index = value
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default();
                     let id = block
                         .get("id")
                         .and_then(Value::as_str)
@@ -308,7 +349,7 @@ fn parse_sse_line(line: &str, pending: &mut StreamState) -> Option<Vec<ProviderE
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned();
-                    pending.tool = Some((id, name, String::new()));
+                    pending.tools.insert(index, (id, name, String::new()));
                     Some(vec![])
                 }
                 "thinking" => Some(vec![]),
@@ -334,7 +375,11 @@ fn parse_sse_line(line: &str, pending: &mut StreamState) -> Option<Vec<ProviderE
                     }
                 }
                 "input_json_delta" => {
-                    if let Some(tool) = pending.tool.as_mut()
+                    let index = value
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default();
+                    if let Some(tool) = pending.tools.get_mut(&index)
                         && let Some(partial) = delta.get("partial_json").and_then(Value::as_str)
                     {
                         tool.2.push_str(partial);
@@ -356,8 +401,14 @@ fn parse_sse_line(line: &str, pending: &mut StreamState) -> Option<Vec<ProviderE
             }
         }
         "content_block_stop" => {
-            if let Some((id, name, input)) = pending.tool.take() {
-                pending.in_text = false;
+            // Only the block that actually stopped flushes; another index's stop must not
+            // emit half of this call's arguments.
+            let index = value
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            pending.in_text = false;
+            if let Some((id, name, input)) = pending.tools.remove(&index) {
                 // Truncated/invalid JSON must not become a runnable call with null arguments —
                 // same refusal OpenAI's assembler makes.
                 let arguments = if input.trim().is_empty() {
@@ -379,7 +430,6 @@ fn parse_sse_line(line: &str, pending: &mut StreamState) -> Option<Vec<ProviderE
                 };
                 return Some(vec![ProviderEvent::ToolCall(call)]);
             }
-            pending.in_text = false;
             Some(vec![])
         }
         "message_delta" => {
@@ -436,7 +486,7 @@ fn finish_pending(pending: &mut StreamState) -> Vec<ProviderEvent> {
     if let Some(note) = stop_note(pending.stop_reason.as_deref()) {
         out.push(ProviderEvent::TextDelta(note));
     }
-    if let Some((id, name, input)) = pending.tool.take() {
+    for (_, (id, name, input)) in std::mem::take(&mut pending.tools) {
         let arguments = if input.trim().is_empty() {
             Some(Value::Object(serde_json::Map::new()))
         } else {
@@ -468,31 +518,14 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Bodies that mean "this account cannot pay for a request", whatever status carries them.
-/// Anthropic reports it as a 400 whose message names the credit balance, so the status alone
-/// would read as a bad request and the turn would be retried forever.
-fn credit_exhausted(body: &str) -> bool {
-    let body = body.to_lowercase();
-    [
-        "insufficient_quota",
-        "insufficient quota",
-        "quota exceeded",
-        "credit balance",
-        "out of credit",
-        "billing",
-        "payment required",
-    ]
-    .iter()
-    .any(|needle| body.contains(needle))
-}
-
 /// Which failure a non-2xx answer is. The classification is deliberately the one `OpenAiProvider`
 /// makes, so a status means the same thing to the kernel whichever provider answered: a rate limit
 /// or a payment refusal ends the turn, and everything else is the provider's side and may be tried
 /// again without touching the transcript.
 fn rejection(status: reqwest::StatusCode, body: &str, endpoint: &str) -> VikramError {
     let text = format!("{status} from {endpoint}: {}", truncate(body, 240));
-    let final_refusal = matches!(status.as_u16(), 402 | 429) || credit_exhausted(body);
+    let final_refusal =
+        matches!(status.as_u16(), 402 | 429) || crate::openai::credit_exhausted(body);
     if final_refusal {
         VikramError::ProviderRejected(text)
     } else {
@@ -913,7 +946,42 @@ mod tests {
                 output_tokens: None
             }
         );
-        assert!(pending.tool.is_none(), "the call is not emitted twice");
+        assert!(pending.tools.is_empty(), "the call is not emitted twice");
+    }
+
+    #[test]
+    fn interleaved_tool_use_blocks_each_keep_their_own_arguments() {
+        let mut pending = StreamState::default();
+        let events = feed(
+            &mut pending,
+            &[
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_a","name":"fs-_read","input":{}}}"#,
+                r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_b","name":"fs-_write","input":{}}}"#,
+                r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"b\""}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a\""}}"#,
+                r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"}"}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"}"}}"#,
+                r#"data: {"type":"content_block_stop","index":0}"#,
+                r#"data: {"type":"content_block_stop","index":1}"#,
+                r#"data: {"type":"message_stop"}"#,
+            ],
+        );
+
+        let calls: Vec<&ToolCall> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 2, "{events:?}");
+        assert_eq!(calls[0].id, ToolCallId::new("toolu_a"));
+        assert_eq!(calls[0].name, "fs.read");
+        assert_eq!(calls[0].arguments, json!({"path": "a"}));
+        assert_eq!(calls[1].id, ToolCallId::new("toolu_b"));
+        assert_eq!(calls[1].name, "fs.write");
+        assert_eq!(calls[1].arguments, json!({"path": "b"}));
+        assert!(pending.tools.is_empty(), "both calls were flushed");
     }
 
     #[test]
@@ -983,7 +1051,7 @@ mod tests {
             );
         }
         assert!(pending.error.is_none(), "none of these is a failure");
-        assert!(pending.tool.is_none(), "none of these starts a tool call");
+        assert!(pending.tools.is_empty(), "none of these starts a tool call");
 
         let events = feed(
             &mut pending,
@@ -1047,7 +1115,7 @@ mod tests {
                 output_tokens: None
             }
         );
-        assert!(pending.tool.is_none(), "the call is flushed once");
+        assert!(pending.tools.is_empty(), "the call is flushed once");
     }
 
     #[test]
@@ -1197,6 +1265,22 @@ mod tests {
             matches!(err, VikramError::ProviderRejected(_)),
             "an account that cannot pay must not be retried: {err:?}"
         );
+    }
+
+    #[test]
+    fn the_quota_phrases_the_sibling_classifier_knows_are_final_here_too() {
+        // The classifier is shared with OpenAiProvider: "exceeded your current quota" and
+        // "no credit" are billing refusals, not transient faults, on either provider.
+        for body in [
+            r#"{"message":"You exceeded your current quota"}"#,
+            r#"{"message":"no credit remaining on this account"}"#,
+        ] {
+            let err = rejection(reqwest::StatusCode::from_u16(400).unwrap(), body, ENDPOINT);
+            assert!(
+                matches!(err, VikramError::ProviderRejected(_)),
+                "{body} must be a final refusal, got {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -1597,6 +1681,40 @@ mod tests {
             }
             other => panic!("expected a transient provider error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_final_sse_line_without_a_newline_is_still_parsed() {
+        // The stream ends on `data: {"type":"message_stop"}` with no trailing newline: the line
+        // loop never sees it, so the tail drain is the only thing that can close the answer.
+        let mut document = sse(&[
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"tail"}}"#,
+            "",
+            r#"data: {"type":"message_stop"}"#,
+        ]);
+        document.pop();
+        let (port, _recorded) =
+            loopback_server("200 OK", "text/event-stream", vec![document]).await;
+        let provider = AnthropicProvider::new(format!("http://127.0.0.1:{port}"), MODEL, "k", None);
+
+        let events = tokio::time::timeout(
+            Duration::from_secs(10),
+            collect(provider.stream(request(vec![Message::user("hi")]))),
+        )
+        .await
+        .expect("the loopback server answers inside the timeout");
+
+        assert_eq!(
+            events,
+            vec![
+                Ok(ProviderEvent::TextDelta("tail".into())),
+                Ok(ProviderEvent::Finished {
+                    input_tokens: None,
+                    output_tokens: None,
+                }),
+            ],
+            "the unterminated final frame must still deliver its content and finish"
+        );
     }
 
     // ---- from_config ----------------------------------------------------------------------

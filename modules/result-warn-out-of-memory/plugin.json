@@ -1,0 +1,25 @@
+{
+  "id": "result-warn-out-of-memory",
+  "name": "Result: memory exhaustion",
+  "version": "1.0.0",
+  "description": "Inspects tool output for memory exhaustion.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 40,
+  "components": {
+    "hooks": [
+      "tool_result"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_result",
+      "result_contain": "out of memory",
+      "append_result": "[plugin] The process ran out of memory. Reduce the workload rather than retrying blindly."
+    }
+  ]
+}

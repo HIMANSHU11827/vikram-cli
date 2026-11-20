@@ -37,6 +37,7 @@
 //! be opened, tested and migrated without the runtime crate.
 
 use std::path::Path;
+use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -256,7 +257,9 @@ pub enum DeliveryError {
 /// deterministic; [`now_unix`] is the production clock.
 #[derive(Debug)]
 pub struct DeliveryLedger {
-    conn: Connection,
+    // rusqlite's Connection is Send but not Sync; the mutex makes one ledger shareable between
+    // the send path and the background sweep. Critical sections are single SQLite statements.
+    conn: Mutex<Connection>,
 }
 
 impl DeliveryLedger {
@@ -277,7 +280,13 @@ impl DeliveryLedger {
 
     fn from_connection(conn: Connection) -> Result<Self, DeliveryError> {
         conn.execute_batch(SCHEMA)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|err| err.into_inner())
     }
 
     /// Record an outbound message as [`LedgerState::Pending`].
@@ -293,31 +302,34 @@ impl DeliveryLedger {
             return Ok(None);
         }
         let total_chunks = delivery.total_chunks.max(1);
-        self.conn.execute(
-            "INSERT INTO gateway_delivery_ledger
+        {
+            let conn = self.lock();
+            conn.execute(
+                "INSERT INTO gateway_delivery_ledger
                  (ledger_id, platform, chat_id, reply_to, body, total_chunks, delivered_chunks,
                   attempts, state, last_error, error_kind, message_id, flood_not_before,
                   created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 'pending', NULL, NULL, NULL, 0, ?7, ?7)
              ON CONFLICT(ledger_id) DO NOTHING",
-            params![
-                delivery.ledger_id,
-                delivery.platform,
-                delivery.chat_id,
-                delivery.reply_to,
-                delivery.body,
-                total_chunks,
-                now,
-            ],
-        )?;
+                params![
+                    delivery.ledger_id,
+                    delivery.platform,
+                    delivery.chat_id,
+                    delivery.reply_to,
+                    delivery.body,
+                    total_chunks,
+                    now,
+                ],
+            )?;
+        }
         self.get(&delivery.ledger_id)
     }
 
     /// Read one row.
     pub fn get(&self, ledger_id: &str) -> Result<Option<LedgerEntry>, DeliveryError> {
         let sql = format!("SELECT {COLUMNS} FROM gateway_delivery_ledger WHERE ledger_id = ?1");
-        let entry = self
-            .conn
+        let conn = self.lock();
+        let entry = conn
             .query_row(&sql, params![ledger_id], row_to_entry)
             .optional()?;
         Ok(entry)
@@ -326,7 +338,7 @@ impl DeliveryLedger {
     /// Rows in the ledger (delivered ones included).
     pub fn len(&self) -> Result<usize, DeliveryError> {
         let count: i64 =
-            self.conn
+            self.lock()
                 .query_row("SELECT COUNT(*) FROM gateway_delivery_ledger", [], |row| {
                     row.get(0)
                 })?;
@@ -347,7 +359,8 @@ impl DeliveryLedger {
               ORDER BY created_at ASC, rowid ASC
               LIMIT ?3"
         );
-        let mut statement = self.conn.prepare(&sql)?;
+        let conn = self.lock();
+        let mut statement = conn.prepare(&sql)?;
         let rows = statement.query_map(params![MAX_ATTEMPTS, now, limit as i64], row_to_entry)?;
         let mut out = Vec::new();
         for row in rows {
@@ -358,7 +371,7 @@ impl DeliveryLedger {
 
     /// How many rows would be claimed by [`Self::claim_due`] at `now`.
     pub fn due_count(&self, now: i64) -> Result<usize, DeliveryError> {
-        let count: i64 = self.conn.query_row(
+        let count: i64 = self.lock().query_row(
             "SELECT COUNT(*) FROM gateway_delivery_ledger
               WHERE (state = 'pending' OR state = 'failed')
                 AND attempts < ?1
@@ -384,7 +397,7 @@ impl DeliveryLedger {
     /// Claim one row. `None` when the id is unknown, terminal, out of attempts or still waiting out
     /// a flood-control delay.
     pub fn claim(&self, ledger_id: &str, now: i64) -> Result<Option<LedgerEntry>, DeliveryError> {
-        let changed = self.conn.execute(
+        let changed = self.lock().execute(
             "UPDATE gateway_delivery_ledger
                 SET state = 'attempting',
                     attempts = attempts + 1,
@@ -410,7 +423,7 @@ impl DeliveryLedger {
         delivered_chunks: u32,
         now: i64,
     ) -> Result<Option<LedgerEntry>, DeliveryError> {
-        let changed = self.conn.execute(
+        let changed = self.lock().execute(
             "UPDATE gateway_delivery_ledger
                 SET state = 'delivered',
                     delivered_chunks = MIN(MAX(?2, 0), total_chunks),
@@ -442,7 +455,7 @@ impl DeliveryLedger {
         if delivered >= total_chunks {
             return self.mark_delivered(ledger_id, None, total_chunks, now);
         }
-        let changed = self.conn.execute(
+        let changed = self.lock().execute(
             "UPDATE gateway_delivery_ledger
                 SET state = 'pending',
                     total_chunks = ?2,
@@ -497,7 +510,7 @@ impl DeliveryLedger {
         } else {
             now.saturating_add(delay)
         };
-        let changed = self.conn.execute(
+        let changed = self.lock().execute(
             "UPDATE gateway_delivery_ledger
                 SET state = ?2,
                     last_error = ?3,
@@ -527,7 +540,7 @@ impl DeliveryLedger {
         reason: Option<&str>,
         now: i64,
     ) -> Result<Option<LedgerEntry>, DeliveryError> {
-        let changed = self.conn.execute(
+        let changed = self.lock().execute(
             "UPDATE gateway_delivery_ledger
                 SET state = 'abandoned',
                     last_error = COALESCE(?2, last_error),
@@ -595,13 +608,17 @@ impl DeliveryLedger {
               WHERE state = 'attempting' AND updated_at <= ?1
               ORDER BY created_at ASC, rowid ASC"
         );
-        let mut statement = self.conn.prepare(&sql)?;
-        let rows = statement.query_map(params![stale_before], row_to_entry)?;
-        let mut stale = Vec::new();
-        for row in rows {
-            stale.push(row?);
-        }
-        drop(statement);
+        let stale = {
+            let conn = self.lock();
+            let mut statement = conn.prepare(&sql)?;
+            let rows = statement.query_map(params![stale_before], row_to_entry)?;
+            let mut stale = Vec::new();
+            for row in rows {
+                stale.push(row?);
+            }
+            drop(statement);
+            stale
+        };
 
         let mut reclaimed = Vec::new();
         for entry in stale {
@@ -610,7 +627,7 @@ impl DeliveryLedger {
             } else {
                 LedgerState::Pending
             };
-            let changed = self.conn.execute(
+            let changed = self.lock().execute(
                 "UPDATE gateway_delivery_ledger
                     SET state = ?2, flood_not_before = 0, updated_at = ?3
                   WHERE ledger_id = ?1 AND state = 'attempting'",

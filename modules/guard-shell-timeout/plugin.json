@@ -1,0 +1,26 @@
+{
+  "id": "guard-shell-timeout",
+  "name": "Guard: cap a shell timeout",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: cap a shell timeout.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 55,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "shell.run",
+      "arguments_contain": "timeout_ms",
+      "arguments_set": "{\"timeout_ms\": 30000}"
+    }
+  ]
+}

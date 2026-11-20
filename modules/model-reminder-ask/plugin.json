@@ -1,0 +1,24 @@
+{
+  "id": "model-reminder-ask",
+  "name": "Model: ask when blocked",
+  "version": "1.0.0",
+  "description": "Asks the model to ask instead of guessing.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 70,
+  "components": {
+    "hooks": [
+      "model_request"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "model_request",
+      "append": "If a decision is genuinely ambiguous and expensive to undo, ask instead of guessing."
+    }
+  ]
+}

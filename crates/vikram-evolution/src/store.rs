@@ -36,6 +36,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// Current schema version. Bump when adding a migration step.
 pub const SCHEMA_VERSION: i64 = 2;
 
+/// Default retention horizon for [`EvolutionStore::prune_older_than`].
+/// 30 days is conservative: it bounds growth of the append-only tables
+/// without touching anything a live workflow could still reference.
+pub const DEFAULT_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
 #[derive(Clone)]
 pub struct EvolutionStore {
     conn: Arc<Mutex<Connection>>,
@@ -87,6 +92,29 @@ impl EvolutionStore {
     pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let conn = self.lock();
         f(&conn)
+    }
+
+    /// Run `f` against the locked connection inside a single `IMMEDIATE`
+    /// transaction. Multi-statement read-modify-write sequences (e.g.
+    /// memory supersession: find live entry → insert replacement → mark
+    /// old entry superseded) use this so no other writer can interleave
+    /// between the read and the writes, and a failure rolls everything
+    /// back instead of leaving a half-applied change.
+    pub(crate) fn transact<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let conn = self.lock();
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        match f(&conn) {
+            Ok(value) => {
+                conn.execute_batch("COMMIT")
+                    .map_err(|e| EvolutionError::Store(e.to_string()))?;
+                Ok(value)
+            }
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
     }
 
     // ---- experiences ----
@@ -169,24 +197,8 @@ impl EvolutionStore {
 
     // ---- memory entries ----
     pub fn save_memory(&self, m: &MemoryEntry) -> Result<()> {
-        // Guard the supersession chain: an entry must never supersede
-        // itself (a self-loop makes the entry invisible to live listings
-        // while pointing at itself as its replacement).
-        if let Some(by) = &m.superseded_by
-            && by == &m.id
-        {
-            return Err(EvolutionError::Validation(format!(
-                "memory entry {} cannot supersede itself",
-                m.id
-            )));
-        }
         let conn = self.lock();
-        conn.execute(
-            "INSERT OR REPLACE INTO memory_entries (id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-            params![m.id, m.layer.as_str(), m.scope, m.key, m.value, m.status.as_str(), m.confidence, m.source_experience, m.provenance, m.created_ms as i64, m.updated_ms as i64, m.expires_ms.map(|x|x as i64), m.superseded_by],
-        ).map_err(|e| EvolutionError::Store(e.to_string()))?;
-        Ok(())
+        save_memory_conn(&conn, m)
     }
     pub fn get_memory(&self, id: &str) -> Result<Option<MemoryEntry>> {
         let conn = self.lock();
@@ -208,14 +220,7 @@ impl EvolutionStore {
         key: &str,
     ) -> Result<Option<MemoryEntry>> {
         let conn = self.lock();
-        let now = crate::types::now_ms() as i64;
-        let mut stmt = conn.prepare("SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE layer=?1 AND scope=?2 AND key=?3 AND superseded_by IS NULL AND (expires_ms IS NULL OR expires_ms > ?4) ORDER BY updated_ms DESC LIMIT 1")
-            .map_err(|e| EvolutionError::Store(e.to_string()))?;
-        let row = stmt
-            .query_row(params![layer.as_str(), scope, key, now], map_mem)
-            .optional()
-            .map_err(|e| EvolutionError::Store(e.to_string()))?;
-        Ok(row)
+        find_memory_conn(&conn, layer, scope, key)
     }
     /// Text search over live memory entries.
     ///
@@ -488,6 +493,20 @@ impl EvolutionStore {
         collect_rows(rows)
     }
 
+    /// Remove one recorded skill version. Used to compensate a failed
+    /// `SKILL.md` materialization so the version table never claims a
+    /// version the skill directory does not contain.
+    pub fn delete_skill_version(&self, skill_name: &str, version: u32) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "DELETE FROM skill_versions WHERE skill_name=?1 AND version=?2",
+                params![skill_name, version as i64],
+            )
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        Ok(n > 0)
+    }
+
     // ---- learning events ----
     pub fn save_event(&self, e: &LearningEvent) -> Result<()> {
         let conn = self.lock();
@@ -525,6 +544,38 @@ impl EvolutionStore {
             .map_err(|e| EvolutionError::Store(e.to_string()))?;
         Ok(count.max(0) as usize)
     }
+
+    /// Bound table growth: delete rows older than `max_age_ms` from the
+    /// append-only, high-volume tables. Returns the number of rows removed.
+    ///
+    /// Only *terminal* rows are eligible — `reflection_jobs` keeps
+    /// `pending`/`running` work and `proposals` keeps `pending`/`approved`
+    /// ones awaiting an operator, because deleting live work would corrupt
+    /// in-flight flows. `memory_entries` keeps live rows and only sheds
+    /// superseded ones past the horizon; `skill_versions` and
+    /// `evaluations`/`candidates`/`hive_lessons` are bounded by their
+    /// parents and are kept as history.
+    ///
+    /// Mirrors the daemon's `prune_runs` pattern: callers invoke it after
+    /// settling work (e.g. [`crate::reflection::ReflectionEngine::process_pending`])
+    /// rather than on every insert.
+    pub fn prune_older_than(&self, max_age_ms: u64) -> Result<usize> {
+        let cutoff = now_ms().saturating_sub(max_age_ms) as i64;
+        let conn = self.lock();
+        let mut removed = 0usize;
+        for sql in [
+            "DELETE FROM experiences WHERE timestamp_ms < ?1",
+            "DELETE FROM learning_events WHERE timestamp_ms < ?1",
+            "DELETE FROM reflection_jobs WHERE status IN ('done','failed') AND updated_ms < ?1",
+            "DELETE FROM proposals WHERE status IN ('rejected','applied') AND created_ms < ?1",
+            "DELETE FROM memory_entries WHERE superseded_by IS NOT NULL AND updated_ms < ?1",
+        ] {
+            removed += conn
+                .execute(sql, params![cutoff])
+                .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        }
+        Ok(removed)
+    }
 }
 
 // ---------- checked (de)serialisation helpers ----------
@@ -535,6 +586,50 @@ fn to_json<T: serde::Serialize>(v: &T) -> Result<String> {
 
 fn from_json<T: for<'de> serde::Deserialize<'de>>(s: &str) -> Result<T> {
     serde_json::from_str(s).map_err(|e| EvolutionError::Serde(e.to_string()))
+}
+
+/// Insert or replace a memory entry on an already-locked connection.
+///
+/// `pub(crate)` so [`EvolutionStore::transact`] callers (e.g.
+/// [`crate::memory::LayeredMemory::remember`]) apply the same SQL and the
+/// same self-supersession guard as [`EvolutionStore::save_memory`].
+pub(crate) fn save_memory_conn(conn: &Connection, m: &MemoryEntry) -> Result<()> {
+    // Guard the supersession chain: an entry must never supersede
+    // itself (a self-loop makes the entry invisible to live listings
+    // while pointing at itself as its replacement).
+    if let Some(by) = &m.superseded_by
+        && by == &m.id
+    {
+        return Err(EvolutionError::Validation(format!(
+            "memory entry {} cannot supersede itself",
+            m.id
+        )));
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO memory_entries (id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        params![m.id, m.layer.as_str(), m.scope, m.key, m.value, m.status.as_str(), m.confidence, m.source_experience, m.provenance, m.created_ms as i64, m.updated_ms as i64, m.expires_ms.map(|x|x as i64), m.superseded_by],
+    ).map_err(|e| EvolutionError::Store(e.to_string()))?;
+    Ok(())
+}
+
+/// Find the live entry for `(layer, scope, key)` on an already-locked
+/// connection — the same query as [`EvolutionStore::find_memory`], for use
+/// inside [`EvolutionStore::transact`].
+pub(crate) fn find_memory_conn(
+    conn: &Connection,
+    layer: MemoryLayer,
+    scope: &str,
+    key: &str,
+) -> Result<Option<MemoryEntry>> {
+    let now = crate::types::now_ms() as i64;
+    let mut stmt = conn.prepare("SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE layer=?1 AND scope=?2 AND key=?3 AND superseded_by IS NULL AND (expires_ms IS NULL OR expires_ms > ?4) ORDER BY updated_ms DESC LIMIT 1")
+        .map_err(|e| EvolutionError::Store(e.to_string()))?;
+    let row = stmt
+        .query_row(params![layer.as_str(), scope, key, now], map_mem)
+        .optional()
+        .map_err(|e| EvolutionError::Store(e.to_string()))?;
+    Ok(row)
 }
 
 fn collect_rows<T>(
@@ -999,4 +1094,159 @@ fn migrate(conn: &Connection) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn experience(id: &str, timestamp_ms: u64) -> Experience {
+        Experience {
+            id: id.to_string(),
+            timestamp_ms,
+            agent_id: "a".to_string(),
+            project_id: None,
+            task_category: "t".to_string(),
+            user_request: "u".to_string(),
+            outcome: ExperienceOutcome::Success,
+            tools_used: vec![],
+            errors: vec![],
+            corrections: vec![],
+            feedback: None,
+            reusable: false,
+            sensitivity: Sensitivity::Public,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    fn event(id: &str, timestamp_ms: u64) -> LearningEvent {
+        LearningEvent {
+            id: id.to_string(),
+            timestamp_ms,
+            agent_id: "a".to_string(),
+            kind: "k".to_string(),
+            summary: "s".to_string(),
+            payload: serde_json::json!({}),
+        }
+    }
+
+    fn job(id: &str, status: ReflectionJobStatus, updated_ms: u64) -> ReflectionJob {
+        ReflectionJob {
+            id: id.to_string(),
+            experience_id: "exp".to_string(),
+            agent_id: "a".to_string(),
+            status,
+            attempts: 1,
+            created_ms: updated_ms,
+            updated_ms,
+            error: None,
+        }
+    }
+
+    fn proposal(id: &str, status: ProposalStatus, created_ms: u64) -> LearningProposal {
+        LearningProposal {
+            id: id.to_string(),
+            experience_id: None,
+            agent_id: "a".to_string(),
+            kind: ProposalKind::RecordIssue,
+            summary: "s".to_string(),
+            details: serde_json::json!({}),
+            confidence: 0.5,
+            requires_approval: false,
+            created_ms,
+            status,
+        }
+    }
+
+    fn memory(id: &str, superseded_by: Option<&str>, updated_ms: u64) -> MemoryEntry {
+        MemoryEntry {
+            id: id.to_string(),
+            layer: MemoryLayer::Semantic,
+            scope: "global".to_string(),
+            key: format!("key-{id}"),
+            value: "v".to_string(),
+            status: KnowledgeStatus::Observed,
+            confidence: 0.5,
+            source_experience: None,
+            provenance: "test".to_string(),
+            created_ms: updated_ms,
+            updated_ms,
+            expires_ms: None,
+            superseded_by: superseded_by.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn prune_removes_only_old_terminal_rows() {
+        let store = EvolutionStore::open_in_memory().unwrap();
+        let now = now_ms();
+        let old = now - DEFAULT_RETENTION_MS - 1000;
+
+        store.save_experience(&experience("exp-old", old)).unwrap();
+        store.save_experience(&experience("exp-new", now)).unwrap();
+        store.save_event(&event("evt-old", old)).unwrap();
+        store.save_event(&event("evt-new", now)).unwrap();
+
+        // Terminal + old → pruned; pending/running and recent → kept.
+        store
+            .save_job(&job("job-old-done", ReflectionJobStatus::Done, old))
+            .unwrap();
+        store
+            .save_job(&job("job-old-failed", ReflectionJobStatus::Failed, old))
+            .unwrap();
+        store
+            .save_job(&job("job-old-pending", ReflectionJobStatus::Pending, old))
+            .unwrap();
+        store
+            .save_job(&job("job-new-done", ReflectionJobStatus::Done, now))
+            .unwrap();
+
+        store
+            .save_proposal(&proposal(
+                "prop-old-rejected",
+                ProposalStatus::Rejected,
+                old,
+            ))
+            .unwrap();
+        store
+            .save_proposal(&proposal("prop-old-pending", ProposalStatus::Pending, old))
+            .unwrap();
+        store
+            .save_proposal(&proposal("prop-new-applied", ProposalStatus::Applied, now))
+            .unwrap();
+
+        store.save_memory(&memory("mem-live", None, old)).unwrap();
+        store
+            .save_memory(&memory("mem-dead", Some("mem-live"), old))
+            .unwrap();
+        store
+            .save_memory(&memory("mem-dead-new", Some("mem-live"), now))
+            .unwrap();
+
+        let removed = store.prune_older_than(DEFAULT_RETENTION_MS).unwrap();
+        assert_eq!(
+            removed, 6,
+            "exp + evt + 2 terminal jobs + 1 terminal proposal + 1 dead memory"
+        );
+
+        assert!(store.get_experience("exp-old").unwrap().is_none());
+        assert!(store.get_experience("exp-new").unwrap().is_some());
+        assert_eq!(store.count_events().unwrap(), 1);
+
+        let pending = store.list_pending_jobs().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "job-old-pending");
+        assert!(store.list_failed_jobs(10).unwrap().is_empty());
+
+        let proposals = store.list_proposals(None).unwrap();
+        assert_eq!(proposals.len(), 2);
+        assert!(proposals.iter().all(|p| p.id != "prop-old-rejected"));
+
+        let memories = store.list_memory_all(None).unwrap();
+        assert_eq!(memories.len(), 2);
+        assert!(memories.iter().all(|m| m.id != "mem-dead"));
+        assert!(memories.iter().any(|m| m.id == "mem-dead-new"));
+        // Live rows are never pruned even when old.
+        assert!(memories.iter().any(|m| m.id == "mem-live"));
+    }
 }

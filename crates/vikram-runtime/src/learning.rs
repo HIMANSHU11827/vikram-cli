@@ -108,6 +108,21 @@ fn default_policy_str() -> String {
     "approval".to_owned()
 }
 
+/// Recover a poisoned lock instead of panicking: one panic while a mutex is held must not take
+/// down every later call into the manager.
+trait RecoverPoisoned<T> {
+    fn recover(self) -> T;
+}
+
+impl<T> RecoverPoisoned<T> for std::sync::LockResult<T> {
+    fn recover(self) -> T {
+        self.unwrap_or_else(|e| {
+            eprintln!("vikram: learning mutex poisoned; recovering");
+            e.into_inner()
+        })
+    }
+}
+
 pub struct LearningManager {
     proposals: Mutex<Vec<LearningProposal>>,
     audit: Mutex<Vec<LearningAuditEntry>>,
@@ -149,38 +164,38 @@ impl LearningManager {
             turns: Mutex::new(HashMap::new()),
             load_error: Mutex::new(None),
         };
-        if let Some(p) = mgr.path.lock().unwrap().clone() {
+        if let Some(p) = mgr.path.lock().recover().clone() {
             match std::fs::read_to_string(&p) {
                 Ok(data) => match serde_json::from_str::<LearningState>(&data) {
                     Ok(state) => {
-                        *mgr.proposals.lock().unwrap() = state.proposals;
-                        *mgr.audit.lock().unwrap() = state.audit;
-                        *mgr.policy_memory.lock().unwrap() =
+                        *mgr.proposals.lock().recover() = state.proposals;
+                        *mgr.audit.lock().recover() = state.audit;
+                        *mgr.policy_memory.lock().recover() =
                             LearningPolicy::parse(&state.policy_memory);
-                        *mgr.policy_skill.lock().unwrap() =
+                        *mgr.policy_skill.lock().recover() =
                             LearningPolicy::parse(&state.policy_skill);
-                        *mgr.policy_instruction.lock().unwrap() =
+                        *mgr.policy_instruction.lock().recover() =
                             LearningPolicy::parse(&state.policy_instruction);
-                        *mgr.policy_identity.lock().unwrap() =
+                        *mgr.policy_identity.lock().recover() =
                             LearningPolicy::parse(&state.policy_identity);
                     }
                     Err(e) => {
-                        *mgr.load_error.lock().unwrap() = Some(format!(
+                        *mgr.load_error.lock().recover() = Some(format!(
                             "learning state at {} is corrupt; starting empty: {e}",
                             p.display()
                         ));
                         eprintln!(
                             "vikram: {}",
-                            mgr.load_error.lock().unwrap().as_deref().unwrap_or("")
+                            mgr.load_error.lock().recover().as_deref().unwrap_or("")
                         );
                     }
                 },
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    *mgr.load_error.lock().unwrap() =
+                    *mgr.load_error.lock().recover() =
                         Some(format!("learning state at {} unreadable: {e}", p.display()));
                     eprintln!(
                         "vikram: {}",
-                        mgr.load_error.lock().unwrap().as_deref().unwrap_or("")
+                        mgr.load_error.lock().recover().as_deref().unwrap_or("")
                     );
                 }
                 Err(_) => {}
@@ -196,17 +211,17 @@ impl LearningManager {
     }
 
     pub fn try_save(&self) -> Result<(), String> {
-        let path = self.path.lock().unwrap().clone();
+        let path = self.path.lock().recover().clone();
         let Some(path) = path else {
             return Ok(());
         };
         let state = LearningState {
-            proposals: self.proposals.lock().unwrap().clone(),
-            audit: self.audit.lock().unwrap().clone(),
-            policy_memory: self.policy_memory.lock().unwrap().as_str().to_owned(),
-            policy_skill: self.policy_skill.lock().unwrap().as_str().to_owned(),
-            policy_instruction: self.policy_instruction.lock().unwrap().as_str().to_owned(),
-            policy_identity: self.policy_identity.lock().unwrap().as_str().to_owned(),
+            proposals: self.proposals.lock().recover().clone(),
+            audit: self.audit.lock().recover().clone(),
+            policy_memory: self.policy_memory.lock().recover().as_str().to_owned(),
+            policy_skill: self.policy_skill.lock().recover().as_str().to_owned(),
+            policy_instruction: self.policy_instruction.lock().recover().as_str().to_owned(),
+            policy_identity: self.policy_identity.lock().recover().as_str().to_owned(),
         };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -216,44 +231,44 @@ impl LearningManager {
     }
 
     pub fn load_error(&self) -> Option<String> {
-        self.load_error.lock().unwrap().clone()
+        self.load_error.lock().recover().clone()
     }
 
     pub fn policy_instruction(&self) -> LearningPolicy {
-        *self.policy_instruction.lock().unwrap()
+        *self.policy_instruction.lock().recover()
     }
     pub fn policy_identity(&self) -> LearningPolicy {
-        *self.policy_identity.lock().unwrap()
+        *self.policy_identity.lock().recover()
     }
 
     pub fn path(&self) -> Option<std::path::PathBuf> {
-        self.path.lock().unwrap().clone()
+        self.path.lock().recover().clone()
     }
 
     pub fn policy_memory(&self) -> LearningPolicy {
-        *self.policy_memory.lock().unwrap()
+        *self.policy_memory.lock().recover()
     }
     pub fn policy_skill(&self) -> LearningPolicy {
-        *self.policy_skill.lock().unwrap()
+        *self.policy_skill.lock().recover()
     }
     pub fn set_policy_memory(&self, p: LearningPolicy) {
-        *self.policy_memory.lock().unwrap() = p;
+        *self.policy_memory.lock().recover() = p;
     }
     pub fn set_policy_skill(&self, p: LearningPolicy) {
-        *self.policy_skill.lock().unwrap() = p;
+        *self.policy_skill.lock().recover() = p;
     }
     pub fn set_policy_instruction(&self, p: LearningPolicy) {
-        *self.policy_instruction.lock().unwrap() = p;
+        *self.policy_instruction.lock().recover() = p;
     }
     pub fn set_policy_identity(&self, p: LearningPolicy) {
-        *self.policy_identity.lock().unwrap() = p;
+        *self.policy_identity.lock().recover() = p;
     }
 
     /// Record that a skill was viewed in this session (read-before-write guard).
     pub fn mark_skill_viewed(&self, session: &SessionId, name: &str) {
         self.viewed_skills
             .lock()
-            .unwrap()
+            .recover()
             .entry(session.clone())
             .or_default()
             .insert(name.to_owned());
@@ -262,20 +277,20 @@ impl LearningManager {
     pub fn skill_was_viewed(&self, session: &SessionId, name: &str) -> bool {
         self.viewed_skills
             .lock()
-            .unwrap()
+            .recover()
             .get(session)
             .map(|s| s.contains(name))
             .unwrap_or(false)
     }
 
     pub fn stage_proposal(&self, proposal: LearningProposal) {
-        self.proposals.lock().unwrap().push(proposal);
+        self.proposals.lock().recover().push(proposal);
     }
 
     pub fn pending_proposals(&self) -> Vec<LearningProposal> {
         self.proposals
             .lock()
-            .unwrap()
+            .recover()
             .iter()
             .filter(|p| p.status == "pending")
             .cloned()
@@ -283,13 +298,13 @@ impl LearningManager {
     }
 
     pub fn all_proposals(&self) -> Vec<LearningProposal> {
-        self.proposals.lock().unwrap().clone()
+        self.proposals.lock().recover().clone()
     }
 
     pub fn find_proposal(&self, id: &str) -> Option<LearningProposal> {
         self.proposals
             .lock()
-            .unwrap()
+            .recover()
             .iter()
             .find(|p| p.id == id)
             .cloned()
@@ -299,7 +314,7 @@ impl LearningManager {
         if let Some(p) = self
             .proposals
             .lock()
-            .unwrap()
+            .recover()
             .iter_mut()
             .find(|p| p.id == id)
         {
@@ -308,11 +323,11 @@ impl LearningManager {
     }
 
     pub fn audit(&self, entry: LearningAuditEntry) {
-        self.audit.lock().unwrap().push(entry);
+        self.audit.lock().recover().push(entry);
     }
 
     pub fn audit_log(&self) -> Vec<LearningAuditEntry> {
-        self.audit.lock().unwrap().clone()
+        self.audit.lock().recover().clone()
     }
 
     pub fn dedup_memory(&self, existing: &[String], candidate: &str) -> bool {
@@ -482,7 +497,7 @@ fn detail_text(details: &serde_json::Value) -> String {
 /// about this run's spend, not a durable ledger.
 impl LearningManager {
     pub fn note_turn(&self, session: &SessionId) -> u64 {
-        let mut turns = self.turns.lock().expect("turn count lock");
+        let mut turns = self.turns.lock().recover();
         let count = turns.entry(session.clone()).or_insert(0);
         *count += 1;
         *count
@@ -610,7 +625,7 @@ fn record_and_reflect(
         metadata: serde_json::json!({"session": session.id.as_str()}),
     };
     let proposals = {
-        let engine = inner.learning.evolution.lock().expect("evolution lock");
+        let engine = inner.learning.evolution.lock().recover();
         let Ok(recorded) = engine.experience.record(experience) else {
             return;
         };
@@ -893,5 +908,17 @@ mod tests {
         assert_eq!(mgr.note_turn(&a), 1);
         assert_eq!(mgr.note_turn(&a), 2);
         assert_eq!(mgr.note_turn(&b), 1);
+    }
+
+    #[test]
+    fn a_poisoned_lock_recovers_instead_of_panicking() {
+        let mgr = LearningManager::new();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mgr.proposals.lock().unwrap();
+            panic!("poison the proposals mutex");
+        }));
+        assert!(poisoned.is_err());
+        assert!(mgr.pending_proposals().is_empty());
+        assert!(mgr.all_proposals().is_empty());
     }
 }

@@ -1,0 +1,25 @@
+{
+  "id": "result-warn-aws-key",
+  "name": "Result: an AWS access key",
+  "version": "1.0.0",
+  "description": "Inspects tool output for an aws access key.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 40,
+  "components": {
+    "hooks": [
+      "tool_result"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_result",
+      "result_contain": "AKIA",
+      "append_result": "[plugin] This output contains something shaped like an AWS access key. Do not echo it."
+    }
+  ]
+}

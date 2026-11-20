@@ -13,6 +13,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// Output retained per session. Older bytes are dropped so a chatty process cannot exhaust memory.
 const MAX_BUFFER: usize = 256 * 1024;
 
+/// Live sessions are capped: each one is a real shell with a PTY and a reader thread, and the
+/// registry is process-global, so an unbounded `terminal open` loop would leak them all.
+const MAX_SESSIONS: usize = 8;
+
 /// Platform-aware default interactive shell.
 fn default_shell() -> String {
     #[cfg(windows)]
@@ -27,6 +31,28 @@ fn default_shell() -> String {
     #[cfg(not(windows))]
     {
         "sh".to_owned()
+    }
+}
+
+/// A shell that runs a sandbox wrapper command line.
+///
+/// Reached only when `Sandbox::wrap_command` rewrote the argv, which happens on Linux
+/// (bubblewrap) and macOS (sandbox-exec). Windows has no enforcing wrapper, so the
+/// `exec` form built by the caller is never produced there.
+fn wrapper_command(script: &str) -> CommandBuilder {
+    #[cfg(windows)]
+    {
+        let mut cmd = CommandBuilder::new("cmd");
+        cmd.arg("/C");
+        cmd.arg(script);
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg(script);
+        cmd
     }
 }
 
@@ -75,6 +101,23 @@ pub fn open_sandboxed(
     rows: u16,
     cols: u16,
 ) -> Result<String, String> {
+    // `cwd` is model-supplied and becomes the child process's working directory, so it gets the
+    // same workspace containment the fs tools apply: anything resolving outside the root is
+    // refused rather than silently chrooting the shell somewhere unintended.
+    let cwd = match cwd {
+        Some(raw) => {
+            let resolved = crate::config::resolve_within(workspace_root, std::path::Path::new(raw))
+                .ok_or_else(|| {
+                    format!(
+                        "cwd `{raw}` is outside the workspace `{}`",
+                        workspace_root.display()
+                    )
+                })?;
+            Some(resolved.to_string_lossy().into_owned())
+        }
+        None => None,
+    };
+    let cwd = cwd.as_deref();
     // Build the wrapped command line as a single shell string for the PTY.
     // portable-pty spawns the shell directly; wrapping via sh -c keeps the wrapper
     // args intact without a second exec machinery.
@@ -122,9 +165,7 @@ pub fn open_sandboxed(
     // On Unix portable-pty spawns with no argv; passing args via the shell string is
     // the only portable route, so run `sh -c 'exec <wrapper> <shell>'` when wrapped.
     if let Some(arg) = _cmd_arg {
-        let mut cmd = CommandBuilder::new("sh");
-        cmd.arg("-c");
-        cmd.arg(&arg);
+        let mut cmd = wrapper_command(&arg);
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
         }
@@ -261,6 +302,14 @@ fn open_named_cmd(
         let _ = child.wait();
         return Ok(id);
     }
+    if reg.len() >= MAX_SESSIONS {
+        drop(reg);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!(
+            "terminal session limit reached ({MAX_SESSIONS}); close a session first"
+        ));
+    }
 
     reg.insert(
         id.clone(),
@@ -337,6 +386,16 @@ pub fn close(id: &str) -> Result<(), String> {
     let mut session = reg
         .remove(id)
         .ok_or_else(|| format!("unknown session `{id}`"))?;
+    // The PTY child called setsid at spawn, so its pid is also its process-group id: killing
+    // the group takes down whatever the session spawned (`npm run dev` and its children), not
+    // just the direct child. Same approach as `verification::kill_tree`.
+    #[cfg(unix)]
+    if let Some(pid) = session.child.process_id() {
+        // SAFETY: kill(2) is always safe to call; a stale pgid just returns ESRCH.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
     let _ = session.child.kill();
     let _ = session.child.wait();
     Ok(())
@@ -397,6 +456,40 @@ mod tests {
         assert!(write("no-such-session", "x").is_err());
         assert!(read("no-such-session", false).is_err());
         assert!(close("no-such-session").is_err());
+    }
+
+    #[test]
+    fn cwd_outside_the_workspace_is_refused() {
+        let dir = match std::env::temp_dir().canonicalize() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let sandbox = crate::sandbox::Sandbox::disabled("test");
+        let err = open_sandboxed(&sandbox, &dir, None, Some("sh"), Some("/etc"), 24, 80)
+            .expect_err("cwd outside the workspace must be refused");
+        assert!(err.contains("outside the workspace"), "{err}");
+        let err = open_sandboxed(&sandbox, &dir, None, Some("sh"), Some("../.."), 24, 80)
+            .expect_err("cwd climbing out must be refused");
+        assert!(err.contains("outside the workspace"), "{err}");
+    }
+
+    #[test]
+    fn session_count_is_capped() {
+        let sandbox = crate::sandbox::Sandbox::disabled("test");
+        let root = std::env::temp_dir();
+        let mut opened = Vec::new();
+        for _ in 0..MAX_SESSIONS {
+            match open_sandboxed(&sandbox, &root, None, Some("sh"), None, 24, 80) {
+                Ok(id) => opened.push(id),
+                Err(_) => return, // no PTY support in this environment
+            }
+        }
+        let err = open_sandboxed(&sandbox, &root, None, Some("sh"), None, 24, 80)
+            .expect_err("the session cap must refuse further opens");
+        assert!(err.contains("session limit"), "{err}");
+        for id in opened {
+            let _ = close(&id);
+        }
     }
 
     #[test]

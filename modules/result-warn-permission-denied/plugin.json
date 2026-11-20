@@ -1,0 +1,25 @@
+{
+  "id": "result-warn-permission-denied",
+  "name": "Result: a permission denial",
+  "version": "1.0.0",
+  "description": "Inspects tool output for a permission denial.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 40,
+  "components": {
+    "hooks": [
+      "tool_result"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_result",
+      "result_contain": "permission denied",
+      "append_result": "[plugin] An operation was denied. Do not retry it with a broader permission."
+    }
+  ]
+}

@@ -113,6 +113,10 @@ fn fit_content(content: &str, token_budget: u64) -> Option<(String, u64)> {
     Some((fitted, tokens))
 }
 
+/// The file cache is a read accelerator, not a store: past this many entries it is cleared
+/// wholesale rather than grown without bound (the next read simply re-caches).
+const MAX_CACHE_ENTRIES: usize = 256;
+
 #[derive(Clone, Debug)]
 struct CachedFile {
     content: String,
@@ -193,6 +197,9 @@ impl ContextLoader {
             }
         };
         let mut cache = self.cache_lock();
+        if cache.len() >= MAX_CACHE_ENTRIES {
+            cache.clear();
+        }
         cache.insert(
             path.to_path_buf(),
             CachedFile {
@@ -443,5 +450,25 @@ impl ContextLoader {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_file_cache_stays_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = ContextLoader::new(dir.path().join("home"), dir.path().to_path_buf());
+        for index in 0..(MAX_CACHE_ENTRIES + 10) {
+            let path = dir.path().join(format!("file-{index}.md"));
+            fs::write(&path, format!("content {index}")).unwrap();
+            assert_eq!(loader.read_file(&path), Some(format!("content {index}")));
+        }
+        assert!(
+            loader.cache_lock().len() <= MAX_CACHE_ENTRIES,
+            "the cache cleared instead of growing without bound"
+        );
     }
 }

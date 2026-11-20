@@ -1,7 +1,13 @@
 use serde_json::{Value, json};
+use std::time::Duration;
 use vikram_contracts::{ActionKind, PermissionRequest, SideEffect, Trust, VikramError};
 
 use crate::tools::*;
+
+/// Git commands get the same timeout discipline as shell commands: `cmd.output()` would block
+/// the calling thread forever on a `gpg`/pinentry prompt, and the wait kills the whole process
+/// group on expiry.
+const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Shared runner: spawn `git` with an argv vector (no shell) in `ctx.workspace_root`,
 /// capture stdout/stderr, and report success from the exit status.
@@ -22,8 +28,8 @@ fn run_git(argv: &[String], ctx: &ToolContext) -> ToolOutput {
     if std::env::var_os("GIT_COMMITTER_EMAIL").is_none() {
         cmd.env("GIT_COMMITTER_EMAIL", "vikram@local");
     }
-    match cmd.output() {
-        Ok(output) => {
+    match crate::verification::wait_with_timeout(&mut cmd, GIT_TIMEOUT, ctx.cancel.as_ref()) {
+        Ok(Some(output)) => {
             let mut body = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr);
             if !stderr.trim().is_empty() {
@@ -42,11 +48,21 @@ fn run_git(argv: &[String], ctx: &ToolContext) -> ToolOutput {
                 ok: output.status.success(),
             }
         }
+        Ok(None) => ToolOutput {
+            content: format!("git timed out after {}s", GIT_TIMEOUT.as_secs()),
+            ok: false,
+        },
         Err(error) => ToolOutput {
             content: format!("failed to start git: {error}"),
             ok: false,
         },
     }
+}
+
+/// A model-supplied path or ref must never be parsed as an option: `--upload-pack=…`,
+/// `-o…`, `--output=…` all start with `-`. Reject them before they reach argv.
+fn looks_like_option(value: &str) -> bool {
+    value.starts_with('-')
 }
 
 pub(crate) struct GitStatus;
@@ -195,13 +211,19 @@ impl Tool for GitCommit {
     }
 
     fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
-        let resource = args
+        // The resource must describe what actually gets staged: an explicit file list, or —
+        // when `files` is absent — the `git add -A` that sweeps every change in the repo,
+        // which is a different approval than committing one file.
+        let files: Vec<&str> = args
             .get("files")
             .and_then(Value::as_array)
-            .and_then(|a| a.first())
-            .and_then(Value::as_str)
-            .unwrap_or("git")
-            .to_owned();
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let resource = if files.is_empty() {
+            "git_commit all-files (git add -A)".to_owned()
+        } else {
+            format!("git_commit {} file(s): {}", files.len(), files.join(", "))
+        };
         Ok(PermissionRequest::new(
             ActionKind::Execute,
             "git_commit",
@@ -223,10 +245,19 @@ impl Tool for GitCommit {
                     .collect()
             })
             .unwrap_or_default();
+        if let Some(bad) = files.iter().find(|f| looks_like_option(f)) {
+            return Ok(ToolOutput {
+                content: format!("`{bad}` looks like an option, not a path to stage"),
+                ok: false,
+            });
+        }
         let mut add_argv = vec!["add".to_string()];
         if files.is_empty() {
             add_argv.push("-A".to_string());
         } else {
+            // `--` ends option parsing so a path like `-foo` can never be read as a flag;
+            // the leading-dash check above already refused those outright.
+            add_argv.push("--".to_string());
             add_argv.extend(files);
         }
         let added = run_git(&add_argv, ctx);
@@ -277,6 +308,12 @@ impl Tool for GitBranch {
         let name = args.get("name").and_then(Value::as_str);
         let list = args.get("list").and_then(Value::as_bool).unwrap_or(false);
         let argv = if let (Some(n), false) = (name, list) {
+            if looks_like_option(n) {
+                return Ok(ToolOutput {
+                    content: format!("`{n}` looks like an option, not a branch name"),
+                    ok: false,
+                });
+            }
             vec!["branch".to_string(), n.to_string()]
         } else {
             vec!["branch".to_string(), "-a".to_string()]
@@ -678,5 +715,45 @@ mod tests {
         let out = GitStash.run(&json!({"action": "list"}), &c).unwrap();
         // Empty repo: command still returns a ToolOutput.
         assert!(!out.content.is_empty());
+    }
+
+    #[test]
+    fn git_branch_rejects_option_like_names() {
+        let dir = tempdir().unwrap();
+        let c = ctx(dir.path());
+        for name in ["-D", "--delete", "-m", "-f"] {
+            let out = GitBranch.run(&json!({"name": name}), &c).unwrap();
+            assert!(!out.ok, "branch name `{name}` must be refused");
+            assert!(out.content.contains("option"), "{}", out.content);
+        }
+    }
+
+    #[test]
+    fn git_commit_rejects_option_like_files() {
+        let dir = tempdir().unwrap();
+        let c = ctx(dir.path());
+        Command::new("git")
+            .args(["init", "-q", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        for file in ["-A", "--all", "-o"] {
+            let out = GitCommit
+                .run(&json!({"message": "m", "files": ["a.txt", file]}), &c)
+                .unwrap();
+            assert!(!out.ok, "file `{file}` must be refused");
+        }
+    }
+
+    #[test]
+    fn git_commit_permission_reports_the_true_staged_scope() {
+        let all = GitCommit.permission(&json!({"message": "m"})).unwrap();
+        assert!(all.resource.contains("all-files"), "{}", all.resource);
+        let some = GitCommit
+            .permission(&json!({"message": "m", "files": ["a.txt", "b.txt"]}))
+            .unwrap();
+        assert!(some.resource.contains("2 file(s)"), "{}", some.resource);
+        assert!(some.resource.contains("a.txt"), "{}", some.resource);
+        assert!(some.resource.contains("b.txt"), "{}", some.resource);
     }
 }

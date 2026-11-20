@@ -633,6 +633,9 @@ pub(crate) struct RuntimeInner {
     pub mcp: std::sync::Arc<std::sync::Mutex<McpRegistry>>,
     pub mcp_visibility: std::sync::Arc<std::sync::Mutex<VisibilityManager>>,
     pub plugins: Mutex<PluginRegistry>,
+    /// The hook chain built from the loaded plugins. Rebuilt after every plugin mutation, so
+    /// disabling a plugin removes its hooks without restarting the runtime.
+    pub hooks: std::sync::RwLock<crate::hooks::HookRegistry>,
     pub skills: std::sync::Mutex<SkillRegistry>,
     // `evolution` field moved into `LearningState` (see `learning` above).
     pub workspace: WorkspaceManager,
@@ -656,6 +659,23 @@ pub(crate) struct RuntimeInner {
     /// Learning reviews this runtime has started and not finished. A one-shot process that exits
     /// without waiting for these drops a review it already paid for.
     pub review_tasks: Arc<AtomicU64>,
+    /// Monotonic sequence for `RuntimeEvent::Activity`; ids derive from it so a consumer can order
+    /// the stream without relying on arrival order.
+    pub activity_seq: AtomicU64,
+}
+
+impl RuntimeInner {
+    /// Dispatch one hook context through the chain. Blocking work (a process hook) happens on the
+    /// caller's thread, which is why call sites use `spawn_blocking`.
+    pub fn dispatch_hook(&self, ctx: &crate::hooks::HookContext) -> crate::hooks::HookOutcome {
+        self.hooks
+            .read()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: hooks lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .dispatch(ctx)
+    }
 }
 
 /// Keeps that count honest even if the review task panics.
@@ -694,6 +714,39 @@ impl MemoryNudgeSession for vikram_contracts::SessionId {
 impl RuntimeInner {
     pub fn emit(&self, event: RuntimeEvent) {
         self.bus.publish(event);
+    }
+
+    /// Publish a structured activity against the session it belongs to. The event carries no
+    /// position in the transcript — the interface files it under that session's activity rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_activity(
+        &self,
+        session: &SessionId,
+        kind: crate::types::ActivityKind,
+        summary: impl Into<String>,
+        bot: Option<BotId>,
+        parent_agent: Option<BotId>,
+        ok: bool,
+    ) {
+        let seq = self.activity_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.emit(RuntimeEvent::Activity(crate::types::ActivityEvent {
+            id: format!("activity-{seq}"),
+            kind,
+            bot,
+            parent_agent,
+            session: session.clone(),
+            turn: None,
+            call: None,
+            summary: summary.into(),
+            resource: None,
+            content: None,
+            detail: None,
+            exit_code: None,
+            ok,
+            duration_ms: None,
+            metadata: None,
+            seq,
+        }));
     }
 
     pub fn session(&self, id: &SessionId) -> Option<Arc<SessionRuntime>> {
@@ -1422,44 +1475,64 @@ impl RuntimeInner {
     /// The child's transcript stays its own; what the parent receives is the final statement, fitted
     /// to `context.delegation_budget_tokens` and journaled so it survives a restart of either session.
     pub fn deliver_delegation(&self, parent: &SessionId, child: &SessionRuntime) {
-        let Some(parent_session) = self.session(parent) else {
-            return;
-        };
-        let budget = self
-            .config
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .context
-            .delegation_budget_tokens;
-        let Some(answer) =
-            crate::compaction::delegation_answer(&child.estimator(), &child.messages(), budget)
-        else {
-            return;
-        };
-        let text = format!(
-            "[VIKRAM delegation result] {} said:\n{answer}",
-            child.title()
-        );
-        let message = vikram_contracts::Message::text(
-            vikram_contracts::Role::System,
-            text,
-            vikram_contracts::Trust::Host,
-        );
-        parent_session.push_message(message.clone(), now_ms());
-        self.journal(
-            parent,
-            RecordKind::Message,
-            serde_json::json!({"message": message}),
-        );
-        self.emit(RuntimeEvent::MessageCommitted {
-            session: parent.clone(),
-            message,
-        });
-        self.emit(RuntimeEvent::Notice {
-            level: NoticeLevel::Info,
-            text: format!("{} answered", child.title()),
-        });
-        self.publish_metrics();
+        if let Some(parent_session) = self.session(parent) {
+            let budget = self
+                .config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .context
+                .delegation_budget_tokens;
+            if let Some(answer) =
+                crate::compaction::delegation_answer(&child.estimator(), &child.messages(), budget)
+            {
+                let text = format!(
+                    "[VIKRAM delegation result] {} said:\n{answer}",
+                    child.title()
+                );
+                let message = vikram_contracts::Message::text(
+                    vikram_contracts::Role::System,
+                    text,
+                    vikram_contracts::Trust::Host,
+                );
+                parent_session.push_message(message.clone(), now_ms());
+                self.journal(
+                    parent,
+                    RecordKind::Message,
+                    serde_json::json!({"message": message}),
+                );
+                self.emit(RuntimeEvent::MessageCommitted {
+                    session: parent.clone(),
+                    message,
+                });
+                self.emit(RuntimeEvent::Notice {
+                    level: NoticeLevel::Info,
+                    text: format!("{} answered", child.title()),
+                });
+                self.emit_activity(
+                    parent,
+                    crate::types::ActivityKind::Delegated,
+                    format!("{} answered", child.title()),
+                    child.bot(),
+                    parent_session.bot(),
+                    true,
+                );
+                self.publish_metrics();
+            }
+        }
+        // A delegated session is one-shot: its answer has been handed over (or there was no
+        // parent left to hand it to), so it is closed rather than left live forever — startup
+        // only rehydrates `active` rows, and `closed` keeps the transcript browsable. Only a
+        // real delegation (`depth > 0`) is reaped: a fork also carries `parent_session` but is
+        // an ordinary conversation the operator keeps. A queued follow-up keeps it alive.
+        if child.depth() > 0 && child.queue_len() == 0 {
+            let _ = self.store.set_session_status(&child.id, "closed", now_ms());
+            self.sessions
+                .lock()
+                .expect("sessions lock")
+                .retain(|s| s.id != child.id);
+            self.emit(RuntimeEvent::SessionClosed(child.id.clone()));
+            self.publish_metrics();
+        }
     }
 
     /// Digest a result the transcript cannot carry, keeping the full text addressable.
@@ -1666,9 +1739,39 @@ impl RuntimeInner {
             use futures_util::StreamExt;
             let mut stream = provider.stream(request);
             let mut collected = String::new();
-            while let Some(item) = stream.next().await {
+            // Same discipline as the turn loop: a hung or silent endpoint must not park this
+            // review (and `wait_for_learning` behind it) forever. Silence is measured from the
+            // last event that produced text, on the configured cap.
+            let silence_cap = std::time::Duration::from_secs(
+                inner
+                    .config
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .stream_silence_secs,
+            );
+            let mut last_progress = std::time::Instant::now();
+            loop {
+                let item = match tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    stream.next(),
+                )
+                .await
+                {
+                    Ok(Some(item)) => Some(item),
+                    Ok(None) => break,
+                    Err(_) => None,
+                };
+                if last_progress.elapsed() >= silence_cap {
+                    break;
+                }
+                let Some(item) = item else { continue };
                 match item {
-                    Ok(crate::provider::ProviderEvent::TextDelta(t)) => collected.push_str(&t),
+                    Ok(crate::provider::ProviderEvent::TextDelta(t)) => {
+                        if !t.is_empty() {
+                            last_progress = std::time::Instant::now();
+                            collected.push_str(&t);
+                        }
+                    }
                     Ok(crate::provider::ProviderEvent::Finished { .. }) => break,
                     Ok(_) => {}
                     Err(_) => break,
@@ -1943,6 +2046,7 @@ impl Runtime {
             crate::config::mcp_config_path().with_file_name("mcp-visibility.json");
         let mcp_visibility = VisibilityManager::with_persist_path(mcp_visibility_path);
         let plugins = PluginRegistry::from_default_dir();
+        let hooks = std::sync::RwLock::new(crate::hooks::HookRegistry::from_plugins(&plugins));
         let skills = std::sync::Mutex::new(SkillRegistry::for_workspace(&workspace_root));
         let evolution_skills_root = crate::config::vikram_home().join("skills");
         if let Err(e) = std::fs::create_dir_all(&evolution_skills_root) {
@@ -2010,6 +2114,7 @@ impl Runtime {
             mcp: Arc::new(Mutex::new(mcp)),
             mcp_visibility: std::sync::Arc::new(Mutex::new(mcp_visibility)),
             plugins: Mutex::new(plugins),
+            hooks,
             skills,
             workspace,
             approvals: Mutex::new(HashMap::new()),
@@ -2023,6 +2128,7 @@ impl Runtime {
             last_turn_ms: Mutex::new(None),
             last_tokens_per_sec: Mutex::new(None),
             review_tasks: Arc::new(AtomicU64::new(0)),
+            activity_seq: AtomicU64::new(0),
         });
 
         // Reload previously derived dialectic insights so the user model survives restarts.
@@ -2534,7 +2640,12 @@ impl RuntimeHandle {
                     "images cannot be queued behind a running turn; wait for it to finish".into(),
                 ));
             }
-            let depth = session.enqueue(message.text_body());
+            let Some(depth) = session.enqueue(message.text_body()) else {
+                return Err(RuntimeError::InvalidState(format!(
+                    "the follow-up queue is full ({} waiting); let the turn finish or cancel it first",
+                    SessionRuntime::MAX_QUEUED_FOLLOW_UPS
+                )));
+            };
             self.inner.emit(RuntimeEvent::Notice {
                 level: NoticeLevel::Info,
                 text: format!("queued ({depth} waiting)"),
@@ -3278,13 +3389,34 @@ impl RuntimeHandle {
                 "delegation depth {depth} exceeds the limit of {limit}"
             )));
         }
+        // One run per bot. A second spawn while the first is still working would replace the
+        // session, task and cancel token underneath it, and both turns would answer as the same
+        // bot. Everything below is synchronous, so this check cannot be raced mid-spawn.
+        let running = agent.state().is_active()
+            || agent.is_paused()
+            || agent
+                .session
+                .lock()
+                .unwrap_or_else(|e| {
+                    eprintln!("vikram: bot session lock mutex poisoned; recovering");
+                    e.into_inner()
+                })
+                .clone()
+                .and_then(|id| self.inner.session(&id))
+                .is_some_and(|session| session.is_busy());
+        if running {
+            return Err(RuntimeError::InvalidState(format!(
+                "{} already has a run in flight",
+                agent.profile.name
+            )));
+        }
         // A delegated session is named for the agent that owns it and the work it was given, so the
         // tab reads "Arun — Security Review". The identity stays in the label because two bots
         // working on the same task must never look like one session.
         let subject = titling::sanitize(&titling::fallback(&task))
             .unwrap_or_else(|| titling::clip(&task, 28));
         let title = format!("{} — {}", agent.profile.name, subject);
-        let agent_session = self.inner.create_session(Some(title))?;
+        let agent_session = self.inner.create_session(Some(title.clone()))?;
         agent_session.set_bot(Some(profile.clone()), now_ms());
         agent_session.set_parent(Some(parent.id.clone()));
         agent_session.set_depth(depth);
@@ -3339,6 +3471,16 @@ impl RuntimeHandle {
         self.inner.task_snapshot(&bg);
         self.inner
             .emit(RuntimeEvent::SessionCreated(agent_session.snapshot()));
+        // The delegation belongs to the session that asked for it: without this row the parent's
+        // transcript shows a child tab appear and an answer arrive with nothing between.
+        self.inner.emit_activity(
+            &parent.id,
+            crate::types::ActivityKind::Delegated,
+            title.clone(),
+            Some(profile.clone()),
+            parent.bot(),
+            true,
+        );
         self.inner.publish_metrics();
 
         crate::turn::spawn_turn(
@@ -3380,6 +3522,19 @@ impl RuntimeHandle {
             }
             BotControl::Stop => {
                 agent.cancel_handle().cancel();
+                // The turn snapshots the *session's* token, not the bot's, so cancelling only
+                // the bot token stopped nothing. Cancel the session the run is actually in.
+                let session_id = agent
+                    .session
+                    .lock()
+                    .unwrap_or_else(|e| {
+                        eprintln!("vikram: bot session lock mutex poisoned; recovering");
+                        e.into_inner()
+                    })
+                    .clone();
+                if let Some(session) = session_id.and_then(|id| self.inner.session(&id)) {
+                    session.cancel_handle().cancel();
+                }
                 agent.set_state(BotState::Stopped);
                 self.inner.emit(RuntimeEvent::Notice {
                     level: NoticeLevel::Warn,
@@ -3448,6 +3603,16 @@ impl RuntimeHandle {
             answer,
         });
         Ok(())
+    }
+
+    /// Abandon a pending `ask_user` question. Dropping the sender resolves the turn's wait as a
+    /// cancellation, so the call fails honestly instead of blocking on an answer nobody will give.
+    pub fn dismiss_question(&self, request_id: &str) {
+        self.inner.close_question(request_id);
+        self.inner.emit(RuntimeEvent::Notice {
+            level: NoticeLevel::Warn,
+            text: "question dismissed".into(),
+        });
     }
 
     pub fn bot_snapshots(&self) -> Vec<BotSnapshot> {
@@ -3658,9 +3823,64 @@ impl RuntimeHandle {
         let installed = registry.installed();
         let loaded = registry.plugins().iter().filter(|p| p.loaded).count();
         drop(registry);
+        self.reload_hooks();
         self.inner
             .emit(RuntimeEvent::PluginsChanged { installed, loaded });
         Ok(())
+    }
+
+    /// Rebuild the hook chain from the loaded plugins.
+    ///
+    /// Called after every install/uninstall/enable/disable, so a disabled plugin's hooks stop
+    /// running on the next dispatch rather than at the next restart.
+    fn reload_hooks(&self) {
+        let plugins = self.inner.plugins.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: plugins lock mutex poisoned; recovering");
+            e.into_inner()
+        });
+        let fresh = crate::hooks::HookRegistry::from_plugins(&plugins);
+        let active = fresh.hooks().len();
+        let rejected = fresh.rejected().to_vec();
+        drop(plugins);
+        *self.inner.hooks.write().unwrap_or_else(|e| {
+            eprintln!("vikram: hooks lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = fresh;
+        for rejection in rejected {
+            self.inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!(
+                    "plugin `{}` hook refused: {}",
+                    rejection.plugin, rejection.reason
+                ),
+            });
+        }
+        if active == 0 {
+            self.inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Info,
+                text: "no plugin hooks are active".to_owned(),
+            });
+        }
+    }
+
+    /// The active hook contributions, in execution order.
+    pub fn plugin_hooks(&self) -> Vec<crate::hooks::HookInfo> {
+        self.inner
+            .hooks
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries()
+            .to_vec()
+    }
+
+    /// Hooks a manifest asked for but did not have the permissions (or the spelling) to register.
+    pub fn plugin_hook_rejections(&self) -> Vec<crate::hooks::HookRejection> {
+        self.inner
+            .hooks
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .rejected()
+            .to_vec()
     }
 
     pub fn plugin_install(&self, path: &std::path::Path) -> Result<String> {
@@ -3672,6 +3892,7 @@ impl RuntimeHandle {
         let installed = registry.installed();
         let loaded = registry.plugins().iter().filter(|p| p.loaded).count();
         drop(registry);
+        self.reload_hooks();
         self.inner
             .emit(RuntimeEvent::PluginsChanged { installed, loaded });
         Ok(id)
@@ -6033,5 +6254,153 @@ mod tests {
         let reloaded = handle.reload_skills();
         assert!(reloaded > before, "reloaded={reloaded} before={before}");
         assert!(handle.skill_list().iter().any(|s| s.name == "alpha"));
+    }
+
+    /// A provider that accepts the request and then says nothing — a turn against it stays in
+    /// flight until something cancels it, which is exactly what the bot-control tests need.
+    struct HangingProvider;
+
+    impl Provider for HangingProvider {
+        fn name(&self) -> &str {
+            "hanging"
+        }
+
+        fn model(&self) -> &str {
+            "test-model"
+        }
+
+        fn context_window(&self) -> Option<u64> {
+            Some(8192)
+        }
+
+        fn stream(
+            &self,
+            _request: crate::provider::CompletionRequest,
+        ) -> crate::provider::ProviderStream {
+            Box::pin(futures_util::stream::pending::<
+                std::result::Result<crate::provider::ProviderEvent, vikram_contracts::VikramError>,
+            >())
+        }
+    }
+
+    /// Wait until the bot's delegated session is actually mid-turn.
+    async fn bot_turn_busy(handle: &RuntimeHandle, bot: &BotId) -> SessionId {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let agent = handle.inner.bots.get(bot).expect("bot is registered");
+            if let Some(id) = agent
+                .session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                && let Some(session) = handle.inner.session(&id)
+                && session.is_busy()
+            {
+                return id;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the delegated turn never started");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn stopping_a_bot_cancels_the_turn_it_is_actually_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime =
+            Runtime::start_with_provider(config_for(dir.path()), Arc::new(HangingProvider))
+                .await
+                .unwrap();
+        let handle = runtime.handle();
+        let parent = handle.snapshot().sessions[0].id.clone();
+        let bot = handle
+            .bot_create("Stopbot", "tester", "stops things")
+            .unwrap();
+        handle
+            .spawn_agent(bot.clone(), "watch the build".into(), parent.clone())
+            .unwrap();
+        let child = bot_turn_busy(&handle, &bot).await;
+        let mut events = handle.events();
+
+        // A second spawn while the first runs must be refused, not raced.
+        assert!(
+            handle
+                .spawn_agent(bot.clone(), "again".into(), parent.clone())
+                .is_err(),
+            "one run per bot"
+        );
+
+        handle.control_bot(&bot, BotControl::Stop).unwrap();
+
+        // `Stopped` is set synchronously by the control call; what proves the stop reached the
+        // turn is the turn itself ending Cancelled.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut outcome = None;
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Ok(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), events.recv()).await
+            else {
+                continue;
+            };
+            if let RuntimeEvent::TurnFinished { state, .. } = event {
+                outcome = Some(state);
+                break;
+            }
+        }
+        assert_eq!(
+            outcome,
+            Some(crate::types::TurnState::Cancelled),
+            "the in-flight turn observed the stop"
+        );
+        let agent = handle.inner.bots.get(&bot).expect("bot is registered");
+        assert_eq!(agent.state(), BotState::Stopped);
+        // The reaped child may already be gone from the live set; if it is still there its turn
+        // must not still be streaming.
+        if let Some(session) = handle.inner.session(&child) {
+            assert_ne!(session.turn(), crate::types::TurnState::Streaming);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delegated_session_is_closed_once_it_has_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let (runtime, _provider) = named_runtime(dir.path(), "the audit is clean").await;
+        let handle = runtime.handle();
+        let parent = handle.snapshot().sessions[0].id.clone();
+        let bot = handle
+            .bot_create("Auditbot", "auditor", "audits things")
+            .unwrap();
+        handle
+            .spawn_agent(bot.clone(), "audit the code".into(), parent)
+            .unwrap();
+        // `spawn_agent` records the child session synchronously; a fast turn may already be
+        // done, so there is nothing to wait for but the reap itself.
+        let child = {
+            let agent = handle.inner.bots.get(&bot).expect("bot is registered");
+            agent
+                .session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .expect("the delegated session is recorded")
+        };
+
+        // Wait for the delegated turn to finish and the child to be reaped.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if handle.inner.session(&child).is_none() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the delegated session was never reaped");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let store = vikram_store::Store::open(&database_path()).unwrap();
+        let row = store.get_session(&child).unwrap().expect("row survives");
+        assert_eq!(row.status, "closed", "closed, not deleted");
     }
 }

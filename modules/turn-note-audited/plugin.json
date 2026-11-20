@@ -1,0 +1,24 @@
+{
+  "id": "turn-note-audited",
+  "name": "Turn: note that the turn is audited",
+  "version": "1.0.0",
+  "description": "Tells the model the turn is journaled.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 80,
+  "components": {
+    "hooks": [
+      "turn_start"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "turn_start",
+      "append": "This turn is audited: every tool call and plugin decision is journaled."
+    }
+  ]
+}

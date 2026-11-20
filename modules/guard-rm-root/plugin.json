@@ -1,0 +1,26 @@
+{
+  "id": "guard-rm-root",
+  "name": "Guard: recursive delete of the root",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: recursive delete of the root.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 120,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "shell.run",
+      "arguments_contain": "rm -rf /",
+      "deny": "refusing a recursive force-delete of the root filesystem"
+    }
+  ]
+}

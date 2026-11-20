@@ -1,0 +1,25 @@
+{
+  "id": "result-warn-test-failure",
+  "name": "Result: a failed test run",
+  "version": "1.0.0",
+  "description": "Inspects tool output for a failed test run.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 40,
+  "components": {
+    "hooks": [
+      "tool_result"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_result",
+      "result_contain": "test result: failed",
+      "append_result": "[plugin] Tests failed. Report the failure and the failing test, never success."
+    }
+  ]
+}

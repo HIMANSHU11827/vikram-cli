@@ -1,0 +1,25 @@
+{
+  "id": "result-warn-timeout",
+  "name": "Result: a timeout",
+  "version": "1.0.0",
+  "description": "Inspects tool output for a timeout.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 40,
+  "components": {
+    "hooks": [
+      "tool_result"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_result",
+      "result_contain": "timed out",
+      "append_result": "[plugin] The operation timed out. Say so rather than implying it succeeded."
+    }
+  ]
+}

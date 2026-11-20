@@ -1,0 +1,26 @@
+{
+  "id": "guard-kill-all",
+  "name": "Guard: kill every process",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: kill every process.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "shell.run",
+      "arguments_contain": "kill -9 -1",
+      "deny": "killing every process would take down the host"
+    }
+  ]
+}

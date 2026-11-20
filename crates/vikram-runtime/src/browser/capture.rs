@@ -16,6 +16,10 @@ const STDERR_LINES: usize = 6;
 /// How many characters of that stderr tail are kept.
 const STDERR_CHARS: usize = 600;
 
+/// How much of a child's stdout is kept. A page that writes without end cannot grow memory;
+/// one byte past the cap is read so the overflow can be told apart from an exact fit.
+const MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
+
 /// What one browser run produced.
 struct Capture {
     stdout: Vec<u8>,
@@ -33,8 +37,23 @@ pub fn navigate(url: &str, timeout_ms: u64) -> Result<String, String> {
     navigate_with(&bin, url, timeout_ms)
 }
 
+/// The schemes a browser run may be pointed at.
+///
+/// Anything else — `file:`, `chrome:`, `data:`, `javascript:` — would turn a page fetch into a
+/// read of the local machine, so the URL is checked before a browser is ever spawned.
+pub fn validate_url(url: &str) -> Result<(), String> {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower == "about:blank" {
+        return Ok(());
+    }
+    Err(format!(
+        "`{url}` is not a URL the browser may load; only http://, https:// and about:blank are allowed"
+    ))
+}
+
 /// [`navigate`] against a named binary, so the failure paths can be exercised without one.
 pub fn navigate_with(bin: &Path, url: &str, timeout_ms: u64) -> Result<String, String> {
+    validate_url(url)?;
     let args = browser_args(&["--dump-dom"], url);
     let capture = run(bin, &args, timeout_ms)?;
     if !capture.success {
@@ -74,6 +93,7 @@ pub fn screenshot_with(
     height: u32,
     timeout_ms: u64,
 ) -> Result<String, String> {
+    validate_url(url)?;
     let width = width.clamp(1, MAX_DIMENSION);
     let height = height.clamp(1, MAX_DIMENSION);
     if let Some(parent) = out_path.parent()
@@ -156,6 +176,14 @@ fn run(bin: &Path, args: &[String], timeout_ms: u64) -> Result<Capture, String> 
     let stdout = stdout.map(collect).unwrap_or_default();
     let stderr = String::from_utf8_lossy(&stderr.map(collect).unwrap_or_default()).into_owned();
 
+    if stdout.len() > MAX_STDOUT_BYTES {
+        return Err(format!(
+            "`{}` wrote more than {MAX_STDOUT_BYTES} bytes of output and was stopped{}",
+            bin.display(),
+            describe_stderr(&stderr)
+        ));
+    }
+
     if timed_out {
         return Err(format!(
             "`{}` did not finish within {timeout_ms} ms and was killed{}",
@@ -172,17 +200,19 @@ fn run(bin: &Path, args: &[String], timeout_ms: u64) -> Result<Capture, String> 
     })
 }
 
-/// Read a pipe to the end on its own thread.
+/// Read a pipe up to [`MAX_STDOUT_BYTES`] on its own thread.
 ///
 /// A thread rather than a blocking read on the main thread: a chatty page must not fill the pipe
 /// buffer and deadlock the child while the exit is being polled. A subprocess that outlives its
 /// parent's kill can keep such a thread alive; it owns nothing but that pipe, so it is left to end
 /// on its own rather than joined.
-fn read_in_background<R: Read + Send + 'static>(mut pipe: R) -> Receiver<Vec<u8>> {
+fn read_in_background<R: Read + Send + 'static>(pipe: R) -> Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
     let _ = std::thread::spawn(move || {
         let mut buffer = Vec::new();
-        let _ = pipe.read_to_end(&mut buffer);
+        let _ = pipe
+            .take(MAX_STDOUT_BYTES as u64 + 1)
+            .read_to_end(&mut buffer);
         let _ = tx.send(buffer);
     });
     rx

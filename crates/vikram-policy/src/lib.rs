@@ -308,23 +308,32 @@ impl MandatoryFloor {
             && let Some(path) = resource_path(req)
         {
             let root = root.trim_end_matches('/');
-            let canonical = if path.is_absolute() {
+            // A root that trims to nothing ("/" or "") confines nothing: resolving it would
+            // accept every path, so the floor fails closed and treats the request as outside.
+            if root.is_empty() {
+                return Some(format!(
+                    "`{}` outside the workspace root `{root}` ({:?} {})",
+                    req.verb, req.action, req.resource,
+                ));
+            }
+            let base = if path.is_absolute() {
                 path.clone()
             } else {
                 std::path::Path::new(root).join(&path)
             };
-            // A root that trims to nothing ("/" or "") confines nothing: `starts_with("")` would
-            // accept every path, so the floor fails closed and treats the request as outside.
-            let within_root =
-                !root.is_empty() && canonical.starts_with(root) && !escapes_root(&canonical, root);
-            let within_extra = self.extra_write_roots.iter().any(|extra| {
-                let extra = extra.trim_end_matches('/');
-                !extra.is_empty()
-                    && (canonical == std::path::Path::new(extra)
-                        || canonical.starts_with(extra) && !escapes_root(&canonical, extra))
-            });
-            let outside = !within_root && !within_extra;
-            if outside {
+            let resolved = resolve_symlinks(&base);
+            let within = |root: &str| {
+                let root = root.trim_end_matches('/');
+                if root.is_empty() {
+                    return false;
+                }
+                resolve_symlinks(std::path::Path::new(root)).is_some_and(|canonical_root| {
+                    resolved.as_ref().is_some_and(|resolved| {
+                        *resolved == canonical_root || resolved.starts_with(&canonical_root)
+                    })
+                })
+            };
+            if !(within(root) || self.extra_write_roots.iter().any(|extra| within(extra))) {
                 return Some(format!(
                     "`{}` outside the workspace root `{root}` ({:?} {})",
                     req.verb, req.action, req.resource,
@@ -336,24 +345,52 @@ impl MandatoryFloor {
     }
 }
 
-/// A path that joins to the root but climbs back out (`root/../etc`) is not within it.
-fn escapes_root(path: &std::path::Path, root: &str) -> bool {
-    let Ok(rel) = path.strip_prefix(root) else {
-        return true;
+/// Resolve a path against a root and refuse escapes — the same semantics as the runtime's
+/// `resolve_within`, duplicated here because this crate cannot depend on it.
+fn resolve_within(root: &Path, candidate: &Path) -> Option<std::path::PathBuf> {
+    let canonical_root = resolve_symlinks(root)?;
+    let resolved = if candidate.is_absolute() {
+        resolve_symlinks(candidate)?
+    } else {
+        resolve_symlinks(&canonical_root.join(candidate))?
     };
-    let mut depth: i64 = 0;
-    for component in rel.components() {
+    (resolved == canonical_root || resolved.starts_with(&canonical_root)).then_some(resolved)
+}
+
+/// Resolve `path` one component at a time, canonicalizing every component that exists so symlink
+/// targets — including the parent a `..` climbs to — are the real ones. A component that exists
+/// but cannot be canonicalized refuses the whole path; a not-yet-existing tail is kept verbatim
+/// because it cannot contain symlinks.
+fn resolve_symlinks(path: &Path) -> Option<std::path::PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut current = std::path::PathBuf::new();
+    for component in absolute.components() {
         use std::path::Component;
         match component {
-            Component::ParentDir => depth -= 1,
-            Component::Normal(_) => depth += 1,
-            _ => {}
-        }
-        if depth < 0 {
-            return true;
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                current.pop();
+            }
+            Component::Normal(name) => {
+                current.push(name);
+                match current.canonicalize() {
+                    Ok(canonical) => current = canonical,
+                    Err(_) => {
+                        if current.symlink_metadata().is_ok() {
+                            return None;
+                        }
+                    }
+                }
+            }
         }
     }
-    false
+    Some(current)
 }
 
 /// The resource as a filesystem path, for actions whose side effects are confined to the
@@ -557,23 +594,15 @@ impl Policy {
             return req.clone();
         };
         let root = root.trim_end_matches('/');
-        if std::path::Path::new(&req.resource).is_absolute() {
+        if root.is_empty() || std::path::Path::new(&req.resource).is_absolute() {
             return req.clone();
         }
-        let mut normalized = std::path::PathBuf::new();
-        for component in std::path::Path::new(root).join(&req.resource).components() {
-            use std::path::Component;
-            match component {
-                Component::ParentDir => {
-                    normalized.pop();
-                }
-                Component::CurDir => {}
-                other => normalized.push(other.as_os_str()),
-            }
-        }
-        if normalized.starts_with(root) {
+        if let Some(resolved) = resolve_within(
+            std::path::Path::new(root),
+            std::path::Path::new(&req.resource),
+        ) {
             let mut out = req.clone();
-            out.resource = normalized.to_string_lossy().into_owned();
+            out.resource = resolved.to_string_lossy().into_owned();
             out
         } else {
             req.clone()
@@ -626,11 +655,9 @@ pub fn allow_reaches_outside(rule: &Rule, root: &Path) -> bool {
         ResourcePattern::Exact(s) | ResourcePattern::Subtree(s) | ResourcePattern::Prefix(s) => s,
     };
     let path = std::path::Path::new(value);
-    if path.is_absolute() {
-        return !(path.starts_with(root) && !escapes_root(path, &root.to_string_lossy()));
-    }
-    // A relative entry is resolved against the root when it is used, so only a climb can escape.
-    escapes_root(&root.join(value), &root.to_string_lossy())
+    // Absolute entries are checked as given; relative ones resolve against the root when used,
+    // so only a climb — or a symlink — can carry them outside.
+    resolve_within(root, path).is_none()
 }
 
 /// Parse the amendment string the runtime proposed back into a rule. Deliberately strict: anything/// that is not exactly the shape we emit is refused rather than guessed at, because this text is the
@@ -942,6 +969,66 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    fn tempdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vikram-policy-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_floor_refuses_writes_that_escape_through_a_symlink() {
+        let base = tempdir("symlink-floor");
+        let root = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+
+        let floor = MandatoryFloor {
+            workspace_root: Some(root.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let policy = Policy::new(
+            vec![Rule::allow(ActionKind::Write, ResourcePattern::Any)],
+            floor,
+        );
+
+        let inside = root.join("ok.txt").to_string_lossy().into_owned();
+        assert!(
+            policy
+                .evaluate(&fs_write(&inside, Trust::Model))
+                .is_allowed()
+        );
+
+        let through_link = root.join("link/evil.txt").to_string_lossy().into_owned();
+        assert!(matches!(
+            policy.evaluate(&fs_write(&through_link, Trust::Model)),
+            Decision::Deny { .. }
+        ));
+
+        let climbing = root.join("link/../evil.txt").to_string_lossy().into_owned();
+        assert!(matches!(
+            policy.evaluate(&fs_write(&climbing, Trust::Model)),
+            Decision::Deny { .. }
+        ));
+
+        assert!(matches!(
+            policy.evaluate(&fs_write("link/evil.txt", Trust::Model)),
+            Decision::Deny { .. }
+        ));
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
     #[test]
     fn subtree_patterns_match_paths_and_not_their_lookalikes() {
         let pattern = ResourcePattern::parse("/tmp/**");
@@ -1126,10 +1213,10 @@ mod tests {
         else {
             panic!("an ask rule always proposes an amendment");
         };
-        assert_eq!(text, "allow execute shell.run resource=cargo test *");
+        assert_eq!(text, "allow execute shell.run resource=cargo *");
         let rule = parse_amendment(&text).expect("the runtime's own amendment parses");
         assert_eq!(rule.verb_prefix.as_deref(), Some("shell.run"));
-        assert_eq!(rule.resource, ResourcePattern::Prefix("cargo test".into()));
+        assert_eq!(rule.resource, ResourcePattern::Prefix("cargo".into()));
         assert_eq!(rule.outcome, RuleOutcome::Allow);
 
         let writes = Policy::with_defaults(

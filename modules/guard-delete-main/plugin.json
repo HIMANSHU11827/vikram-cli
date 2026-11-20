@@ -1,0 +1,26 @@
+{
+  "id": "guard-delete-main",
+  "name": "Guard: delete the main branch",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: delete the main branch.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "shell.run",
+      "arguments_contain": "branch -d main",
+      "deny": "deleting the main branch is an operator decision"
+    }
+  ]
+}

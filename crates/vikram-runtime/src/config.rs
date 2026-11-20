@@ -39,8 +39,8 @@ pub struct Config {
     /// Cap on generated tokens per completion request.
     pub max_output_tokens: Option<u32>,
     /// How long a provider may stay completely silent before the turn abandons the request. The
-    /// HTTP client tolerates ten minutes, which is longer than anyone should watch a frozen clock
-    /// and get no answer. Defaults to 60.
+    /// HTTP client tolerates thirty minutes of total request time, but silence is abandoned far
+    /// sooner — this is the watchdog that matters. Defaults to 60.
     #[serde(default = "default_stream_silence_secs")]
     pub stream_silence_secs: u64,
     /// Every Nth tool-bearing turn gets a background model review of its transcript, which spends
@@ -719,29 +719,52 @@ impl McpConfig {
     }
 }
 
-/// Resolve a path against the workspace root and refuse escapes.
+/// Resolve a path against the workspace root and refuse escapes. Symlinks are resolved
+/// component by component so `..` applies to the resolved target, not the lexical spelling.
 pub fn resolve_within(root: &Path, candidate: &Path) -> Option<PathBuf> {
-    let joined = if candidate.is_absolute() {
-        candidate.to_path_buf()
+    let canonical_root = resolve_symlinks(root)?;
+    let resolved = if candidate.is_absolute() {
+        resolve_symlinks(candidate)?
     } else {
-        root.join(candidate)
+        resolve_symlinks(&canonical_root.join(candidate))?
     };
-    let mut normalized = PathBuf::new();
-    for component in joined.components() {
+    (resolved == canonical_root || resolved.starts_with(&canonical_root)).then_some(resolved)
+}
+
+/// Resolve `path` one component at a time, canonicalizing every component that exists so symlink
+/// targets — including the parent a `..` climbs to — are the real ones. A component that exists
+/// but cannot be canonicalized refuses the whole path; a not-yet-existing tail is kept verbatim
+/// because it cannot contain symlinks.
+fn resolve_symlinks(path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
         use std::path::Component;
         match component {
-            Component::ParentDir => {
-                normalized.pop();
-            }
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
             Component::CurDir => {}
-            other => normalized.push(other.as_os_str()),
+            Component::ParentDir => {
+                current.pop();
+            }
+            Component::Normal(name) => {
+                current.push(name);
+                match current.canonicalize() {
+                    Ok(canonical) => current = canonical,
+                    Err(_) => {
+                        if current.symlink_metadata().is_ok() {
+                            return None;
+                        }
+                    }
+                }
+            }
         }
     }
-    if normalized.starts_with(root) {
-        Some(normalized)
-    } else {
-        None
-    }
+    Some(current)
 }
 
 /// `VIKRAM_HOME` and the security switches are process-global, and `ModeAvailability` reads them
@@ -922,6 +945,64 @@ mod tests {
         assert!(resolve_within(root, Path::new("src/main.rs")).is_some());
         assert!(resolve_within(root, Path::new("../etc/passwd")).is_none());
         assert!(resolve_within(root, Path::new("/etc/passwd")).is_none());
+    }
+
+    #[cfg(unix)]
+    fn symlinked_workspace() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        (dir, root)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_the_workspace_cannot_read_outside_it() {
+        let (dir, root) = symlinked_workspace();
+        std::fs::write(dir.path().join("outside/secret.txt"), "x").unwrap();
+        assert!(resolve_within(&root, Path::new("link/secret.txt")).is_none());
+        assert!(
+            resolve_within(&root, Path::new("link/../secret.txt")).is_none(),
+            "`..` must apply to the resolved symlink target, not the lexical spelling"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_directory_cannot_be_written_through() {
+        let (_dir, root) = symlinked_workspace();
+        assert!(resolve_within(&root, Path::new("link/new-file.txt")).is_none());
+        assert!(resolve_within(&root, Path::new("link/sub/dir/file.txt")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_paths_still_resolve_including_new_files() {
+        let (_dir, root) = symlinked_workspace();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        let existing = resolve_within(&root, Path::new("src/main.rs")).unwrap();
+        assert!(existing.ends_with("src/main.rs"));
+        let created = resolve_within(&root, Path::new("src/new/module.rs")).unwrap();
+        assert!(created.ends_with("src/new/module.rs"));
+        assert!(resolve_within(&root, Path::new(".")).is_some());
+        assert!(resolve_within(&root, Path::new("../escape")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_workspace_root_still_confines() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-ws");
+        std::fs::create_dir_all(&real).unwrap();
+        let link_root = dir.path().join("link-ws");
+        std::os::unix::fs::symlink(&real, &link_root).unwrap();
+        let resolved = resolve_within(&link_root, Path::new("file.txt")).unwrap();
+        assert!(resolved.starts_with(real.canonicalize().unwrap()));
+        assert!(resolve_within(&link_root, Path::new("../outside")).is_none());
     }
 
     /// Neutralise every layer a test is not deliberately setting, then restore on the same lock.

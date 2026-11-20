@@ -1,0 +1,26 @@
+{
+  "id": "guard-sudo",
+  "name": "Guard: privilege escalation",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: privilege escalation.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "shell.run",
+      "arguments_contain": "sudo ",
+      "deny": "the runtime has no sudo contract; run privileged work outside the agent"
+    }
+  ]
+}

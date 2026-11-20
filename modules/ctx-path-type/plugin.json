@@ -1,0 +1,24 @@
+{
+  "id": "ctx-path-type",
+  "name": "Context: use std::path",
+  "version": "1.0.0",
+  "description": "Adds a standing instruction to every turn: use std::path.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 60,
+  "components": {
+    "hooks": [
+      "context_build"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "context_build",
+      "append": "Build paths with std::path rather than string concatenation, so Windows and Unix both work."
+    }
+  ]
+}

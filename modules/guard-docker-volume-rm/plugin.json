@@ -1,0 +1,26 @@
+{
+  "id": "guard-docker-volume-rm",
+  "name": "Guard: remove a docker volume",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: remove a docker volume.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "shell.run",
+      "arguments_contain": "docker volume rm",
+      "deny": "removing a volume destroys data"
+    }
+  ]
+}

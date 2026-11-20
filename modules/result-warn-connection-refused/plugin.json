@@ -1,0 +1,25 @@
+{
+  "id": "result-warn-connection-refused",
+  "name": "Result: a refused connection",
+  "version": "1.0.0",
+  "description": "Inspects tool output for a refused connection.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 40,
+  "components": {
+    "hooks": [
+      "tool_result"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_result",
+      "result_contain": "connection refused",
+      "append_result": "[plugin] Nothing is listening there. Start the service or report it as unavailable."
+    }
+  ]
+}

@@ -21,9 +21,15 @@ const STDERR_FILE: &str = "chromium-stderr.log";
 /// How many bytes of that log are read back when something goes wrong.
 const STDERR_BYTES: u64 = 8 * 1024;
 
-/// Longest a single reply may be before it is treated as not-JSON. A `document.body.innerText`
+/// Longest a single reply may be before the call fails. A `document.body.innerText`
 /// dump is the only thing that gets near it.
 const MAX_REPLY_BYTES: usize = 8 * 1024 * 1024;
+
+/// The most one `browser.type` call may insert, mirroring `computer.type`'s limit.
+const MAX_TYPED_CHARS: usize = 10_000;
+
+/// One budget for the whole char-by-char typing fallback, rather than `CALL_TIMEOUT_MS` per key.
+const TYPE_CHARACTERS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Longest the debugger's HTTP reply may be. `/json/list` for a browser with many tabs is a few
 /// kilobytes; this only stops a wedged endpoint from filling memory.
@@ -79,7 +85,11 @@ impl Session {
                 _ => continue,
             };
             if text.len() > MAX_REPLY_BYTES {
-                continue;
+                // The browser answered; the answer was just unusable. A protocol failure keeps
+                // the session alive — a transport failure would kill the browser over one page.
+                return Err(Failure::Protocol(format!(
+                    "`{method}` reply exceeded {MAX_REPLY_BYTES} bytes"
+                )));
             }
             let Ok(value) = serde_json::from_str::<Value>(&text) else {
                 continue;
@@ -183,6 +193,7 @@ pub fn open(url: &str) -> Result<String, String> {
 
 /// [`open`] against a named binary, so the failure paths can be exercised without a browser.
 pub fn open_with(bin: &Path, url: &str) -> Result<String, String> {
+    validate_url(url)?;
     let profile = profile_dir()?;
     let mut child = match spawn(bin, &profile) {
         Ok(child) => child,
@@ -295,14 +306,17 @@ pub fn click(session: &str, selector: &str) -> Result<String, String> {
 /// emptied, because clearing it would also throw away the caret the keystrokes need.
 pub fn type_text(session: &str, selector: &str, text: &str) -> Result<String, String> {
     require_non_empty(selector, "selector")?;
+    let length = text.chars().count();
+    if length > MAX_TYPED_CHARS {
+        return Err(format!(
+            "text is {length} characters; the limit for a single call is {MAX_TYPED_CHARS}"
+        ));
+    }
     with_session(session, |s| {
         focus(s, selector)?;
         clear_value(s, selector)?;
         insert_text(s, text)?;
-        Ok(format!(
-            "typed {} characters into {selector}",
-            text.chars().count()
-        ))
+        Ok(format!("typed {length} characters into {selector}"))
     })
 }
 
@@ -471,11 +485,22 @@ fn insert_text(session: &mut Session, text: &str) -> Result<(), Failure> {
 }
 
 /// The last resort for typing: one `char` key event per character.
+///
+/// Every character is its own round trip, so the loop gets one wall-clock budget for all of
+/// them: `CALL_TIMEOUT_MS` per character would let a long text stall a session for hours.
 fn type_characters(session: &mut Session, text: &str) -> Result<(), Failure> {
+    let deadline = Instant::now() + TYPE_CHARACTERS_TIMEOUT;
     for ch in text.chars() {
+        if Instant::now() >= deadline {
+            return Err(Failure::Protocol(format!(
+                "typing one character at a time exceeded {} s; the rest was not typed",
+                TYPE_CHARACTERS_TIMEOUT.as_secs()
+            )));
+        }
         let mut buffer = [0u8; 4];
         let params = json!({"type": "char", "text": ch.encode_utf8(&mut buffer)});
-        session.call("Input.dispatchKeyEvent", params, call_deadline())?;
+        let per_call = (Instant::now() + Duration::from_millis(CALL_TIMEOUT_MS)).min(deadline);
+        session.call("Input.dispatchKeyEvent", params, per_call)?;
     }
     Ok(())
 }
@@ -717,7 +742,7 @@ fn http_get(port: u16, path: &str) -> Result<String, String> {
             }
         }
     }
-    parse_http_response(&String::from_utf8_lossy(&raw))
+    parse_http_response(&raw)
 }
 
 /// Connect a WebSocket to a `ws://` endpoint, bounding every read and write by `timeout`.
@@ -747,6 +772,7 @@ fn connect(endpoint: &str, port: u16, timeout: Duration) -> Result<WebSocket<Tcp
 
 /// Navigate an open session and give the page a chance to finish loading.
 fn navigate_to(session: &mut Session, url: &str, deadline: Instant) -> Result<(), String> {
+    validate_url(url)?;
     let result = session
         .call("Page.navigate", json!({"url": url}), deadline)
         .map_err(Failure::into_message)?;
@@ -849,12 +875,17 @@ fn content_length(head: &str) -> Option<usize> {
 /// The body of an HTTP/1.1 reply, or an error naming the status line.
 ///
 /// Chromium answers these requests with `Content-Length`; chunked framing is handled anyway
-/// because it costs a dozen lines and a silent truncation would be hard to diagnose.
-fn parse_http_response(raw: &str) -> Result<String, String> {
+/// because it costs a dozen lines and a silent truncation would be hard to diagnose. The reply
+/// is decoded as bytes, not as a lossy string: a chunk's size counts raw bytes, and slicing a
+/// `String` at those offsets can land mid-character — or past the end, once `U+FFFD` has
+/// replaced invalid bytes and changed the lengths.
+fn parse_http_response(raw: &[u8]) -> Result<String, String> {
     let split = raw
-        .find("\r\n\r\n")
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
         .ok_or_else(|| "the debugger's reply had no header terminator".to_string())?;
     let (head, body) = (&raw[..split], &raw[split + 4..]);
+    let head = String::from_utf8_lossy(head);
     let status = head.lines().next().unwrap_or_default();
     if !status.contains(" 200") {
         return Err(format!("the debugger refused the request: {status}"));
@@ -865,20 +896,21 @@ fn parse_http_response(raw: &str) -> Result<String, String> {
     {
         return dechunk(body);
     }
-    Ok(body.to_string())
+    Ok(String::from_utf8_lossy(body).into_owned())
 }
 
 /// Decode HTTP chunked framing.
-fn dechunk(body: &str) -> Result<String, String> {
+fn dechunk(body: &[u8]) -> Result<String, String> {
     let mut out = String::with_capacity(body.len());
     let mut cursor = 0usize;
     while cursor < body.len() {
         let line_end = body[cursor..]
-            .find("\r\n")
-            .ok_or_else(|| "a chunk header was unterminated".to_string())?
-            + cursor;
-        let header = body[cursor..line_end].trim();
-        let size_text = header.split(';').next().unwrap_or(header).trim();
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map(|at| at + cursor)
+            .ok_or_else(|| "a chunk header was unterminated".to_string())?;
+        let header = String::from_utf8_lossy(&body[cursor..line_end]);
+        let size_text = header.split(';').next().unwrap_or_default().trim();
         let size = usize::from_str_radix(size_text, 16)
             .map_err(|_| format!("`{size_text}` is not a chunk size"))?;
         if size == 0 {
@@ -889,7 +921,7 @@ fn dechunk(body: &str) -> Result<String, String> {
             .checked_add(size)
             .filter(|end| *end <= body.len())
             .ok_or_else(|| "a chunk ran past the end of the reply".to_string())?;
-        out.push_str(&body[start..end]);
+        out.push_str(&String::from_utf8_lossy(&body[start..end]));
         cursor = end + 2;
     }
     Ok(out)
@@ -1317,36 +1349,47 @@ mod tests {
 
     #[test]
     fn an_http_reply_yields_its_body() {
-        let raw = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]";
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]";
         assert_eq!(parse_http_response(raw).unwrap(), "[]");
     }
 
     #[test]
     fn a_non_200_reply_is_an_error_naming_the_status() {
-        let raw = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        let raw = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
         let err = parse_http_response(raw).unwrap_err();
         assert!(err.contains("404"), "{err}");
     }
 
     #[test]
     fn a_reply_without_a_header_terminator_is_an_error() {
-        assert!(parse_http_response("HTTP/1.1 200 OK").is_err());
+        assert!(parse_http_response(b"HTTP/1.1 200 OK").is_err());
     }
 
     #[test]
     fn a_chunked_reply_is_decoded() {
-        let raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
                        4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
         assert_eq!(parse_http_response(raw).unwrap(), "Wikipedia");
     }
 
     #[test]
     fn chunk_extensions_and_short_chunks_are_handled() {
-        assert_eq!(dechunk("3;ext=1\r\nabc\r\n0\r\n\r\n").unwrap(), "abc");
-        let err = dechunk("14\r\nabc\r\n0\r\n\r\n").unwrap_err();
+        assert_eq!(dechunk(b"3;ext=1\r\nabc\r\n0\r\n\r\n").unwrap(), "abc");
+        let err = dechunk(b"14\r\nabc\r\n0\r\n\r\n").unwrap_err();
         assert!(err.contains("past the end"), "{err}");
-        let err = dechunk("zz\r\nabc\r\n").unwrap_err();
+        let err = dechunk(b"zz\r\nabc\r\n").unwrap_err();
         assert!(err.contains("not a chunk size"), "{err}");
+    }
+
+    #[test]
+    fn a_chunked_reply_with_non_utf8_bytes_does_not_panic() {
+        // Chunk sizes count raw bytes; decoding the whole reply as a lossy string first would
+        // change those offsets and slice mid-character. Each chunk is decoded on its own.
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                       2\r\n\xff\xfe\r\n3\r\na\xe2\x82\r\n0\r\n\r\n";
+        let body = parse_http_response(raw).unwrap();
+        assert_eq!(body, "\u{FFFD}\u{FFFD}a\u{FFFD}");
+        assert_eq!(dechunk(b"1\r\n\xc3\r\n0\r\n\r\n").unwrap(), "\u{FFFD}");
     }
 
     #[test]
@@ -1923,5 +1966,32 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("cannot start"), "{err}");
         assert_eq!(count(), before);
+    }
+
+    #[test]
+    fn open_refuses_non_http_urls_before_spawning_a_browser() {
+        let before = count();
+        for url in [
+            "file:///etc/passwd",
+            "chrome://settings",
+            "data:text/html,<p>x</p>",
+            "javascript:alert(1)",
+        ] {
+            let err = open_with(Path::new("/nonexistent/vikram-chromium"), url).unwrap_err();
+            assert!(
+                err.contains("not a URL the browser may load"),
+                "{url}: {err}"
+            );
+        }
+        assert_eq!(count(), before);
+    }
+
+    #[test]
+    fn typing_is_capped_like_computer_type() {
+        // The limit is checked before the session is even looked up, so an unknown session id
+        // still reports the cap rather than "unknown session".
+        let huge = "a".repeat(MAX_TYPED_CHARS + 1);
+        let err = type_text("browser-1", "#q", &huge).unwrap_err();
+        assert!(err.contains(&MAX_TYPED_CHARS.to_string()), "{err}");
     }
 }

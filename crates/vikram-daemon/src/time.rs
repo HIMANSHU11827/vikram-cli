@@ -528,11 +528,11 @@ pub fn parse_duration(text: &str) -> Option<Millis> {
             'w' => 7 * 86_400 * MS_PER_SEC,
             _ => return None,
         };
-        total += value * factor;
+        total = total.checked_add(value.checked_mul(factor)?)?;
         number.clear();
         unit = Some(ch);
     }
-    if !number.is_empty() || unit.is_none() || total == 0 {
+    if !number.is_empty() || unit.is_none() || total <= 0 {
         return None;
     }
     Some(total)
@@ -687,6 +687,17 @@ mod tests {
         assert_eq!(parse_duration("10x"), None);
         assert_eq!(parse_duration("1h30"), None);
         assert_eq!(parse_duration(""), None);
+    }
+
+    #[test]
+    fn durations_that_overflow_are_refused_not_wrapped() {
+        assert_eq!(
+            parse_duration("999999999999999999d"),
+            None,
+            "a duration past i64 milliseconds is refused, never wrapped into the past"
+        );
+        assert_eq!(parse_duration("999999999999999999w"), None);
+        assert_eq!(parse_duration("9223372036854775807s"), None);
     }
 
     #[test]

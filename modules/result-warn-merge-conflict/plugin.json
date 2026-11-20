@@ -1,0 +1,25 @@
+{
+  "id": "result-warn-merge-conflict",
+  "name": "Result: a git conflict",
+  "version": "1.0.0",
+  "description": "Inspects tool output for a git conflict.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 40,
+  "components": {
+    "hooks": [
+      "tool_result"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_result",
+      "result_contain": "CONFLICT (",
+      "append_result": "[plugin] Git reported a conflict. Stop and resolve it explicitly."
+    }
+  ]
+}

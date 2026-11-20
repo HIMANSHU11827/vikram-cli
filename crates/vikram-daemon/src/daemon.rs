@@ -159,18 +159,54 @@ fn holder_is_alive(body: &LockBody) -> bool {
         // A lock written on another machine says nothing about this one; leave it alone.
         return false;
     }
-    // /proc counts start time in whole clock ticks, so the reading can be a few milliseconds off the
-    // one recorded; the comparison is about identity, not precision.
-    process_started_ms(body.pid).is_some_and(|started| (started - body.started_ms).abs() <= 2_000)
+    match process_started_ms(body.pid) {
+        // /proc counts start time in whole clock ticks, so the reading can be a few milliseconds off
+        // the one recorded; the comparison is about identity, not precision.
+        Some(started) => (started - body.started_ms).abs() <= 2_000,
+        // No /proc (macOS, Windows) means no start time, so a live pid is all the identity left to
+        // check. A reused pid then looks like the holder — the safer mistake, because the
+        // alternative is a second daemon writing the same SQLite file.
+        None => process_alive(body.pid),
+    }
 }
 
 fn hostname() -> String {
     std::env::var("HOSTNAME")
         .ok()
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
         .or_else(|| fs::read_to_string("/proc/sys/kernel/hostname").ok())
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "localhost".into())
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 runs the existence and permission checks without delivering anything.
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: the handle is null-checked and closed on every path. A process we cannot open is
+    // either gone or not ours, and in both cases it is not holding this lock.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut code) != 0;
+        let _ = CloseHandle(handle);
+        ok && code == STILL_ACTIVE
+    }
 }
 
 /// When a live process started, in epoch milliseconds, or `None` when it is gone.
@@ -325,8 +361,9 @@ impl Daemon {
         }
 
         // A cancel is a request written by `vikram jobs cancel`. Nothing aborts a task on its own,
-        // so this is where it lands; the flag is cleared once honoured so the next pass does not
-        // repeat it. A run that already finished has nothing left to abort.
+        // so this is where it lands; the key is deleted once honoured so the next pass does not
+        // repeat it and `daemon_state` does not keep every cancel ever asked for. A run that
+        // already finished has nothing left to abort; its key is swept as litter instead.
         let cancelling: Vec<String> = self
             .running
             .iter()
@@ -339,7 +376,7 @@ impl Daemon {
             .collect();
         for id in cancelling {
             self.pool.cancel(&id);
-            let _ = self.store.set_state(&format!("cancel.{id}"), "0");
+            let _ = self.store.delete_state(&format!("cancel.{id}"));
         }
 
         for job in self.store.list_jobs()? {
@@ -362,8 +399,62 @@ impl Daemon {
         }
 
         self.collect(&mut report, now).await?;
+        self.reconcile_lost(now)?;
+        self.sweep_state()?;
         self.beat(now, &mut report).await;
         Ok(report)
+    }
+
+    /// A `running` row older than its job's timeout is a lost Finished, not a slow job: the work
+    /// cannot legitimately outlive its own deadline, so whatever is left is aborted and the run
+    /// settled as unknown, which is what unblocks the job's next claim.
+    fn reconcile_lost(&mut self, now: Millis) -> Result<(), StoreError> {
+        for run in self.store.running_runs()? {
+            let Ok(Some(job)) = self.store.get_job(&run.job_id) else {
+                continue;
+            };
+            let timeout = job.timeout_ms.unwrap_or(DEFAULT_JOB_TIMEOUT_MS).max(1_000);
+            // The grace covers a Finished already sent but not yet collected: it can only be a
+            // tick old, never a whole timeout.
+            if now.saturating_sub(run.started_ms) <= timeout.saturating_add(self.tick_ms as Millis)
+            {
+                continue;
+            }
+            self.pool.cancel(&run.id);
+            self.store.expire_run(&run, now)?;
+            self.running.retain(|entry| entry.run_id != run.id);
+            if job.next_run_ms.is_none() {
+                self.store.set_enabled(&job.id, false, now)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `cancel.` and `member.` keys belong to a run. Honoured cancels are deleted where they are
+    /// honoured, but a request that lands after its run ended — or a member stop on a hive that
+    /// crashed — would sit in `daemon_state` forever, so anything whose run is no longer live is
+    /// swept.
+    fn sweep_state(&self) -> Result<(), StoreError> {
+        let mut live: std::collections::HashSet<String> = self
+            .running
+            .iter()
+            .map(|entry| entry.run_id.clone())
+            .collect();
+        live.extend(self.store.running_runs()?.into_iter().map(|run| run.id));
+        for prefix in ["cancel.", "member."] {
+            for key in self.store.state_keys(prefix)? {
+                // Run ids never contain a dot, so the first segment after the prefix is the run;
+                // for `member.` keys the rest is the agent that was asked to stop.
+                let run = key
+                    .strip_prefix(prefix)
+                    .and_then(|rest| rest.split('.').next())
+                    .unwrap_or("");
+                if !run.is_empty() && !live.contains(run) {
+                    self.store.delete_state(&key)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Advance a slot that is older than the tolerance instead of running it.
@@ -990,5 +1081,121 @@ mod tests {
         let outcome = work_for(&job, 1_000, None).await;
         assert!(!outcome.ok);
         assert!(outcome.error.unwrap_or_default().contains("--agent"));
+    }
+
+    #[tokio::test]
+    async fn state_keys_for_runs_that_are_over_are_swept() {
+        let store = store();
+        let manager = JobManager::new(store.clone());
+        let now = time::now_ms();
+        let job = manager
+            .create(
+                NewJob::new("sweep me", "every 1m")
+                    .mode(JobMode::Script)
+                    .payload("sleep 1")
+                    .target("none"),
+                now,
+            )
+            .unwrap();
+        manager.run_now(&job.id, now).unwrap();
+        let dir = home();
+        let mut daemon = Daemon::new(store.clone(), dir.path()).with_tick_ms(50);
+        daemon.tick(now).await.unwrap();
+        let run = store.runs_for(&job.id, 1).unwrap().remove(0);
+        assert_eq!(run.status, RunStatus::Running);
+
+        // Keys for a run that does not exist are litter; keys for the live run are not.
+        store.set_state("cancel.run_dead_1_2_3", "1").unwrap();
+        store
+            .set_state(
+                &crate::store::member_stop_key("run_dead_1_2_3", "mira"),
+                "1",
+            )
+            .unwrap();
+        store
+            .set_state(&crate::store::member_stop_key(&run.id, "mira"), "1")
+            .unwrap();
+        daemon.tick(time::now_ms()).await.unwrap();
+
+        assert!(store.state("cancel.run_dead_1_2_3").unwrap().is_none());
+        assert!(
+            store
+                .state(&crate::store::member_stop_key("run_dead_1_2_3", "mira"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .state(&crate::store::member_stop_key(&run.id, "mira"))
+                .unwrap()
+                .is_some(),
+            "a live run keeps the keys the operator may still need"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1_400)).await;
+        daemon.tick(time::now_ms()).await.unwrap();
+        assert!(
+            store
+                .state(&crate::store::member_stop_key(&run.id, "mira"))
+                .unwrap()
+                .is_none(),
+            "once the run is over its keys go too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_that_never_reported_back_stops_wedging_its_job() {
+        let store = store();
+        let manager = JobManager::new(store.clone());
+        let now = time::now_ms();
+        let anchor = manager
+            .create(
+                NewJob::new("anchor", "every 1m")
+                    .mode(JobMode::Script)
+                    .payload("sleep 30")
+                    .target("none"),
+                now,
+            )
+            .unwrap();
+        manager.run_now(&anchor.id, now).unwrap();
+        let stuck_job = manager
+            .create(
+                NewJob::new("stuck", "every 1m")
+                    .mode(JobMode::Script)
+                    .payload("true")
+                    .target("none")
+                    .timeout_ms(500),
+                now,
+            )
+            .unwrap();
+
+        let dir = home();
+        let mut daemon = Daemon::new(store.clone(), dir.path()).with_tick_ms(50);
+        daemon.tick(now).await.unwrap();
+        // The stuck job's run row exists and its Finished was lost: the daemon still lists it as
+        // in flight even though nothing is running it.
+        let stuck_run = store.begin_run(&stuck_job, now, None).unwrap();
+        daemon.running.push(Running {
+            job_id: stuck_job.id.clone(),
+            run_id: stuck_run.id.clone(),
+        });
+
+        tokio::time::sleep(Duration::from_millis(1_300)).await;
+        daemon.tick(time::now_ms()).await.unwrap();
+
+        let run = store.get_run(&stuck_run.id).unwrap().unwrap();
+        assert_eq!(
+            run.status,
+            RunStatus::Unknown,
+            "a lost Finished is settled as unknown, not left running"
+        );
+        assert_eq!(daemon.in_flight(), 1, "only the anchor is still in flight");
+
+        // The in-flight check that wedged the job now lets it be claimed again.
+        let slot = time::now_ms();
+        store.set_next_run(&stuck_job.id, Some(slot), slot).unwrap();
+        let fresh = store.get_job(&stuck_job.id).unwrap().unwrap();
+        let claimed = manager.claim(&fresh, slot, slot).unwrap();
+        assert!(claimed.is_some(), "the job can be claimed again");
     }
 }

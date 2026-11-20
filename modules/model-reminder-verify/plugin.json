@@ -1,0 +1,24 @@
+{
+  "id": "model-reminder-verify",
+  "name": "Model: verify before finishing",
+  "version": "1.0.0",
+  "description": "Asks the model to verify the change before reporting it.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 70,
+  "components": {
+    "hooks": [
+      "model_request"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "model_request",
+      "append": "Before reporting, verify the change with the narrowest relevant check."
+    }
+  ]
+}

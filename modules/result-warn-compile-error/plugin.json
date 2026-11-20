@@ -1,0 +1,25 @@
+{
+  "id": "result-warn-compile-error",
+  "name": "Result: a compiler error",
+  "version": "1.0.0",
+  "description": "Inspects tool output for a compiler error.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 40,
+  "components": {
+    "hooks": [
+      "tool_result"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_result",
+      "result_contain": "error[E",
+      "append_result": "[plugin] The compiler rejected this. Fix the error before summarising."
+    }
+  ]
+}

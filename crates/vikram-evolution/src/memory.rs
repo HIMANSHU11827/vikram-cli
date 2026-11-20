@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::redact::sanitize_for_storage;
-use crate::store::EvolutionStore;
+use crate::store::{EvolutionStore, find_memory_conn, save_memory_conn};
 use crate::types::{KnowledgeStatus, MemoryEntry, MemoryLayer, gen_id, now_ms};
 
 pub struct LayeredMemory {
@@ -60,63 +60,68 @@ impl LayeredMemory {
         let value = sanitize_for_storage(value)?;
         let key = sanitize_for_storage(key)?;
         let now = now_ms();
-        if let Some(existing) = self.store.find_memory(layer, scope, &key)? {
-            // Conflict handling
-            if confidence > existing.confidence + 0.05
-                || status_rank(status) > status_rank(existing.status)
-            {
-                // New entry supersedes the old one. The id is generated
-                // *before* saving so the old row can point at it.
-                let new_id = gen_id("mem");
-                let prov = format!("{provenance} | supersedes {}", existing.id);
-                let entry = MemoryEntry {
-                    id: new_id.clone(),
-                    layer,
-                    scope: scope.to_string(),
-                    key,
-                    value,
-                    status,
-                    confidence: confidence.max(existing.confidence),
-                    source_experience: source
-                        .map(|s| s.to_string())
-                        .or_else(|| existing.source_experience.clone()),
-                    provenance: prov,
-                    created_ms: now,
-                    updated_ms: now,
-                    expires_ms,
-                    superseded_by: None,
-                };
-                self.store.save_memory(&entry)?;
-                // Now retire the old entry, pointing at the new one.
-                // (Never at itself — `save_memory` rejects self-loops.)
-                let mut old = existing.clone();
-                old.superseded_by = Some(new_id);
-                old.updated_ms = now;
-                self.store.save_memory(&old)?;
-                return Ok(entry);
-            } else {
+        // Find + insert + supersede run in one IMMEDIATE transaction:
+        // previously each step took the store lock separately, so two
+        // concurrent `remember`s for the same key could both observe "no
+        // live entry" and both insert, leaving duplicate live rows.
+        self.store.transact(|conn| {
+            if let Some(existing) = find_memory_conn(conn, layer, scope, &key)? {
+                // Conflict handling
+                if confidence > existing.confidence + 0.05
+                    || status_rank(status) > status_rank(existing.status)
+                {
+                    // New entry supersedes the old one. The id is generated
+                    // *before* saving so the old row can point at it.
+                    let new_id = gen_id("mem");
+                    let prov = format!("{provenance} | supersedes {}", existing.id);
+                    let entry = MemoryEntry {
+                        id: new_id.clone(),
+                        layer,
+                        scope: scope.to_string(),
+                        key,
+                        value,
+                        status,
+                        confidence: confidence.max(existing.confidence),
+                        source_experience: source
+                            .map(|s| s.to_string())
+                            .or_else(|| existing.source_experience.clone()),
+                        provenance: prov,
+                        created_ms: now,
+                        updated_ms: now,
+                        expires_ms,
+                        superseded_by: None,
+                    };
+                    save_memory_conn(conn, &entry)?;
+                    // Now retire the old entry, pointing at the new one.
+                    // (Never at itself — `save_memory_conn` rejects self-loops.)
+                    let mut old = existing.clone();
+                    old.superseded_by = Some(new_id);
+                    old.updated_ms = now;
+                    save_memory_conn(conn, &old)?;
+                    return Ok(entry);
+                }
                 // keep existing (superseded/expired rows are already
-                // excluded by `find_memory`)
+                // excluded by `find_memory_conn`)
                 return Ok(existing);
             }
-        }
-        let entry = MemoryEntry {
-            id: gen_id("mem"),
-            layer,
-            scope: scope.to_string(),
-            key,
-            value,
-            status,
-            confidence,
-            source_experience: source.map(|s| s.to_string()),
-            provenance: provenance.to_string(),
-            created_ms: now,
-            updated_ms: now,
-            expires_ms,
-            superseded_by: None,
-        };
-        self.store.save_memory(&entry)?;
-        Ok(entry)
+            let entry = MemoryEntry {
+                id: gen_id("mem"),
+                layer,
+                scope: scope.to_string(),
+                key,
+                value,
+                status,
+                confidence,
+                source_experience: source.map(|s| s.to_string()),
+                provenance: provenance.to_string(),
+                created_ms: now,
+                updated_ms: now,
+                expires_ms,
+                superseded_by: None,
+            };
+            save_memory_conn(conn, &entry)?;
+            Ok(entry)
+        })
     }
 
     pub fn recall(
@@ -223,5 +228,70 @@ fn status_rank(s: KnowledgeStatus) -> u8 {
         KnowledgeStatus::Inferred => 3,
         KnowledgeStatus::Hypothesis => 2,
         KnowledgeStatus::Temporary => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn concurrent_remembers_of_same_key_leave_one_live_entry() {
+        let store = EvolutionStore::open_in_memory().unwrap();
+        let barrier = Arc::new(Barrier::new(8));
+        let mut handles = Vec::new();
+        for i in 0..8u32 {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                let memory = LayeredMemory::new(store);
+                barrier.wait();
+                memory
+                    .remember(
+                        MemoryLayer::Project,
+                        "project:p1",
+                        "db",
+                        &format!("value-{i}"),
+                        KnowledgeStatus::Observed,
+                        0.5 + i as f32 * 0.1,
+                        None,
+                        "concurrency-test",
+                    )
+                    .unwrap()
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let all = store.list_memory_all(None).unwrap();
+        let key_rows: Vec<&MemoryEntry> = all.iter().filter(|m| m.key == "db").collect();
+        assert!(
+            !key_rows.is_empty(),
+            "at least one remember must have inserted"
+        );
+        let live = key_rows.iter().filter(|m| m.is_live(now_ms())).count();
+        assert_eq!(
+            live, 1,
+            "find+insert+supersede is atomic: exactly one live entry per key"
+        );
+        // Every non-live row for the key must be properly superseded —
+        // never a duplicate live row and never a self-loop.
+        for row in &key_rows {
+            if !row.is_live(now_ms()) {
+                let by = row
+                    .superseded_by
+                    .as_deref()
+                    .expect("dead row is superseded");
+                assert_ne!(by, row.id.as_str(), "no self-supersession");
+            }
+        }
+        assert!(
+            store
+                .find_memory(MemoryLayer::Project, "project:p1", "db")
+                .unwrap()
+                .is_some()
+        );
     }
 }

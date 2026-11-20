@@ -1,0 +1,24 @@
+{
+  "id": "ctx-small-diffs",
+  "name": "Context: smallest diff",
+  "version": "1.0.0",
+  "description": "Adds a standing instruction to every turn: smallest diff.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 60,
+  "components": {
+    "hooks": [
+      "context_build"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "context_build",
+      "append": "Prefer the smallest diff that fixes the cause; do not refactor untouched code."
+    }
+  ]
+}

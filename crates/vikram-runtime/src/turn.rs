@@ -151,11 +151,19 @@ pub(crate) fn spawn_turn(
     // separate steps, so two submits can both see an idle session. The loser queues its text —
     // the same slot the queue drain claims through here — rather than starting a second turn.
     if !session.claim_turn() {
-        let depth = session.enqueue(message.text_body());
-        inner.emit(RuntimeEvent::Notice {
-            level: NoticeLevel::Info,
-            text: format!("queued ({depth} waiting)"),
-        });
+        match session.enqueue(message.text_body()) {
+            Some(depth) => inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Info,
+                text: format!("queued ({depth} waiting)"),
+            }),
+            None => inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!(
+                    "the follow-up queue is full ({} waiting); the message was not queued",
+                    SessionRuntime::MAX_QUEUED_FOLLOW_UPS
+                ),
+            }),
+        }
         return;
     }
     tokio::spawn(async move {
@@ -172,6 +180,20 @@ pub(crate) async fn run_turn(
     let turn = TurnId::generate();
     let started = Instant::now();
     let cancel = session.cancel_handle();
+    // The claim was taken in `spawn_turn` before this task existed, so a panic that unwinds past
+    // `finish` would strand it: the slot stays held, `is_busy` never clears, and every later
+    // submit queues behind a turn that no longer exists. The guard is the unwind path `finish`
+    // cannot be — armed for the whole turn and disarmed only after `finish` hands the slot back.
+    let claim_guard = TurnGuard {
+        inner: Arc::clone(&inner),
+        session: Arc::clone(&session),
+        turn: turn.clone(),
+        agent: agent.as_ref().map(|run| AgentRun {
+            agent: Arc::clone(&run.agent),
+            task_id: run.task_id.clone(),
+        }),
+        armed: std::cell::Cell::new(true),
+    };
 
     // The user's message is durable before any model work begins.
     let request_text = message.text_body();
@@ -225,6 +247,40 @@ pub(crate) async fn run_turn(
     let mut step_notice_sent = false;
     let mut live_metrics = Instant::now();
 
+    // A turn-start hook may refuse the request or attach context the turn then carries. It runs
+    // before the provider gate so a refusal is reported even when no model is configured.
+    let turn_start = run_hook(
+        &inner,
+        &session,
+        crate::hooks::HookContext::new(crate::hooks::HookPoint::TurnStart)
+            .with_session(session.id.as_str())
+            .with_turn(turn.as_str())
+            .with_workspace(inner.workspace_root.display().to_string())
+            .with_model(inner.model())
+            .with_text(&request_text),
+    )
+    .await;
+    if let Some(reason) = &turn_start.effect.deny {
+        inner.emit(RuntimeEvent::Error {
+            text: format!("a plugin refused this turn: {reason}"),
+        });
+        finish(
+            &inner,
+            &session,
+            &agent,
+            turn,
+            TurnReport {
+                outcome: TurnState::Failed,
+                started,
+                output_tokens,
+                request: &request_text,
+                growth: &growth,
+            },
+        );
+        claim_guard.disarm();
+        return;
+    }
+
     let Some(provider) = inner.provider.read().expect("provider lock").clone() else {
         inner.emit(RuntimeEvent::Error {
             text: "no model configured: set `model` and the API key named by `api_key_env`".into(),
@@ -242,6 +298,7 @@ pub(crate) async fn run_turn(
                 growth: &TurnGrowth::default(),
             },
         );
+        claim_guard.disarm();
         return;
     };
 
@@ -269,6 +326,9 @@ pub(crate) async fn run_turn(
         // prices what is actually being sent rather than guessing at the shape afterwards.
         let mut prefix: Vec<Message> = Vec::new();
         let mut labels: Vec<&'static str> = Vec::new();
+        // What the turn-start hook asked to add goes in front of everything the host assembled.
+        let mut injected_prefix: Vec<String> = turn_start.effect.prepend.clone();
+        injected_prefix.extend(turn_start.effect.append.iter().cloned());
         if !catalog_text.trim().is_empty() {
             labels.push("skill catalogue");
             prefix.push(Message::text(Role::System, catalog_text, Trust::External));
@@ -312,7 +372,16 @@ pub(crate) async fn run_turn(
         //   Layer 1 (base context) — durable retrieved memory, project/agent identity.
         //   Layer 2 (dialectic supplement) — the heuristic user model derived from earlier
         //   turns (preferences/habits/goals). Labelled separately so the meter can price each.
-        if let Some(memory_text) = inner.retrieved_memory(&session) {
+        // Retrieval is a SQLite query plus disk reads; like the code-index fallback below it runs
+        // on the blocking pool so it cannot hold an executor thread the stream loop shares.
+        let memory_text = {
+            let inner = Arc::clone(&inner);
+            let session = Arc::clone(&session);
+            tokio::task::spawn_blocking(move || inner.retrieved_memory(&session))
+                .await
+                .unwrap_or_default()
+        };
+        if let Some(memory_text) = memory_text {
             labels.insert(0, "retrieved memory");
             prefix.insert(0, Message::text(Role::System, memory_text, Trust::External));
         }
@@ -341,7 +410,7 @@ pub(crate) async fn run_turn(
                     if ctx.contains("no index") {
                         // Degraded: tell the model a grep fallback ran, without flooding.
                         if let Some(marker) = ctx.find("grep fallback") {
-                            let slice = ctx[marker..ctx.len().min(marker + 600)].to_owned();
+                            let slice = bounded_prefix(&ctx[marker..], 600);
                             labels.push("code index (grep fallback)");
                             prefix.push(Message::text(Role::System, slice, Trust::External));
                         }
@@ -351,6 +420,47 @@ pub(crate) async fn run_turn(
                     }
                 }
             }
+        }
+        let context_hook = run_hook(
+            &inner,
+            &session,
+            crate::hooks::HookContext::new(crate::hooks::HookPoint::ContextBuild)
+                .with_session(session.id.as_str())
+                .with_turn(turn.as_str())
+                .with_workspace(inner.workspace_root.display().to_string())
+                .with_model(inner.model())
+                .with_text(&request_text),
+        )
+        .await;
+        if let Some(reason) = &context_hook.effect.deny {
+            inner.emit(RuntimeEvent::Error {
+                text: format!("a plugin refused this turn's context: {reason}"),
+            });
+            finish(
+                &inner,
+                &session,
+                &agent,
+                turn,
+                TurnReport {
+                    outcome: TurnState::Failed,
+                    started,
+                    output_tokens,
+                    request: &request_text,
+                    growth: &growth,
+                },
+            );
+            claim_guard.disarm();
+            return;
+        }
+        let mut injected: Vec<String> = injected_prefix.clone();
+        injected.extend(context_hook.effect.prepend.iter().cloned());
+        for (offset, text) in injected.into_iter().enumerate() {
+            prefix.insert(offset, Message::text(Role::System, text, Trust::External));
+            labels.insert(offset, "plugin context");
+        }
+        for text in &context_hook.effect.append {
+            prefix.push(Message::text(Role::System, text.clone(), Trust::External));
+            labels.push("plugin context");
         }
         let (transcript, budget) = inner.prepare_context(&session, &prefix);
         let estimator = session.estimator();
@@ -407,15 +517,66 @@ pub(crate) async fn run_turn(
         // estimator learns this model's real cost per character.
         let estimated_input = estimator.estimate_messages(&request_messages);
         last_estimated_input = estimated_input;
+        let model_hook = run_hook(
+            &inner,
+            &session,
+            crate::hooks::HookContext::new(crate::hooks::HookPoint::ModelRequest)
+                .with_session(session.id.as_str())
+                .with_turn(turn.as_str())
+                .with_workspace(inner.workspace_root.display().to_string())
+                .with_model(inner.model())
+                .with_text(&request_text),
+        )
+        .await;
+        if let Some(reason) = &model_hook.effect.deny {
+            inner.emit(RuntimeEvent::Error {
+                text: format!("a plugin refused the model request: {reason}"),
+            });
+            finish(
+                &inner,
+                &session,
+                &agent,
+                turn,
+                TurnReport {
+                    outcome: TurnState::Failed,
+                    started,
+                    output_tokens,
+                    request: &request_text,
+                    growth: &growth,
+                },
+            );
+            claim_guard.disarm();
+            return;
+        }
+        for text in model_hook.effect.prepend.iter().rev() {
+            request_messages.insert(
+                0,
+                Message::text(Role::System, text.clone(), Trust::External),
+            );
+        }
+        for text in &model_hook.effect.append {
+            request_messages.push(Message::text(Role::System, text.clone(), Trust::External));
+        }
         let request = CompletionRequest {
             model: inner.model(),
             messages: request_messages,
             tools: inner.tools.specs(),
-            max_output_tokens: inner
-                .config
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .max_output_tokens,
+            max_output_tokens: model_hook
+                .effect
+                .max_output_tokens
+                .or_else(|| {
+                    inner
+                        .config
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .max_output_tokens
+                })
+                // Nothing explicit: the registry's per-model figure, so Anthropic stops
+                // hard-capping every turn at its 4096 default. Unknown models send no cap —
+                // the assumed floor is a budgeting guess, not a provider limit.
+                .or_else(|| {
+                    crate::context_engine::ModelLimits::declared_output_cap(&inner.model())
+                }),
         };
 
         let mut stream = provider.stream(request);
@@ -715,11 +876,9 @@ pub(crate) async fn run_turn(
         for (call_id, content, ok) in results {
             let result = Message::tool_result(call_id, content, ok);
             session.push_message(result.clone(), now_ms());
-            inner.journal(
-                &session.id,
-                RecordKind::ToolResult,
-                serde_json::json!({"message": result}),
-            );
+            let mut journaled = serde_json::json!({"message": result});
+            crate::redact::redact_json(&mut journaled);
+            inner.journal(&session.id, RecordKind::ToolResult, journaled);
             inner.emit(RuntimeEvent::MessageCommitted {
                 session: session.id.clone(),
                 message: result,
@@ -826,6 +985,7 @@ pub(crate) async fn run_turn(
             growth: &growth,
         },
     );
+    claim_guard.disarm();
 }
 
 /// The resource a call touches, when two calls touching the same one must keep their order.
@@ -975,6 +1135,48 @@ fn commit_assistant_text(
         session: session.id.clone(),
         message,
     });
+}
+
+/// The unwind path `finish` cannot be. `run_turn` is spawned with its `JoinHandle` dropped, so
+/// a panic inside it surfaces to nobody: without this guard the turn slot stays claimed forever
+/// and the session wedges. The guard fires only while the turn still looks mid-flight — a
+/// claimed slot *and* a busy state — which is exactly the state a panic leaves behind and never
+/// the state a finished (or already-reported) turn is in.
+struct TurnGuard {
+    inner: Arc<RuntimeInner>,
+    session: Arc<SessionRuntime>,
+    turn: TurnId,
+    agent: Option<AgentRun>,
+    armed: std::cell::Cell<bool>,
+}
+
+impl TurnGuard {
+    fn disarm(&self) {
+        self.armed.set(false);
+    }
+}
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        if !self.armed.get() || !self.session.turn_claimed() || !self.session.is_busy() {
+            return;
+        }
+        self.session.finish_turn(TurnState::Failed, now_ms());
+        if let Some(run) = &self.agent {
+            run.agent.set_state(BotState::Failed);
+            run.agent.set_task(None);
+            self.inner.publish_bot(&run.agent);
+            if let Some(task) = self.inner.tasks.finish(&run.task_id, TaskState::Failed) {
+                self.inner.task_snapshot(&task);
+            }
+        }
+        self.inner.emit(RuntimeEvent::TurnFinished {
+            session: self.session.id.clone(),
+            turn: self.turn.clone(),
+            state: TurnState::Failed,
+        });
+        self.session.release_turn();
+    }
 }
 
 /// What a finished turn is worth telling the rest of the runtime: how it ended, what it cost, what
@@ -1199,7 +1401,7 @@ async fn run_tool_once(
 ) -> (String, bool) {
     let started = std::time::Instant::now();
     let cwd = inner.tool_context().workspace_root.display().to_string();
-    let arguments_text = truncate(&call.arguments.to_string(), 8_000);
+    let mut arguments_text = truncate(&call.arguments.to_string(), 8_000);
     let elapsed = move || started.elapsed().as_millis() as u64;
 
     let Some(tool) = inner.tools.get(&call.name) else {
@@ -1233,6 +1435,50 @@ async fn run_tool_once(
         });
         return (format!("tool `{}` is disabled", call.name), false);
     }
+    // The call hook runs before policy so a rewritten argument is the one policy judges, and a
+    // denial costs nothing: the tool never runs and the model is told why.
+    let mut call = call.clone();
+    let call_hook = run_hook(
+        inner,
+        session,
+        crate::hooks::HookContext::new(crate::hooks::HookPoint::ToolCall)
+            .with_session(session.id.as_str())
+            .with_workspace(inner.workspace_root.display().to_string())
+            .with_model(inner.model())
+            .with_text(call.name.clone())
+            .with_tool(call.name.clone(), call.arguments.clone()),
+    )
+    .await;
+    if let Some(reason) = &call_hook.effect.deny {
+        let content = format!("denied by plugin: {reason}");
+        inner.emit(RuntimeEvent::ToolStarted {
+            session: session.id.clone(),
+            call: call.id.clone(),
+            name: call.name.clone(),
+            summary: content.clone(),
+            resource: String::new(),
+            arguments: arguments_text.clone(),
+            cwd: cwd.clone(),
+        });
+        inner.emit(RuntimeEvent::ToolFinished {
+            session: session.id.clone(),
+            call: call.id.clone(),
+            name: call.name.clone(),
+            ok: false,
+            summary: content.clone(),
+            content: content.clone(),
+            resource: String::new(),
+            arguments: arguments_text.clone(),
+            cwd: cwd.clone(),
+            duration_ms: elapsed(),
+        });
+        return (content, false);
+    }
+    if let Some(arguments) = call_hook.effect.arguments {
+        call.arguments = arguments;
+        arguments_text = truncate(&call.arguments.to_string(), 8_000);
+    }
+
     let mut request = match tool.permission(&call.arguments) {
         Ok(request) => PermissionRequest {
             originating_trust: origin.trust(),
@@ -1403,10 +1649,14 @@ async fn run_tool_once(
         Decision::Allow => {}
     }
 
+    // Arguments are journaled for replay, but a command can carry a credential (`curl -H
+    // "Authorization: Bearer …"`); the journal is plaintext, so secrets are redacted first.
+    let mut journaled_arguments = call.arguments.clone();
+    crate::redact::redact_json(&mut journaled_arguments);
     inner.journal(
         &session.id,
         RecordKind::ToolCall,
-        serde_json::json!({"call": call.id.as_str(), "name": call.name, "arguments": call.arguments}),
+        serde_json::json!({"call": call.id.as_str(), "name": call.name, "arguments": journaled_arguments}),
     );
 
     let summary = summarize_arguments(&call.arguments);
@@ -1500,6 +1750,35 @@ async fn run_tool_once(
         }
     }
 
+    // A result hook sees what the tool produced before the transcript does, so a plugin can
+    // annotate or withhold it without replacing the tool.
+    let result_hook = run_hook(
+        inner,
+        session,
+        crate::hooks::HookContext::new(crate::hooks::HookPoint::ToolResult)
+            .with_session(session.id.as_str())
+            .with_workspace(inner.workspace_root.display().to_string())
+            .with_model(inner.model())
+            .with_text(call.name.clone())
+            .with_tool(call.name.clone(), call.arguments.clone())
+            .with_result(content.clone(), ok),
+    )
+    .await;
+    if let Some(reason) = &result_hook.effect.deny {
+        content = format!("the result was withheld by a plugin: {reason}");
+        ok = false;
+    }
+    if let Some(replacement) = result_hook.effect.content {
+        content = replacement;
+    }
+    if let Some(flag) = result_hook.effect.ok {
+        ok = flag;
+    }
+    for note in &result_hook.effect.append {
+        content.push('\n');
+        content.push_str(note);
+    }
+
     // What is journaled and sent next is what the model will be held to: the digest. The full text
     // stays on disk under the session's spool, named by the handle appended to it.
     let content = inner.spool_output(&session.id, call.id.as_str(), content);
@@ -1511,7 +1790,7 @@ async fn run_tool_once(
             "call": call.id.as_str(),
             "name": call.name,
             "ok": ok,
-            "content": truncate(&content, 64_000),
+            "content": truncate(&crate::redact::redact_secrets(&content), 64_000),
         }),
     );
     inner.emit(RuntimeEvent::ToolFinished {
@@ -1532,6 +1811,47 @@ async fn run_tool_once(
     });
 
     (content, ok)
+}
+
+/// Dispatch one hook context off the async threads and journal every decision it produced.
+///
+/// Process hooks are blocking by nature, so the chain runs on the blocking pool. A dispatch that
+/// cannot complete is a warning, not a failed turn: the default behaviour stands.
+async fn run_hook(
+    inner: &Arc<RuntimeInner>,
+    session: &Arc<SessionRuntime>,
+    ctx: crate::hooks::HookContext,
+) -> crate::hooks::HookOutcome {
+    let point = ctx.point.as_str();
+    let runtime = Arc::clone(inner);
+    let outcome = match tokio::task::spawn_blocking(move || runtime.dispatch_hook(&ctx)).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!("a plugin hook could not be dispatched: {err}"),
+            });
+            crate::hooks::HookOutcome::default()
+        }
+    };
+    if !outcome.applied.is_empty() {
+        inner.journal(
+            &session.id,
+            RecordKind::Hook,
+            serde_json::json!({
+                "point": point,
+                "applied": outcome
+                    .applied
+                    .iter()
+                    .map(|entry| serde_json::json!({
+                        "plugin": entry.plugin,
+                        "effect": entry.effect,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
+    outcome
 }
 
 async fn wait_for_approval(
@@ -1620,6 +1940,20 @@ fn summarize_arguments(arguments: &serde_json::Value) -> String {
         other => other.to_string(),
     };
     truncate(&text, 80)
+}
+
+/// The first `limit` bytes of `text`, cut on a char boundary. The grep-fallback excerpt is
+/// sliced out of workspace file contents — arbitrary UTF-8 — so a raw byte cut can land inside
+/// a multi-byte character and panic the whole turn.
+fn bounded_prefix(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
 }
 
 fn truncate(text: &str, limit: usize) -> String {
@@ -3206,7 +3540,14 @@ mod tests {
             "the parent's own transcript is not echoed back: {answer}"
         );
 
-        // A chain deeper than the floor is refused, not silently allowed to nest.
+        // A chain deeper than the floor is refused, not silently allowed to nest. The child was
+        // reaped once it answered, so it is reopened before it can be asked to delegate again.
+        if handle.inner.session(&child_id).is_none() {
+            handle
+                .open_session(&child_id)
+                .expect("the reaped child reopens");
+        }
+        let child = handle.inner.session(&child_id).expect("the child session");
         child.set_depth(handle.inner.policy().max_delegation_depth());
         let refused = handle.spawn_agent(
             vikram_contracts::BotId::new("delegatee"),
@@ -3773,5 +4114,283 @@ mod tests {
         let session2 = handle2.inner.session(&sid2).expect("session");
         session2.push_message(vikram_contracts::Message::user("one"), 1);
         assert!(!handle2.inner.memory_nudge_due(&session2));
+    }
+
+    fn install_hook_plugin(dir: &Path, id: &str, manifest: serde_json::Value) {
+        let plugin = dir.join("home").join("plugins").join(id);
+        std::fs::create_dir_all(&plugin).expect("plugin directory");
+        std::fs::write(plugin.join("plugin.json"), manifest.to_string()).expect("plugin manifest");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_tool_result_hook_rewrites_what_the_model_reads() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        install_hook_plugin(
+            dir.path(),
+            "redact-probe",
+            serde_json::json!({
+                "id": "redact-probe",
+                "version": "1.0.0",
+                "components": {"hooks": ["tool_result"]},
+                "permissions": ["tools"],
+                "priority": 50,
+                "hook_rules": [{
+                    "point": "tool_result",
+                    "tool": "probe",
+                    "result_contain": "probe: done",
+                    "replace_result": "probe: withheld by a plugin"
+                }]
+            }),
+        );
+        let call = ToolCall::new("probe", serde_json::json!({}));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![ProviderEvent::ToolCall(call), finished()],
+            vec![ProviderEvent::TextDelta("finished".into()), finished()],
+        ]));
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), provider)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        handle.inner.tools.register(Box::new(ProbeTool));
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "audit the code".into())
+            .expect("the turn is accepted");
+        let seen = record(&mut events).await;
+
+        let content = seen
+            .iter()
+            .find_map(|event| match event {
+                Seen::ToolResult(_, content) => Some(content.clone()),
+                _ => None,
+            })
+            .expect("the tool ran and produced a result");
+        assert_eq!(content, "probe: withheld by a plugin");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_tool_call_hook_stops_the_tool_before_it_runs() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        install_hook_plugin(
+            dir.path(),
+            "deny-probe",
+            serde_json::json!({
+                "id": "deny-probe",
+                "version": "1.0.0",
+                "components": {"hooks": ["tool_call"]},
+                "permissions": ["tools"],
+                "priority": 100,
+                "hook_rules": [{
+                    "point": "tool_call",
+                    "tool": "probe",
+                    "deny": "probe is disabled by a plugin"
+                }]
+            }),
+        );
+        let call = ToolCall::new("probe", serde_json::json!({}));
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            ProviderEvent::ToolCall(call),
+            finished(),
+        ]]));
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), provider.clone())
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        handle.inner.tools.register(Box::new(ProbeTool));
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "audit the code".into())
+            .expect("the turn is accepted");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut failed = false;
+        let mut refused = None;
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Ok(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), events.recv()).await
+            else {
+                continue;
+            };
+            match event {
+                RuntimeEvent::ToolFinished { name, ok, .. } if name == "probe" => {
+                    failed |= !ok;
+                }
+                RuntimeEvent::MessageCommitted { message, .. } if message.role == Role::Tool => {
+                    for block in message.blocks {
+                        if let Block::ToolResult { content, .. } = block {
+                            refused = Some(content);
+                        }
+                    }
+                }
+                RuntimeEvent::TurnFinished { .. } => break,
+                _ => {}
+            }
+        }
+
+        assert!(failed, "the refusal is published as a failed call");
+        let content = refused.expect("the refusal is recorded as the call's result");
+        assert!(
+            content.contains("denied by plugin: probe is disabled by a plugin"),
+            "unexpected result: {content}"
+        );
+        let requests = provider.taken();
+        assert_eq!(
+            requests.len(),
+            2,
+            "the model is asked to react to the refusal"
+        );
+        assert!(
+            requests
+                .last()
+                .into_iter()
+                .flat_map(|messages| messages.iter())
+                .flat_map(|message| message.blocks.iter())
+                .any(|block| matches!(block, Block::ToolResult { content, .. } if content.contains("denied by plugin"))),
+            "the second request carries the refusal"
+        );
+    }
+
+    #[test]
+    fn the_grep_fallback_slice_never_cuts_a_multibyte_character() {
+        // 598 ASCII bytes after the marker put the 600-byte cut inside the three-byte '€'.
+        let mut text = "grep fallback ".to_owned();
+        text.push_str(&"a".repeat(598));
+        text.push('€');
+        text.push_str(&"b".repeat(50));
+        let excerpt = bounded_prefix(&text["grep fallback".len()..], 600);
+        assert_eq!(excerpt.len(), 599, "the cut walks back to a boundary");
+        assert!(!excerpt.contains('€'));
+        assert!(excerpt.is_char_boundary(excerpt.len()));
+    }
+
+    #[tokio::test]
+    async fn a_guard_dropped_mid_turn_releases_the_claim_and_reports_failure() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::new(ScriptedProvider::new(vec![])),
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        let session = named_session(&handle);
+        let live = handle.inner.session(&session).expect("live session");
+        live.claim_turn();
+        live.set_turn(TurnState::Streaming);
+
+        let guard = TurnGuard {
+            inner: Arc::clone(&handle.inner),
+            session: Arc::clone(&live),
+            turn: TurnId::generate(),
+            agent: None,
+            armed: std::cell::Cell::new(true),
+        };
+        drop(guard);
+
+        assert!(
+            !live.turn_claimed(),
+            "the panic path must hand the slot back"
+        );
+        assert_eq!(live.turn(), TurnState::Failed);
+        assert!(!live.is_busy(), "the session must not stay wedged");
+    }
+
+    #[tokio::test]
+    async fn a_disarmed_guard_leaves_the_finished_turn_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::new(ScriptedProvider::new(vec![])),
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        let session = named_session(&handle);
+        let live = handle.inner.session(&session).expect("live session");
+        live.claim_turn();
+        live.set_turn(TurnState::Streaming);
+
+        let guard = TurnGuard {
+            inner: Arc::clone(&handle.inner),
+            session: Arc::clone(&live),
+            turn: TurnId::generate(),
+            agent: None,
+            armed: std::cell::Cell::new(true),
+        };
+        guard.disarm();
+        drop(guard);
+
+        assert!(live.turn_claimed(), "finish owns the release once disarmed");
+        assert_eq!(live.turn(), TurnState::Streaming);
+    }
+
+    /// A provider whose stream panics the moment it is polled — the shape a transport bug or a
+    /// poisoned lock inside a provider takes. The turn must still end: the guard reports it
+    /// failed and frees the slot instead of wedging the session.
+    struct PanickingProvider;
+
+    impl Provider for PanickingProvider {
+        fn name(&self) -> &str {
+            "panicking"
+        }
+
+        fn model(&self) -> &str {
+            "test-model"
+        }
+
+        fn context_window(&self) -> Option<u64> {
+            Some(8192)
+        }
+
+        fn stream(&self, _request: CompletionRequest) -> ProviderStream {
+            Box::pin(futures_util::stream::poll_fn(|_| {
+                panic!("provider exploded mid-stream")
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_turn_still_ends_and_frees_the_session() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let runtime =
+            Runtime::start_with_provider(config_for(dir.path()), Arc::new(PanickingProvider))
+                .await
+                .expect("runtime starts");
+        let handle = runtime.handle();
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "audit the code".into())
+            .expect("the turn is accepted");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut finished = None;
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Ok(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), events.recv()).await
+            else {
+                continue;
+            };
+            if let RuntimeEvent::TurnFinished { state, .. } = event {
+                finished = Some(state);
+                break;
+            }
+        }
+        assert_eq!(
+            finished,
+            Some(TurnState::Failed),
+            "the guard reports the panicked turn as failed"
+        );
+        let live = handle.inner.session(&session).expect("session survives");
+        assert!(!live.turn_claimed(), "the wedged claim is released");
+        assert!(!live.is_busy());
     }
 }

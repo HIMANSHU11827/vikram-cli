@@ -53,12 +53,21 @@ impl OpenAiProvider {
         context_window: Option<u64>,
     ) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = reqwest::Client::builder()
+        // `.timeout()` bounds the whole request including the body stream. Ten minutes cut off
+        // legitimate long answers; the turn's silence watchdog is the real hang guard, so the
+        // ceiling only needs to outlast the longest plausible stream.
+        let client = match reqwest::Client::builder()
             .use_preconfigured_tls(crate::tls_config())
             .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(600))
+            .timeout(Duration::from_secs(1800))
             .build()
-            .unwrap_or_default();
+        {
+            Ok(client) => client,
+            Err(err) => {
+                eprintln!("vikram: http client failed to build ({err}); using a plain client");
+                reqwest::Client::new()
+            }
+        };
         Self {
             client,
             base_url: base_url.into().trim_end_matches('/').to_owned(),
@@ -105,7 +114,7 @@ pub fn model_ids(body: &Value) -> Vec<String> {
 
 /// The longest server-directed wait a turn will sit through. Beyond this the operator is better off
 /// being told to wait than watching a silent clock, so nothing is retried.
-const MAX_RETRY_WAIT: Duration = Duration::from_secs(10);
+pub(crate) const MAX_RETRY_WAIT: Duration = Duration::from_secs(10);
 
 /// How many times one request is put on the wire before the refusal is believed.
 pub(crate) const MAX_ATTEMPTS: u32 = 3;
@@ -259,6 +268,23 @@ fn quota_window_exhausted(body: &str) -> bool {
         || (body.contains("x-ratelimit-remaining") && body.contains("\"0\""))
 }
 
+/// Whether a 400 is the endpoint refusing `stream_options`/`include_usage` specifically. Strict
+/// proxies and newer models reject the field by name; usage reporting is a nicety, so one resend
+/// without it fixes the request where a resend of the same body would fail identically.
+fn rejects_stream_options(status: reqwest::StatusCode, body: &str) -> bool {
+    if status != reqwest::StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let body = body.to_lowercase();
+    let names_option = body.contains("stream_options") || body.contains("include_usage");
+    let refuses = body.contains("unrecognized")
+        || body.contains("unsupported")
+        || body.contains("unknown")
+        || body.contains("not supported")
+        || body.contains("invalid");
+    names_option && refuses
+}
+
 /// What a refusal deserves: another attempt after a wait, or an answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Retry {
@@ -320,7 +346,7 @@ pub(crate) fn retry_decision(
 
 /// Bodies that mean "this account cannot pay for a request", whatever status carries them. OpenAI
 /// answers 429 with `insufficient_quota`, others answer 402 or 403.
-fn credit_exhausted(body: &str) -> bool {
+pub(crate) fn credit_exhausted(body: &str) -> bool {
     let body = body.to_lowercase();
     [
         "insufficient_quota",
@@ -392,7 +418,7 @@ fn explain_rejection_with(
 
 /// A gap in words, the way an operator says it: `3h 12m`, `48s`. No date formatting, so the answer
 /// needs no clock arithmetic the reader has to redo.
-fn human_gap(gap: Duration) -> String {
+pub(crate) fn human_gap(gap: Duration) -> String {
     let secs = gap.as_secs();
     if secs >= 3600 {
         format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
@@ -496,7 +522,8 @@ impl Provider for OpenAiProvider {
         let client = self.client.clone();
         let endpoint = self.endpoint();
         let api_key = self.api_key.clone();
-        let body = build_request_body(&request);
+        let mut body = build_request_body(&request);
+        let mut stream_options_stripped = false;
 
         tokio::spawn(async move {
             let mut attempt = 0u32;
@@ -524,10 +551,17 @@ impl Provider for OpenAiProvider {
                                 .and_then(|value| value.to_str().ok()),
                             "",
                         );
-                        let body = response.text().await.unwrap_or_default();
-                        let reset = reset.or_else(|| rate_limit_reset(None, &body));
-                        let billing = status.as_u16() == 402 || credit_exhausted(&body);
-                        match retry_decision(status, &body, wait, attempt) {
+                        let reply = response.text().await.unwrap_or_default();
+                        let reset = reset.or_else(|| rate_limit_reset(None, &reply));
+                        if !stream_options_stripped && rejects_stream_options(status, &reply) {
+                            stream_options_stripped = true;
+                            if let Some(object) = body.as_object_mut() {
+                                object.remove("stream_options");
+                            }
+                            continue;
+                        }
+                        let billing = status.as_u16() == 402 || credit_exhausted(&reply);
+                        match retry_decision(status, &reply, wait, attempt) {
                             Retry::After(delay) => {
                                 // The wait is the provider's, not the model's, and an interface that
                                 // does not say so shows a frozen clock and an empty pane.
@@ -543,7 +577,16 @@ impl Provider for OpenAiProvider {
                                 continue;
                             }
                             Retry::Never => {
-                                let text = explain_rejection_with(status, &body, &endpoint, reset);
+                                let mut text =
+                                    explain_rejection_with(status, &reply, &endpoint, reset);
+                                // A server-directed wait past the cap is a refusal with a time on
+                                // it; the operator deserves to know how long it asked for.
+                                if let Some(wait) = wait.filter(|wait| *wait > MAX_RETRY_WAIT) {
+                                    text.push_str(&format!(
+                                        " The endpoint asked for a wait of at least {}.",
+                                        human_gap(wait)
+                                    ));
+                                }
                                 let _ = tx
                                     .send(Err(if billing || status.as_u16() == 429 {
                                         VikramError::ProviderRejected(text)
@@ -624,21 +667,29 @@ impl Provider for OpenAiProvider {
                             let _ = tx.send(Err(VikramError::ProviderRejected(text))).await;
                             return;
                         }
-                        for event in events {
-                            match event {
-                                ProviderEvent::Finished { .. } => {
-                                    if tx.send(Ok(event)).await.is_err() {
-                                        return;
-                                    }
-                                    finished = true;
-                                }
-                                other => {
-                                    if tx.send(Ok(other)).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            }
+                        if !deliver_events(&tx, events, &mut finished).await {
+                            return;
                         }
+                    }
+                }
+            }
+
+            // The last `data:` frame can arrive without its trailing newline; the line loop only
+            // fires on '\n', so whatever remains is parsed once here before the stream is flushed.
+            if !utf8_tail.is_empty() {
+                buffer.push_str(&String::from_utf8_lossy(&utf8_tail));
+                utf8_tail.clear();
+            }
+            if !buffer.trim().is_empty() {
+                let line = buffer.trim_end().to_owned();
+                buffer.clear();
+                if let Some(events) = parse_sse_line(&line, &mut pending) {
+                    if let Some(text) = pending.error.take() {
+                        let _ = tx.send(Err(VikramError::ProviderRejected(text))).await;
+                        return;
+                    }
+                    if !deliver_events(&tx, events, &mut finished).await {
+                        return;
                     }
                 }
             }
@@ -671,8 +722,10 @@ impl Provider for OpenAiProvider {
 }
 
 /// OpenAI-compatible endpoints restrict function names to `[a-zA-Z0-9_-]`, while VIKRAM registers
-/// dotted names. Underscore, dash and dot each get a two-character code so the mapping is
-/// reversible and two different tools can never arrive at the same wire name.
+/// dotted names — and MCP tools are not guaranteed ASCII at all. Underscore, dash and dot each
+/// get a two-character code, and every other illegal character is escaped as `-x<hex>_`, so the
+/// mapping is reversible and two different tools can never arrive at the same wire name. A lone
+/// `-` never appears in the output except inside these codes, which is what makes `-x` unambiguous.
 pub fn wire_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
@@ -681,7 +734,10 @@ pub fn wire_name(name: &str) -> String {
             '-' => out.push_str("--"),
             '.' => out.push_str("-_"),
             other if is_endpoint_legal(other) => out.push(other),
-            _ => out.push('_'),
+            other => {
+                out.push_str("-x");
+                out.push_str(&format!("{:x}_", other as u32));
+            }
         }
     }
     out
@@ -712,6 +768,35 @@ pub fn from_wire_name(wire: &str) -> String {
                 out.push('.');
                 i += 2;
             }
+            ('-', Some('x')) => {
+                // `-x<hex>_` is the escape [`wire_name`] emits for a character the endpoint
+                // cannot carry. The `_` terminator is required: hex letters are legal name
+                // characters, so the escape is only unambiguous with it.
+                let mut j = i + 2;
+                let mut value: u32 = 0;
+                let mut digits = 0usize;
+                while j < chars.len() {
+                    let Some(digit) = chars[j].to_digit(16) else {
+                        break;
+                    };
+                    value = value.saturating_mul(16).saturating_add(digit);
+                    digits += 1;
+                    j += 1;
+                }
+                let decoded = (digits > 0 && chars.get(j) == Some(&'_'))
+                    .then(|| char::from_u32(value))
+                    .flatten();
+                match decoded {
+                    Some(ch) => {
+                        out.push(ch);
+                        i = j + 1;
+                    }
+                    None => {
+                        out.push('-');
+                        i += 1;
+                    }
+                }
+            }
             _ => {
                 out.push(chars[i]);
                 i += 1;
@@ -719,6 +804,17 @@ pub fn from_wire_name(wire: &str) -> String {
         }
     }
     out
+}
+
+/// Models that retired `max_tokens` for `max_completion_tokens`: the reasoning family and the
+/// gpt-5 line. They — and strict proxies in front of them — answer a `max_tokens` body with a
+/// hard 400, while older chat models and local servers still expect `max_tokens`.
+fn prefers_completion_tokens(model: &str) -> bool {
+    // A routed name like `openai/o3` is judged by its last segment.
+    let name = model.rsplit('/').next().unwrap_or(model).to_lowercase();
+    ["o1", "o3", "o4", "gpt-5"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 fn build_request_body(request: &CompletionRequest) -> Value {
@@ -729,7 +825,11 @@ fn build_request_body(request: &CompletionRequest) -> Value {
         "stream_options": {"include_usage": true},
     });
     if let Some(max) = request.max_output_tokens {
-        body["max_tokens"] = json!(max);
+        if prefers_completion_tokens(&request.model) {
+            body["max_completion_tokens"] = json!(max);
+        } else {
+            body["max_tokens"] = json!(max);
+        }
     }
     if !request.tools.is_empty() {
         let tools: Vec<Value> = request
@@ -781,6 +881,13 @@ pub fn map_messages(messages: &[Message]) -> Vec<Value> {
             }
         }
 
+        // A tool result is only ever a `Role::Tool` message (`Message::tool_result` is the sole
+        // constructor the kernel uses). Anywhere else it would emit an orphan `role:"tool"`
+        // entry the endpoint answers with a 400.
+        debug_assert!(
+            message.role == Role::Tool || tool_results.is_empty(),
+            "a tool result block outside a Role::Tool message orphans it on the wire"
+        );
         match message.role {
             Role::Tool => out.extend(tool_results),
             Role::System | Role::User => {
@@ -1035,6 +1142,25 @@ fn finish_pending(state: &mut StreamState) -> Vec<ProviderEvent> {
         });
     }
     events
+}
+
+/// Send parsed events downstream, marking `finished` on the terminal one. `false` means the
+/// consumer went away and the task should stop. Shared with the Anthropic provider, whose SSE
+/// loop is the same shape.
+pub(crate) async fn deliver_events(
+    tx: &tokio::sync::mpsc::Sender<std::result::Result<ProviderEvent, VikramError>>,
+    events: Vec<ProviderEvent>,
+    finished: &mut bool,
+) -> bool {
+    for event in events {
+        if matches!(event, ProviderEvent::Finished { .. }) {
+            *finished = true;
+        }
+        if tx.send(Ok(event)).await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 fn truncate(text: &str, limit: usize) -> String {
@@ -1642,6 +1768,332 @@ mod tests {
                 delay >= Duration::from_millis(1600) && delay <= Duration::from_millis(2400),
                 "jitter must not turn a two-second wait into {delay:?}"
             );
+        }
+    }
+
+    #[test]
+    fn non_ascii_tool_names_round_trip_through_the_wire_encoding() {
+        for name in ["fs.réad", "mcp.工具.读", "my tool", "aéb-c_d.e"] {
+            let wire = wire_name(name);
+            assert!(
+                wire.chars().all(is_endpoint_legal),
+                "{name} encoded to {wire}, which still has illegal characters"
+            );
+            assert_eq!(
+                from_wire_name(&wire),
+                name,
+                "{name} must survive the round trip, got {wire}"
+            );
+        }
+        // The escape is what makes this reversible: the old encoder collapsed every illegal
+        // character to `_`, so `fs.réad` and `fs.r_ad` arrived at the same wire name.
+        assert_ne!(wire_name("fs.réad"), wire_name("fs.r_ad"));
+    }
+
+    #[test]
+    fn the_output_cap_field_follows_what_the_model_accepts() {
+        let mut request = CompletionRequest::new("o3-mini", vec![Message::user("hi")], Vec::new());
+        request.max_output_tokens = Some(1_000);
+        let body = build_request_body(&request);
+        assert_eq!(body["max_completion_tokens"], json!(1_000));
+        assert!(body.get("max_tokens").is_none(), "{body}");
+
+        request.model = "gpt-4o".into();
+        let body = build_request_body(&request);
+        assert_eq!(body["max_tokens"], json!(1_000));
+        assert!(body.get("max_completion_tokens").is_none(), "{body}");
+
+        request.model = "openai/gpt-5".into();
+        let body = build_request_body(&request);
+        assert_eq!(
+            body["max_completion_tokens"],
+            json!(1_000),
+            "a routed name is judged by its last segment"
+        );
+    }
+
+    #[test]
+    fn a_400_naming_stream_options_is_the_only_shape_the_downgrade_applies_to() {
+        let strict =
+            r#"{"error":{"message":"Unrecognized request argument supplied: stream_options"}}"#;
+        assert!(rejects_stream_options(
+            reqwest::StatusCode::BAD_REQUEST,
+            strict
+        ));
+        assert!(rejects_stream_options(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"unsupported parameter: include_usage"}}"#
+        ));
+        // A 400 about anything else, or the same words on another status, is not this retry.
+        assert!(!rejects_stream_options(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"messages is required"}}"#
+        ));
+        assert!(!rejects_stream_options(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            strict
+        ));
+    }
+
+    // ---- a real socket, on loopback only --------------------------------------------------
+
+    /// The byte index just past the blank line that ends an HTTP request head.
+    fn head_end(buffer: &[u8]) -> Option<usize> {
+        buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+    }
+
+    /// The `content-length` a request head declares, in bytes.
+    fn content_length(head: &[u8]) -> usize {
+        String::from_utf8_lossy(head)
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0)
+    }
+
+    /// One canned reply: a status line, a content type and the body pieces. Every connection gets
+    /// the next reply in order, repeating the last — a retried request is a new connection.
+    type Canned = (&'static str, &'static str, Vec<String>);
+
+    /// One-shot-per-connection HTTP server on a loopback port that records every full request
+    /// (head and body) it is sent. Nothing here leaves the machine.
+    async fn loopback_server_replies(
+        replies: Vec<Canned>,
+    ) -> (u16, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let port = listener.local_addr().expect("loopback address").port();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let replies = std::sync::Arc::new(replies);
+
+        tokio::spawn(async move {
+            let mut index = 0usize;
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let (status, content_type, body_pieces) =
+                    replies[index.min(replies.len() - 1)].clone();
+                index += 1;
+                let recorded = tx.clone();
+                tokio::spawn(async move {
+                    let mut received = Vec::new();
+                    let mut chunk = [0u8; 2048];
+                    loop {
+                        let read = socket.read(&mut chunk).await.expect("read the request");
+                        if read == 0 {
+                            break;
+                        }
+                        received.extend_from_slice(&chunk[..read]);
+                        if let Some(end) = head_end(&received)
+                            && received.len() >= end + content_length(&received[..end])
+                        {
+                            break;
+                        }
+                    }
+                    let _ = recorded.send(String::from_utf8_lossy(&received).into_owned());
+
+                    let length: usize = body_pieces.iter().map(String::len).sum();
+                    let response_head = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                    );
+                    socket
+                        .write_all(response_head.as_bytes())
+                        .await
+                        .expect("write the response head");
+                    for piece in body_pieces {
+                        socket
+                            .write_all(piece.as_bytes())
+                            .await
+                            .expect("write a response piece");
+                        socket.flush().await.expect("flush");
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        (port, rx)
+    }
+
+    async fn loopback_server(
+        status: &'static str,
+        body: String,
+    ) -> (u16, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        loopback_server_replies(vec![(status, "text/event-stream", vec![body])]).await
+    }
+
+    /// Drain a provider stream, so an assertion can see the whole answer.
+    async fn collect(
+        mut stream: ProviderStream,
+    ) -> Vec<std::result::Result<ProviderEvent, VikramError>> {
+        use futures_util::StreamExt;
+
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item);
+        }
+        events
+    }
+
+    fn sse(lines: &[&str]) -> String {
+        let mut document = String::new();
+        for line in lines {
+            document.push_str(line);
+            document.push('\n');
+        }
+        document
+    }
+
+    const TEXT_ANSWER: &[&str] = &[
+        r#"data: {"choices":[{"delta":{"content":"Hello"}}]}"#,
+        "",
+        r#"data: {"choices":[{"delta":{"content":" there"}}]}"#,
+        "",
+        r#"data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}"#,
+        "",
+        "data: [DONE]",
+        "",
+    ];
+
+    #[tokio::test]
+    async fn a_final_sse_line_without_a_newline_is_still_parsed() {
+        // The stream ends on `data: [DONE]` with no trailing newline: the line loop never sees
+        // it, so the tail drain is the only thing that can close the answer.
+        let mut document = sse(&TEXT_ANSWER[..TEXT_ANSWER.len() - 2]);
+        document.push_str("data: [DONE]");
+        let (port, _recorded) = loopback_server("200 OK", document).await;
+        let provider = OpenAiProvider::new(format!("http://127.0.0.1:{port}/v1"), "m", "k", None);
+
+        let events = tokio::time::timeout(
+            Duration::from_secs(10),
+            collect(provider.stream(CompletionRequest::new(
+                "m",
+                vec![Message::user("hi")],
+                Vec::new(),
+            ))),
+        )
+        .await
+        .expect("the loopback server answers inside the timeout");
+
+        assert_eq!(
+            events,
+            vec![
+                Ok(ProviderEvent::TextDelta("Hello".into())),
+                Ok(ProviderEvent::TextDelta(" there".into())),
+                Ok(ProviderEvent::Finished {
+                    input_tokens: Some(3),
+                    output_tokens: Some(2),
+                }),
+            ],
+            "the unterminated final frame must still deliver its content and finish"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_400_refusing_stream_options_is_resent_once_without_it() {
+        let (port, mut recorded) = loopback_server_replies(vec![
+            (
+                "400 Bad Request",
+                "application/json",
+                vec![
+                    r#"{"error":{"message":"Unrecognized request argument supplied: stream_options"}}"#
+                        .to_owned(),
+                ],
+            ),
+            ("200 OK", "text/event-stream", vec![sse(TEXT_ANSWER)]),
+        ])
+        .await;
+        let provider = OpenAiProvider::new(format!("http://127.0.0.1:{port}/v1"), "m", "k", None);
+
+        let events = tokio::time::timeout(
+            Duration::from_secs(10),
+            collect(provider.stream(CompletionRequest::new(
+                "m",
+                vec![Message::user("hi")],
+                Vec::new(),
+            ))),
+        )
+        .await
+        .expect("the loopback server answers inside the timeout");
+
+        assert!(
+            events.iter().all(|event| event.is_ok()),
+            "the downgrade is silent: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(Ok(ProviderEvent::Finished { .. }))),
+            "the resent request still finishes: {events:?}"
+        );
+
+        let first = recorded
+            .try_recv()
+            .expect("the refused request was recorded");
+        let second = tokio::time::timeout(Duration::from_secs(5), recorded.recv())
+            .await
+            .expect("the resend was recorded")
+            .expect("a second request arrived");
+        assert!(first.contains("stream_options"), "{first}");
+        assert!(
+            !second.contains("stream_options"),
+            "the retry must drop the refused field: {second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_beyond_the_cap_names_the_wait_the_endpoint_asked_for() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let port = listener.local_addr().expect("loopback address").port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.expect("one request");
+            let mut buf = vec![0u8; 8192];
+            let _ = socket.read(&mut buf).await;
+            let body = r#"{"error":{"message":"slow down"}}"#;
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+        let provider = OpenAiProvider::new(format!("http://127.0.0.1:{port}/v1"), "m", "k", None);
+
+        let events = tokio::time::timeout(
+            Duration::from_secs(10),
+            collect(provider.stream(CompletionRequest::new(
+                "m",
+                vec![Message::user("hi")],
+                Vec::new(),
+            ))),
+        )
+        .await
+        .expect("the loopback server answers inside the timeout");
+
+        match events.last() {
+            Some(Err(VikramError::ProviderRejected(text))) => {
+                assert!(text.contains("rate limited"), "{text}");
+                assert!(
+                    text.contains("wait of at least 1m"),
+                    "the server's requested wait must be named: {text}"
+                );
+            }
+            other => panic!("expected a final refusal, got {other:?}"),
         }
     }
 }

@@ -1,0 +1,26 @@
+{
+  "id": "guard-npm-publish",
+  "name": "Guard: npm publish",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: npm publish.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "shell.run",
+      "arguments_contain": "npm publish",
+      "deny": "publishing a package is an operator decision"
+    }
+  ]
+}

@@ -1,3 +1,4 @@
+use crate::hooks::HookRule;
 use std::path::{Path, PathBuf};
 
 /// A declared dependency: another plugin by name, and the version requirement it must satisfy.
@@ -33,6 +34,10 @@ pub struct PluginManifest {
     pub entry: String,
     /// Absent manifests are treated as enabled, matching discovery behaviour.
     pub enabled: bool,
+    /// Hook ordering: higher runs first, ties broken by plugin id.
+    pub priority: i32,
+    /// Declarative hook rules, evaluated in-process for every loaded plugin.
+    pub hook_rules: Vec<HookRule>,
 }
 
 impl Default for PluginManifest {
@@ -53,6 +58,8 @@ impl Default for PluginManifest {
             permissions: Vec::new(),
             entry: String::new(),
             enabled: true,
+            priority: 0,
+            hook_rules: Vec::new(),
         }
     }
 }

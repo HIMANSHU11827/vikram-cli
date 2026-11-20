@@ -1,0 +1,24 @@
+{
+  "id": "model-cap-4096",
+  "name": "Model: cap output at 4096 tokens",
+  "version": "1.0.0",
+  "description": "Caps every completion at 4096 output tokens.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 70,
+  "components": {
+    "hooks": [
+      "model_request"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "model_request",
+      "max_output_tokens": 4096
+    }
+  ]
+}

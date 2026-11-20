@@ -26,19 +26,21 @@
 //!
 //! Limitations, stated so they are not mistaken for guarantees:
 //!
-//! - The guard resolves nothing. A public hostname that resolves to `10.0.0.1` at connect time
-//!   (**DNS rebinding**) gets through; defeating that needs a resolver hooked into the connection,
-//!   which is out of scope for this simple lexical guard.
+//! - The guard above is lexical: it sees the text of the URL. The real transport's byte client
+//!   closes the DNS-rebinding gap by resolving each host once, refusing the fetch when any
+//!   answer is private (unless the operator opted in), and dialing only the vetted addresses —
+//!   see `ReqwestTransport`'s byte client in [`crate::transport`]. A custom [`Transport`]
+//!   that does not do the same is only covered by the lexical check.
 //! - Redirects are not followed: the byte transport is built with `redirect::Policy::none()`, so a
 //!   public URL that answers 302 to a private one is refused rather than re-checked.
 //! - Only still images are fetched. Video, audio, PDFs and platform-specific sticker/animation
 //!   payloads are skipped even when the adapter recorded a URL for them.
-//! - The whole body is buffered by the transport before the byte cap is applied, so a hostile
-//!   server can still make the process allocate one oversized response before it is discarded.
+//! - The byte cap is enforced while the body streams in; a response that exceeds it aborts the
+//!   download instead of buffering the whole payload first.
 
 use vikram_contracts::ImageSource;
 
-use crate::transport::{HttpRequest, Transport};
+use crate::transport::{HttpRequest, Transport, TransportError};
 
 /// How much of an event's media one turn is allowed to inline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,22 +83,38 @@ impl FetchedImage {
 
 /// Fetch the images behind `urls`, reporting what was skipped and why.
 ///
+/// `declared_types` is the adapter's per-attachment type list, parallel to `urls` but allowed to
+/// be shorter: a concrete non-image declaration (`video/mp4`, `application/pdf`, …) skips the
+/// download entirely, because the payload could never pass the image sniff anyway. An empty slot,
+/// `application/octet-stream` or anything that does not parse as `type/subtype` is "unknown" and
+/// falls back to fetching and sniffing, exactly as an untyped URL always did.
+///
 /// The reasons never contain the URL or any part of a payload: an attachment URL is routinely a
 /// signed, expiring one, and this string ends up on a terminal. They are safe to log.
 pub async fn fetch_images_with_skips(
     transport: &dyn Transport,
     urls: &[String],
+    declared_types: &[String],
     limits: &MediaFetchLimits,
 ) -> (Vec<FetchedImage>, Vec<String>) {
     let mut images = Vec::new();
     let mut skipped = Vec::new();
-    for url in urls {
+    for (index, url) in urls.iter().enumerate() {
         if images.len() >= limits.max_items {
             skipped.push(format!(
                 "only the first {} attachment(s) are inlined",
                 limits.max_items
             ));
             break;
+        }
+        if let Some(mime) = declared_non_image(
+            declared_types
+                .get(index)
+                .map(String::as_str)
+                .unwrap_or_default(),
+        ) {
+            skipped.push(format!("the attachment is declared {mime}, not an image"));
+            continue;
         }
         match fetch_one(transport, url, limits).await {
             Ok(image) => images.push(image),
@@ -110,9 +128,41 @@ pub async fn fetch_images_with_skips(
 pub async fn fetch_images(
     transport: &dyn Transport,
     urls: &[String],
+    declared_types: &[String],
     limits: &MediaFetchLimits,
 ) -> Vec<FetchedImage> {
-    fetch_images_with_skips(transport, urls, limits).await.0
+    fetch_images_with_skips(transport, urls, declared_types, limits)
+        .await
+        .0
+}
+
+/// The normalized MIME an adapter declared for an attachment, when that declaration already rules
+/// out an inlinable image. `None` means "maybe an image": the type is missing, empty,
+/// `application/octet-stream` (the adapters' "unknown binary" answer), malformed, or `image/*`.
+fn declared_non_image(declared: &str) -> Option<String> {
+    let mime = declared
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let (major, minor) = mime.split_once('/')?;
+    if major.is_empty() || minor.is_empty() || major == "image" {
+        return None;
+    }
+    if mime == "application/octet-stream" {
+        return None;
+    }
+    // A declared type only vetoes a download when it looks like a real MIME token; anything else
+    // (a platform's coarse label like "file", a path, prose) is treated as unknown.
+    if mime.len() > 127
+        || !mime
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '-' | '_' | '.'))
+    {
+        return None;
+    }
+    Some(mime)
 }
 
 /// Fetch one URL and vouch for the result. `Err` carries a reason safe to log.
@@ -132,9 +182,15 @@ async fn fetch_one(
     // The transport's error text can quote the URL (query string included), so it is replaced
     // rather than forwarded.
     let body = transport
-        .execute_bytes(request)
+        .execute_bytes(request, limits.max_bytes)
         .await
-        .map_err(|_| "the attachment could not be downloaded".to_string())?;
+        .map_err(|err| match err {
+            TransportError::TooLarge(_) => format!(
+                "the attachment is larger than the {} byte limit",
+                limits.max_bytes
+            ),
+            _ => "the attachment could not be downloaded".to_string(),
+        })?;
     if body.is_empty() {
         return Err("the attachment was empty".to_string());
     }
@@ -191,9 +247,9 @@ fn host_of(url: &str) -> Result<String, String> {
 
 /// Why a host must not be fetched, or `None` when it is a public name or address.
 ///
-/// This is a lexical check: it sees the text of the URL, not what the resolver will answer. See
-/// the module docs on DNS rebinding.
-fn private_target(host: &str) -> Option<&'static str> {
+/// This is a lexical check: it sees the text of the URL, not what the resolver will answer. The
+/// real transport re-checks every resolved address before dialing; see the module docs.
+pub(crate) fn private_target(host: &str) -> Option<&'static str> {
     if host == "localhost" || host.ends_with(".localhost") {
         return Some("localhost attachments are refused");
     }
@@ -238,7 +294,7 @@ fn numeric_label(label: &str) -> bool {
     !label.is_empty() && label.chars().all(|c| c.is_ascii_digit())
 }
 
-fn private_address(address: std::net::IpAddr) -> bool {
+pub(crate) fn private_address(address: std::net::IpAddr) -> bool {
     match address {
         std::net::IpAddr::V4(v4) => {
             v4.is_loopback()
@@ -313,6 +369,7 @@ mod tests {
     use crate::transport::{HttpResponse, TransportError};
     use async_trait::async_trait;
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The four formats the sniffer knows, with the smallest payload that identifies each.
@@ -341,6 +398,9 @@ mod tests {
     struct MockTransport {
         bodies: BTreeMap<String, Vec<u8>>,
         requests: AtomicUsize,
+        /// The `max_bytes` each `execute_bytes` call was handed, in order. The mock does not
+        /// enforce the cap itself, so the post-download check in `fetch_one` still applies.
+        byte_limits: Mutex<Vec<usize>>,
     }
 
     impl MockTransport {
@@ -351,11 +411,19 @@ mod tests {
                     .map(|(url, body)| ((*url).to_string(), body.clone()))
                     .collect(),
                 requests: AtomicUsize::new(0),
+                byte_limits: Mutex::new(Vec::new()),
             }
         }
 
         fn calls(&self) -> usize {
             self.requests.load(Ordering::SeqCst)
+        }
+
+        fn byte_limits(&self) -> Vec<usize> {
+            self.byte_limits
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .clone()
         }
     }
 
@@ -367,8 +435,16 @@ mod tests {
             ))
         }
 
-        async fn execute_bytes(&self, request: HttpRequest) -> Result<Vec<u8>, TransportError> {
+        async fn execute_bytes(
+            &self,
+            request: HttpRequest,
+            max_bytes: usize,
+        ) -> Result<Vec<u8>, TransportError> {
             self.requests.fetch_add(1, Ordering::SeqCst);
+            self.byte_limits
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .push(max_bytes);
             match self.bodies.get(&request.url) {
                 Some(body) => Ok(body.clone()),
                 None => Err(TransportError::Request("404 not found".to_string())),
@@ -378,6 +454,10 @@ mod tests {
 
     fn urls(list: &[&str]) -> Vec<String> {
         list.iter().map(|url| (*url).to_string()).collect()
+    }
+
+    fn types(list: &[&str]) -> Vec<String> {
+        list.iter().map(|kind| (*kind).to_string()).collect()
     }
 
     #[test]
@@ -485,9 +565,13 @@ mod tests {
         // request counter is what actually proves nothing was asked for.
         let transport = MockTransport::with(&[("https://cdn.example.test/a.png", png())]);
         for url in refused {
-            let (images, skipped) =
-                fetch_images_with_skips(&transport, &urls(&[url]), &MediaFetchLimits::default())
-                    .await;
+            let (images, skipped) = fetch_images_with_skips(
+                &transport,
+                &urls(&[url]),
+                &[],
+                &MediaFetchLimits::default(),
+            )
+            .await;
             assert!(images.is_empty(), "{url} produced an image");
             assert_eq!(skipped.len(), 1, "{url} was not reported");
             assert!(!skipped[0].is_empty(), "{url} skipped without a reason");
@@ -499,6 +583,7 @@ mod tests {
         let allowed = fetch_images(
             &transport,
             &urls(&["https://cdn.example.test/a.png"]),
+            &[],
             &MediaFetchLimits::default(),
         )
         .await;
@@ -512,6 +597,7 @@ mod tests {
         let images = fetch_images(
             &transport,
             &urls(&["https://cdn.example.test/a.png"]),
+            &types(&["image/png"]),
             &MediaFetchLimits::default(),
         )
         .await;
@@ -543,6 +629,13 @@ mod tests {
                 "https://cdn.example.test/d",
                 "https://cdn.example.test/e",
             ]),
+            &types(&[
+                "image/png",
+                "image/png",
+                "image/gif",
+                "image/webp",
+                "application/octet-stream",
+            ]),
             // Five URLs, so the item cap is lifted: this test is about the payload, not the count.
             &MediaFetchLimits {
                 max_items: 8,
@@ -567,6 +660,7 @@ mod tests {
         let (images, skipped) = fetch_images_with_skips(
             &transport,
             &urls(&["https://cdn.example.test/a.png"]),
+            &[],
             &MediaFetchLimits::default(),
         )
         .await;
@@ -591,11 +685,54 @@ mod tests {
                 "https://cdn.example.test/big.png",
                 "https://cdn.example.test/small.png",
             ]),
+            &[],
             &limits,
         )
         .await;
         assert_eq!(images.len(), 1, "the small image still arrives");
         assert_eq!(images[0].mime, "image/png");
+        assert_eq!(
+            skipped,
+            vec!["the attachment is larger than the 9 byte limit".to_string()]
+        );
+        assert_eq!(transport.byte_limits(), vec![9, 9]);
+    }
+
+    /// A transport that enforces the cap while streaming reports `TooLarge`; the skip reason must
+    /// be the same "larger than the limit" message a post-download check would have produced.
+    struct StreamingCapTransport;
+
+    #[async_trait]
+    impl Transport for StreamingCapTransport {
+        async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse, TransportError> {
+            Err(TransportError::Request(
+                "the mock only speaks bytes".to_string(),
+            ))
+        }
+
+        async fn execute_bytes(
+            &self,
+            _request: HttpRequest,
+            max_bytes: usize,
+        ) -> Result<Vec<u8>, TransportError> {
+            Err(TransportError::TooLarge(max_bytes))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transport_that_aborts_on_the_cap_is_reported_as_too_large() {
+        let limits = MediaFetchLimits {
+            max_bytes: 9,
+            ..MediaFetchLimits::default()
+        };
+        let (images, skipped) = fetch_images_with_skips(
+            &StreamingCapTransport,
+            &urls(&["https://cdn.example.test/big.png"]),
+            &[],
+            &limits,
+        )
+        .await;
+        assert!(images.is_empty());
         assert_eq!(
             skipped,
             vec!["the attachment is larger than the 9 byte limit".to_string()]
@@ -620,6 +757,7 @@ mod tests {
                 "https://cdn.example.test/2.png",
                 "https://cdn.example.test/3.png",
             ]),
+            &[],
             &limits,
         )
         .await;
@@ -636,6 +774,7 @@ mod tests {
         let (images, skipped) = fetch_images_with_skips(
             &transport,
             &urls(&["https://cdn.example.test/1.png"]),
+            &[],
             &none,
         )
         .await;
@@ -655,6 +794,7 @@ mod tests {
                 "https://cdn.example.test/missing.png",
                 "https://cdn.example.test/ok.png",
             ]),
+            &[],
             &MediaFetchLimits::default(),
         )
         .await;
@@ -672,6 +812,7 @@ mod tests {
         let denied = fetch_images(
             &transport,
             &urls(&["http://127.0.0.1:9000/a.png"]),
+            &[],
             &MediaFetchLimits::default(),
         )
         .await;
@@ -682,18 +823,111 @@ mod tests {
             allow_private: true,
             ..MediaFetchLimits::default()
         };
-        let allowed =
-            fetch_images(&transport, &urls(&["http://127.0.0.1:9000/a.png"]), &limits).await;
+        let allowed = fetch_images(
+            &transport,
+            &urls(&["http://127.0.0.1:9000/a.png"]),
+            &[],
+            &limits,
+        )
+        .await;
         assert_eq!(allowed.len(), 1);
         assert_eq!(allowed[0].mime, "image/png");
         assert_eq!(transport.calls(), 1);
     }
 
     #[tokio::test]
+    async fn a_declared_non_image_type_is_skipped_without_a_download() {
+        // The video body is registered so a regression that fetched anyway would still produce an
+        // image; the request counter is what proves the early skip happened.
+        let transport = MockTransport::with(&[("https://cdn.example.test/clip.mp4", png())]);
+        let (images, skipped) = fetch_images_with_skips(
+            &transport,
+            &urls(&["https://cdn.example.test/clip.mp4"]),
+            &types(&["video/mp4"]),
+            &MediaFetchLimits::default(),
+        )
+        .await;
+        assert!(images.is_empty());
+        assert_eq!(
+            skipped,
+            vec!["the attachment is declared video/mp4, not an image".to_string()]
+        );
+        assert_eq!(
+            transport.calls(),
+            0,
+            "a declared non-image is never fetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_and_image_declarations_still_fetch_and_sniff() {
+        let transport = MockTransport::with(&[
+            ("https://cdn.example.test/a.png", png()),
+            ("https://cdn.example.test/b.bin", png()),
+            ("https://cdn.example.test/c.png", png()),
+        ]);
+        let (images, skipped) = fetch_images_with_skips(
+            &transport,
+            &urls(&[
+                "https://cdn.example.test/a.png",
+                "https://cdn.example.test/b.bin",
+                "https://cdn.example.test/c.png",
+            ]),
+            // Empty slot, the adapters' unknown-binary answer, a coarse label and an image type
+            // are all "maybe an image": the payload decides, as it always did.
+            &types(&[
+                "",
+                "application/octet-stream",
+                "file",
+                "IMAGE/PNG; charset=binary",
+            ]),
+            &MediaFetchLimits::default(),
+        )
+        .await;
+        assert_eq!(images.len(), 3);
+        assert!(skipped.is_empty());
+        assert_eq!(transport.calls(), 3);
+    }
+
+    #[test]
+    fn declared_non_image_only_vetoes_real_non_image_mime_types() {
+        for declared in [
+            "video/mp4",
+            "audio/ogg",
+            "application/pdf",
+            "text/plain",
+            "VIDEO/MP4; codecs=avc1",
+        ] {
+            assert!(
+                declared_non_image(declared).is_some(),
+                "{declared} should veto the download"
+            );
+        }
+        for declared in [
+            "",
+            "image/png",
+            "image/webp",
+            "IMAGE/JPEG",
+            "application/octet-stream",
+            "file",
+            "video",
+            "not a mime type at all",
+            "video/",
+            "/mp4",
+        ] {
+            assert_eq!(
+                declared_non_image(declared),
+                None,
+                "{declared} must fall back to sniffing"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn no_urls_means_no_requests() {
         let transport = MockTransport::with(&[]);
         let (images, skipped) =
-            fetch_images_with_skips(&transport, &[], &MediaFetchLimits::default()).await;
+            fetch_images_with_skips(&transport, &[], &[], &MediaFetchLimits::default()).await;
         assert!(images.is_empty());
         assert!(skipped.is_empty());
         assert_eq!(transport.calls(), 0);

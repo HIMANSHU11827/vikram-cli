@@ -220,6 +220,17 @@ impl From<BotRow> for BotProfile {
 #[derive(Debug, Default)]
 pub struct TaskManager {
     tasks: Mutex<HashMap<String, BackgroundTask>>,
+    next_task: AtomicUsize,
+}
+
+/// Terminal tasks kept for inspection; older finished entries are evicted on finish.
+const MAX_TERMINAL_TASKS: usize = 64;
+
+fn is_terminal(state: &TaskState) -> bool {
+    matches!(
+        state,
+        TaskState::Completed | TaskState::Failed | TaskState::Cancelled
+    )
 }
 
 impl TaskManager {
@@ -228,8 +239,9 @@ impl TaskManager {
     }
 
     pub fn start(&self, name: impl Into<String>, session: SessionId) -> BackgroundTask {
+        let seq = self.next_task.fetch_add(1, Ordering::Relaxed);
         let task = BackgroundTask {
-            id: format!("task-{}", now_ms()),
+            id: format!("task-{}-{seq}", now_ms()),
             name: name.into(),
             session,
             state: TaskState::Running,
@@ -249,7 +261,20 @@ impl TaskManager {
         });
         let task = tasks.get_mut(id)?;
         task.state = state;
-        Some(task.clone())
+        let finished = task.clone();
+        let mut terminal: Vec<(u64, String)> = tasks
+            .iter()
+            .filter(|(_, t)| is_terminal(&t.state))
+            .map(|(id, t)| (t.started_ms, id.clone()))
+            .collect();
+        if terminal.len() > MAX_TERMINAL_TASKS {
+            let excess = terminal.len() - MAX_TERMINAL_TASKS;
+            terminal.sort_unstable();
+            for (_, old_id) in terminal.into_iter().take(excess) {
+                tasks.remove(&old_id);
+            }
+        }
+        Some(finished)
     }
 
     pub fn list(&self) -> Vec<BackgroundTask> {
@@ -316,5 +341,50 @@ mod tests {
         manager.finish(&task.id, TaskState::Completed);
         assert_eq!(manager.running_count(), 0);
         assert_eq!(manager.list()[0].state, TaskState::Completed);
+    }
+
+    #[test]
+    fn tasks_started_in_the_same_millisecond_get_distinct_ids() {
+        let manager = TaskManager::new();
+        let a = manager.start("a", SessionId::generate());
+        let b = manager.start("b", SessionId::generate());
+        assert_ne!(a.id, b.id);
+        assert!(manager.finish(&a.id, TaskState::Completed).is_some());
+        assert!(manager.finish(&b.id, TaskState::Completed).is_some());
+        assert_eq!(manager.list().len(), 2);
+    }
+
+    #[test]
+    fn finished_tasks_are_evicted_past_the_terminal_cap() {
+        let manager = TaskManager::new();
+        let session = SessionId::generate();
+        let mut ids = Vec::new();
+        for i in 0..(MAX_TERMINAL_TASKS + 10) {
+            let task = manager.start(format!("t{i}"), session.clone());
+            ids.push(task.id.clone());
+            manager.finish(&task.id, TaskState::Completed);
+        }
+        let tasks = manager.list();
+        assert_eq!(tasks.len(), MAX_TERMINAL_TASKS);
+        assert!(tasks.iter().all(|t| t.state == TaskState::Completed));
+        // The oldest finished tasks are the ones evicted.
+        assert!(!tasks.iter().any(|t| t.id == ids[0]));
+        assert!(tasks.iter().any(|t| t.id == *ids.last().unwrap()));
+    }
+
+    #[test]
+    fn running_tasks_are_never_evicted() {
+        let manager = TaskManager::new();
+        let session = SessionId::generate();
+        for _ in 0..(MAX_TERMINAL_TASKS + 5) {
+            let task = manager.start("bg", session.clone());
+            manager.finish(&task.id, TaskState::Failed);
+        }
+        let live = manager.start("still-running", session);
+        let extra = manager.start("extra", SessionId::generate());
+        manager.finish(&extra.id, TaskState::Completed);
+        assert!(manager.list().iter().any(|t| t.id == live.id));
+        assert!(manager.finish(&live.id, TaskState::Completed).is_some());
+        assert_eq!(manager.running_count(), 0);
     }
 }

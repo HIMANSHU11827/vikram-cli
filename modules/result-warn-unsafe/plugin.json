@@ -1,0 +1,25 @@
+{
+  "id": "result-warn-unsafe",
+  "name": "Result: an unsafe block",
+  "version": "1.0.0",
+  "description": "Inspects tool output for an unsafe block.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 40,
+  "components": {
+    "hooks": [
+      "tool_result"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_result",
+      "result_contain": "unsafe {",
+      "append_result": "[plugin] The change introduces unsafe code. Justify its invariants before it ships."
+    }
+  ]
+}

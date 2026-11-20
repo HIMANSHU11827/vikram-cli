@@ -1,0 +1,24 @@
+{
+  "id": "model-reminder-secrets",
+  "name": "Model: never echo secrets",
+  "version": "1.0.0",
+  "description": "Reminds the model that secrets must not be echoed.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 70,
+  "components": {
+    "hooks": [
+      "model_request"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "model_request",
+      "append": "Never echo a secret, even one that appeared in tool output."
+    }
+  ]
+}

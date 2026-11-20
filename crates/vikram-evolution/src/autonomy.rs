@@ -77,6 +77,9 @@ pub enum ApprovalStatus {
     Pending,
     Approved,
     Rejected,
+    /// Approved and already spent by one [`AutonomyManager::execute_controlled`]
+    /// call. An approval authorizes exactly one execution.
+    Executed,
 }
 
 pub struct AutonomyManager {
@@ -202,30 +205,34 @@ impl AutonomyManager {
         description: &str,
         approval_request_id: &str,
     ) -> Result<ActionRecord> {
-        let request = self
+        let idx = self
             .pending_approvals
             .iter()
-            .find(|r| r.id == approval_request_id)
+            .position(|r| r.id == approval_request_id)
             .ok_or_else(|| {
                 EvolutionError::NotFound(format!(
                     "approval request {approval_request_id} not found"
                 ))
             })?;
 
-        if request.status != ApprovalStatus::Approved {
-            return Err(EvolutionError::Security(format!(
-                "approval request {approval_request_id} is {:?}, not Approved",
-                request.status
-            )));
+        {
+            let request = &self.pending_approvals[idx];
+            if request.status != ApprovalStatus::Approved {
+                return Err(EvolutionError::Security(format!(
+                    "approval request {approval_request_id} is {:?}, not Approved",
+                    request.status
+                )));
+            }
+
+            if request.action_type != action {
+                return Err(EvolutionError::Validation(format!(
+                    "approval request {approval_request_id} covers {:?}, not {:?}",
+                    request.action_type, action
+                )));
+            }
         }
 
-        if request.action_type != action {
-            return Err(EvolutionError::Validation(format!(
-                "approval request {approval_request_id} covers {:?}, not {:?}",
-                request.action_type, action
-            )));
-        }
-
+        let request = &self.pending_approvals[idx];
         let level = self.determine_autonomy_level(&action);
         let approved_by = request.approved_by.clone();
 
@@ -242,6 +249,11 @@ impl AutonomyManager {
 
         self.action_history.push(record.clone());
         self.record_event(&record)?;
+        // The approval is consumed by this execution: a second
+        // `execute_controlled` with the same id fails the Approved check.
+        // Marked only after the event is recorded, so a store failure
+        // leaves the approval usable for a retry.
+        self.pending_approvals[idx].status = ApprovalStatus::Executed;
         Ok(record)
     }
 
@@ -445,6 +457,29 @@ mod tests {
             .unwrap();
         assert_eq!(record.autonomy_level, AutonomyLevel::ApprovalRequired);
         assert_eq!(record.approved_by.as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn an_approval_authorizes_exactly_one_execution() {
+        let mut manager = manager();
+
+        let request =
+            manager.request_approval(ActionType::ModifySourceCode, "change", "need approval");
+        manager.approve_request(&request.id, "user").unwrap();
+
+        manager
+            .execute_controlled(ActionType::ModifySourceCode, "change", &request.id)
+            .unwrap();
+
+        let err = manager
+            .execute_controlled(ActionType::ModifySourceCode, "change", &request.id)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Executed") && err.contains("not Approved"),
+            "second use of a spent approval must fail: {err}"
+        );
+        assert_eq!(manager.get_action_history().len(), 2);
     }
 
     #[test]

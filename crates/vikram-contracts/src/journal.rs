@@ -28,6 +28,8 @@ pub enum RecordKind {
     Cancellation,
     /// A scheduled or background activity event.
     Activity,
+    /// A plugin hook's decision at a turn, context, model or tool point.
+    Hook,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

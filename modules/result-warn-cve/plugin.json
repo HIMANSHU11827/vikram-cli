@@ -1,0 +1,25 @@
+{
+  "id": "result-warn-cve",
+  "name": "Result: a CVE reference",
+  "version": "1.0.0",
+  "description": "Inspects tool output for a cve reference.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 40,
+  "components": {
+    "hooks": [
+      "tool_result"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_result",
+      "result_contain": "CVE-",
+      "append_result": "[plugin] A CVE is referenced. Treat it as a finding to report, not to silently upgrade around."
+    }
+  ]
+}

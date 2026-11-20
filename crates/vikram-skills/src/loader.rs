@@ -191,6 +191,17 @@ impl Loader {
                 rel: rel.to_string(),
             });
         }
+        // Check the size before reading: a multi-GB resource must not be loaded into
+        // memory only to be rejected afterwards.
+        let meta = fs::metadata(&path).map_err(|err| SkillError::io(&path, &err))?;
+        let size = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+        if size > limit {
+            return Err(SkillError::TooLarge {
+                what: format!("resource `{rel}` of `{name}`"),
+                size,
+                limit,
+            });
+        }
         let text = fs::read_to_string(&path).map_err(|err| SkillError::io(&path, &err))?;
         if text.len() > limit {
             return Err(SkillError::TooLarge {
@@ -559,6 +570,35 @@ mod tests {
             .read_resource(&loaded.skill, "references/big.md")
             .expect_err("too large");
         assert!(matches!(err, SkillError::TooLarge { limit: 100, .. }));
+    }
+
+    #[test]
+    fn a_resource_over_the_limit_is_rejected_from_its_metadata_size() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let dir = tmp.path().join("alpha");
+        write_skill(&dir, "body");
+        fs::create_dir_all(dir.join("references")).expect("dirs");
+        // Sparse file: reports a large size without occupying the bytes.
+        let big = fs::File::create(dir.join("references/huge.md")).expect("create");
+        big.set_len(1_000_000).expect("set_len");
+        let loader = Loader::new(Budget {
+            resource_bytes: 100,
+            ..Budget::default()
+        });
+        let loaded = loader
+            .load(&summary(&dir, "alpha", TrustLevel::UserTrusted))
+            .expect("load");
+        let err = loader
+            .read_resource(&loaded.skill, "references/huge.md")
+            .expect_err("too large");
+        assert!(matches!(
+            err,
+            SkillError::TooLarge {
+                size: 1_000_000,
+                limit: 100,
+                ..
+            }
+        ));
     }
 
     #[test]

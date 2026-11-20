@@ -9,7 +9,7 @@ Vikram CLI is a terminal AI runtime built as a Rust workspace. It is a multi-use
 - `vikram-contracts`: stable typed contracts (IDs, messages, policy, journal, trust, versioning, tickets).
 - `vikram-policy`: deny-first permission evaluation with mandatory floor.
 - `vikram-store`: SQLite durable state (sessions, agents, teams, journal, users, profiles, entities, active identity, hive sessions/participants/messages, tickets, ticket participants/messages/assignments/events).
-- `vikram-runtime`: central process state, sessions, agents, teams, providers, tools, memory, skills, MCP, plugins, context loader, hive manager, ticket manager, sandbox.
+- `vikram-runtime`: central process state, sessions, agents, teams, providers, tools, memory, skills, MCP, plugins, hook registry (`hooks.rs`), context loader, hive manager, ticket manager, sandbox.
 - `vikram-skills`: skill discovery, loading, activation, installation.
 - `vikram-tui`: Ratatui terminal interface.
 - `vikram-cli`: Clap CLI entry point.

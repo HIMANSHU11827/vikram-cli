@@ -1,0 +1,26 @@
+{
+  "id": "guard-chmod-000",
+  "name": "Guard: unreadable file",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: unreadable file.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "shell.run",
+      "arguments_contain": "chmod 000",
+      "deny": "stripping all permissions hides the file from the operator too"
+    }
+  ]
+}

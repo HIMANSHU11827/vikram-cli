@@ -1,0 +1,25 @@
+{
+  "id": "turn-refuse-disable-floor",
+  "name": "Turn: refuse disabling the floor",
+  "version": "1.0.0",
+  "description": "Refuses a turn that asks to disable the permission floor.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 80,
+  "components": {
+    "hooks": [
+      "turn_start"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "turn_start",
+      "text_contain": "disable the permission floor",
+      "deny": "the mandatory permission floor cannot be widened or disabled by a turn"
+    }
+  ]
+}

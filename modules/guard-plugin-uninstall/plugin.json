@@ -1,0 +1,26 @@
+{
+  "id": "guard-plugin-uninstall",
+  "name": "Guard: uninstall a plugin",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: uninstall a plugin.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "shell.run",
+      "arguments_contain": "vikram plugins uninstall",
+      "deny": "plugin removal is an operator action"
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "id": "result-warn-conflict-marker",
+  "name": "Result: a merge conflict",
+  "version": "1.0.0",
+  "description": "Inspects tool output for a merge conflict.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 40,
+  "components": {
+    "hooks": [
+      "tool_result"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_result",
+      "result_contain": "<<<<<<<",
+      "append_result": "[plugin] A merge conflict is present. Resolve it before claiming the work is done."
+    }
+  ]
+}

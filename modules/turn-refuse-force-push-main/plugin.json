@@ -1,0 +1,25 @@
+{
+  "id": "turn-refuse-force-push-main",
+  "name": "Turn: refuse a force push to main",
+  "version": "1.0.0",
+  "description": "Refuses a turn that asks to force push main.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 80,
+  "components": {
+    "hooks": [
+      "turn_start"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "turn_start",
+      "text_contain": "force push to main",
+      "deny": "rewriting the main branch is an operator decision"
+    }
+  ]
+}

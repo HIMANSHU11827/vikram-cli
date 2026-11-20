@@ -3,16 +3,16 @@ use vikram_mcp::discovery::DiscoveryCatalog;
 use vikram_mcp::server::{ExposedTool, McpServer, McpServerConfig};
 use vikram_mcp::visibility::{Visibility, VisibilityManager};
 
-#[test]
-fn server_handles_initialize() {
+#[tokio::test]
+async fn server_handles_initialize() {
     let server = McpServer::new(McpServerConfig::default());
     let req = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
-    let resp = server.handle_request(&req);
+    let resp = server.handle_request(&req).await;
     assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
 }
 
-#[test]
-fn server_lists_tools() {
+#[tokio::test]
+async fn server_lists_tools() {
     // `approved_tools` is an explicit allowlist with no implicit allow-all:
     // a registered tool is only advertised once it is approved.
     let config = McpServerConfig {
@@ -26,13 +26,13 @@ fn server_lists_tools() {
         input_schema: json!({"type": "object"}),
     });
     let req = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
-    let resp = server.handle_request(&req);
+    let resp = server.handle_request(&req).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 1);
 }
 
-#[test]
-fn server_lists_no_tools_when_none_approved() {
+#[tokio::test]
+async fn server_lists_no_tools_when_none_approved() {
     // Empty allowlist exposes nothing, even for registered tools.
     let mut server = McpServer::new(McpServerConfig::default());
     server.register_tool(ExposedTool {
@@ -41,11 +41,11 @@ fn server_lists_no_tools_when_none_approved() {
         input_schema: json!({"type": "object"}),
     });
     let req = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
-    let resp = server.handle_request(&req);
+    let resp = server.handle_request(&req).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
     assert!(tools.is_empty());
     let req = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "test_tool", "arguments": {}}});
-    let resp = server.handle_request(&req);
+    let resp = server.handle_request(&req).await;
     assert!(
         resp["error"]["message"]
             .as_str()
@@ -54,8 +54,8 @@ fn server_lists_no_tools_when_none_approved() {
     );
 }
 
-#[test]
-fn server_rejects_auth_required_without_token() {
+#[tokio::test]
+async fn server_rejects_auth_required_without_token() {
     // Misconfiguration is a startup error, not a silent rejection loop.
     let config = McpServerConfig {
         auth_required: true,
@@ -65,27 +65,30 @@ fn server_rejects_auth_required_without_token() {
     assert!(McpServer::try_new(config).is_err());
 }
 
-#[test]
-fn server_rejects_unknown_tool() {
+#[tokio::test]
+async fn server_rejects_unknown_tool() {
     let server = McpServer::new(McpServerConfig::default());
     let req = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "nonexistent", "arguments": {}}});
-    let resp = server.handle_request(&req);
+    let resp = server.handle_request(&req).await;
     assert!(resp["error"].is_object());
 }
 
-#[test]
-fn server_handles_unknown_method() {
+#[tokio::test]
+async fn server_handles_unknown_method() {
     let server = McpServer::new(McpServerConfig::default());
     let req = json!({"jsonrpc": "2.0", "id": 4, "method": "foo/bar"});
-    let resp = server.handle_request(&req);
+    let resp = server.handle_request(&req).await;
     assert_eq!(resp["error"]["code"], -32601);
 }
 
 #[test]
-fn visibility_defaults_to_private() {
+fn visibility_defaults_to_public_and_unregistered_names_stay_closed() {
+    // Registering a server exposes it: Private is an operator's explicit choice, and
+    // withholding by default would disable every MCP server on first run.
     let mut vm = VisibilityManager::new();
     vm.register("my-server".to_string());
-    assert!(!vm.is_public("my-server"));
+    assert!(vm.is_public("my-server"));
+    assert!(!vm.is_public("never-registered"));
 }
 
 #[test]
@@ -103,9 +106,9 @@ fn visibility_independent() {
     let mut vm = VisibilityManager::new();
     vm.register("a".to_string());
     vm.register("b".to_string());
-    vm.set_visibility("a", Visibility::Public);
-    assert!(vm.is_public("a"));
-    assert!(!vm.is_public("b"));
+    vm.set_visibility("a", Visibility::Private);
+    assert!(!vm.is_public("a"));
+    assert!(vm.is_public("b"));
 }
 
 #[test]

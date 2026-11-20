@@ -1,0 +1,26 @@
+{
+  "id": "guard-write-outside",
+  "name": "Guard: write outside the workspace",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: write outside the workspace.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "fs.write",
+      "arguments_contain": "../",
+      "deny": "writes are confined to the workspace"
+    }
+  ]
+}

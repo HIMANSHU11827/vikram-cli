@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tokio::sync::watch;
 
+use crate::delivery::{DeliveryLedger, NewDelivery, now_unix};
 use crate::event::MessageEvent;
 use crate::platform::{OutboundMedia, PlatformAdapter, SendResult};
 use crate::platforms::{
@@ -68,19 +69,49 @@ pub struct HostStats {
     pub errors: u64,
 }
 
+/// How often the delivery-ledger sweep runs: reclaim stale claims, then send due rows.
+const LEDGER_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Rows one sweep may claim.
+const LEDGER_SWEEP_BATCH: usize = 16;
+
 /// Serve one platform until `stop` flips to `true`.
 ///
-/// A read error is not fatal: it is counted and retried after a short pause, because a dropped
-/// socket is the normal state of a messaging platform, not an outage of this process.
+/// Replies go through an in-memory [`DeliveryLedger`]: a failed send is recorded and retried by
+/// the sweep instead of being dropped. [`serve_with_ledger`] is the entry point for a caller that
+/// can supply a file-backed ledger (the documented `gateway_state.db`).
 pub async fn serve(
     platform: Arc<dyn GatewayPlatform>,
     handler: ReplyHandler,
-    mut stop: watch::Receiver<bool>,
+    stop: watch::Receiver<bool>,
 ) -> HostStats {
+    let ledger = match DeliveryLedger::in_memory() {
+        Ok(ledger) => Some(Arc::new(ledger)),
+        Err(err) => {
+            eprintln!(
+                "[gateway] in-memory delivery ledger unavailable: {err}; replies are sent without retry"
+            );
+            None
+        }
+    };
+    serve_with_ledger(platform, handler, stop, ledger).await
+}
+
+/// [`serve`] with a caller-supplied ledger. `None` disables the ledger and keeps the legacy
+/// send-and-forget path.
+pub async fn serve_with_ledger(
+    platform: Arc<dyn GatewayPlatform>,
+    handler: ReplyHandler,
+    mut stop: watch::Receiver<bool>,
+    ledger: Option<Arc<DeliveryLedger>>,
+) -> HostStats {
+    let sweep = ledger
+        .as_ref()
+        .map(|ledger| spawn_ledger_sweep(Arc::clone(&platform), Arc::clone(ledger), stop.clone()));
     let mut stats = HostStats::default();
+    let mut reply_seq = 0u64;
     loop {
         if *stop.borrow() {
-            return stats;
+            break;
         }
         let events = match platform.next_events().await {
             Ok(events) => events,
@@ -88,7 +119,7 @@ pub async fn serve(
                 stats.errors += 1;
                 eprintln!("[gateway:{}] read failed: {err}", platform.name());
                 if wait_or_stop(&mut stop, std::time::Duration::from_secs(1)).await {
-                    return stats;
+                    break;
                 }
                 continue;
             }
@@ -97,31 +128,187 @@ pub async fn serve(
         // is enough because real long-poll transports already block server-side.
         if events.is_empty() && wait_or_stop(&mut stop, std::time::Duration::from_millis(250)).await
         {
-            return stats;
+            break;
         }
         for event in events {
             if *stop.borrow() {
-                return stats;
+                break;
             }
             let chat_id = event.source.chat_id.clone();
+            // The platform message id is the ledger identity when the adapter supplied one
+            // (hermes uses it so a redelivered update cannot enqueue a second reply); without
+            // one, a unique id per reply keeps distinct answers distinct.
+            let ledger_id = event
+                .ledger_message_id
+                .clone()
+                .or_else(|| event.message_id.clone())
+                .unwrap_or_else(|| {
+                    reply_seq += 1;
+                    format!("{}:{chat_id}:{}:{reply_seq}", platform.name(), now_unix())
+                });
             stats.events += 1;
             let reply = (handler)(event).await;
             if let Some(text) = reply {
                 if text.trim().is_empty() {
                     continue;
                 }
-                let result = platform.send(&chat_id, &text).await;
-                if result.success {
-                    stats.replies += 1;
-                } else {
-                    stats.errors += 1;
-                    eprintln!(
-                        "[gateway:{}] reply to {chat_id} failed: {}",
-                        platform.name(),
-                        result.error.unwrap_or_else(|| "unknown error".into())
-                    );
+                deliver_text(
+                    &platform,
+                    ledger.as_deref(),
+                    &ledger_id,
+                    &chat_id,
+                    &text,
+                    &mut stats,
+                )
+                .await;
+            }
+        }
+    }
+    if let Some(task) = sweep {
+        task.abort();
+    }
+    stats
+}
+
+/// Send one reply. With a ledger the send is claim-then-record so a failure becomes a retryable
+/// row; without one (or when the ledger itself errors) the legacy direct send is preserved.
+async fn deliver_text(
+    platform: &Arc<dyn GatewayPlatform>,
+    ledger: Option<&DeliveryLedger>,
+    ledger_id: &str,
+    chat_id: &str,
+    text: &str,
+    stats: &mut HostStats,
+) {
+    let Some(ledger) = ledger else {
+        send_direct(platform, chat_id, text, stats).await;
+        return;
+    };
+    let now = now_unix();
+    let delivery = NewDelivery::new(ledger_id, platform.name(), chat_id, text);
+    if let Err(err) = ledger.enqueue(delivery, now) {
+        eprintln!(
+            "[gateway:{}] delivery ledger enqueue failed: {err}; sending directly",
+            platform.name()
+        );
+        send_direct(platform, chat_id, text, stats).await;
+        return;
+    }
+    match ledger.claim(ledger_id, now) {
+        Ok(Some(_)) => {
+            let result = platform.send(chat_id, text).await;
+            if let Err(err) = ledger.record_send_result(ledger_id, &result, now_unix()) {
+                eprintln!(
+                    "[gateway:{}] delivery ledger record failed for {ledger_id}: {err}",
+                    platform.name()
+                );
+            }
+            record_send_stats(stats, platform.name(), chat_id, &result);
+        }
+        // The row is already delivered, in flight, or waiting out flood control: the ledger (and
+        // the sweep) owns it now, so a duplicate event must not send a second copy.
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!(
+                "[gateway:{}] delivery ledger claim failed for {ledger_id}: {err}; sending directly",
+                platform.name()
+            );
+            send_direct(platform, chat_id, text, stats).await;
+        }
+    }
+}
+
+async fn send_direct(
+    platform: &Arc<dyn GatewayPlatform>,
+    chat_id: &str,
+    text: &str,
+    stats: &mut HostStats,
+) {
+    let result = platform.send(chat_id, text).await;
+    record_send_stats(stats, platform.name(), chat_id, &result);
+}
+
+fn record_send_stats(
+    stats: &mut HostStats,
+    platform_name: &str,
+    chat_id: &str,
+    result: &SendResult,
+) {
+    if result.success {
+        stats.replies += 1;
+    } else {
+        stats.errors += 1;
+        eprintln!(
+            "[gateway:{platform_name}] reply to {chat_id} failed: {}",
+            result
+                .error
+                .clone()
+                .unwrap_or_else(|| "unknown error".into())
+        );
+    }
+}
+
+/// Background task owning retries: reclaim rows a dead send stranded, then claim and send every
+/// due row through the same platform transport. Stops when `stop` flips or the task is aborted.
+fn spawn_ledger_sweep(
+    platform: Arc<dyn GatewayPlatform>,
+    ledger: Arc<DeliveryLedger>,
+    mut stop: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(LEDGER_SWEEP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    sweep_once(&platform, &ledger, now_unix()).await;
+                }
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() {
+                        break;
+                    }
                 }
             }
+        }
+    })
+}
+
+/// One sweep pass. `now` is explicit so tests are deterministic.
+///
+/// Resumed rows resend their whole body: `GatewayPlatform::send` takes the full text and the
+/// chunk boundaries that produced a `partial_overflow` live inside the adapter, so the ledger's
+/// delivered-chunk bookkeeping is recorded faithfully even though a tail-only resend is not yet
+/// expressible at this layer.
+async fn sweep_once(platform: &Arc<dyn GatewayPlatform>, ledger: &DeliveryLedger, now: i64) {
+    if let Err(err) = ledger.reclaim_stale(now) {
+        eprintln!("[gateway:{}] ledger reclaim failed: {err}", platform.name());
+    }
+    let claimed = match ledger.claim_due(now, LEDGER_SWEEP_BATCH) {
+        Ok(claimed) => claimed,
+        Err(err) => {
+            eprintln!("[gateway:{}] ledger claim failed: {err}", platform.name());
+            return;
+        }
+    };
+    for entry in claimed {
+        let result = platform.send(&entry.chat_id, &entry.body).await;
+        if let Err(err) = ledger.record_send_result(&entry.ledger_id, &result, now_unix()) {
+            eprintln!(
+                "[gateway:{}] ledger record failed for {}: {err}",
+                platform.name(),
+                entry.ledger_id
+            );
+        }
+        if !result.success {
+            eprintln!(
+                "[gateway:{}] ledger retry to {} failed: {}",
+                platform.name(),
+                entry.chat_id,
+                result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".into())
+            );
         }
     }
 }
@@ -899,6 +1086,7 @@ mod tests {
     struct FakePlatform {
         events: Mutex<Vec<MessageEvent>>,
         sent: Mutex<Vec<(String, String)>>,
+        fail_sends: std::sync::atomic::AtomicBool,
         wake: Notify,
     }
 
@@ -907,6 +1095,7 @@ mod tests {
             Arc::new(Self {
                 events: Mutex::new(events),
                 sent: Mutex::new(Vec::new()),
+                fail_sends: std::sync::atomic::AtomicBool::new(false),
                 wake: Notify::new(),
             })
         }
@@ -930,6 +1119,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((chat_id.to_string(), content.to_string()));
+            if self.fail_sends.load(std::sync::atomic::Ordering::SeqCst) {
+                return SendResult::failed("boom", Some("transient"));
+            }
             SendResult::ok("m")
         }
     }
@@ -1017,5 +1209,151 @@ mod tests {
                 errors: 0
             }
         );
+    }
+
+    async fn wait_until(mut check: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !check() {
+            assert!(tokio::time::Instant::now() < deadline, "timed out waiting");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_successful_reply_is_recorded_delivered() {
+        use crate::delivery::LedgerState;
+
+        let mut inbound = event("chat-1", "hello");
+        inbound.message_id = Some("m-1".to_string());
+        let platform = FakePlatform::new(vec![inbound]);
+        let ledger = Arc::new(crate::delivery::DeliveryLedger::in_memory().unwrap());
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(serve_with_ledger(
+            platform.clone(),
+            echo(),
+            stop_rx,
+            Some(Arc::clone(&ledger)),
+        ));
+        wait_until(|| !platform.sent.lock().unwrap().is_empty()).await;
+        stop_tx.send(true).unwrap();
+        platform.wake.notify_waiters();
+        let stats = task.await.unwrap();
+        assert_eq!(stats.replies, 1);
+        let entry = ledger.get("m-1").unwrap().expect("ledger row");
+        assert_eq!(entry.state, LedgerState::Delivered);
+        assert_eq!(entry.message_id.as_deref(), Some("m"));
+        assert_eq!(entry.chat_id, "chat-1");
+        assert_eq!(entry.body, "echo: hello");
+    }
+
+    #[tokio::test]
+    async fn a_failed_reply_is_marked_failed_then_retried_by_the_sweep() {
+        use crate::delivery::{DEFAULT_RETRY_BACKOFF_SECS, LedgerState, now_unix};
+
+        let mut inbound = event("chat-1", "hello");
+        inbound.message_id = Some("m-2".to_string());
+        let platform = FakePlatform::new(vec![inbound]);
+        platform
+            .fail_sends
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let ledger = Arc::new(crate::delivery::DeliveryLedger::in_memory().unwrap());
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(serve_with_ledger(
+            platform.clone(),
+            echo(),
+            stop_rx,
+            Some(Arc::clone(&ledger)),
+        ));
+        // First attempt fails; the ledger owns the retry instead of dropping the reply.
+        wait_until(|| !platform.sent.lock().unwrap().is_empty()).await;
+        wait_until(|| {
+            ledger
+                .get("m-2")
+                .unwrap()
+                .is_some_and(|entry| entry.state == LedgerState::Failed)
+        })
+        .await;
+        let failed = ledger.get("m-2").unwrap().unwrap();
+        assert_eq!(failed.attempts, 1);
+        assert_eq!(failed.last_error.as_deref(), Some("boom"));
+        assert_eq!(failed.error_kind.as_deref(), Some("transient"));
+        assert!(failed.flood_not_before > now_unix());
+
+        // The platform recovers; once the backoff has elapsed the sweep resends and delivers.
+        platform
+            .fail_sends
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        sweep_once(
+            &dyn_platform,
+            &ledger,
+            now_unix() + DEFAULT_RETRY_BACKOFF_SECS + 1,
+        )
+        .await;
+        let entry = ledger.get("m-2").unwrap().unwrap();
+        assert_eq!(entry.state, LedgerState::Delivered);
+        assert_eq!(entry.attempts, 2);
+        assert_eq!(platform.sent.lock().unwrap().len(), 2);
+
+        stop_tx.send(true).unwrap();
+        platform.wake.notify_waiters();
+        let _ = task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_sweep_reclaims_a_stale_attempt_and_sends_it() {
+        use crate::delivery::{LedgerState, STALE_RECLAIM_AFTER_SECS};
+
+        let ledger = crate::delivery::DeliveryLedger::in_memory().unwrap();
+        let now = now_unix();
+        ledger
+            .enqueue(
+                NewDelivery::new("stale-1", "fake", "chat-9", " stranded reply"),
+                now,
+            )
+            .unwrap()
+            .unwrap();
+        ledger.claim("stale-1", now).unwrap().unwrap();
+        assert_eq!(
+            ledger.get("stale-1").unwrap().unwrap().state,
+            LedgerState::Attempting
+        );
+
+        let platform = FakePlatform::new(vec![]);
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        // A claim this old belongs to a dead process; the sweep reclaims it and sends the body.
+        sweep_once(&dyn_platform, &ledger, now + STALE_RECLAIM_AFTER_SECS + 1).await;
+        let entry = ledger.get("stale-1").unwrap().unwrap();
+        assert_eq!(entry.state, LedgerState::Delivered);
+        assert_eq!(entry.attempts, 2);
+        assert_eq!(
+            platform.sent.lock().unwrap().as_slice(),
+            &[("chat-9".to_string(), " stranded reply".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redelivered_message_id_does_not_send_twice() {
+        let mut first = event("chat-1", "hello");
+        first.message_id = Some("dup-1".to_string());
+        let mut second = event("chat-1", "hello again");
+        second.message_id = Some("dup-1".to_string());
+        let platform = FakePlatform::new(vec![first, second]);
+        let ledger = Arc::new(crate::delivery::DeliveryLedger::in_memory().unwrap());
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(serve_with_ledger(
+            platform.clone(),
+            echo(),
+            stop_rx,
+            Some(Arc::clone(&ledger)),
+        ));
+        wait_until(|| !platform.sent.lock().unwrap().is_empty()).await;
+        // Give the loop a moment to (not) process the duplicate, then stop.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        stop_tx.send(true).unwrap();
+        platform.wake.notify_waiters();
+        let _ = task.await.unwrap();
+        assert_eq!(platform.sent.lock().unwrap().len(), 1);
+        assert_eq!(ledger.len().unwrap(), 1);
     }
 }

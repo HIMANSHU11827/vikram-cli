@@ -105,17 +105,36 @@ impl ModelLimits {
         }
     }
 
-    /// Prefix match against the registry, longest key winning.
+    /// The output cap the registry declares for `model`, clamped to what a request field can
+    /// hold. `None` for a model the registry does not know: the assumed floor is a budgeting
+    /// guess, not a limit the provider stated, and putting it on the wire would cap answers
+    /// that were allowed to run longer.
+    pub fn declared_output_cap(model: &str) -> Option<u32> {
+        Self::lookup(model).map(|limits| limits.max_output_tokens.min(u32::MAX as u64) as u32)
+    }
+
+    /// Match against the registry, longest key winning. A routed name like `openai/o3` is judged
+    /// by its last `/`-segment. Prefix hits cover dated suffixes (`gpt-4o-mini-2024-07-18`); a
+    /// contains hit is accepted only behind a `.`/`:` vendor or finetune prefix
+    /// (`anthropic.claude-3-5`, `ft:gpt-4o`), never inside a longer token — `my-o1-x` is not `o1`.
     pub fn lookup(model: &str) -> Option<Self> {
-        let name = model.trim().to_lowercase();
+        let name = model
+            .rsplit('/')
+            .next()
+            .unwrap_or(model)
+            .trim()
+            .to_lowercase();
         if name.is_empty() {
             return None;
         }
-        // A dated or routed name usually carries a suffix the registry key does not, so a
-        // substring hit is accepted when no prefix does. Longest key wins either way.
         let row = REGISTRY
             .iter()
-            .filter(|row| name.starts_with(row.0) || name.contains(row.0))
+            .filter(|row| {
+                name.starts_with(row.0)
+                    || name
+                        .match_indices(row.0)
+                        .any(|(i, _)| i > 0 && matches!(name.as_bytes()[i - 1], b'.' | b':'))
+            })
             .max_by_key(|row| row.0.len());
         row.map(|(_, window, output)| Self {
             context_window: *window,
@@ -355,6 +374,59 @@ mod tests {
         assert_eq!(mini.context_window, 128_000);
         let four = ModelLimits::lookup("gpt-4-0613").unwrap();
         assert_eq!(four.context_window, 8_192);
+    }
+
+    #[test]
+    fn registry_lookup_judges_the_last_routed_segment() {
+        assert_eq!(
+            ModelLimits::lookup("openai/o3").unwrap().context_window,
+            200_000
+        );
+        assert_eq!(
+            ModelLimits::lookup("azure/gpt-4o-mini")
+                .unwrap()
+                .context_window,
+            128_000
+        );
+    }
+
+    #[test]
+    fn registry_lookup_rejects_substring_impersonators() {
+        // `my-o1-x` contains "o1" but is not the o1 family: it must not inherit the 200k window.
+        assert!(ModelLimits::lookup("my-o1-x").is_none());
+        assert!(ModelLimits::lookup("not-gpt-4o").is_none());
+        // Vendor and finetune prefixes still resolve: the hit sits behind `.` or `:`.
+        assert_eq!(
+            ModelLimits::lookup("anthropic.claude-3-5-sonnet")
+                .unwrap()
+                .context_window,
+            200_000
+        );
+        assert_eq!(
+            ModelLimits::lookup("ft:gpt-4o:org:run")
+                .unwrap()
+                .context_window,
+            128_000
+        );
+    }
+
+    #[test]
+    fn the_declared_output_cap_is_the_registry_figure_and_only_for_known_models() {
+        assert_eq!(ModelLimits::declared_output_cap("gpt-4o"), Some(16_384));
+        assert_eq!(
+            ModelLimits::declared_output_cap("claude-sonnet-4-5"),
+            Some(64_000)
+        );
+        assert_eq!(
+            ModelLimits::declared_output_cap("some-private-weights"),
+            None
+        );
+        // It is the same figure the resolved limits carry, so the request and the budget agree.
+        let limits = ModelLimits::resolve("o3-mini", None, None);
+        assert_eq!(
+            u64::from(ModelLimits::declared_output_cap("o3-mini").unwrap()),
+            limits.max_output_tokens
+        );
     }
 
     #[test]

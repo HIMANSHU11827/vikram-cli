@@ -161,6 +161,8 @@ pub enum TransportError {
     Request(String),
     #[error("response was not json: {0}")]
     Json(String),
+    #[error("response body is larger than the {0} byte limit")]
+    TooLarge(usize),
 }
 
 #[async_trait]
@@ -178,8 +180,16 @@ pub trait Transport: Send + Sync {
     ///
     /// The default refuses. A transport that has not thought about binary bodies should fail
     /// loudly rather than hand back something that was never a byte-for-byte copy.
-    async fn execute_bytes(&self, request: HttpRequest) -> Result<Vec<u8>, TransportError> {
-        let _ = request;
+    ///
+    /// `max_bytes` is a hard ceiling on the body. A transport that streams must abort the
+    /// download as soon as the received bytes exceed it — buffering the whole response and
+    /// checking afterwards lets a hostile server force an oversized allocation.
+    async fn execute_bytes(
+        &self,
+        request: HttpRequest,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, TransportError> {
+        let _ = (request, max_bytes);
         Err(TransportError::Request(
             "binary bodies are not supported by this transport".to_string(),
         ))
@@ -193,27 +203,85 @@ pub struct ReqwestTransport {
     client: reqwest::Client,
     /// `execute_bytes` serves untrusted attachment URLs. It uses a client that does not follow
     /// redirects: the SSRF guard in `media_fetch` vets the URL it was handed, and a 302 would move
-    /// the fetch to a host that was never checked.
+    /// the fetch to a host that was never checked. Its DNS resolver resolves each host once,
+    /// refuses private answers, and dials only the vetted addresses — so a public name cannot
+    /// rebind to a private address between the guard's check and the connect.
     bytes_client: reqwest::Client,
+}
+
+/// DNS resolver for the bytes client. Every answer is checked against the same private-address
+/// rule `media_fetch` applies to the URL text; if any resolved address is private the whole
+/// name is refused, and the surviving addresses are the only ones the connector dials.
+struct VettedDns {
+    allow_private: bool,
+}
+
+/// True when any resolved address is one `media_fetch` would refuse.
+fn private_resolution(addrs: &[std::net::SocketAddr]) -> bool {
+    addrs
+        .iter()
+        .any(|addr| crate::media_fetch::private_address(addr.ip()))
+}
+
+impl reqwest::dns::Resolve for VettedDns {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        let allow_private = self.allow_private;
+        Box::pin(async move {
+            let fail = |message: &str| {
+                Box::new(std::io::Error::other(message.to_string()))
+                    as Box<dyn std::error::Error + Send + Sync>
+            };
+            let addrs = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|err| fail(&err.to_string()))?
+                .collect::<Vec<std::net::SocketAddr>>();
+            if addrs.is_empty() {
+                return Err(fail("the host resolved to no addresses"));
+            }
+            if !allow_private && private_resolution(&addrs) {
+                return Err(fail("the host resolves to a private address"));
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 impl ReqwestTransport {
     pub fn new() -> Result<Self, TransportError> {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let build = |redirects: bool| {
-            let mut builder = reqwest::Client::builder()
-                .use_preconfigured_tls(crate::tls_config())
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(60));
-            if !redirects {
-                builder = builder.redirect(reqwest::redirect::Policy::none());
-            }
-            builder.build()
-        };
         Ok(Self {
-            client: build(true).map_err(|err| TransportError::Request(err.to_string()))?,
-            bytes_client: build(false).map_err(|err| TransportError::Request(err.to_string()))?,
+            client: Self::build_client(true, false)?,
+            bytes_client: Self::build_client(false, false)?,
         })
+    }
+
+    /// Let `execute_bytes` connect to hosts that resolve to private addresses. Off by default,
+    /// mirroring `MediaFetchLimits::allow_private`: an operator talking to a local bridge opts
+    /// in here as well as in the fetch limits.
+    pub fn with_private_media(mut self) -> Result<Self, TransportError> {
+        self.bytes_client = Self::build_client(false, true)?;
+        Ok(self)
+    }
+
+    fn build_client(
+        redirects: bool,
+        media_private: bool,
+    ) -> Result<reqwest::Client, TransportError> {
+        let mut builder = reqwest::Client::builder()
+            .use_preconfigured_tls(crate::tls_config())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(60));
+        if !redirects {
+            builder = builder
+                .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(VettedDns {
+                    allow_private: media_private,
+                });
+        }
+        builder
+            .build()
+            .map_err(|err| TransportError::Request(err.to_string()))
     }
 
     pub fn into_shared(self) -> SharedTransport {
@@ -269,8 +337,12 @@ impl Transport for ReqwestTransport {
         })
     }
 
-    async fn execute_bytes(&self, request: HttpRequest) -> Result<Vec<u8>, TransportError> {
-        let response = self.send(&self.bytes_client, request).await?;
+    async fn execute_bytes(
+        &self,
+        request: HttpRequest,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, TransportError> {
+        let mut response = self.send(&self.bytes_client, request).await?;
         // Redirects are not followed for binary downloads; a 3xx here means the attachment URL
         // tried to move the fetch somewhere the caller's SSRF guard never vetted.
         if response.status().is_redirection() {
@@ -278,11 +350,25 @@ impl Transport for ReqwestTransport {
                 "the server answered with a redirect, which is not followed".to_string(),
             ));
         }
-        let bytes = response
-            .bytes()
+        if let Some(length) = response.content_length()
+            && length > max_bytes as u64
+        {
+            return Err(TransportError::TooLarge(max_bytes));
+        }
+        // Stream the body and stop the moment it crosses the cap: `bytes()` would buffer the
+        // whole response first, letting a hostile server force an oversized allocation.
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|err| TransportError::Request(err.without_url().to_string()))?;
-        Ok(bytes.to_vec())
+            .map_err(|err| TransportError::Request(err.without_url().to_string()))?
+        {
+            if body.len().saturating_add(chunk.len()) > max_bytes {
+                return Err(TransportError::TooLarge(max_bytes));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     }
 }
 
@@ -340,9 +426,59 @@ mod tests {
         let fetched = transport
             .execute_bytes(
                 HttpRequest::get(format!("http://{addr}/a.png")).header("Accept", "image/png"),
+                1024,
             )
             .await;
         assert_eq!(fetched.ok(), Some(png));
+    }
+
+    #[tokio::test]
+    async fn execute_bytes_aborts_once_the_body_crosses_the_cap() {
+        let body = vec![0x89u8; 8192];
+        let addr = serve_once("image/png", &body).await;
+        let transport = match ReqwestTransport::new() {
+            Ok(transport) => transport,
+            Err(err) => unreachable!("a client builds without a network: {err}"),
+        };
+        let result = transport
+            .execute_bytes(HttpRequest::get(format!("http://{addr}/a.png")), 1024)
+            .await;
+        assert!(matches!(result, Err(TransportError::TooLarge(1024))));
+    }
+
+    #[tokio::test]
+    async fn execute_bytes_rejects_a_declared_length_over_the_cap_before_reading() {
+        // The server advertises far more than the cap and then closes; the transport must fail
+        // on the Content-Length alone, without waiting for a body that never fully arrives.
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => unreachable!("the test server must bind a loopback port: {err}"),
+        };
+        let addr = listener
+            .local_addr()
+            .expect("a bound listener reports its address");
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = vec![0u8; 2048];
+            let _ = stream.read(&mut buffer).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            let _ = stream.write_all(b"tiny").await;
+            let _ = stream.flush().await;
+        });
+        let transport = match ReqwestTransport::new() {
+            Ok(transport) => transport,
+            Err(err) => unreachable!("a client builds without a network: {err}"),
+        };
+        let result = transport
+            .execute_bytes(HttpRequest::get(format!("http://{addr}/a.png")), 1024)
+            .await;
+        assert!(matches!(result, Err(TransportError::TooLarge(1024))));
     }
 
     #[tokio::test]
@@ -382,7 +518,7 @@ mod tests {
     #[tokio::test]
     async fn a_transport_without_a_binary_body_refuses_instead_of_guessing() {
         let result = TextOnly
-            .execute_bytes(HttpRequest::get("https://example.test/a.png"))
+            .execute_bytes(HttpRequest::get("https://example.test/a.png"), 1024)
             .await;
         assert_eq!(
             result.err().map(|err| err.to_string()),
@@ -462,5 +598,42 @@ mod tests {
             };
             assert!(!response.ok(), "{status}");
         }
+    }
+
+    #[test]
+    fn a_resolution_is_refused_when_any_answer_is_private() {
+        let public = std::net::SocketAddr::from(([8, 8, 8, 8], 443));
+        let private_v4 = std::net::SocketAddr::from(([10, 0, 0, 1], 443));
+        let private_v6 = std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 443));
+        assert!(!private_resolution(&[public]));
+        assert!(private_resolution(&[public, private_v4]));
+        assert!(private_resolution(&[private_v6]));
+        assert!(!private_resolution(&[]));
+    }
+
+    /// `localhost` resolves through the OS resolver to loopback in every environment that can
+    /// run this test, so it exercises the real lookup path without touching the network.
+    #[tokio::test]
+    async fn the_dns_guard_refuses_a_name_that_resolves_private() {
+        use reqwest::dns::{Name, Resolve};
+        use std::str::FromStr;
+
+        let name = Name::from_str("localhost").expect("localhost is a valid name");
+        let strict = VettedDns {
+            allow_private: false,
+        };
+        assert!(strict.resolve(name).await.is_err());
+
+        let lenient = VettedDns {
+            allow_private: true,
+        };
+        let name = Name::from_str("localhost").expect("localhost is a valid name");
+        let addrs = lenient
+            .resolve(name)
+            .await
+            .expect("an opted-in resolver returns the loopback answers")
+            .collect::<Vec<_>>();
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(|addr| addr.ip().is_loopback()));
     }
 }

@@ -1,0 +1,26 @@
+{
+  "id": "guard-delete-root",
+  "name": "Guard: delete the filesystem root",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: delete the filesystem root.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "fs.delete",
+      "arguments_contain": "\"path\":\"/\"",
+      "deny": "deleting the root is never a tool call"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "id": "guard-git-force-push-short",
+  "name": "Guard: force push (-f)",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: force push (-f).",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "shell.run",
+      "arguments_contain": "git push -f",
+      "deny": "force-pushing rewrites shared history; push a new branch instead"
+    }
+  ]
+}

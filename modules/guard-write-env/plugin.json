@@ -1,0 +1,26 @@
+{
+  "id": "guard-write-env",
+  "name": "Guard: write .env",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: write .env.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "fs.write",
+      "arguments_contain": ".env",
+      "deny": "writing .env would let the turn change its own credentials"
+    }
+  ]
+}

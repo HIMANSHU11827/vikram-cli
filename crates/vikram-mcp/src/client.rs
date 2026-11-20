@@ -582,117 +582,105 @@ async fn establish(
         }
     }
 
-    write_line(
-        &mut stdin,
-        &json!({"jsonrpc": "2.0", "id": 3, "method": "resources/list"}),
-    )
-    .await?;
+    // `resources` and `prompts` are optional MCP capabilities: a server may
+    // legitimately answer -32601 Method not found, and a timeout or closed
+    // stream must not kill a connection whose initialize/tools/list already
+    // succeeded. Failures here yield empty lists, not a dropped connection.
+    let resource_items =
+        optional_items(&mut stdin, &mut lines, 3, "resources/list", "resources").await;
     let mut resources = Vec::new();
-    for _ in 0..10 {
-        let line = read_line(&mut lines, "resources/list").await?;
-        let value: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        if value.get("id").and_then(Value::as_u64) == Some(3) {
-            if let Some(err) = value.get("error") {
-                let cleanup = terminate(&mut child).await;
-                let rejected = format!("resources/list rejected: {err}");
-                return Err(match cleanup {
-                    Ok(()) => rejected,
-                    Err(err) => format!("{rejected} (also failed to stop child: {err})"),
-                });
-            }
-            if let Some(arr) = value
-                .get("result")
-                .and_then(|r| r.get("resources"))
-                .and_then(Value::as_array)
-            {
-                for r in arr {
-                    let uri = r
-                        .get("uri")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    if uri.is_empty() {
-                        continue;
-                    }
-                    let name = r
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let description = r
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let mime_type = r.get("mimeType").and_then(Value::as_str).map(String::from);
-                    resources.push(ResourceInfo {
-                        server: server.name.clone(),
-                        uri,
-                        name,
-                        description,
-                        mime_type,
-                    });
-                }
-            }
-            break;
+    for r in resource_items {
+        let uri = r
+            .get("uri")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if uri.is_empty() {
+            continue;
         }
+        let name = r
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let description = r
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let mime_type = r.get("mimeType").and_then(Value::as_str).map(String::from);
+        resources.push(ResourceInfo {
+            server: server.name.clone(),
+            uri,
+            name,
+            description,
+            mime_type,
+        });
     }
 
-    write_line(
-        &mut stdin,
-        &json!({"jsonrpc": "2.0", "id": 4, "method": "prompts/list"}),
-    )
-    .await?;
+    let prompt_items = optional_items(&mut stdin, &mut lines, 4, "prompts/list", "prompts").await;
     let mut prompts = Vec::new();
-    for _ in 0..10 {
-        let line = read_line(&mut lines, "prompts/list").await?;
-        let value: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        if value.get("id").and_then(Value::as_u64) == Some(4) {
-            if let Some(err) = value.get("error") {
-                let cleanup = terminate(&mut child).await;
-                let rejected = format!("prompts/list rejected: {err}");
-                return Err(match cleanup {
-                    Ok(()) => rejected,
-                    Err(err) => format!("{rejected} (also failed to stop child: {err})"),
-                });
-            }
-            if let Some(arr) = value
-                .get("result")
-                .and_then(|r| r.get("prompts"))
-                .and_then(Value::as_array)
-            {
-                for p in arr {
-                    let name = p
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    if name.is_empty() {
-                        continue;
-                    }
-                    let description = p
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    prompts.push(PromptInfo {
-                        server: server.name.clone(),
-                        name,
-                        description,
-                    });
-                }
-            }
-            break;
+    for p in prompt_items {
+        let name = p
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            continue;
         }
+        let description = p
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        prompts.push(PromptInfo {
+            server: server.name.clone(),
+            name,
+            description,
+        });
     }
 
     Ok((child, stdin, lines, tools, resources, prompts))
+}
+
+/// Fetch one optional capability list (`resources/list`, `prompts/list`).
+///
+/// Any failure — write error, timeout, closed stream, a JSON-RPC error such
+/// as -32601 Method not found, or no matching response within the retry
+/// budget — yields an empty item list rather than failing the connection.
+async fn optional_items(
+    stdin: &mut ChildStdin,
+    lines: &mut tokio::io::Lines<BufReader<ChildStdout>>,
+    id: u64,
+    method: &str,
+    result_key: &str,
+) -> Vec<Value> {
+    let request = json!({"jsonrpc": "2.0", "id": id, "method": method});
+    if write_line(stdin, &request).await.is_err() {
+        return Vec::new();
+    }
+    for _ in 0..10 {
+        let Ok(line) = read_line(lines, method).await else {
+            return Vec::new();
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("id").and_then(Value::as_u64) != Some(id) {
+            continue;
+        }
+        if value.get("error").is_some() {
+            return Vec::new();
+        }
+        return value
+            .get("result")
+            .and_then(|r| r.get(result_key))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+    }
+    Vec::new()
 }
 
 /// Kill a child and await its exit so it is reaped rather than left as a zombie.
@@ -809,6 +797,70 @@ mod tests {
         assert_eq!(parse_tools_response(line), Some(2));
         assert_eq!(parse_tools_response("not json"), None);
         assert_eq!(parse_tools_response(r#"{"id":2}"#), None);
+    }
+
+    /// A fake MCP server scripted in `sh`: answers initialize and
+    /// tools/list, but rejects the optional resources/prompts lists with
+    /// -32601 Method not found — which per MCP must not fail the connect.
+    fn fake_server_spec(name: &str, resources_reply: &str, prompts_reply: &str) -> ServerSpec {
+        let script = format!(
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2024-11-05","capabilities":{{}},"serverInfo":{{"name":"fake","version":"0"}}}}}}' ;;
+    *notifications/initialized*) : ;;
+    *'"method":"tools/list"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"t","description":"d","inputSchema":{{"type":"object"}}}}]}}}}' ;;
+    *'"method":"resources/list"'*) {resources_reply} ;;
+    *'"method":"prompts/list"'*) {prompts_reply} ;;
+  esac
+done"#,
+        );
+        ServerSpec {
+            name: name.into(),
+            command: "sh".into(),
+            args: vec!["-c".into(), script],
+            env: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_capability_failures_do_not_kill_the_connection() {
+        let not_found = |id: u64| {
+            format!(
+                r#"printf '%s\n' '{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32601,"message":"Method not found"}}}}'"#
+            )
+        };
+        let registry =
+            McpRegistry::load(vec![fake_server_spec("fake", &not_found(3), &not_found(4))]);
+        let (registry, result) = registry.connect_all().await;
+        assert!(
+            result.is_ok(),
+            "resources/prompts -32601 is not a connect failure: {result:?}"
+        );
+        assert_eq!(registry.connected_count(), 1);
+        assert_eq!(registry.tools_count(), 1);
+        assert_eq!(registry.resources_count(), 0);
+        assert_eq!(registry.prompts_count(), 0);
+        let _ = registry.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn tools_list_failure_still_fails_the_connection() {
+        let script = r#"while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"0"}}}' ;;
+    *notifications/initialized*) : ;;
+    *'"method":"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}' ;;
+  esac
+done"#;
+        let registry = McpRegistry::load(vec![ServerSpec {
+            name: "fake".into(),
+            command: "sh".into(),
+            args: vec!["-c".into(), script.to_string()],
+            env: Default::default(),
+        }]);
+        let (registry, result) = registry.connect_all().await;
+        assert!(result.is_err(), "tools/list is required, not optional");
+        assert_eq!(registry.connected_count(), 0);
     }
 
     #[test]

@@ -1,0 +1,26 @@
+{
+  "id": "guard-git-reset-hard",
+  "name": "Guard: hard reset",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: hard reset.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "shell.run",
+      "arguments_contain": "git reset --hard",
+      "deny": "a hard reset discards uncommitted work; stash or commit first"
+    }
+  ]
+}

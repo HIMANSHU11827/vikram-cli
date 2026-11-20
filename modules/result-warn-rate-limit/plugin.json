@@ -1,0 +1,25 @@
+{
+  "id": "result-warn-rate-limit",
+  "name": "Result: rate limiting",
+  "version": "1.0.0",
+  "description": "Inspects tool output for rate limiting.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 40,
+  "components": {
+    "hooks": [
+      "tool_result"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_result",
+      "result_contain": "429",
+      "append_result": "[plugin] The remote side is rate-limiting. Back off instead of retrying immediately."
+    }
+  ]
+}

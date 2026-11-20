@@ -45,7 +45,7 @@ type Mark = (usize, u16, ThoughtKey, bool);
 
 /// Activity rows fold in their own key space so a tool row and a thinking block never share a
 /// fold. The first half of the key is a marker no message index can reach.
-const ACTIVITY_TOOL: usize = usize::MAX - 1;
+pub(crate) const ACTIVITY_TOOL: usize = usize::MAX - 1;
 
 /// Where a turn's own work is folded away. The second half of the key is the turn's place in the
 /// transcript: the request it starts at, so two turns never share a fold and clicking one header

@@ -1,0 +1,24 @@
+{
+  "id": "ctx-preserve-licenses",
+  "name": "Context: preserve license headers",
+  "version": "1.0.0",
+  "description": "Adds a standing instruction to every turn: preserve license headers.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 60,
+  "components": {
+    "hooks": [
+      "context_build"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "context_build",
+      "append": "Do not remove or relicense existing copyright headers."
+    }
+  ]
+}

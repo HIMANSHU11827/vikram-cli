@@ -1,0 +1,25 @@
+{
+  "id": "result-warn-todo",
+  "name": "Result: a TODO marker",
+  "version": "1.0.0",
+  "description": "Inspects tool output for a todo marker.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 40,
+  "components": {
+    "hooks": [
+      "tool_result"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_result",
+      "result_contain": "TODO",
+      "append_result": "[plugin] A TODO was left behind. Either finish it or name it in the summary."
+    }
+  ]
+}

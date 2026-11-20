@@ -1,0 +1,24 @@
+{
+  "id": "ctx-colocated-tests",
+  "name": "Context: colocated tests",
+  "version": "1.0.0",
+  "description": "Adds a standing instruction to every turn: colocated tests.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 60,
+  "components": {
+    "hooks": [
+      "context_build"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "context_build",
+      "append": "Tests belong in the crate's #[cfg(test)] module unless the project already uses a tests/ directory."
+    }
+  ]
+}

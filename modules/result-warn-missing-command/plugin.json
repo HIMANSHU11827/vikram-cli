@@ -1,0 +1,25 @@
+{
+  "id": "result-warn-missing-command",
+  "name": "Result: a missing command",
+  "version": "1.0.0",
+  "description": "Inspects tool output for a missing command.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 40,
+  "components": {
+    "hooks": [
+      "tool_result"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_result",
+      "result_contain": "command not found",
+      "append_result": "[plugin] The command does not exist here. Check the toolchain instead of retrying."
+    }
+  ]
+}

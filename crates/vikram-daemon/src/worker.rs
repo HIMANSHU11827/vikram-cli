@@ -134,7 +134,11 @@ pub enum PoolError {
 struct Running {
     class: TaskClass,
     started_ms: Millis,
+    /// The bookkeeping task: frees the slot and reports Finished.
     abort: AbortHandle,
+    /// The work itself. Aborting only the wrapper would leave it running detached, still holding
+    /// whatever credentials and children it started.
+    work: AbortHandle,
 }
 
 /// A bounded executor. Dispatch never blocks: a job with no free slot stays queued in the database
@@ -174,7 +178,10 @@ impl WorkerPool {
 
     /// The one receiver of finished tasks. Taken once by whoever owns the loop.
     pub fn take_results(&self) -> Option<UnboundedReceiver<Finished>> {
-        self.receiver.lock().expect("pool lock").take()
+        self.receiver
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     pub fn limits(&self) -> Limits {
@@ -186,11 +193,17 @@ impl WorkerPool {
     }
 
     pub fn running_count(&self) -> usize {
-        self.running.lock().expect("pool lock").len()
+        self.running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 
     pub fn running_ids(&self) -> Vec<String> {
-        let running = self.running.lock().expect("pool lock");
+        let running = self
+            .running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut ids: Vec<String> = running.keys().cloned().collect();
         ids.sort();
         ids
@@ -225,7 +238,10 @@ impl WorkerPool {
     {
         let id = id.into();
         {
-            let running = self.running.lock().expect("pool lock");
+            let running = self
+                .running
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if running.contains_key(&id) {
                 return Err(PoolError::Duplicate(id));
             }
@@ -245,16 +261,24 @@ impl WorkerPool {
         let results = self.results.clone();
         let task_id = id.clone();
 
+        // Run `work` in an inner task: a panic must still free the slot, drop the running
+        // entry, and report Finished — otherwise the pool leaks the id until restart. The
+        // wrapper awaits the JoinHandle, so a panic arrives as a JoinError either way; what the
+        // inner task buys is that `cancel` can abort the work itself instead of only the
+        // bookkeeping around it.
+        let work = tokio::spawn(work);
+        let work_abort = work.abort_handle();
         let handle = tokio::spawn(async move {
-            // Run `work` in an inner task: a panic must still free the slot, drop the running
-            // entry, and report Finished — otherwise the pool leaks the id until restart.
-            let outcome = match tokio::spawn(work).await {
+            let outcome = match work.await {
                 Ok(outcome) => outcome,
                 Err(err) => RunOutcome::failed(format!("worker task failed: {err}")),
             };
             // Hold the permit until the work is done, then drop it so the class frees a slot.
             drop(permit);
-            running.lock().expect("pool lock").remove(&task_id);
+            running
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&task_id);
             let finished = Finished {
                 id: task_id.clone(),
                 class,
@@ -266,25 +290,36 @@ impl WorkerPool {
             let _ = results.send(finished);
         });
 
-        self.running.lock().expect("pool lock").insert(
-            id,
-            Running {
-                class,
-                started_ms,
-                abort: handle.abort_handle(),
-            },
-        );
+        self.running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                id,
+                Running {
+                    class,
+                    started_ms,
+                    abort: handle.abort_handle(),
+                    work: work_abort,
+                },
+            );
         Ok(())
     }
 
     /// Stop `id`, if it is running. The task being aborted cannot report itself, so the pool reports
     /// the cancellation on its behalf.
     pub fn cancel(&self, id: &str) -> bool {
-        let removed = self.running.lock().expect("pool lock").remove(id);
+        let removed = self
+            .running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(id);
         let Some(running) = removed else {
             return false;
         };
+        // Both handles: the wrapper alone would leave the work running detached until its own
+        // timeout, still holding whatever it opened.
         running.abort.abort();
+        running.work.abort();
         let _ = self.results.send(Finished {
             id: id.to_string(),
             class: running.class,
@@ -383,6 +418,46 @@ mod tests {
         assert!(finished.cancelled, "{finished:?}");
         assert_eq!(finished.outcome.summary(), "cancelled");
         assert!(!pool.cancel("long"), "cancelling twice is not an error");
+    }
+
+    #[tokio::test]
+    async fn a_cancel_reaches_the_work_not_just_its_wrapper() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Flag(Arc<AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let pool = WorkerPool::new(Limits::default());
+        let mut results = pool.take_results().expect("receiver");
+        let dropped = Arc::new(AtomicBool::new(false));
+        // The guard is captured by the future rather than built inside it: an abort can land
+        // before the task's first poll, and only a captured value is dropped in that case.
+        let flag = Flag(dropped.clone());
+        pool.dispatch("stuck", TaskClass::Agent, async move {
+            let _flag = flag;
+            std::future::pending::<RunOutcome>().await
+        })
+        .expect("dispatch");
+
+        assert!(pool.cancel("stuck"));
+        // The work's own abort handle must fire: a guard inside the future is dropped only when
+        // the task running it is actually aborted, not when its wrapper is.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cancelled work was dropped promptly");
+
+        let finished = WorkerPool::next_finished(&mut results, Duration::from_secs(5))
+            .await
+            .expect("finished");
+        assert!(finished.cancelled, "{finished:?}");
     }
 
     #[tokio::test]

@@ -15,12 +15,13 @@ use vikram_contracts::{ImageSource, Message, PermissionMode};
 use vikram_gateway::access::{
     AuthzInput, EnvLookup, PairingVerdict, PlatformAuthSpec, authorize_source,
 };
+use vikram_gateway::delivery::DeliveryLedger;
 use vikram_gateway::event::MessageEvent;
 use vikram_gateway::host::{
     BuzzPlatform, ChannelPlatform, DingTalkStreamPlatform, DiscordPlatform, EmailPlatform,
     GatewayPlatform, IrcPlatform, MatrixPlatform, MattermostPlatform, NtfyPlatform, PhotonPlatform,
     SignalPlatform, SimplexPlatform, TelegramPlatform, WeComPlatform, WeixinPlatform,
-    WhatsAppPlatform, YuanbaoPlatform, serve,
+    WhatsAppPlatform, YuanbaoPlatform, serve_with_ledger,
 };
 use vikram_gateway::ingress::{
     WebhookHandler, WebhookHub, WebhookPlatform, event_route, serve as serve_webhooks,
@@ -1124,11 +1125,22 @@ pub async fn run(config: Config) -> Result<(), String> {
     let media_transport: SharedTransport = ReqwestTransport::new()
         .map_err(|err| format!("could not build the media transport: {err}"))?
         .into_shared();
+    // One file-backed delivery ledger shared by every platform: replies survive a restart and a
+    // failed send is retried by the sweep instead of being dropped. If the store cannot be opened
+    // the gateway still runs on the legacy send-and-forget path — never worse than before.
+    let ledger = match DeliveryLedger::open(vikram_home().join("gateway_state.db")) {
+        Ok(ledger) => Some(Arc::new(ledger)),
+        Err(err) => {
+            eprintln!("[gateway] delivery ledger unavailable: {err}; sends are not retried");
+            None
+        }
+    };
     for platform in platforms {
         let handle = handle.clone();
         let sessions = Arc::clone(&sessions);
         let media = Arc::clone(&media_transport);
         let auth = Arc::clone(&auth);
+        let ledger = ledger.clone();
         let spec = auth_spec(platform.name());
         let handler: vikram_gateway::host::ReplyHandler = Arc::new(move |event| {
             turn(
@@ -1144,7 +1156,7 @@ pub async fn run(config: Config) -> Result<(), String> {
         let name = platform.name().to_string();
         let platform_for_log = Arc::clone(&platform);
         tasks.push(tokio::spawn(async move {
-            let stats = serve(platform, handler, stop).await;
+            let stats = serve_with_ledger(platform, handler, stop, ledger.clone()).await;
             let suffix = if stats.errors > 0 {
                 format!(", {} error(s)", stats.errors)
             } else {
@@ -1256,6 +1268,7 @@ fn turn(
             let (fetched, skipped) = fetch_images_with_skips(
                 media_transport.as_ref(),
                 &event.media_urls,
+                &event.media_types,
                 &MediaFetchLimits::default(),
             )
             .await;

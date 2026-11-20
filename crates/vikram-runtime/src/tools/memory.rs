@@ -315,7 +315,11 @@ impl Tool for MemoryConsolidate {
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         use crate::consolidation::{ConsolidationPolicy, ConsolidationStore, score};
         let action = args.get("action").and_then(Value::as_str).unwrap_or("run");
-        let scope = check_scope(ctx, args.get("scope").and_then(Value::as_str), false)?;
+        // capture/run mutate the store, and so does the consolidation fallthrough for any
+        // unknown action — only list/score are pure reads. The write flag keeps a bot from
+        // capturing into or consolidating over the operator's `global` scope.
+        let write = !matches!(action, "list" | "score");
+        let scope = check_scope(ctx, args.get("scope").and_then(Value::as_str), write)?;
         let store = ConsolidationStore::open(crate::config::database_path())
             .map_err(|e| VikramError::Storage(e.to_string()))?;
         let policy = ConsolidationPolicy::default();
@@ -541,5 +545,22 @@ mod tests {
     fn a_lookup_reads_the_speaker_then_the_shared_shelf() {
         assert_eq!(read_scopes("bot:b1"), vec!["bot:b1", "global"]);
         assert_eq!(read_scopes("global"), vec!["global"]);
+    }
+
+    #[test]
+    fn a_bot_cannot_capture_or_consolidate_into_the_global_scope() {
+        let ctx = context_with_bot(Some("b1"));
+        for action in ["capture", "run"] {
+            let err = MemoryConsolidate
+                .run(
+                    &json!({"action": action, "key": "k", "value": "v", "scope": "global"}),
+                    &ctx,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err, VikramError::Storage(_)),
+                "{action} into global must fail scope check: {err:?}"
+            );
+        }
     }
 }

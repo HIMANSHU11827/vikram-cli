@@ -33,8 +33,10 @@
 //!   (`sendRichMessageDraft`) is not ported; see [`PlatformAdapter::send_draft`].
 //!
 //! Deliberately not ported (see the module report in the port plan): python-telegram-bot's rich
-//! messages, inline keyboards/callbacks, media download/caching, albums (`sendMediaGroup`), GIF
-//! animations (`sendAnimation`), voice bubbles (`sendVoice`), video thumbnail/geometry probing,
+//! messages, inline keyboards/callbacks, media download/caching (only the `getFile` → download-URL
+//! resolution is ported; the bytes themselves are fetched downstream by `media_fetch`), albums
+//! (`sendMediaGroup`), GIF animations (`sendAnimation`), voice bubbles (`sendVoice`), video
+//! thumbnail/geometry probing,
 //! image pre-compression, DM topics/forum routing, per-chat flood cooldowns, reconnect ladders,
 //! webhook mode and allowlist gating. Those need runtime state (locks, background tasks, stores,
 //! ffmpeg/ffprobe) that does not belong to a stateless wire adapter.
@@ -71,6 +73,7 @@ const EDIT_MESSAGE_TEXT: &str = "editMessageText";
 const DELETE_MESSAGE: &str = "deleteMessage";
 const SEND_CHAT_ACTION: &str = "sendChatAction";
 const GET_CHAT: &str = "getChat";
+const GET_FILE: &str = "getFile";
 const SEND_PHOTO: &str = "sendPhoto";
 const SEND_VIDEO: &str = "sendVideo";
 const SEND_AUDIO: &str = "sendAudio";
@@ -702,7 +705,45 @@ impl TelegramAdapter {
             Some(updates) => updates,
             None => return Ok(Vec::new()),
         };
-        Ok(updates.iter().filter_map(parse_update).collect())
+        let mut parsed: Vec<ParsedUpdate> = updates.iter().filter_map(parse_update).collect();
+        for update in &mut parsed {
+            self.resolve_media_urls(&mut update.event).await;
+        }
+        Ok(parsed)
+    }
+
+    /// Turn every Bot API `file_id` in `event.media_urls` into the HTTPS URL the media fetcher can
+    /// download: `getFile` answers the `file_path`, and the bytes live at
+    /// `{api_base}/file/bot{token}/{file_path}`. A `file_id` whose `getFile` call fails stays in
+    /// place — it is not a URL, so the fetcher's own skip reason reports it — and an entry that
+    /// is already an absolute URL (a mirror or a hand-built event) is left untouched.
+    async fn resolve_media_urls(&self, event: &mut MessageEvent) {
+        if event.media_urls.is_empty() {
+            return;
+        }
+        for url in &mut event.media_urls {
+            if url.contains("://") {
+                continue;
+            }
+            if let Some(download) = self.file_download_url(url).await {
+                *url = download;
+            }
+        }
+    }
+
+    /// `getFile` for `file_id`, returning the `file/bot{token}/` download URL, or `None` when the
+    /// Bot API refuses or answers without a usable `file_path`.
+    async fn file_download_url(&self, file_id: &str) -> Option<String> {
+        let result = self
+            .call_api(GET_FILE, &json!({ "file_id": file_id }))
+            .await
+            .ok()?;
+        let path = result
+            .get("file_path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())?;
+        Some(format!("{}/file/bot{}/{path}", self.api_base, self.token))
     }
 }
 
@@ -1271,8 +1312,9 @@ fn media_entry(message_type: MessageType, file: &Value, fallback_mime: &str) -> 
 /// Classify a message's attachment the way hermes `_media_message_type` does: the first present
 /// attachment wins, in sticker → photo → video → video_note → audio → voice → document order.
 ///
-/// `file_id`s land in `media_urls` because download/caching is not part of this port: a `file_id` is
-/// what the Bot API hands out, and a fetcher can resolve it later with `getFile`.
+/// `file_id`s land in `media_urls` as the Bot API hands them out; [`TelegramAdapter::poll_once`]
+/// resolves each one to its `file/bot{token}/` download URL with `getFile` before the event is
+/// emitted, so the fetcher only ever sees real URLs.
 fn media_from_message(message: &Value) -> InboundMedia {
     if let Some(sticker) = message.get("sticker").filter(|sticker| sticker.is_object()) {
         return media_entry(MessageType::Sticker, sticker, "image/webp");
@@ -2066,81 +2108,145 @@ mod tests {
 
     #[tokio::test]
     async fn poll_once_parses_a_photo_update() {
-        let mock = MockTransport::new(vec![api_ok(json!([private_update(
-            701,
-            json!({
-                "message_id": 12,
-                "date": 1_700_000_100,
-                "chat": { "id": -100123, "type": "supergroup", "title": "Team" },
-                "from": { "id": 9, "is_bot": false, "first_name": "Bob" },
-                "caption": "look at this",
-                "photo": [
-                    { "file_id": "small", "file_unique_id": "a", "width": 90, "height": 90 },
-                    { "file_id": "large", "file_unique_id": "b", "width": 1280, "height": 1280 },
-                ],
-            }),
-        )]))]);
+        let mock = MockTransport::new(vec![
+            api_ok(json!([private_update(
+                701,
+                json!({
+                    "message_id": 12,
+                    "date": 1_700_000_100,
+                    "chat": { "id": -100123, "type": "supergroup", "title": "Team" },
+                    "from": { "id": 9, "is_bot": false, "first_name": "Bob" },
+                    "caption": "look at this",
+                    "photo": [
+                        { "file_id": "small", "file_unique_id": "a", "width": 90, "height": 90 },
+                        { "file_id": "large", "file_unique_id": "b", "width": 1280, "height": 1280 },
+                    ],
+                }),
+            )])),
+            api_ok(json!({
+                "file_id": "large",
+                "file_unique_id": "b",
+                "file_size": 12345,
+                "file_path": "photos/file_1.jpg",
+            })),
+        ]);
         let updates = polled(adapter(&mock).poll_once(None, 0).await);
 
         assert_eq!(updates.len(), 1);
         let event = &updates[0].event;
         assert_eq!(event.message_type, MessageType::Photo);
         assert_eq!(event.text, "look at this");
-        assert_eq!(event.media_urls, vec!["large"]);
+        // The largest size's file_id was resolved through getFile into a real download URL.
+        assert_eq!(
+            event.media_urls,
+            vec!["https://api.telegram.org/file/botTEST-TOKEN/photos/file_1.jpg"]
+        );
         assert_eq!(event.media_types, vec!["image/jpeg"]);
         assert_eq!(event.media_filenames, vec![String::new()]);
         assert_eq!(event.source.chat_type, "group");
         assert_eq!(event.source.chat_name.as_deref(), Some("Team"));
         // No offset means no offset parameter.
         assert!(!mock.requests()[0].url.contains("offset="));
+        // The second request is the getFile lookup for the file_id, not a download.
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].url,
+            "https://api.telegram.org/botTEST-TOKEN/getFile"
+        );
+        assert_eq!(request_body(&requests[1])["file_id"], json!("large"));
     }
 
     #[tokio::test]
     async fn poll_once_maps_document_voice_and_sticker_media() {
-        let mock = MockTransport::new(vec![api_ok(json!([
-            private_update(
-                702,
-                json!({
-                    "message_id": 13,
-                    "chat": { "id": 4242, "type": "private" },
-                    "from": { "id": 4242, "is_bot": false, "first_name": "Ann" },
-                    "document": {
-                        "file_id": "doc-1",
-                        "file_name": "notes.pdf",
-                        "mime_type": "application/pdf",
-                    },
-                }),
-            ),
-            private_update(
-                703,
-                json!({
-                    "message_id": 14,
-                    "chat": { "id": 4242, "type": "private" },
-                    "from": { "id": 4242, "is_bot": false, "first_name": "Ann" },
-                    "voice": { "file_id": "voice-1", "duration": 3 },
-                }),
-            ),
-            private_update(
-                704,
-                json!({
-                    "message_id": 15,
-                    "chat": { "id": 4242, "type": "private" },
-                    "from": { "id": 4242, "is_bot": false, "first_name": "Ann" },
-                    "sticker": { "file_id": "sticker-1" },
-                }),
-            ),
-        ]))]);
+        let mock = MockTransport::new(vec![
+            api_ok(json!([
+                private_update(
+                    702,
+                    json!({
+                        "message_id": 13,
+                        "chat": { "id": 4242, "type": "private" },
+                        "from": { "id": 4242, "is_bot": false, "first_name": "Ann" },
+                        "document": {
+                            "file_id": "doc-1",
+                            "file_name": "notes.pdf",
+                            "mime_type": "application/pdf",
+                        },
+                    }),
+                ),
+                private_update(
+                    703,
+                    json!({
+                        "message_id": 14,
+                        "chat": { "id": 4242, "type": "private" },
+                        "from": { "id": 4242, "is_bot": false, "first_name": "Ann" },
+                        "voice": { "file_id": "voice-1", "duration": 3 },
+                    }),
+                ),
+                private_update(
+                    704,
+                    json!({
+                        "message_id": 15,
+                        "chat": { "id": 4242, "type": "private" },
+                        "from": { "id": 4242, "is_bot": false, "first_name": "Ann" },
+                        "sticker": { "file_id": "sticker-1" },
+                    }),
+                ),
+            ])),
+            // One getFile answer per attachment, in update order.
+            api_ok(json!({ "file_id": "doc-1", "file_path": "docs/file_0.pdf" })),
+            api_ok(json!({ "file_id": "voice-1", "file_path": "voice/file_1.oga" })),
+            api_ok(json!({ "file_id": "sticker-1", "file_path": "stickers/file_2.webp" })),
+        ]);
         let updates = polled(adapter(&mock).poll_once(None, 0).await);
 
         assert_eq!(updates.len(), 3);
         assert_eq!(updates[0].event.message_type, MessageType::Document);
-        assert_eq!(updates[0].event.media_urls, vec!["doc-1"]);
+        assert_eq!(
+            updates[0].event.media_urls,
+            vec!["https://api.telegram.org/file/botTEST-TOKEN/docs/file_0.pdf"]
+        );
         assert_eq!(updates[0].event.media_types, vec!["application/pdf"]);
         assert_eq!(updates[0].event.media_filenames, vec!["notes.pdf"]);
         assert_eq!(updates[1].event.message_type, MessageType::Voice);
+        assert_eq!(
+            updates[1].event.media_urls,
+            vec!["https://api.telegram.org/file/botTEST-TOKEN/voice/file_1.oga"]
+        );
         assert_eq!(updates[1].event.media_types, vec!["audio/ogg"]);
         assert_eq!(updates[2].event.message_type, MessageType::Sticker);
+        assert_eq!(
+            updates[2].event.media_urls,
+            vec!["https://api.telegram.org/file/botTEST-TOKEN/stickers/file_2.webp"]
+        );
         assert_eq!(updates[2].event.media_types, vec!["image/webp"]);
+        // getUpdates plus one getFile per attachment.
+        assert_eq!(mock.requests().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn poll_once_keeps_the_file_id_when_get_file_fails() {
+        // A refused getFile must not fabricate a URL: the raw file_id stays, and the fetcher's
+        // own "not absolute" skip reason is what the operator sees.
+        let mock = MockTransport::new(vec![
+            api_ok(json!([private_update(
+                709,
+                json!({
+                    "message_id": 18,
+                    "chat": { "id": 4242, "type": "private" },
+                    "from": { "id": 4242, "is_bot": false, "first_name": "Ann" },
+                    "photo": [
+                        { "file_id": "stuck", "file_unique_id": "z", "width": 90, "height": 90 },
+                    ],
+                }),
+            )])),
+            api_error(400, "Bad Request: file_id is too old"),
+        ]);
+        let updates = polled(adapter(&mock).poll_once(None, 0).await);
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].event.media_urls, vec!["stuck"]);
+        assert_eq!(updates[0].event.media_types, vec!["image/jpeg"]);
     }
 
     #[tokio::test]

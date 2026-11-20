@@ -12,7 +12,8 @@ default directory.
 
 ## Files
 
-- `crates/vikram-runtime/src/plugins.rs`
+- `crates/vikram-runtime/src/plugins/` (`manifest.rs`, `registry.rs`, `permission.rs`, `install.rs`)
+- `crates/vikram-runtime/src/hooks.rs` — hook engine; see [hooks.md](hooks.md)
 
 ## Tests
 

@@ -1,0 +1,24 @@
+{
+  "id": "model-reminder-evidence",
+  "name": "Model: evidence over assertion",
+  "version": "1.0.0",
+  "description": "Reminds the model to ground claims in tool output or files it read.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 70,
+  "components": {
+    "hooks": [
+      "model_request"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "model_request",
+      "append": "Ground every claim about the code in output you actually read. Say what you inspected."
+    }
+  ]
+}

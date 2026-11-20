@@ -568,11 +568,6 @@ fn handle_conversation(app: &mut App, key: KeyEvent) -> bool {
                 session.selected_activity = Some(idx);
                 if let Some(activity) = session.activity.get_mut(idx) {
                     activity.expanded = !activity.expanded;
-                    if activity.expanded {
-                        session.expanded_activities.insert(idx);
-                    } else {
-                        session.expanded_activities.remove(&idx);
-                    }
                 }
             }
             true
@@ -932,8 +927,15 @@ fn accept_suggestion(app: &mut App) {
 
 /// Walk the workspace for `@` file completion. Skips heavy/vendored directories and caps the walk.
 /// Resolve @path references in text by reading file content and appending as context.
+///
+/// The session cwd is the boundary: `@` must never read outside the workspace, or `@../.env`
+/// would inline secrets into the prompt. Canonicalizing resolves `..` and symlinks, so a link
+/// pointing out of the tree is refused the same as an escape spelled with slashes.
 fn resolve_references(text: &str, cwd: std::path::PathBuf) -> String {
     let mut result = text.to_owned();
+    let Ok(root) = cwd.canonicalize() else {
+        return result;
+    };
     // Find @path tokens
     let mut replacements = Vec::new();
     for token in text.split_whitespace() {
@@ -943,7 +945,13 @@ fn resolve_references(text: &str, cwd: std::path::PathBuf) -> String {
                 continue;
             }
             let full = cwd.join(path);
-            if let Ok(content) = std::fs::read_to_string(&full) {
+            let Ok(canonical) = full.canonicalize() else {
+                continue;
+            };
+            if !canonical.starts_with(&root) {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&canonical) {
                 let snippet = if content.chars().count() > 2000 {
                     let truncated: String = content.chars().take(2000).collect();
                     format!("{}... (truncated)", truncated)
@@ -1754,13 +1762,17 @@ fn answer_approval(app: &mut App, allow: bool, persist: bool) {
         return;
     };
     app.commands.push(UiCommand::AnswerApproval {
-        approval,
+        approval: approval.clone(),
         allow,
         persist,
     });
+    // The answer is in flight: leave the row in place and a second Enter re-sends for the same
+    // request before `ApprovalResolved` lands. Drop it now — a refused answer is restored by the
+    // next snapshot resync, and `ApprovalResolved`'s retain becomes a no-op.
+    app.approvals.retain(|prompt| prompt.approval != approval);
     // One answer leaves the panel open for the rest. Closing it here used to hide every other
     // pending request, so the operator had to remember they existed and open the panel again.
-    let remaining = app.approvals.len().saturating_sub(1);
+    let remaining = app.approvals.len();
     if remaining == 0 {
         app.overlay = None;
         return;
@@ -3053,5 +3065,46 @@ mod tests {
                 .any(|notice| notice.text.contains("1 more waiting")),
             "the notice counts what is left"
         );
+    }
+
+    #[test]
+    fn at_reference_inlines_a_file_inside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "hello workspace").unwrap();
+        let resolved = resolve_references("look at @notes.txt please", dir.path().to_path_buf());
+        assert!(resolved.contains("hello workspace"), "{resolved}");
+        assert!(
+            resolved.contains("@notes.txt (content below)"),
+            "{resolved}"
+        );
+    }
+
+    #[test]
+    fn at_reference_refuses_a_parent_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("secret.txt");
+        std::fs::write(&outside, "top secret").unwrap();
+        let inner = dir.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        // An absolute path is one spelling of the escape; a relative one is the other.
+        for token in [
+            format!("@{}", outside.display()),
+            "@../secret.txt".to_owned(),
+            "@sub/../../secret.txt".to_owned(),
+        ] {
+            let resolved = resolve_references(&format!("read {token}"), inner.clone());
+            assert!(
+                !resolved.contains("top secret"),
+                "{token} must not inline the file: {resolved}"
+            );
+            assert!(resolved.contains(&token), "the literal stays: {resolved}");
+        }
+    }
+
+    #[test]
+    fn at_reference_refuses_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = resolve_references("read @nope.txt", dir.path().to_path_buf());
+        assert_eq!(resolved, "read @nope.txt");
     }
 }

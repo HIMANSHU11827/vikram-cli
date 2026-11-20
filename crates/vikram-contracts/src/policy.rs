@@ -354,15 +354,32 @@ fn normalize_lexical(path: &str) -> String {
 pub fn amendment_for(request: &PermissionRequest) -> String {
     let scope = match request.action {
         ActionKind::Execute => {
-            // The resource is the whole command line; the saved rule scopes to its executable —
-            // `cargo *`, not `cargo test *` — matching what approvals granted before resources
-            // carried the full command.
-            let head = request
-                .resource
-                .split_whitespace()
-                .next()
-                .unwrap_or("shell");
-            format!("{head} *")
+            if request.side_effect == SideEffect::Destructive {
+                // A destructive command saves the exact line, never a wildcard: approving
+                // `rm -rf /tmp/x` must not persist `rm *`. `parse_amendment` reads an
+                // exact resource with spaces back as `Exact`, which only ever matches the
+                // identical command — and a multi-segment command matches nothing at all,
+                // so it simply asks again. A trailing ` *` or `/**` is the exception: it
+                // would reparse as a Prefix/Subtree rule wider than the command approved
+                // (`rm -rf *` becoming `rm -rf`), so those get a resource with one more
+                // `*` appended — no canonical pattern spelling contains a `*` inside an
+                // Exact value, so `parse_amendment` refuses it and no rule is saved.
+                if request.resource.ends_with(" *") || request.resource.ends_with("/**") {
+                    format!("{}*", request.resource)
+                } else {
+                    request.resource.clone()
+                }
+            } else {
+                // The resource is the whole command line; the saved rule scopes to its executable —
+                // `cargo *`, not `cargo test *` — matching what approvals granted before resources
+                // carried the full command.
+                let head = request
+                    .resource
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("shell");
+                format!("{head} *")
+            }
         }
         ActionKind::Read | ActionKind::Write => match request.resource.rfind('/') {
             Some(idx) if idx > 0 => format!("{}/**", &request.resource[..idx]),
@@ -663,6 +680,55 @@ mod tests {
         for (req, expect_auto, why) in cases {
             let after = PermissionMode::Smart.resolve(prompt(), &req, posture(Some("/work")));
             assert_eq!(after.is_allowed(), expect_auto, "{why} (verb {})", req.verb);
+        }
+    }
+
+    #[test]
+    fn a_destructive_command_amendment_saves_the_exact_line_not_a_wildcard() {
+        let req = gated(
+            ActionKind::Execute,
+            "rm -rf /tmp/x",
+            SideEffect::Destructive,
+        );
+        assert_eq!(
+            crate::amendment_for(&req),
+            "allow execute shell.run resource=rm -rf /tmp/x"
+        );
+        // The routine tier keeps the executable-scoped wildcard it always saved.
+        let routine = gated(
+            ActionKind::Execute,
+            "cargo test -p x",
+            SideEffect::LocalMutation,
+        );
+        assert_eq!(
+            crate::amendment_for(&routine),
+            "allow execute shell.run resource=cargo *"
+        );
+    }
+
+    #[test]
+    fn a_destructive_command_ending_in_a_wildcard_gets_no_saveable_rule() {
+        // `rm -rf *` saved verbatim would reparse as the prefix rule `rm -rf`, wider than
+        // the command that was approved — the amendment must not parse back into a rule.
+        let req = gated(ActionKind::Execute, "rm -rf *", SideEffect::Destructive);
+        let amendment = crate::amendment_for(&req);
+        assert!(
+            amendment.contains("rm -rf **"),
+            "expected an unparseable resource, got {amendment}"
+        );
+    }
+
+    #[test]
+    fn smart_asks_for_execute_tiers_it_cannot_vouch_for() {
+        // `shell.run` reports ExternalChange/Destructive precisely so Smart does not
+        // auto-allow it; only an operator rule can let it run quietly.
+        for effect in [SideEffect::ExternalChange, SideEffect::Destructive] {
+            let req = gated(ActionKind::Execute, "ls -la", effect);
+            let after = PermissionMode::Smart.resolve(prompt(), &req, posture(Some("/work")));
+            assert!(
+                matches!(after, Decision::RequireApproval { .. }),
+                "Smart must not auto-allow Execute+{effect:?}"
+            );
         }
     }
 

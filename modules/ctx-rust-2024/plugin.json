@@ -1,0 +1,24 @@
+{
+  "id": "ctx-rust-2024",
+  "name": "Context: Rust 2024 idioms",
+  "version": "1.0.0",
+  "description": "Adds a standing instruction to every turn: rust 2024 idioms.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 60,
+  "components": {
+    "hooks": [
+      "context_build"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "context_build",
+      "append": "This workspace uses Rust 2024; prefer the edition's idioms over older patterns."
+    }
+  ]
+}

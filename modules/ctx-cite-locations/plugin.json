@@ -1,0 +1,24 @@
+{
+  "id": "ctx-cite-locations",
+  "name": "Context: cite file locations",
+  "version": "1.0.0",
+  "description": "Adds a standing instruction to every turn: cite file locations.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 60,
+  "components": {
+    "hooks": [
+      "context_build"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "context_build",
+      "append": "Cite files as path:line when describing code."
+    }
+  ]
+}

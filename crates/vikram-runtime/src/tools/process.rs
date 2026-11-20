@@ -35,11 +35,26 @@ impl Tool for Process {
             ("kill", None) => "process kill".to_string(),
             _ => format!("process {action}"),
         };
+        if action == "kill"
+            && let Some(pid) = args.get("pid").and_then(Value::as_i64)
+            && kills_own_tree(pid)
+        {
+            return Err(VikramError::ProviderRejected(format!(
+                "refusing to kill pid {pid}: it is the runtime's own process or an ancestor"
+            )));
+        }
+        // Killing an arbitrary pid — including the runtime's own tree — is not a routine local
+        // mutation, so `Smart` must not auto-allow it.
+        let side_effect = if action == "kill" {
+            SideEffect::Destructive
+        } else {
+            SideEffect::LocalMutation
+        };
         Ok(PermissionRequest::new(
             ActionKind::Execute,
             "process.run",
             resource,
-            SideEffect::LocalMutation,
+            side_effect,
             Trust::Model,
         ))
     }
@@ -90,6 +105,11 @@ impl Tool for Process {
                         "`pid` must be a positive integer, got {pid}"
                     )));
                 }
+                if kills_own_tree(pid) {
+                    return Err(VikramError::ProviderRejected(format!(
+                        "refusing to kill pid {pid}: it is the runtime's own process or an ancestor"
+                    )));
+                }
                 #[cfg(windows)]
                 let mut cmd = {
                     let mut c = std::process::Command::new("taskkill");
@@ -128,6 +148,49 @@ impl Tool for Process {
             }),
         }
     }
+}
+
+/// True when `pid` is the runtime itself, its process group, or an ancestor — the pids a
+/// `kill` must never reach even with approval, because terminating them takes the agent down
+/// with the target. Ancestors are walked through `/proc` where it exists (Linux); elsewhere
+/// only the self pid and process group are known.
+#[cfg(unix)]
+fn kills_own_tree(pid: i64) -> bool {
+    let own = std::process::id() as i64;
+    if pid == own {
+        return true;
+    }
+    // SAFETY: getpgrp has no failure mode that matters here; -1 just never matches a pid.
+    let pgid = unsafe { libc::getpgrp() };
+    if pgid > 0 && pid == pgid as i64 {
+        return true;
+    }
+    let mut current = own;
+    for _ in 0..64 {
+        let status = match std::fs::read_to_string(format!("/proc/{current}/status")) {
+            Ok(status) => status,
+            Err(_) => return false,
+        };
+        let parent = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:"))
+            .and_then(|value| value.trim().parse::<i64>().ok());
+        match parent {
+            Some(parent) if parent > 1 => {
+                if pid == parent {
+                    return true;
+                }
+                current = parent;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+#[cfg(not(unix))]
+fn kills_own_tree(pid: i64) -> bool {
+    pid == std::process::id() as i64
 }
 
 // Task storage helpers

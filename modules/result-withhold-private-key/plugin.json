@@ -1,0 +1,25 @@
+{
+  "id": "result-withhold-private-key",
+  "name": "Result: private key material",
+  "version": "1.0.0",
+  "description": "Inspects tool output for private key material.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 40,
+  "components": {
+    "hooks": [
+      "tool_result"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_result",
+      "result_contain": "PRIVATE KEY",
+      "deny": "private key material is withheld from the conversation"
+    }
+  ]
+}

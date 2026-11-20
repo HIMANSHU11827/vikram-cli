@@ -135,12 +135,23 @@ impl Catalog {
     pub fn discover(opts: &DiscoveryOptions) -> Catalog {
         let state = opts.state_dir.clone().unwrap_or_else(paths::state_dir);
         let trust = opts.trust.clone().unwrap_or_else(TrustPolicy::load);
-        let disabled = read_disabled(&state);
-
-        let mut catalog = Catalog {
-            disabled_names: disabled.clone(),
-            ..Catalog::default()
+        let mut catalog = Catalog::default();
+        let (disabled, disabled_unknown) = match read_disabled(&state) {
+            Ok(disabled) => (disabled, false),
+            // Fail closed: an unreadable disabled list must not silently re-enable every
+            // skill the user turned off, so all of them report as disabled.
+            Err(reason) => {
+                catalog.diagnostics.push(Diagnostic::new(
+                    DiagnosticLevel::Error,
+                    &state.join("disabled.json"),
+                    format!(
+                        "cannot read disabled list; treating every skill as disabled: {reason}"
+                    ),
+                ));
+                (BTreeSet::new(), true)
+            }
         };
+        catalog.disabled_names = disabled.clone();
         let mut policies: BTreeMap<SkillId, ActivationPolicy> = BTreeMap::new();
 
         if opts.include_builtin {
@@ -154,6 +165,7 @@ impl Catalog {
                     Compat::Native,
                     &trust,
                     &disabled,
+                    disabled_unknown,
                     &mut catalog.diagnostics,
                 ) {
                     record(&mut catalog, summary, policy, &mut policies);
@@ -175,12 +187,14 @@ impl Catalog {
                 exclude.extend(paths::compat_subdirs());
             }
             let mut found = Vec::new();
+            let mut visited = BTreeSet::new();
             walk(
                 &root,
                 &canonical_root,
                 1,
                 opts,
                 &exclude,
+                &mut visited,
                 &mut found,
                 &mut catalog.stats,
                 &mut catalog.diagnostics,
@@ -200,6 +214,7 @@ impl Catalog {
                     compat,
                     &trust,
                     &disabled,
+                    disabled_unknown,
                     &mut catalog.diagnostics,
                 ) {
                     record(&mut catalog, summary, policy, &mut policies);
@@ -388,10 +403,19 @@ fn walk(
     depth: usize,
     opts: &DiscoveryOptions,
     exclude: &[String],
+    visited: &mut BTreeSet<PathBuf>,
     found: &mut Vec<PathBuf>,
     stats: &mut CatalogStats,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // A followed symlink may point at an ancestor of the root, which would otherwise
+    // recurse forever when max_depth is unlimited. Canonical dirs are walked once.
+    if opts.follow_symlinks {
+        let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        if !visited.insert(canonical) {
+            return;
+        }
+    }
     stats.dirs_scanned += 1;
     let entries = match paths::sorted_entries(dir) {
         Ok(entries) => entries,
@@ -482,6 +506,7 @@ fn walk(
                         depth + 1,
                         opts,
                         exclude,
+                        visited,
                         found,
                         stats,
                         diagnostics,
@@ -501,6 +526,7 @@ fn first_line(text: &str) -> String {
     line.chars().take(160).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn summarize(
     dir: &Path,
     text: Result<String>,
@@ -508,6 +534,7 @@ fn summarize(
     compat: Compat,
     trust: &TrustPolicy,
     disabled: &BTreeSet<SkillId>,
+    disabled_unknown: bool,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<(SkillSummary, ActivationPolicy)> {
     let dir_name = dir.file_name()?.to_string_lossy().into_owned();
@@ -523,7 +550,7 @@ fn summarize(
         }
     };
     let mut summary = SkillSummary {
-        enabled: !disabled.contains(&name),
+        enabled: !disabled_unknown && !disabled.contains(&name),
         name,
         description: String::new(),
         dir: dir.to_path_buf(),
@@ -586,21 +613,17 @@ fn summarize(
     Some((summary, activation))
 }
 
-fn read_disabled(state_dir: &Path) -> BTreeSet<SkillId> {
+fn read_disabled(state_dir: &Path) -> std::result::Result<BTreeSet<SkillId>, String> {
     let path = state_dir.join("disabled.json");
     let names: Vec<String> = match paths::read_json_strict(&path) {
         Ok(Some(names)) => names,
-        Ok(None) => return BTreeSet::new(),
-        // Corrupt disabled.json must not silently re-enable every disabled skill.
-        Err(reason) => {
-            eprintln!("vikram: ignoring unreadable {}: {reason}", path.display());
-            return BTreeSet::new();
-        }
+        Ok(None) => return Ok(BTreeSet::new()),
+        Err(reason) => return Err(reason),
     };
-    names
+    Ok(names
         .iter()
         .filter_map(|name| SkillId::new(name).ok())
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -782,6 +805,46 @@ mod tests {
                 .contains(&SkillId::new("alpha").expect("id"))
         );
         assert!(!catalog.resolve("alpha").expect("alpha").enabled);
+    }
+
+    #[test]
+    fn a_corrupt_disabled_file_does_not_re_enable_skills() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let root = tmp.path().join("skills");
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&state).expect("state");
+        fs::write(state.join("disabled.json"), "{not json").expect("write");
+        write_skill(&root, "alpha", &skill_doc("alpha", "d"));
+
+        let catalog = Catalog::discover(&opts(&root, &state, Scope::User));
+        let summary = catalog.resolve("alpha").expect("kept");
+        assert!(!summary.enabled);
+        assert!(
+            catalog
+                .diagnostics_at(DiagnosticLevel::Error)
+                .iter()
+                .any(|d| d.message.contains("disabled list"))
+        );
+        assert!(catalog.disabled().contains(&summary.name));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_loop_back_to_an_ancestor_terminates() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let root = tmp.path().join("skills");
+        let nested = root.join("group/inner");
+        fs::create_dir_all(&nested).expect("dirs");
+        write_skill(&nested, "alpha", &skill_doc("alpha", "d"));
+        std::os::unix::fs::symlink(&root, root.join("loop")).expect("symlink");
+        std::os::unix::fs::symlink(tmp.path(), root.join("group/up")).expect("symlink");
+
+        let mut options = opts(&root, tmp.path(), Scope::User);
+        options.follow_symlinks = true;
+        options.max_depth = 0;
+        let catalog = Catalog::discover(&options);
+        assert!(catalog.resolve("alpha").is_some());
+        assert_eq!(catalog.stats.dirs_scanned, 3);
     }
 
     #[test]

@@ -1,0 +1,26 @@
+# VIKRAM tmpfiles — directories and env files that the system units expect.
+#
+# Install location: /etc/tmpfiles.d/vikram.conf
+# Apply with: systemd-tmpfiles --create /etc/tmpfiles.d/vikram.conf
+# (install.sh does this for you; running it twice is harmless.)
+#
+# systemd's StateDirectory=vikram on the units already creates /var/lib/vikram. This entry
+# repeats it with an explicit mode/owner so the same layout exists when the units are
+# installed but not yet started, and so an operator can see the intended ownership in one
+# place.
+#
+# format: type path mode user group age
+
+# Runtime state: vikram.db (SQLite WAL), config.json, .env, sessions/, skills/, plugins/,
+# the daemon lock. Mode 0700 because config.json and .env can hold API keys.
+d /var/lib/vikram 0700 vikram vikram -
+
+# Operator configuration. Root-owned, group-readable by the service user; never world
+# readable, because everything in here is credentials.
+d /etc/vikram 0750 root vikram -
+
+# Empty env files so the units' "-" (optional) EnvironmentFile= lines have a real target to
+# edit. Type 'f' creates the file only if it is missing and never truncates an existing one,
+# so re-running tmpfiles cannot wipe a configured key.
+f /etc/vikram/vikram.env 0640 root vikram -
+f /etc/vikram/gateway.env 0640 root vikram -

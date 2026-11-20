@@ -140,7 +140,10 @@ impl MemoryStore {
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
-        self.conn.lock().expect("memory store mutex not poisoned")
+        self.conn.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: memory store mutex poisoned; recovering");
+            e.into_inner()
+        })
     }
 
     /// Save with an explicit importance weight (0..1) and an optional f32 embedding.
@@ -884,6 +887,18 @@ mod tests {
             store.recall_terms(&terms, &[], 8).unwrap().is_empty(),
             "no granted scope means no recall at all, deny-first"
         );
+    }
+
+    #[test]
+    fn a_poisoned_lock_recovers_instead_of_panicking() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.conn.lock().unwrap();
+            panic!("poison the memory mutex");
+        }));
+        assert!(poisoned.is_err());
+        store.save("k", "v", "global").unwrap();
+        assert_eq!(store.get("k", "global").unwrap(), Some("v".to_string()));
     }
 
     #[test]

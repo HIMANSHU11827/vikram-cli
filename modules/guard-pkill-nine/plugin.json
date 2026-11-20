@@ -1,0 +1,26 @@
+{
+  "id": "guard-pkill-nine",
+  "name": "Guard: pkill -9",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: pkill -9.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "shell.run",
+      "arguments_contain": "pkill -9",
+      "deny": "an unconditional SIGKILL sweep is refused"
+    }
+  ]
+}

@@ -152,7 +152,7 @@ fn run_step(workspace_root: &Path, step: &PlanStep, sandbox: &Sandbox) -> StepRe
     }
 
     let mut timed_out = false;
-    let output = match wait_with_timeout(&mut cmd, step.timeout) {
+    let output = match wait_with_timeout(&mut cmd, step.timeout, None) {
         Ok(Some(output)) => output,
         Ok(None) => {
             timed_out = true;
@@ -219,14 +219,18 @@ pub(crate) fn shell_cmd(command: &str) -> Command {
 ///
 /// `Ok(Some)` is a finished command, `Ok(None)` is a timeout, and `Err` is a
 /// spawn or wait failure — the three must stay distinct so a command that never
-/// started is never reported as having timed out. On Unix the child leads its
-/// own process group, so a timeout kills the whole group: a backgrounded
-/// grandchild cannot outlive the call. The pipes are drained on detached threads
-/// with a deadline (the `computer.rs` pattern): `wait_with_output` would block
-/// on pipe EOF forever when a surviving grandchild holds stdout open.
+/// started is never reported as having timed out. `cancel`, when present, is polled
+/// on the same cadence as the deadline: a cancelled call kills the process tree and
+/// reports `cancelled`, which is how a tool honouring `ToolContext::cancel` actually
+/// stops the command it spawned rather than only abandoning the wait. On Unix the
+/// child leads its own process group, so a timeout or cancel kills the whole group:
+/// a backgrounded grandchild cannot outlive the call. The pipes are drained on
+/// detached threads with a deadline (the `computer.rs` pattern): `wait_with_output`
+/// would block on pipe EOF forever when a surviving grandchild holds stdout open.
 pub(crate) fn wait_with_timeout(
     cmd: &mut Command,
     timeout: Duration,
+    cancel: Option<&vikram_contracts::CancellationToken>,
 ) -> Result<Option<std::process::Output>, String> {
     use std::io::Read;
     #[cfg(unix)]
@@ -247,6 +251,10 @@ pub(crate) fn wait_with_timeout(
                 if Instant::now() >= deadline {
                     kill_tree(&mut child);
                     return Ok(None);
+                }
+                if cancel.is_some_and(|token| token.is_cancelled()) {
+                    kill_tree(&mut child);
+                    return Err("cancelled".to_owned());
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
@@ -571,6 +579,34 @@ mod tests {
         .unwrap();
         assert!(!outcome.ok);
         assert_eq!(outcome.attempts, 1, "no-change repair must not burn budget");
+    }
+
+    #[test]
+    fn a_cancelled_wait_kills_the_process_instead_of_timing_out() {
+        let dir = workspace_with("cancel", "");
+        let marker = dir.join("survived");
+        let token = vikram_contracts::CancellationToken::new();
+        let cancel = token.clone();
+        let killer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            cancel.cancel();
+        });
+        // The command would write the marker two seconds in; a live process means the cancel
+        // only abandoned the wait, a dead one means the tree was actually killed.
+        let mut cmd = shell_cmd(&format!("sleep 2; touch {}", marker.display()));
+        let started = Instant::now();
+        let result = wait_with_timeout(&mut cmd, Duration::from_secs(60), Some(&token));
+        killer.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cancel must not wait out the timeout"
+        );
+        assert_eq!(result.unwrap_err(), "cancelled");
+        std::thread::sleep(Duration::from_millis(2100));
+        assert!(
+            !marker.exists(),
+            "the cancelled command's process tree was killed"
+        );
     }
 
     #[test]

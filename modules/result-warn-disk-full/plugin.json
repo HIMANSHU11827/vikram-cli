@@ -1,0 +1,25 @@
+{
+  "id": "result-warn-disk-full",
+  "name": "Result: a full disk",
+  "version": "1.0.0",
+  "description": "Inspects tool output for a full disk.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 40,
+  "components": {
+    "hooks": [
+      "tool_result"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_result",
+      "result_contain": "no space left on device",
+      "append_result": "[plugin] The disk is full. Free space before continuing."
+    }
+  ]
+}

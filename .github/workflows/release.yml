@@ -1,0 +1,445 @@
+# VIKRAM release
+#
+# The only path that publishes shipped artifacts: a `v*` tag push (or a manual
+# dispatch) builds the single `vikram` binary from crates/vikram-cli for every
+# platform docs/install.md promises, packages it, and publishes a multi-arch
+# container image to GHCR. ci.yml stays the PR gate and deliberately defers the
+# cross builds (its header, lines 8-12); they live here because a broken cross
+# build must block a release, not every pull request.
+#
+# Why the musl and aarch64-gnu targets need no extra runtime here:
+#  - TLS is rustls + ring (workspace deps), never OpenSSL, so nothing links
+#    against a system libssl on any target;
+#  - `rusqlite` is `bundled`, so SQLite is compiled from C by the target
+#    compiler — which is why the cross builds install a real C compiler for the
+#    target (zig cc / the Android NDK clang) rather than only a linker;
+#  - `ring` 0.17.14 also compiles C, same requirement.
+#
+# Cross tool choice for the three Linux cross targets (aarch64-gnu, x86_64-musl,
+# aarch64-musl): cargo-zigbuild, not `cross`.
+#  1. One install covers all three, needs no Docker daemon and no privileged
+#     binfmt registration on the runner.
+#  2. `cross`'s prebuilt images pin their own toolchain/glibc, so the runtime
+#     floor of a release binary would silently follow whichever image tag was
+#     current. With zigbuild the floor is written into the target string
+#     (`aarch64-unknown-linux-gnu.2.28`) and shows up in review diffs.
+#  3. zig cc is a genuine cross C compiler, which is exactly what ring and
+#     bundled SQLite need.
+# Zig itself arrives via the official PyPI `ziglang` package, which
+# `pip install cargo-zigbuild` pulls in (upstream README, "Installation").
+#
+# Targets NOT shipped here, and why: i686/armv7 Linux (no demand, doubles the
+# matrix), macOS universal2 (two separate darwin tarballs cover both arches),
+# x86_64-linux-gnu built against an old glibc (see the note on that matrix row —
+# the musl tarball is the portable Linux artifact).
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tag to build, e.g. v0.1.0 (default: workspace version). Manual runs publish no GitHub Release."
+        required: false
+        type: string
+
+# A superseded tag push must not be cancelled halfway: an aborted run can leave a
+# GitHub Release holding half its assets. Manual runs are superseded freely.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
+
+# Read-only by default; each job that must write asks for exactly that scope.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: resolve version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+      image: ${{ steps.v.outputs.image }}
+      is_release: ${{ steps.v.outputs.is_release }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag, version and image name
+        id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          is_release=false
+          tag=""
+
+          if [ "$EVENT" = "push" ] && [ "${REF#refs/tags/}" != "$REF" ]; then
+            tag="${REF#refs/tags/}"
+            is_release=true
+          elif [ -n "${INPUT_VERSION:-}" ]; then
+            tag="$INPUT_VERSION"
+          else
+            # [workspace.package] version is the single `version = "..."` line in
+            # the workspace manifest; every crate inherits it.
+            base="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+            tag="v${base}"
+          fi
+
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Release tag '$tag' is not a v<semver> tag."
+            exit 1
+          fi
+
+          version="${tag#v}"
+          # GHCR rejects uppercase path components; the owner here is uppercase.
+          image="ghcr.io/${REPO,,}"
+
+          manifest="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ "$version" != "$manifest" ]; then
+            echo "::warning::Tag $tag does not match workspace version $manifest. Shipping binaries labelled $tag."
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "image=$image"
+            echo "is_release=$is_release"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "tag=$tag version=$version image=$image is_release=$is_release"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      # No `strip` binary for aarch64/musl/android on the runner. `-C strip` is
+      # the compiler's own symbol strip and works for every target, so all
+      # artifacts (and the container's expectations in the Dockerfile) match.
+      RUSTFLAGS: "-C strip=symbols"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native. ubuntu-latest (24.04/26.04) sets this binary's glibc floor at
+          # the runner's glibc; users on older distros should take the musl
+          # tarball, which has no libc dependency at all.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            smoke: true
+
+          # cross (zigbuild): floor pinned to glibc 2.28 = Debian 10 / Ubuntu
+          # 20.04 / RHEL 8, with headroom over the 2.17 that modern glibc-heavy
+          # crates can miss symbols from.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            zig: true
+            zig_target: aarch64-unknown-linux-gnu.2.28
+
+          # cross (zigbuild): musl targets are static by default, so these are the
+          # "runs on any Linux" artifacts.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+            zig_target: x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+            zig_target: aarch64-unknown-linux-musl
+
+          # macos-latest is arm64, so aarch64 is native and x86_64 is a rustc
+          # cross build over the universal macOS SDK. The x86_64 binary is only
+          # smoke-tested if Rosetta happens to be present, so it gets `file`
+          # verification instead of execution.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            smoke: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            smoke: true
+
+          # Termux (docs/termux.md): Bionic libc, not musl. API 24 keeps it
+          # installable on everything Termux still supports.
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+            android: true
+            android_api: 24
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to the `stable` channel tag rather than ci.yml's `@master`, so a
+      # release build cannot silently change toolchain without a diff here.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cargo-zigbuild + zig
+        if: matrix.zig
+        run: |
+          set -euo pipefail
+          venv="$RUNNER_TEMP/zig"
+          python3 -m venv "$venv"
+          # Pin: zigbuild's zig/linker wrapper is version-coupled to zig itself,
+          # and an unpinned pair can drift into an unsupported combination.
+          "$venv/bin/pip" install --quiet --disable-pip-version-check "cargo-zigbuild==0.24.1"
+          echo "$venv/bin" >> "$GITHUB_PATH"
+          "$venv/bin/cargo-zigbuild" --version
+          "$venv/bin/zig" version
+
+      - name: Configure Android NDK toolchain
+        if: matrix.android
+        # The NDK is preinstalled on ubuntu images (ANDROID_NDK_HOME, currently
+        # 27.3.x). rustc only needs the linker; the C crates (ring, bundled
+        # SQLite) need CC/AR for this target or their build scripts fall back to
+        # the host gcc and fail at link time.
+        run: |
+          set -euo pipefail
+          ndk="${ANDROID_NDK_HOME:-${ANDROID_NDK:-}}"
+          [ -n "$ndk" ] || { echo "::error::No Android NDK on this runner"; exit 1; }
+          toolchain="$ndk/toolchains/llvm/prebuilt/linux-x86_64"
+          api="${{ matrix.android_api }}"
+          clang="$toolchain/bin/aarch64-linux-android${api}-clang"
+          [ -x "$clang" ] || { echo "::error::$clang missing in $ndk"; exit 1; }
+          {
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$clang"
+            echo "CC_aarch64_linux_android=$clang"
+            echo "CXX_aarch64_linux_android=${clang}++"
+            echo "AR_aarch64_linux_android=$toolchain/bin/llvm-ar"
+            echo "RANLIB_aarch64_linux_android=$toolchain/bin/llvm-ranlib"
+          } >> "$GITHUB_ENV"
+
+      # --locked: Cargo.lock is committed, and a release must build exactly it.
+      # -p vikram-cli: the workspace has 16 crates; only this one produces a
+      # binary.
+      - name: Build (native)
+        if: matrix.zig != true && matrix.android != true
+        env:
+          # Both arches of the SDK are present; this only moves the floor off
+          # rustc's default 10.12 for x86_64.
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: cargo build --release --locked -p vikram-cli --target ${{ matrix.target }}
+
+      - name: Build (zigbuild)
+        if: matrix.zig
+        run: cargo zigbuild --release --locked -p vikram-cli --target ${{ matrix.zig_target || matrix.target }}
+
+      - name: Build (android)
+        if: matrix.android
+        run: cargo build --release --locked -p vikram-cli --target ${{ matrix.target }}
+
+      - name: Inspect binary
+        if: runner.os != 'Windows'
+        # Cheap evidence of what the archive actually contains: a static musl
+        # binary, a glibc binary, or the right Mach-O slice.
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/vikram"
+          ls -l "$bin"
+          file "$bin"
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ] || [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            # Static build ⇒ no interpreter. `ldd` says "not a dynamic
+            # executable"; a missing interpreter must fail here, not on a user's
+            # machine.
+            if readelf -l "$bin" | grep -q "INTERP"; then
+              echo "::error::musl binary is dynamically linked"
+              exit 1
+            fi
+          fi
+
+      # Only targets the runner can execute are run. aarch64-linux-gnu/musl and
+      # android have no binfmt handler on a hosted runner, and x86_64-apple-darwin
+      # would need Rosetta — those are compile-verified only.
+      - name: Smoke test
+        if: matrix.smoke && runner.os != 'Windows'
+        run: "target/${{ matrix.target }}/release/vikram --version"
+
+      - name: Smoke test (windows)
+        if: matrix.smoke && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "target/${{ matrix.target }}/release/vikram.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "vikram --version exited $LASTEXITCODE" }
+
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # zigbuild strips the `.2.28` glibc suffix before calling cargo, so the
+          # artifact lands under the plain triple; the find is a guard against
+          # that ever changing.
+          bin="target/$TARGET/release/vikram"
+          [ -f "$bin" ] || bin="$(find target -type f -path '*/release/vikram' | head -n1)"
+          [ -n "$bin" ] && [ -f "$bin" ] || { echo "::error::no vikram binary for $TARGET"; exit 1; }
+
+          name="vikram-${TAG}-${TARGET}"
+          mkdir -p "dist/$name"
+          cp "$bin" README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          tar -C dist -czf "dist/${name}.tar.gz" "$name"
+          rm -rf "dist/$name"
+          ls -l "dist/${name}.tar.gz"
+
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $bin = "target/$env:TARGET/release/vikram.exe"
+          if (-not (Test-Path $bin)) { throw "missing $bin" }
+          $name = "vikram-$env:TAG-$env:TARGET"
+          $stage = Join-Path "dist" $name
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item $bin, "README.md", "LICENSE-MIT", "LICENSE-APACHE" -Destination $stage
+          Compress-Archive -Path $stage -DestinationPath "dist/$name.zip"
+          Remove-Item -Recurse -Force $stage
+          Get-ChildItem "dist" | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vikram-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  checksums:
+    name: SHA256SUMS
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -l
+          # Written last so the file does not checksum itself.
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vikram-SHA256SUMS
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub release
+    needs: [prepare, build, checksums]
+    # Manual dispatches only produce run artifacts; a Release needs a real tag.
+    if: needs.prepare.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          # Fails if a tarball went missing upstream, instead of publishing a
+          # release with a hole in it.
+          fail_on_unmatched_files: true
+          files: dist/*
+          generate_release_notes: true
+
+  docker:
+    name: docker (linux/amd64, linux/arm64)
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # The existing Dockerfile needs no changes for arm64: the builder
+      # (rust:1.89-bookworm) and runtime (debian:bookworm-slim) are both
+      # multi-arch, `tini` and `ca-certificates` exist for arm64, and nothing in
+      # it pins a host arch or a build platform. So arm64 is produced by QEMU
+      # emulation of the whole compile — correct, but slow. Making it fast means
+      # cross-compiling inside the builder (`--platform=$BUILDPLATFORM` plus a
+      # target triple); that is a Dockerfile change, deferred deliberately.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image tags
+        id: tags
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          IS_RELEASE: ${{ needs.prepare.outputs.is_release }}
+        run: |
+          set -euo pipefail
+          tags="$IMAGE:$VERSION"
+          # `latest` moves only on a tag push; a manual run must never repoint it.
+          if [ "$IS_RELEASE" = "true" ]; then
+            tags="$(printf '%s\n%s' "$tags" "$IMAGE:latest")"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "$tags"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "$tags"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

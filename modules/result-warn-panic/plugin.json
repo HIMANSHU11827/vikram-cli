@@ -1,0 +1,25 @@
+{
+  "id": "result-warn-panic",
+  "name": "Result: a panic",
+  "version": "1.0.0",
+  "description": "Inspects tool output for a panic.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 40,
+  "components": {
+    "hooks": [
+      "tool_result"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_result",
+      "result_contain": "panicked at",
+      "append_result": "[plugin] The program panicked. Quote the panic and the location."
+    }
+  ]
+}

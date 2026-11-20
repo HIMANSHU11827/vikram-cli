@@ -1,0 +1,26 @@
+{
+  "id": "guard-token-in-command",
+  "name": "Guard: token on the command line",
+  "version": "1.0.0",
+  "description": "Refuses or rewrites a tool call: token on the command line.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 100,
+  "components": {
+    "hooks": [
+      "tool_call"
+    ]
+  },
+  "permissions": [
+    "tools"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "tool_call",
+      "tool": "shell.run",
+      "arguments_contain": "token=",
+      "deny": "secrets must not be placed on a command line"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "id": "turn-note-concise",
+  "name": "Turn: ask for a concise answer",
+  "version": "1.0.0",
+  "description": "Sets a compact answer shape for the turn.",
+  "author": "VIKRAM hook catalog",
+  "license": "MIT",
+  "priority": 80,
+  "components": {
+    "hooks": [
+      "turn_start"
+    ]
+  },
+  "permissions": [
+    "agents"
+  ],
+  "enabled": true,
+  "hook_rules": [
+    {
+      "point": "turn_start",
+      "append": "Keep the final answer under 200 words unless detail was requested."
+    }
+  ]
+}
