@@ -3227,6 +3227,7 @@ dependencies = [
  "tokio",
  "vikram-contracts",
  "vikram-daemon",
+ "vikram-evolution",
  "vikram-gateway",
  "vikram-mcp",
  "vikram-policy",

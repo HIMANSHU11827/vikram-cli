@@ -20,6 +20,7 @@ vikram-mcp.workspace = true
 vikram-daemon.workspace = true
 vikram-policy.workspace = true
 vikram-gateway = { path = "../vikram-gateway" }
+vikram-evolution = { path = "../vikram-evolution" }
 clap.workspace = true
 tokio.workspace = true
 futures-util.workspace = true

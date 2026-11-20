@@ -1279,6 +1279,37 @@ impl RuntimeInner {
                         }
                     }
                 }
+                // Reflection auto-apply writes correction-derived facts to the evolution
+                // engine's layered memory under `agent:<id>` — a second store nothing else
+                // reads. Same budget and same section; a value already injected above is
+                // not repeated (auto-apply can land the same correction in both stores).
+                let agent_id = session
+                    .bot()
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "main".to_owned());
+                let engine = self.learning.evolution.lock().unwrap_or_else(|e| {
+                    eprintln!("vikram: runtime evolution lock mutex poisoned; recovering");
+                    e.into_inner()
+                });
+                // An empty query recalls the scope's most recent live entries: correction
+                // memories are few and agent-scoped, so recency is the relevance signal.
+                if let Ok(hits) = engine
+                    .memory
+                    .recall(Some(&format!("agent:{agent_id}")), "", 4)
+                {
+                    let mut known: std::collections::HashSet<String> = entries
+                        .iter()
+                        .map(|(_, _, value)| value.trim().to_owned())
+                        .collect();
+                    for hit in hits {
+                        let value = hit.value.trim();
+                        if value.is_empty() || !known.insert(value.to_owned()) {
+                            continue;
+                        }
+                        entries.push(("evolution".to_owned(), hit.key.clone(), hit.value.clone()));
+                    }
+                }
+                drop(engine);
                 if !entries.is_empty() {
                     let mut memory_block = String::from(
                         "Relevant memory (durable notes from earlier sessions; may be stale, verify before relying on it):\n",
@@ -7144,5 +7175,122 @@ mod tests {
         let store = vikram_store::Store::open(&database_path()).unwrap();
         let row = store.get_session(&child).unwrap().expect("row survives");
         assert_eq!(row.status, "closed", "closed, not deleted");
+    }
+
+    fn seeded_session(
+        handle: &RuntimeHandle,
+        text: &str,
+    ) -> (SessionId, std::sync::Arc<crate::session::SessionRuntime>) {
+        let id = handle.snapshot().sessions[0].id.clone();
+        let session = handle.inner.session(&id).expect("session is live");
+        session.push_message(vikram_contracts::Message::user(text), 1);
+        (id, session)
+    }
+
+    fn remember_correction(handle: &RuntimeHandle, scope: &str, value: &str) {
+        let engine = handle.evolution();
+        engine
+            .memory
+            .remember(
+                vikram_evolution::MemoryLayer::User,
+                scope,
+                &format!("correction-test-{}", value.len()),
+                value,
+                vikram_evolution::KnowledgeStatus::UserStated,
+                0.9,
+                None,
+                "test",
+            )
+            .expect("evolution memory accepts the entry");
+    }
+
+    #[tokio::test]
+    async fn retrieved_memory_surfaces_evolution_layered_memories() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let (_id, session) = seeded_session(&handle, "check the deployment checklist again");
+        remember_correction(&handle, "agent:main", "always run migrations before deploy");
+        // A different agent's scope must never leak into this session's recall.
+        remember_correction(&handle, "agent:other", "other agent secret note");
+
+        let block = handle
+            .inner
+            .retrieved_memory(&session)
+            .expect("the seeded correction produces a memory block");
+        assert!(block.contains("always run migrations before deploy"));
+        assert!(block.contains("[evolution]"));
+        assert!(!block.contains("other agent secret note"));
+    }
+
+    #[tokio::test]
+    async fn retrieved_memory_does_not_double_inject_a_correction_in_both_stores() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let (id, session) = seeded_session(&handle, "check the deployment checklist again");
+        let shared = "deployment checklist says run migrations first";
+        handle
+            .inner
+            .memory
+            .save("deploy-notes", shared, id.as_str())
+            .expect("memory store accepts the entry");
+        remember_correction(&handle, "agent:main", shared);
+
+        let block = handle
+            .inner
+            .retrieved_memory(&session)
+            .expect("the shared correction produces a memory block");
+        assert_eq!(
+            block.matches(shared).count(),
+            1,
+            "the same correction text must be injected once, not once per store"
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieved_memory_respects_the_shared_memory_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let (_id, session) = seeded_session(&handle, "check the deployment checklist again");
+        remember_correction(&handle, "agent:main", "always run migrations before deploy");
+        handle
+            .inner
+            .config
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .context
+            .memory_budget_tokens = 1;
+
+        let block = handle.inner.retrieved_memory(&session);
+        assert!(
+            block
+                .map(|b| !b.contains("always run migrations before deploy"))
+                .unwrap_or(true),
+            "a one-token budget cannot fit even the section header"
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieved_memory_survives_the_in_memory_evolution_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        // A directory where evolution.db belongs makes the durable open fail, so the
+        // runtime falls back to an in-memory engine — recall must still be safe.
+        std::fs::create_dir_all(dir.path().join("home").join("evolution.db")).unwrap();
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let (_id, session) = seeded_session(&handle, "check the deployment checklist again");
+        remember_correction(&handle, "agent:main", "always run migrations before deploy");
+
+        let block = handle
+            .inner
+            .retrieved_memory(&session)
+            .expect("the in-memory engine still answers recall");
+        assert!(block.contains("always run migrations before deploy"));
     }
 }

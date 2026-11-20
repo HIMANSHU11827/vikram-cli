@@ -7,6 +7,7 @@ mod archive;
 mod chat;
 mod dist;
 mod doctor;
+mod evolution;
 mod gateway;
 mod gateway_config;
 mod module_sdk;
@@ -184,6 +185,11 @@ enum Command {
     Learning {
         #[command(subcommand)]
         action: LearningAction,
+    },
+    /// Inspect the self-evolution engine's store (read-only).
+    Evolution {
+        #[command(subcommand)]
+        action: Option<evolution::EvolutionAction>,
     },
     /// Run and supervise the background daemon.
     Daemon {
@@ -901,6 +907,7 @@ fn main() -> std::process::ExitCode {
         Command::Entities { action } => entities(action),
         Command::Hive { action } => run_async(hive(action)),
         Command::Learning { action } => learning(action),
+        Command::Evolution { action } => exit(evolution::run(action)),
         Command::Tickets { action } => tickets(action),
         Command::Daemon { action } => daemon(action.unwrap_or(DaemonAction::Status)),
         Command::Heartbeat { action } => heartbeat(action.unwrap_or(HeartbeatAction::Status)),
