@@ -174,7 +174,7 @@ pub(crate) fn spawn_turn(
 pub(crate) async fn run_turn(
     inner: Arc<RuntimeInner>,
     session: Arc<SessionRuntime>,
-    message: Message,
+    mut message: Message,
     agent: Option<AgentRun>,
 ) {
     let turn = TurnId::generate();
@@ -194,6 +194,26 @@ pub(crate) async fn run_turn(
         }),
         armed: std::cell::Cell::new(true),
     };
+
+    // A user-input hook sees the message before it is durable: it may refuse it or rewrite the
+    // prose the model will read. A rewrite lands in the journaled message itself, so what the
+    // plugin changed is what the transcript and the model both carry.
+    let user_input = run_hook(
+        &inner,
+        &session,
+        crate::hooks::HookContext::new(crate::hooks::HookPoint::UserInput)
+            .with_session(session.id.as_str())
+            .with_turn(turn.as_str())
+            .with_workspace(inner.workspace_root.display().to_string())
+            .with_model(inner.model())
+            .with_text(message.text_body()),
+    )
+    .await;
+    if user_input.effect.deny.is_none()
+        && let Some(text) = user_input.effect.text.clone()
+    {
+        rewrite_message_text(&mut message, text);
+    }
 
     // The user's message is durable before any model work begins.
     let request_text = message.text_body();
@@ -247,6 +267,28 @@ pub(crate) async fn run_turn(
     let mut step_notice_sent = false;
     let mut live_metrics = Instant::now();
 
+    if let Some(reason) = &user_input.effect.deny {
+        inner.emit(RuntimeEvent::Error {
+            text: format!("a plugin refused this input: {reason}"),
+        });
+        turn_end_hook(&inner, &session, &turn, TurnState::Failed, 0, output_tokens).await;
+        finish(
+            &inner,
+            &session,
+            &agent,
+            turn,
+            TurnReport {
+                outcome: TurnState::Failed,
+                started,
+                output_tokens,
+                request: &request_text,
+                growth: &growth,
+            },
+        );
+        claim_guard.disarm();
+        return;
+    }
+
     // A turn-start hook may refuse the request or attach context the turn then carries. It runs
     // before the provider gate so a refusal is reported even when no model is configured.
     let turn_start = run_hook(
@@ -264,6 +306,7 @@ pub(crate) async fn run_turn(
         inner.emit(RuntimeEvent::Error {
             text: format!("a plugin refused this turn: {reason}"),
         });
+        turn_end_hook(&inner, &session, &turn, TurnState::Failed, 0, output_tokens).await;
         finish(
             &inner,
             &session,
@@ -285,6 +328,7 @@ pub(crate) async fn run_turn(
         inner.emit(RuntimeEvent::Error {
             text: "no model configured: set `model` and the API key named by `api_key_env`".into(),
         });
+        turn_end_hook(&inner, &session, &turn, TurnState::Failed, 0, output_tokens).await;
         finish(
             &inner,
             &session,
@@ -326,8 +370,11 @@ pub(crate) async fn run_turn(
         // prices what is actually being sent rather than guessing at the shape afterwards.
         let mut prefix: Vec<Message> = Vec::new();
         let mut labels: Vec<&'static str> = Vec::new();
-        // What the turn-start hook asked to add goes in front of everything the host assembled.
-        let mut injected_prefix: Vec<String> = turn_start.effect.prepend.clone();
+        // What the input and turn-start hooks asked to add goes in front of everything the host
+        // assembled, in the order the hooks ran.
+        let mut injected_prefix: Vec<String> = user_input.effect.prepend.clone();
+        injected_prefix.extend(user_input.effect.append.iter().cloned());
+        injected_prefix.extend(turn_start.effect.prepend.iter().cloned());
         injected_prefix.extend(turn_start.effect.append.iter().cloned());
         if !catalog_text.trim().is_empty() {
             labels.push("skill catalogue");
@@ -380,6 +427,29 @@ pub(crate) async fn run_turn(
             tokio::task::spawn_blocking(move || inner.retrieved_memory(&session))
                 .await
                 .unwrap_or_default()
+        };
+        // A recall hook sees what the store is about to inject — and may withhold it or rewrite
+        // it — before the prefix is assembled. It fires once per step because retrieval does.
+        let memory_text = match memory_text {
+            Some(text) => {
+                let recall = run_hook(
+                    &inner,
+                    &session,
+                    crate::hooks::HookContext::new(crate::hooks::HookPoint::MemoryRecall)
+                        .with_session(session.id.as_str())
+                        .with_turn(turn.as_str())
+                        .with_workspace(inner.workspace_root.display().to_string())
+                        .with_model(inner.model())
+                        .with_text(&text),
+                )
+                .await;
+                if recall.effect.deny.is_some() {
+                    None
+                } else {
+                    Some(recall.effect.text.unwrap_or(text))
+                }
+            }
+            None => None,
         };
         if let Some(memory_text) = memory_text {
             labels.insert(0, "retrieved memory");
@@ -436,6 +506,15 @@ pub(crate) async fn run_turn(
             inner.emit(RuntimeEvent::Error {
                 text: format!("a plugin refused this turn's context: {reason}"),
             });
+            turn_end_hook(
+                &inner,
+                &session,
+                &turn,
+                TurnState::Failed,
+                steps_used,
+                output_tokens,
+            )
+            .await;
             finish(
                 &inner,
                 &session,
@@ -532,6 +611,15 @@ pub(crate) async fn run_turn(
             inner.emit(RuntimeEvent::Error {
                 text: format!("a plugin refused the model request: {reason}"),
             });
+            turn_end_hook(
+                &inner,
+                &session,
+                &turn,
+                TurnState::Failed,
+                steps_used,
+                output_tokens,
+            )
+            .await;
             finish(
                 &inner,
                 &session,
@@ -755,7 +843,15 @@ pub(crate) async fn run_turn(
         }
         if cancel.is_cancelled() {
             if !text_buffer.is_empty() {
-                commit_assistant_text(&inner, &session, &text_buffer, &reasoning_buffer, &[]);
+                commit_assistant(
+                    &inner,
+                    &session,
+                    &turn,
+                    &text_buffer,
+                    &reasoning_buffer,
+                    &[],
+                )
+                .await;
                 reasoning_buffer.clear();
             }
             outcome = TurnState::Cancelled;
@@ -763,7 +859,15 @@ pub(crate) async fn run_turn(
         }
         if stream_failed {
             if !text_buffer.is_empty() || !reasoning_buffer.is_empty() {
-                commit_assistant_text(&inner, &session, &text_buffer, &reasoning_buffer, &[]);
+                commit_assistant(
+                    &inner,
+                    &session,
+                    &turn,
+                    &text_buffer,
+                    &reasoning_buffer,
+                    &[],
+                )
+                .await;
                 text_buffer.clear();
                 reasoning_buffer.clear();
             }
@@ -781,7 +885,15 @@ pub(crate) async fn run_turn(
         // transcript says "assistant said nothing" followed by an unexplained result, and a model
         // that cannot see its own call runs the same tool again under a new name.
         if !text_buffer.is_empty() || !reasoning_buffer.is_empty() || !calls.is_empty() {
-            commit_assistant_text(&inner, &session, &text_buffer, &reasoning_buffer, &calls);
+            commit_assistant(
+                &inner,
+                &session,
+                &turn,
+                &text_buffer,
+                &reasoning_buffer,
+                &calls,
+            )
+            .await;
             text_buffer.clear();
             reasoning_buffer.clear();
         }
@@ -972,6 +1084,7 @@ pub(crate) async fn run_turn(
             measured: reported_input.is_some() && reported_output.is_some(),
         });
     }
+    turn_end_hook(&inner, &session, &turn, outcome, steps_used, output_tokens).await;
     finish(
         &inner,
         &session,
@@ -1092,6 +1205,113 @@ impl RepeatGuard {
         }
         self.advised_at = self.failures_in_row;
         true
+    }
+}
+
+/// Replace a message's prose, keeping every non-text block (images) in place. The first text
+/// block takes the rewrite and the rest are dropped, so a multi-paragraph input collapses to the
+/// single text a hook produced.
+fn rewrite_message_text(message: &mut Message, text: String) {
+    let mut rewritten = false;
+    let mut blocks = Vec::with_capacity(message.blocks.len());
+    for block in message.blocks.drain(..) {
+        match block {
+            Block::Text { trust, .. } if !rewritten => {
+                blocks.push(Block::Text {
+                    text: text.clone(),
+                    trust,
+                });
+                rewritten = true;
+            }
+            Block::Text { .. } => {}
+            other => blocks.push(other),
+        }
+    }
+    if !rewritten {
+        blocks.insert(
+            0,
+            Block::Text {
+                text,
+                trust: Trust::User,
+            },
+        );
+    }
+    message.blocks = blocks;
+}
+
+/// Commit one assistant message after `response_delivery` hooks have seen the prose. A denial
+/// withholds the text but never the reasoning or tool calls it announced — dropping those would
+/// orphan the results that follow. A `text` effect rewrites what lands.
+async fn commit_assistant(
+    inner: &Arc<RuntimeInner>,
+    session: &Arc<SessionRuntime>,
+    turn: &TurnId,
+    text: &str,
+    reasoning: &str,
+    calls: &[ToolCall],
+) {
+    let mut delivered = text.to_owned();
+    if !delivered.is_empty() {
+        let hook = run_hook(
+            inner,
+            session,
+            crate::hooks::HookContext::new(crate::hooks::HookPoint::ResponseDelivery)
+                .with_session(session.id.as_str())
+                .with_turn(turn.as_str())
+                .with_workspace(inner.workspace_root.display().to_string())
+                .with_model(inner.model())
+                .with_text(&delivered)
+                .with_details(serde_json::json!({"tool_calls": calls.len()})),
+        )
+        .await;
+        if hook.effect.deny.is_some() {
+            delivered.clear();
+        } else if let Some(rewritten) = hook.effect.text {
+            delivered = rewritten;
+        }
+    }
+    commit_assistant_text(inner, session, &delivered, reasoning, calls);
+}
+
+/// The turn's closing dispatch: outcome, step count and token figures for observers. It runs
+/// before `finish` publishes `TurnFinished`, while the turn still reads as open. The outcome is
+/// already decided, so effects other than observation have nothing left to refuse.
+async fn turn_end_hook(
+    inner: &Arc<RuntimeInner>,
+    session: &Arc<SessionRuntime>,
+    turn: &TurnId,
+    outcome: TurnState,
+    steps: u64,
+    output_tokens: u64,
+) {
+    let outcome_name = format!("{outcome:?}").to_lowercase();
+    let _ = run_hook(
+        inner,
+        session,
+        crate::hooks::HookContext::new(crate::hooks::HookPoint::TurnEnd)
+            .with_session(session.id.as_str())
+            .with_turn(turn.as_str())
+            .with_workspace(inner.workspace_root.display().to_string())
+            .with_model(inner.model())
+            .with_text(&outcome_name)
+            .with_details(serde_json::json!({
+                "outcome": outcome_name,
+                "steps": steps,
+                "output_tokens": output_tokens,
+            })),
+    )
+    .await;
+}
+
+/// Which memory-scoped point a tool call belongs to, when it is one at all. Reads recall,
+/// everything else the memory tools do mutates the store.
+fn memory_hook_point(name: &str) -> Option<crate::hooks::HookPoint> {
+    match name {
+        "memory.search" | "memory.list" => Some(crate::hooks::HookPoint::MemoryRecall),
+        "memory.save" | "memory.delete" | "memory.consolidate" | "memory.note" => {
+            Some(crate::hooks::HookPoint::MemoryWrite)
+        }
+        _ => None,
     }
 }
 
@@ -1391,6 +1611,40 @@ async fn run_tool(
     }
 }
 
+/// Publish the start/finish pair for a call a plugin refused before it ran: the tool never
+/// executed, but the transcript still shows the attempt and the reason.
+fn emit_tool_denial(
+    inner: &Arc<RuntimeInner>,
+    session: &Arc<SessionRuntime>,
+    call: &ToolCall,
+    content: &str,
+    arguments_text: &str,
+    cwd: &str,
+    started: Instant,
+) {
+    inner.emit(RuntimeEvent::ToolStarted {
+        session: session.id.clone(),
+        call: call.id.clone(),
+        name: call.name.clone(),
+        summary: content.to_owned(),
+        resource: String::new(),
+        arguments: arguments_text.to_owned(),
+        cwd: cwd.to_owned(),
+    });
+    inner.emit(RuntimeEvent::ToolFinished {
+        session: session.id.clone(),
+        call: call.id.clone(),
+        name: call.name.clone(),
+        ok: false,
+        summary: content.to_owned(),
+        content: content.to_owned(),
+        resource: String::new(),
+        arguments: arguments_text.to_owned(),
+        cwd: cwd.to_owned(),
+        duration_ms: started.elapsed().as_millis() as u64,
+    });
+}
+
 async fn run_tool_once(
     inner: &Arc<RuntimeInner>,
     session: &Arc<SessionRuntime>,
@@ -1451,32 +1705,53 @@ async fn run_tool_once(
     .await;
     if let Some(reason) = &call_hook.effect.deny {
         let content = format!("denied by plugin: {reason}");
-        inner.emit(RuntimeEvent::ToolStarted {
-            session: session.id.clone(),
-            call: call.id.clone(),
-            name: call.name.clone(),
-            summary: content.clone(),
-            resource: String::new(),
-            arguments: arguments_text.clone(),
-            cwd: cwd.clone(),
-        });
-        inner.emit(RuntimeEvent::ToolFinished {
-            session: session.id.clone(),
-            call: call.id.clone(),
-            name: call.name.clone(),
-            ok: false,
-            summary: content.clone(),
-            content: content.clone(),
-            resource: String::new(),
-            arguments: arguments_text.clone(),
-            cwd: cwd.clone(),
-            duration_ms: elapsed(),
-        });
+        emit_tool_denial(
+            inner,
+            session,
+            &call,
+            &content,
+            &arguments_text,
+            &cwd,
+            started,
+        );
         return (content, false);
     }
     if let Some(arguments) = call_hook.effect.arguments {
         call.arguments = arguments;
         arguments_text = truncate(&call.arguments.to_string(), 8_000);
+    }
+
+    // A `memory.*` call gets its own point after the generic call hook, so it sees the arguments
+    // that survived `tool_call` rewrites and can refuse the store operation on its own.
+    if let Some(point) = memory_hook_point(&call.name) {
+        let memory_hook = run_hook(
+            inner,
+            session,
+            crate::hooks::HookContext::new(point)
+                .with_session(session.id.as_str())
+                .with_workspace(inner.workspace_root.display().to_string())
+                .with_model(inner.model())
+                .with_text(call.name.clone())
+                .with_tool(call.name.clone(), call.arguments.clone()),
+        )
+        .await;
+        if let Some(reason) = &memory_hook.effect.deny {
+            let content = format!("denied by plugin: {reason}");
+            emit_tool_denial(
+                inner,
+                session,
+                &call,
+                &content,
+                &arguments_text,
+                &cwd,
+                started,
+            );
+            return (content, false);
+        }
+        if let Some(arguments) = memory_hook.effect.arguments {
+            call.arguments = arguments;
+            arguments_text = truncate(&call.arguments.to_string(), 8_000);
+        }
     }
 
     let mut request = match tool.permission(&call.arguments) {
@@ -1834,23 +2109,7 @@ async fn run_hook(
             crate::hooks::HookOutcome::default()
         }
     };
-    if !outcome.applied.is_empty() {
-        inner.journal(
-            &session.id,
-            RecordKind::Hook,
-            serde_json::json!({
-                "point": point,
-                "applied": outcome
-                    .applied
-                    .iter()
-                    .map(|entry| serde_json::json!({
-                        "plugin": entry.plugin,
-                        "effect": entry.effect,
-                    }))
-                    .collect::<Vec<_>>(),
-            }),
-        );
-    }
+    inner.journal_hook(&session.id, point, &outcome);
     outcome
 }
 
@@ -4392,5 +4651,444 @@ mod tests {
         let live = handle.inner.session(&session).expect("session survives");
         assert!(!live.turn_claimed(), "the wedged claim is released");
         assert!(!live.is_busy());
+    }
+
+    /// The hook points a session's journal recorded, in order.
+    fn hook_points(handle: &crate::runtime::RuntimeHandle, session: &SessionId) -> Vec<String> {
+        handle
+            .inner
+            .store
+            .replay_messages(session)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|record| record.kind == RecordKind::Hook)
+            .filter_map(|record| {
+                record
+                    .payload
+                    .get("point")
+                    .and_then(|point| point.as_str())
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    /// Drain events until the turn ends.
+    async fn drain_turn(events: &mut broadcast::Receiver<RuntimeEvent>) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Ok(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), events.recv()).await
+            else {
+                continue;
+            };
+            if matches!(event, RuntimeEvent::TurnFinished { .. }) {
+                return;
+            }
+        }
+        panic!("the turn never finished");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_user_input_hook_rewrites_what_the_model_reads() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        install_hook_plugin(
+            dir.path(),
+            "rewrite-input",
+            serde_json::json!({
+                "id": "rewrite-input",
+                "version": "1.0.0",
+                "components": {"hooks": ["user_input"]},
+                "permissions": ["agents"],
+                "hook_rules": [{
+                    "point": "user_input",
+                    "text_contain": "audit",
+                    "replace_text": "a rewritten request"
+                }]
+            }),
+        );
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("done".into()),
+            finished(),
+        ]]));
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), provider.clone())
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "audit the code".into())
+            .expect("the turn is accepted");
+        let _seen = record(&mut events).await;
+
+        let requests = provider.taken();
+        let user_text = requests
+            .first()
+            .and_then(|messages| messages.iter().find(|m| m.role == Role::User))
+            .map(|m| m.text_body());
+        assert_eq!(
+            user_text.as_deref(),
+            Some("a rewritten request"),
+            "the model reads the rewrite, not the typed text"
+        );
+        let live = handle.inner.session(&session).expect("session survives");
+        assert!(
+            live.messages()
+                .iter()
+                .any(|m| m.role == Role::User && m.text_body() == "a rewritten request"),
+            "the durable transcript carries the rewrite"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_user_input_hook_can_refuse_the_message_before_the_model() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        install_hook_plugin(
+            dir.path(),
+            "gate-input",
+            serde_json::json!({
+                "id": "gate-input",
+                "version": "1.0.0",
+                "components": {"hooks": ["user_input"]},
+                "permissions": ["agents"],
+                "hook_rules": [{
+                    "point": "user_input",
+                    "text_contain": "audit",
+                    "deny": "this input is refused"
+                }]
+            }),
+        );
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), provider.clone())
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "audit the code".into())
+            .expect("the turn is accepted");
+        drain_turn(&mut events).await;
+
+        assert!(
+            provider.taken().is_empty(),
+            "a refused input never reaches the provider"
+        );
+        let live = handle.inner.session(&session).expect("session survives");
+        assert_eq!(live.turn(), TurnState::Failed);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_turn_end_hook_is_journaled_with_the_turn() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        install_hook_plugin(
+            dir.path(),
+            "turn-end-note",
+            serde_json::json!({
+                "id": "turn-end-note",
+                "version": "1.0.0",
+                "components": {"hooks": ["turn_end"]},
+                "permissions": ["agents"],
+                "hook_rules": [{"point": "turn_end", "append": "the turn is over"}]
+            }),
+        );
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::new(ScriptedProvider::new(vec![vec![
+                ProviderEvent::TextDelta("done".into()),
+                finished(),
+            ]])),
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "audit the code".into())
+            .expect("the turn is accepted");
+        let _seen = record(&mut events).await;
+
+        let points = hook_points(&handle, &session);
+        assert!(
+            points.contains(&"turn_end".to_owned()),
+            "the closing point fired: {points:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_response_delivery_hook_rewrites_the_reply() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        install_hook_plugin(
+            dir.path(),
+            "delivery-edit",
+            serde_json::json!({
+                "id": "delivery-edit",
+                "version": "1.0.0",
+                "components": {"hooks": ["response_delivery"]},
+                "permissions": ["agents"],
+                "hook_rules": [{
+                    "point": "response_delivery",
+                    "replace_text": "delivered by a plugin"
+                }]
+            }),
+        );
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("raw answer".into()),
+            finished(),
+        ]]));
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), provider)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "audit the code".into())
+            .expect("the turn is accepted");
+        let seen = record(&mut events).await;
+
+        assert!(
+            seen.contains(&Seen::Speech("delivered by a plugin".to_owned())),
+            "the committed reply is the rewrite: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_memory_write_hook_stops_the_write_before_policy() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        install_hook_plugin(
+            dir.path(),
+            "memory-guard",
+            serde_json::json!({
+                "id": "memory-guard",
+                "version": "1.0.0",
+                "components": {"hooks": ["memory_write"]},
+                "permissions": ["tools"],
+                "hook_rules": [{
+                    "point": "memory_write",
+                    "tool": "memory.save",
+                    "deny": "the store is closed"
+                }]
+            }),
+        );
+        let call = ToolCall::new("memory.save", serde_json::json!({"key": "k", "value": "v"}));
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::new(ScriptedProvider::new(vec![
+                vec![ProviderEvent::ToolCall(call), finished()],
+                vec![ProviderEvent::TextDelta("ok".into()), finished()],
+            ])),
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        handle
+            .inner
+            .tools
+            .register(Box::new(NamedProbeTool("memory.save")));
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "remember this".into())
+            .expect("the turn is accepted");
+        drain_turn(&mut events).await;
+
+        let live = handle.inner.session(&session).expect("session survives");
+        let refused = live.messages().iter().any(|m| {
+            m.blocks.iter().any(|b| {
+                matches!(b, Block::ToolResult { content, ok: false, .. }
+                    if content.contains("denied by plugin: the store is closed"))
+            })
+        });
+        assert!(
+            refused,
+            "the memory write was refused: {:?}",
+            live.messages()
+        );
+        let points = hook_points(&handle, &session);
+        assert!(points.contains(&"memory_write".to_owned()), "{points:?}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_memory_recall_hook_fires_for_memory_search() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        install_hook_plugin(
+            dir.path(),
+            "recall-guard",
+            serde_json::json!({
+                "id": "recall-guard",
+                "version": "1.0.0",
+                "components": {"hooks": ["memory_recall"]},
+                "permissions": ["tools"],
+                "hook_rules": [{
+                    "point": "memory_recall",
+                    "tool": "memory.search",
+                    "deny": "recall is disabled"
+                }]
+            }),
+        );
+        let call = ToolCall::new("memory.search", serde_json::json!({"query": "k"}));
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::new(ScriptedProvider::new(vec![
+                vec![ProviderEvent::ToolCall(call), finished()],
+                vec![ProviderEvent::TextDelta("ok".into()), finished()],
+            ])),
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        handle
+            .inner
+            .tools
+            .register(Box::new(NamedProbeTool("memory.search")));
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "what do you remember".into())
+            .expect("the turn is accepted");
+        drain_turn(&mut events).await;
+
+        let points = hook_points(&handle, &session);
+        assert!(
+            points.contains(&"memory_recall".to_owned()),
+            "the memory point fired: {points:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn session_hooks_bracket_the_session_lifecycle() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        install_hook_plugin(
+            dir.path(),
+            "session-hooks",
+            serde_json::json!({
+                "id": "session-hooks",
+                "version": "1.0.0",
+                "components": {"hooks": ["session_start", "session_end"]},
+                "permissions": ["agents"],
+                "hook_rules": [
+                    {"point": "session_start", "append": "opened"},
+                    {"point": "session_end", "append": "closed"}
+                ]
+            }),
+        );
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::new(ScriptedProvider::new(vec![])),
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        let session = handle
+            .create_session(Some("hooked session".into()))
+            .expect("the session is created");
+        handle.close_session(&session).expect("the session closes");
+
+        let points = hook_points(&handle, &session);
+        assert!(
+            points.contains(&"session_start".to_owned())
+                && points.contains(&"session_end".to_owned()),
+            "both lifecycle points fired: {points:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn delegation_hooks_wrap_the_spawned_run() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        install_hook_plugin(
+            dir.path(),
+            "delegation-hooks",
+            serde_json::json!({
+                "id": "delegation-hooks",
+                "version": "1.0.0",
+                "components": {"hooks": ["delegation_start", "delegation_end", "session_end"]},
+                "permissions": ["agents"],
+                "hook_rules": [
+                    {"point": "delegation_start", "append": "spawned"},
+                    {"point": "delegation_end", "append": "answered"},
+                    {"point": "session_end", "append": "reaped"}
+                ]
+            }),
+        );
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("the delegated answer".into()),
+            finished(),
+        ]]));
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), provider)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        let parent_id = handle.snapshot().sessions[0].id.clone();
+        let profile = vikram_contracts::BotId::new("hooked-delegate");
+        handle.inner.bots.add(Arc::new(ManagedBot::from_profile(
+            crate::types::BotProfile {
+                id: profile.clone(),
+                name: "Delegate".into(),
+                role: "reviewer".into(),
+                description: "reads code".into(),
+                icon: None,
+                created_ms: now_ms(),
+                soul: String::new(),
+            },
+        )));
+        handle
+            .spawn_agent(profile, "summarise the findings".into(), parent_id.clone())
+            .expect("the agent starts");
+        let child_id = handle
+            .snapshot()
+            .sessions
+            .iter()
+            .find(|s| s.id != parent_id)
+            .expect("a child session")
+            .id
+            .clone();
+
+        // Wait for the answer to land, which is also when the delegation end hooks have run.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let arrived = handle
+                .inner
+                .session(&parent_id)
+                .expect("parent")
+                .messages()
+                .iter()
+                .any(|m| m.text_body().contains("delegation result"));
+            if arrived {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "no answer arrived");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let parent_points = hook_points(&handle, &parent_id);
+        assert!(
+            parent_points.contains(&"delegation_start".to_owned()),
+            "the spawn was seen: {parent_points:?}"
+        );
+        let child_points = hook_points(&handle, &child_id);
+        for point in ["delegation_end", "session_end"] {
+            assert!(
+                child_points.contains(&point.to_owned()),
+                "{point} fired on the child: {child_points:?}"
+            );
+        }
     }
 }

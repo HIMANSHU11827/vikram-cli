@@ -46,35 +46,71 @@ pub const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 /// rejected at load time rather than stored as an inert promise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HookPoint {
+    /// A session row was created and is about to go live.
+    SessionStart,
+    /// A user message enters a turn, before it is durable. May rewrite the prose.
+    UserInput,
     /// The turn has been accepted and is about to assemble its context.
     TurnStart,
     /// The system prefix has been assembled, before the transcript is fitted to the budget.
     ContextBuild,
+    /// Long-term memory is being read into the context for this step.
+    MemoryRecall,
     /// The completion request is built, immediately before it is sent.
     ModelRequest,
     /// A model tool call is about to be judged by policy and run.
     ToolCall,
+    /// A `memory.*` tool call is about to be judged by policy and run.
+    MemoryWrite,
     /// A tool returned, before its output is committed to the conversation.
     ToolResult,
+    /// Assistant prose is about to be committed to the transcript. May rewrite or withhold it.
+    ResponseDelivery,
+    /// The turn has finished or failed, before `TurnFinished` is published.
+    TurnEnd,
+    /// A delegated run is about to be spawned.
+    DelegationStart,
+    /// A delegated run's answer is being handed back to the session that asked.
+    DelegationEnd,
+    /// A session leaves the live set (closed, deleted, or reaped after delegation).
+    SessionEnd,
 }
 
 impl HookPoint {
-    /// Every point, in the order a turn reaches them.
-    pub const ALL: [HookPoint; 5] = [
+    /// Every point, in the order a session or turn reaches them.
+    pub const ALL: [HookPoint; 14] = [
+        HookPoint::SessionStart,
+        HookPoint::UserInput,
         HookPoint::TurnStart,
         HookPoint::ContextBuild,
+        HookPoint::MemoryRecall,
         HookPoint::ModelRequest,
         HookPoint::ToolCall,
+        HookPoint::MemoryWrite,
         HookPoint::ToolResult,
+        HookPoint::ResponseDelivery,
+        HookPoint::TurnEnd,
+        HookPoint::DelegationStart,
+        HookPoint::DelegationEnd,
+        HookPoint::SessionEnd,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
+            HookPoint::SessionStart => "session_start",
+            HookPoint::UserInput => "user_input",
             HookPoint::TurnStart => "turn_start",
             HookPoint::ContextBuild => "context_build",
+            HookPoint::MemoryRecall => "memory_recall",
             HookPoint::ModelRequest => "model_request",
             HookPoint::ToolCall => "tool_call",
+            HookPoint::MemoryWrite => "memory_write",
             HookPoint::ToolResult => "tool_result",
+            HookPoint::ResponseDelivery => "response_delivery",
+            HookPoint::TurnEnd => "turn_end",
+            HookPoint::DelegationStart => "delegation_start",
+            HookPoint::DelegationEnd => "delegation_end",
+            HookPoint::SessionEnd => "session_end",
         }
     }
 
@@ -82,18 +118,37 @@ impl HookPoint {
     pub fn parse(raw: &str) -> Option<Self> {
         let normalized = raw.trim().to_ascii_lowercase().replace(['-', '.'], "_");
         match normalized.as_str() {
+            "session_start" => Some(HookPoint::SessionStart),
+            "user_input" | "input" => Some(HookPoint::UserInput),
             "turn_start" => Some(HookPoint::TurnStart),
             "context_build" | "context" => Some(HookPoint::ContextBuild),
+            "memory_recall" | "memory_read" => Some(HookPoint::MemoryRecall),
             "model_request" | "model" => Some(HookPoint::ModelRequest),
             "tool_call" => Some(HookPoint::ToolCall),
+            "memory_write" => Some(HookPoint::MemoryWrite),
             "tool_result" => Some(HookPoint::ToolResult),
+            "response_delivery" | "response" => Some(HookPoint::ResponseDelivery),
+            "turn_end" => Some(HookPoint::TurnEnd),
+            "delegation_start" | "delegate_start" => Some(HookPoint::DelegationStart),
+            "delegation_end" | "delegate_end" => Some(HookPoint::DelegationEnd),
+            "session_end" => Some(HookPoint::SessionEnd),
             _ => None,
         }
     }
 
     /// Does this point carry a tool call?
+    ///
+    /// The memory points qualify because their primary site is a `memory.*` tool call: they need
+    /// the `tools` permission and accept a `tool` glob. Fired outside a tool (recall into the
+    /// context) they simply carry no `tool`, and rules conditioned on one do not match.
     pub fn is_tool_surface(self) -> bool {
-        matches!(self, HookPoint::ToolCall | HookPoint::ToolResult)
+        matches!(
+            self,
+            HookPoint::ToolCall
+                | HookPoint::ToolResult
+                | HookPoint::MemoryRecall
+                | HookPoint::MemoryWrite
+        )
     }
 
     /// The manifest permission a hook for this point must declare.
@@ -122,9 +177,12 @@ pub struct HookResult {
 
 /// Everything a hook is given at one point.
 ///
-/// `text` is the notable prose for the point: the user's request at `turn_start` and
-/// `context_build`, empty at `model_request`, and the call's name at `tool_call`/`tool_result`
-/// (`tool`/`result` carry the structured view).
+/// `text` is the notable prose for the point: the user's request at `user_input`, `turn_start`,
+/// `context_build`, `memory_recall` and `model_request`, the assistant prose at
+/// `response_delivery`, the outcome name at `turn_end`, empty at `tool_call`/`tool_result`
+/// (`tool`/`result` carry the structured view). `details` carries point-specific structured
+/// payload — a turn's outcome/steps/tokens at `turn_end`, a delegation's bot and task at
+/// `delegation_*` — so process hooks receive it without a schema change per point.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HookContext {
     pub point: HookPoint,
@@ -135,6 +193,7 @@ pub struct HookContext {
     pub text: String,
     pub tool: Option<HookTool>,
     pub result: Option<HookResult>,
+    pub details: Value,
 }
 
 impl HookContext {
@@ -148,6 +207,7 @@ impl HookContext {
             text: String::new(),
             tool: None,
             result: None,
+            details: Value::Null,
         }
     }
 
@@ -192,6 +252,11 @@ impl HookContext {
         self
     }
 
+    pub fn with_details(mut self, details: Value) -> Self {
+        self.details = details;
+        self
+    }
+
     /// The context as a process hook receives it.
     pub fn to_json(&self) -> Value {
         json!({
@@ -209,6 +274,7 @@ impl HookContext {
                 "content": result.content,
                 "ok": result.ok,
             })),
+            "details": self.details,
         })
     }
 }
@@ -231,6 +297,9 @@ pub struct HookEffect {
     pub ok: Option<bool>,
     /// Replacement output cap for a model request.
     pub max_output_tokens: Option<u32>,
+    /// Replacement prose for the point's `text` — the user input at `user_input`, the assistant
+    /// reply at `response_delivery`. Points that carry no rewritable prose ignore it.
+    pub text: Option<String>,
 }
 
 impl HookEffect {
@@ -256,6 +325,7 @@ impl HookEffect {
             && self.content.is_none()
             && self.ok.is_none()
             && self.max_output_tokens.is_none()
+            && self.text.is_none()
     }
 
     /// Merge another effect into this one, later values winning where a field is a single value.
@@ -276,6 +346,9 @@ impl HookEffect {
         }
         if other.max_output_tokens.is_some() {
             self.max_output_tokens = other.max_output_tokens;
+        }
+        if other.text.is_some() {
+            self.text = other.text;
         }
     }
 
@@ -302,6 +375,9 @@ impl HookEffect {
         }
         if let Some(max) = self.max_output_tokens {
             parts.push(format!("cap output at {max}"));
+        }
+        if self.text.is_some() {
+            parts.push("rewrite text".to_owned());
         }
         if parts.is_empty() {
             "allow".to_owned()
@@ -351,6 +427,9 @@ impl HookEffect {
                 u32::try_from(max).map_err(|_| "`max_output_tokens` is too large".to_owned())?,
             );
         }
+        if let Some(text) = object.get("text").and_then(Value::as_str) {
+            effect.text = Some(text.to_owned());
+        }
         Ok(effect)
     }
 }
@@ -393,6 +472,9 @@ pub struct HookRule {
     /// Replacement arguments as a JSON object literal; merged into the call's arguments.
     pub arguments_set: Option<String>,
     pub max_output_tokens: Option<u32>,
+    /// Replacement prose for the point's text; only `user_input` and `response_delivery` carry
+    /// rewritable prose.
+    pub replace_text: Option<String>,
 }
 
 impl HookRule {
@@ -409,6 +491,7 @@ impl HookRule {
             || self.set_ok.is_some()
             || self.arguments_set.is_some()
             || self.max_output_tokens.is_some()
+            || self.replace_text.is_some()
     }
 
     /// Check the rule against its own point. An invalid rule is reported, never registered.
@@ -441,6 +524,14 @@ impl HookRule {
         if self.max_output_tokens.is_some() && point != HookPoint::ModelRequest {
             return Err(format!(
                 "`max_output_tokens` does not apply to `{}`",
+                point.as_str()
+            ));
+        }
+        if self.replace_text.is_some()
+            && !matches!(point, HookPoint::UserInput | HookPoint::ResponseDelivery)
+        {
+            return Err(format!(
+                "`replace_text` does not apply to `{}`",
                 point.as_str()
             ));
         }
@@ -530,6 +621,9 @@ impl HookRule {
         }
         if let Some(max) = self.max_output_tokens {
             effect.max_output_tokens = Some(max);
+        }
+        if let Some(text) = &self.replace_text {
+            effect.text = Some(text.clone());
         }
         effect
     }
@@ -1064,6 +1158,9 @@ fn apply_to_context(ctx: &mut HookContext, effect: &HookEffect) {
     {
         result.ok = ok;
     }
+    if let Some(text) = &effect.text {
+        ctx.text = text.clone();
+    }
     for text in &effect.append {
         ctx.text.push('\n');
         ctx.text.push_str(text);
@@ -1406,5 +1503,59 @@ mod tests {
         assert_eq!(hooks.hooks().len(), 1, "only the installed plugin hooks");
         assert_eq!(hooks.hooks()[0].plugin(), "installed");
         unsafe { std::env::remove_var("VIKRAM_HOME") };
+    }
+
+    #[test]
+    fn every_point_round_trips_through_its_manifest_spelling() {
+        for point in HookPoint::ALL {
+            assert_eq!(
+                HookPoint::parse(point.as_str()),
+                Some(point),
+                "{} must parse back to itself",
+                point.as_str()
+            );
+        }
+        assert!(HookPoint::parse("not_a_point").is_none());
+    }
+
+    #[test]
+    fn details_reach_the_process_payload() {
+        let ctx = HookContext::new(HookPoint::TurnEnd)
+            .with_details(json!({"outcome": "idle", "steps": 3}));
+        assert_eq!(ctx.to_json()["details"]["steps"], json!(3));
+        assert_eq!(
+            HookContext::new(HookPoint::TurnStart).to_json()["details"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn replace_text_is_limited_to_prose_points() {
+        let rule = HookRule {
+            point: "user_input".to_owned(),
+            replace_text: Some("rewritten".to_owned()),
+            ..HookRule::default()
+        };
+        assert!(rule.validate().is_ok());
+        let effect = rule.effect(&HookContext::new(HookPoint::UserInput));
+        assert_eq!(effect.text.as_deref(), Some("rewritten"));
+
+        for point in ["turn_start", "context_build", "tool_call"] {
+            let rule = HookRule {
+                point: point.to_owned(),
+                replace_text: Some("rewritten".to_owned()),
+                ..HookRule::default()
+            };
+            assert!(rule.validate().is_err(), "{point} has no rewritable prose");
+        }
+    }
+
+    #[test]
+    fn hooks_at_equal_priority_run_in_plugin_id_order() {
+        let mut registry = HookRegistry::new();
+        registry.register(append_hook("zeta", 0, "first"));
+        registry.register(append_hook("alpha", 0, "second"));
+        let outcome = registry.dispatch(&HookContext::new(HookPoint::ContextBuild));
+        assert_eq!(outcome.effect.append, vec!["second", "first"]);
     }
 }

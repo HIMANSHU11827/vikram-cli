@@ -172,6 +172,22 @@ impl MemoryProviderManager {
         Self::default()
     }
 
+    /// Build the memory backend `config.memory_provider` names. Only `builtin` ships in this
+    /// build; any other name is an error, not a silent fall back to no memory.
+    pub fn from_config(config: &crate::config::Config, store: MemoryStore) -> crate::Result<Self> {
+        let mut manager = Self::new();
+        match config.memory_provider.trim() {
+            "builtin" => manager.add_provider(Box::new(BuiltInMemoryProvider::new(store))),
+            other => {
+                return Err(crate::RuntimeError::Config {
+                    path: crate::config::config_path(),
+                    reason: format!("unknown memory provider `{other}`; expected `builtin`"),
+                });
+            }
+        }
+        Ok(manager)
+    }
+
     pub fn add_provider(&mut self, provider: Box<dyn MemoryProvider>) {
         let is_builtin = provider.name() == "builtin";
         let is_external = !is_builtin;
@@ -586,5 +602,26 @@ mod tests {
         let e2 = MockProvider::new("e2");
         mgr.add_external(Box::new(e1)).unwrap();
         assert!(mgr.add_external(Box::new(e2)).is_err());
+    }
+
+    #[test]
+    fn from_config_builds_the_named_backend_or_fails() {
+        let store = || MemoryStore::open_in_memory().unwrap();
+        let builtin = crate::config::Config {
+            memory_provider: "builtin".into(),
+            ..Default::default()
+        };
+        let mgr = MemoryProviderManager::from_config(&builtin, store()).unwrap();
+        assert_eq!(mgr.providers().len(), 1);
+        assert_eq!(mgr.providers()[0].name(), "builtin");
+
+        let unknown = crate::config::Config {
+            memory_provider: "not-a-provider".into(),
+            ..Default::default()
+        };
+        let err = MemoryProviderManager::from_config(&unknown, store())
+            .err()
+            .expect("an unknown memory provider must fail loudly");
+        assert!(err.to_string().contains("not-a-provider"));
     }
 }

@@ -19,6 +19,15 @@ pub struct Config {
     /// Messages API). Other names are reserved for future backends.
     #[serde(default = "default_provider_kind")]
     pub provider: String,
+    /// Model the same backend retries with when the primary request fails before producing
+    /// any output. Empty disables failover. The fallback is a second provider on the same
+    /// endpoint, key and kind — only the model name changes.
+    #[serde(default)]
+    pub fallback_model: String,
+    /// Which memory backend feeds recall and prompt hooks: "builtin" (default) or the name of
+    /// another compiled-in provider. Unknown names are refused at startup.
+    #[serde(default = "default_memory_provider")]
+    pub memory_provider: String,
     /// Model identifier. Empty means unconfigured, and the runtime reports that rather than
     /// inventing a name.
     pub model: String,
@@ -126,6 +135,10 @@ impl Default for SandboxSettings {
 
 fn default_provider_kind() -> String {
     "openai".to_owned()
+}
+
+fn default_memory_provider() -> String {
+    "builtin".to_owned()
 }
 
 fn default_true() -> bool {
@@ -433,6 +446,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             provider: default_provider_kind(),
+            fallback_model: String::new(),
+            memory_provider: default_memory_provider(),
             base_url: "https://api.openai.com/v1".into(),
             model: String::new(),
             api_key_env: "OPENAI_API_KEY".into(),
@@ -1156,5 +1171,24 @@ mod tests {
         assert!(strict.permits(PermissionMode::AllowList));
         assert!(!strict.available().contains(&PermissionMode::Yolo));
         unsafe { std::env::remove_var("VIKRAM_DISABLE_AUTO_APPROVE") };
+    }
+
+    #[test]
+    fn provider_seams_default_to_builtin_and_no_fallback() {
+        let cfg = Config::default();
+        assert_eq!(cfg.provider, "openai");
+        assert_eq!(cfg.memory_provider, "builtin");
+        assert!(cfg.fallback_model.is_empty());
+    }
+
+    #[test]
+    fn provider_seams_parse_from_json() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","fallback_model":"claude-haiku","memory_provider":"builtin","model":"m"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.provider, "anthropic");
+        assert_eq!(cfg.fallback_model, "claude-haiku");
+        assert_eq!(cfg.memory_provider, "builtin");
     }
 }

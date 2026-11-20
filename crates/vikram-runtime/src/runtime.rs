@@ -676,6 +676,49 @@ impl RuntimeInner {
             })
             .dispatch(ctx)
     }
+
+    /// Journal what a dispatched hook outcome did, the same record the turn loop's `run_hook`
+    /// writes. Callers that already ran [`Self::dispatch_hook`] use this; synchronous lifecycle
+    /// sites use [`Self::dispatch_hook_journaled`].
+    pub(crate) fn journal_hook(
+        &self,
+        session: &SessionId,
+        point: &str,
+        outcome: &crate::hooks::HookOutcome,
+    ) {
+        if outcome.applied.is_empty() {
+            return;
+        }
+        self.journal(
+            session,
+            RecordKind::Hook,
+            serde_json::json!({
+                "point": point,
+                "applied": outcome
+                    .applied
+                    .iter()
+                    .map(|entry| serde_json::json!({
+                        "plugin": entry.plugin,
+                        "effect": entry.effect,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
+
+    /// Dispatch a hook from synchronous runtime code — session lifecycle and delegation run on
+    /// paths with no async boundary to move a process hook onto, so the caller's thread blocks
+    /// for at most `HOOK_TIMEOUT` per hook, the bound every dispatch already has.
+    pub(crate) fn dispatch_hook_journaled(
+        &self,
+        session: &SessionId,
+        ctx: &crate::hooks::HookContext,
+    ) -> crate::hooks::HookOutcome {
+        let point = ctx.point.as_str().to_owned();
+        let outcome = self.dispatch_hook(ctx);
+        self.journal_hook(session, &point, &outcome);
+        outcome
+    }
 }
 
 /// Keeps that count honest even if the review task panics.
@@ -1531,8 +1574,29 @@ impl RuntimeInner {
                 .expect("sessions lock")
                 .retain(|s| s.id != child.id);
             self.emit(RuntimeEvent::SessionClosed(child.id.clone()));
+            self.dispatch_hook_journaled(
+                &child.id,
+                &crate::hooks::HookContext::new(crate::hooks::HookPoint::SessionEnd)
+                    .with_session(child.id.as_str())
+                    .with_workspace(self.workspace_root.display().to_string())
+                    .with_model(self.model())
+                    .with_text(child.title())
+                    .with_details(serde_json::json!({"title": child.title()})),
+            );
             self.publish_metrics();
         }
+        self.dispatch_hook_journaled(
+            &child.id,
+            &crate::hooks::HookContext::new(crate::hooks::HookPoint::DelegationEnd)
+                .with_session(child.id.as_str())
+                .with_workspace(self.workspace_root.display().to_string())
+                .with_model(self.model())
+                .with_text(child.title())
+                .with_details(serde_json::json!({
+                    "parent": parent.as_str(),
+                    "bot": child.bot().map(|bot| bot.to_string()),
+                })),
+        );
     }
 
     /// Digest a result the transcript cannot carry, keeping the full text addressable.
@@ -1609,6 +1673,23 @@ impl RuntimeInner {
                 .map_err(|e| RuntimeError::Store(e.to_string()))?;
         }
         let session = Arc::new(SessionRuntime::from_row(row));
+        // A session-start hook may refuse the session before it ever goes live; a refused row is
+        // closed in the store so a restart does not resurrect it.
+        let start = self.dispatch_hook_journaled(
+            &session.id,
+            &crate::hooks::HookContext::new(crate::hooks::HookPoint::SessionStart)
+                .with_session(session.id.as_str())
+                .with_workspace(self.workspace_root.display().to_string())
+                .with_model(self.model())
+                .with_text(session.title())
+                .with_details(serde_json::json!({"title": session.title()})),
+        );
+        if let Some(reason) = &start.effect.deny {
+            let _ = self.store.set_session_status(&session.id, "closed", now);
+            return Err(RuntimeError::InvalidState(format!(
+                "a plugin refused this session: {reason}"
+            )));
+        }
         self.sessions
             .lock()
             .expect("sessions lock")
@@ -2030,12 +2111,7 @@ impl Runtime {
         }
         let provider = match provider_override {
             Some(provider) => Some(provider),
-            None => match config.provider.as_str() {
-                "anthropic" => crate::anthropic::AnthropicProvider::from_config(&config)?
-                    .map(|p| Arc::new(p) as Arc<dyn Provider>),
-                _ => crate::openai::OpenAiProvider::from_config(&config)?
-                    .map(|p| Arc::new(p) as Arc<dyn Provider>),
-            },
+            None => crate::provider::for_config(&config)?,
         };
 
         // Visibility state persists next to the MCP config so `toggle_mcp_visibility`
@@ -2377,7 +2453,9 @@ impl RuntimeHandle {
             || old.base_url != new_config.base_url
             || old.api_key_env != new_config.api_key_env
             || old.context_window != new_config.context_window
-            || old.api_key() != new_config.api_key();
+            || old.api_key() != new_config.api_key()
+            || old.fallback_model != new_config.fallback_model
+            || old.memory_provider != new_config.memory_provider;
         // Drop the read guard before taking the write lock.
         drop(old);
 
@@ -2389,12 +2467,7 @@ impl RuntimeHandle {
                 eprintln!("vikram: runtime provider lock rwlock poisoned; recovering");
                 e.into_inner()
             });
-            let built: Result<Option<Arc<dyn Provider>>> = match new_config.provider.as_str() {
-                "anthropic" => crate::anthropic::AnthropicProvider::from_config(&new_config)
-                    .map(|provider| provider.map(|p| Arc::new(p) as Arc<dyn Provider>)),
-                _ => crate::openai::OpenAiProvider::from_config(&new_config)
-                    .map(|provider| provider.map(|p| Arc::new(p) as Arc<dyn Provider>)),
-            };
+            let built = crate::provider::for_config(&new_config);
             match built {
                 Ok(Some(provider)) => {
                     *provider_slot = Some(provider);
@@ -2750,12 +2823,7 @@ impl RuntimeHandle {
             Some(p) => p.model() != model,
         };
         if needs_rebuild {
-            let built: Result<Option<Arc<dyn Provider>>> = match config.provider.as_str() {
-                "anthropic" => crate::anthropic::AnthropicProvider::from_config(&config)
-                    .map(|provider| provider.map(|p| Arc::new(p) as Arc<dyn Provider>)),
-                _ => crate::openai::OpenAiProvider::from_config(&config)
-                    .map(|provider| provider.map(|p| Arc::new(p) as Arc<dyn Provider>)),
-            };
+            let built = crate::provider::for_config(&config);
             match built {
                 Ok(Some(provider)) => {
                     *provider_slot = Some(provider);
@@ -3143,6 +3211,15 @@ impl RuntimeHandle {
             .map_err(|e| RuntimeError::Store(e.to_string()))?;
         self.inner
             .emit(RuntimeEvent::SessionClosed(session.id.clone()));
+        self.inner.dispatch_hook_journaled(
+            &session.id,
+            &crate::hooks::HookContext::new(crate::hooks::HookPoint::SessionEnd)
+                .with_session(session.id.as_str())
+                .with_workspace(self.inner.workspace_root.display().to_string())
+                .with_model(self.inner.model())
+                .with_text(session.title())
+                .with_details(serde_json::json!({"title": session.title()})),
+        );
         self.inner.publish_metrics();
         Ok(())
     }
@@ -3153,6 +3230,19 @@ impl RuntimeHandle {
         if let Some(live) = self.inner.session(session) {
             live.cancel_handle().cancel();
         }
+        let title = self
+            .inner
+            .session(session)
+            .map(|live| live.title())
+            .or_else(|| {
+                self.inner
+                    .store
+                    .get_session(session)
+                    .ok()
+                    .flatten()
+                    .map(|row| row.title)
+            })
+            .unwrap_or_default();
         self.inner
             .store
             .delete_session(session)
@@ -3164,6 +3254,15 @@ impl RuntimeHandle {
             .retain(|s| &s.id != session);
         self.inner
             .emit(RuntimeEvent::SessionClosed(session.clone()));
+        self.inner.dispatch_hook_journaled(
+            session,
+            &crate::hooks::HookContext::new(crate::hooks::HookPoint::SessionEnd)
+                .with_session(session.as_str())
+                .with_workspace(self.inner.workspace_root.display().to_string())
+                .with_model(self.inner.model())
+                .with_text(&title)
+                .with_details(serde_json::json!({"title": title, "deleted": true})),
+        );
         self.inner.publish_metrics();
         Ok(())
     }
@@ -3408,6 +3507,26 @@ impl RuntimeHandle {
             return Err(RuntimeError::InvalidState(format!(
                 "{} already has a run in flight",
                 agent.profile.name
+            )));
+        }
+        // A delegation hook may refuse the spawn before a session exists for it; everything above
+        // is a check that costs nothing, so a denial here is cheap and clean.
+        let delegation = self.inner.dispatch_hook_journaled(
+            &parent.id,
+            &crate::hooks::HookContext::new(crate::hooks::HookPoint::DelegationStart)
+                .with_session(parent.id.as_str())
+                .with_workspace(self.inner.workspace_root.display().to_string())
+                .with_model(self.inner.model())
+                .with_text(task.as_str())
+                .with_details(serde_json::json!({
+                    "bot": profile.to_string(),
+                    "task": task.as_str(),
+                    "depth": depth,
+                })),
+        );
+        if let Some(reason) = &delegation.effect.deny {
+            return Err(RuntimeError::InvalidState(format!(
+                "a plugin refused this delegation: {reason}"
             )));
         }
         // A delegated session is named for the agent that owns it and the work it was given, so the
