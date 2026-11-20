@@ -1,8 +1,8 @@
 //! Agent Client Protocol (ACP) — client and server over JSON-RPC 2.0 on stdio.
 //!
 //! EXPERIMENTAL — no crate in the workspace depends on this yet. Known gaps before use:
-//! `new_session` cannot pass `mcpServers`, and agent→client requests are answered with
-//! `-32601` rather than actually handled.
+//! `new_session` cannot pass `mcpServers`, and agent→client `terminal/*` requests are
+//! answered with `-32601` rather than actually handled.
 //!
 //! ACP connects a *client* (IDE/host) to an *agent* (Vikram or another compatible agent).
 //! It is distinct from MCP (agent↔tools) and A2A (agent↔agent).
@@ -141,6 +141,170 @@ pub struct CancelParams {
     pub session_id: String,
 }
 
+// ---------- agent→client request types ----------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PermissionOption {
+    #[serde(rename = "optionId")]
+    pub option_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RequestPermissionParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "toolCall", default)]
+    pub tool_call: Value,
+    #[serde(default)]
+    pub options: Vec<PermissionOption>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PermissionOutcome {
+    #[serde(rename = "outcome")]
+    pub outcome: String,
+    #[serde(default, rename = "optionId", skip_serializing_if = "Option::is_none")]
+    pub option_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RequestPermissionResult {
+    pub outcome: PermissionOutcome,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReadTextFileParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReadTextFileResult {
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WriteTextFileParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub path: String,
+    pub content: String,
+}
+
+/// Handles requests an ACP agent sends back to the client
+/// (`session/request_permission`, `fs/read_text_file`, `fs/write_text_file`).
+///
+/// Every method defaults to a `-32601 Method not found` error, so implementers
+/// only override what they support. There is no built-in filesystem or
+/// permission policy — the caller decides what `read_text_file` /
+/// `write_text_file` / `request_permission` are allowed to do.
+pub trait AgentRequestHandler {
+    fn request_permission(
+        &self,
+        _params: RequestPermissionParams,
+    ) -> std::result::Result<RequestPermissionResult, JsonRpcError> {
+        Err(method_not_found())
+    }
+
+    fn read_text_file(
+        &self,
+        _params: ReadTextFileParams,
+    ) -> std::result::Result<ReadTextFileResult, JsonRpcError> {
+        Err(method_not_found())
+    }
+
+    fn write_text_file(
+        &self,
+        _params: WriteTextFileParams,
+    ) -> std::result::Result<(), JsonRpcError> {
+        Err(method_not_found())
+    }
+}
+
+/// Default handler: every agent→client request gets `-32601`.
+pub struct NoopAgentRequestHandler;
+
+impl AgentRequestHandler for NoopAgentRequestHandler {}
+
+fn method_not_found() -> JsonRpcError {
+    JsonRpcError {
+        code: -32601,
+        message: "Method not found".into(),
+        data: None,
+    }
+}
+
+fn invalid_params(message: &str) -> JsonRpcError {
+    JsonRpcError {
+        code: -32602,
+        message: format!("Invalid params: {message}"),
+        data: None,
+    }
+}
+
+fn internal_error(message: &str) -> JsonRpcError {
+    JsonRpcError {
+        code: -32603,
+        message: format!("Internal error: {message}"),
+        data: None,
+    }
+}
+
+fn decode_params<T: serde::de::DeserializeOwned>(
+    req: &JsonRpcRequest,
+) -> std::result::Result<T, JsonRpcError> {
+    let value = req
+        .params
+        .clone()
+        .ok_or_else(|| invalid_params("missing params"))?;
+    serde_json::from_value(value).map_err(|e| invalid_params(&e.to_string()))
+}
+
+fn respond<T: Serialize>(
+    res: std::result::Result<T, JsonRpcError>,
+) -> (Option<Value>, Option<JsonRpcError>) {
+    match res {
+        Ok(v) => match serde_json::to_value(v) {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(internal_error(&e.to_string()))),
+        },
+        Err(e) => (None, Some(e)),
+    }
+}
+
+fn agent_request_response(
+    handler: &dyn AgentRequestHandler,
+    req: &JsonRpcRequest,
+) -> JsonRpcResponse {
+    let (result, error) = match req.method.as_str() {
+        "session/request_permission" => respond(
+            decode_params::<RequestPermissionParams>(req)
+                .and_then(|p| handler.request_permission(p)),
+        ),
+        "fs/read_text_file" => respond(
+            decode_params::<ReadTextFileParams>(req).and_then(|p| handler.read_text_file(p)),
+        ),
+        "fs/write_text_file" => respond(
+            decode_params::<WriteTextFileParams>(req).and_then(|p| handler.write_text_file(p)),
+        ),
+        _ => (None, Some(method_not_found())),
+    };
+    JsonRpcResponse {
+        jsonrpc: "2.0".into(),
+        id: req.id.clone(),
+        result,
+        error,
+    }
+}
+
 // ---------- ACP Client ----------
 
 pub struct AcpClient {
@@ -149,6 +313,7 @@ pub struct AcpClient {
     rx: Option<Receiver<String>>,
     request_timeout: Duration,
     next_id: i64,
+    agent_handler: Box<dyn AgentRequestHandler>,
 }
 
 impl AcpClient {
@@ -159,6 +324,7 @@ impl AcpClient {
             rx: None,
             request_timeout: Duration::from_secs(300),
             next_id: 1,
+            agent_handler: Box::new(NoopAgentRequestHandler),
         }
     }
 
@@ -195,11 +361,18 @@ impl AcpClient {
             rx: Some(rx),
             request_timeout: Duration::from_secs(300),
             next_id: 1,
+            agent_handler: Box::new(NoopAgentRequestHandler),
         })
     }
 
     pub fn set_request_timeout(&mut self, timeout: Duration) {
         self.request_timeout = timeout;
+    }
+
+    /// Install a handler for agent→client requests. Defaults to
+    /// `NoopAgentRequestHandler` (`-32601` for every request).
+    pub fn set_agent_request_handler<H: AgentRequestHandler + 'static>(&mut self, handler: H) {
+        self.agent_handler = Box::new(handler);
     }
 
     fn alloc_id(&mut self) -> i64 {
@@ -209,11 +382,12 @@ impl AcpClient {
     }
 
     /// Handle one inbound line from the agent. Returns `Some` when it is the
-    /// response to `our_id`; agent→client requests get a `-32601` reply.
+    /// response to `our_id`; agent→client requests are answered by `handler`.
     fn handle_inbound<W: Write>(
         out: &mut W,
         line: &str,
         our_id: i64,
+        handler: &dyn AgentRequestHandler,
     ) -> Result<Option<JsonRpcResponse>> {
         let value: Value = match serde_json::from_str(line) {
             Ok(v) => v,
@@ -222,16 +396,7 @@ impl AcpClient {
         if value.get("method").is_some() {
             // Agent→client request or notification, not a response to us.
             if let Ok(req) = serde_json::from_value::<JsonRpcRequest>(value.clone()) {
-                let resp = JsonRpcResponse {
-                    jsonrpc: "2.0".into(),
-                    id: req.id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32601,
-                        message: "Method not found".into(),
-                        data: None,
-                    }),
-                };
+                let resp = agent_request_response(handler, &req);
                 writeln!(out, "{}", serde_json::to_string(&resp)?)?;
                 out.flush()?;
             }
@@ -273,7 +438,8 @@ impl AcpClient {
                 continue;
             }
             let stdin = self.stdin.as_mut().ok_or(AcpError::NotConnected)?;
-            if let Some(resp) = Self::handle_inbound(stdin, &line, id)? {
+            let handler = &*self.agent_handler;
+            if let Some(resp) = Self::handle_inbound(stdin, &line, id, handler)? {
                 return Ok(resp);
             }
         }
@@ -530,10 +696,18 @@ mod tests {
         assert!(res.is_err());
     }
 
+    fn handle_inbound(
+        out: &mut Vec<u8>,
+        line: &str,
+        our_id: i64,
+    ) -> Result<Option<JsonRpcResponse>> {
+        AcpClient::handle_inbound(out, line, our_id, &NoopAgentRequestHandler)
+    }
+
     #[test]
     fn handle_inbound_matches_response_by_id() {
         let mut out = Vec::new();
-        let resp = AcpClient::handle_inbound(
+        let resp = handle_inbound(
             &mut out,
             r#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#,
             7,
@@ -546,19 +720,17 @@ mod tests {
     #[test]
     fn handle_inbound_ignores_response_for_other_id() {
         let mut out = Vec::new();
-        let resp =
-            AcpClient::handle_inbound(&mut out, r#"{"jsonrpc":"2.0","id":9,"result":{}}"#, 7)
-                .unwrap();
+        let resp = handle_inbound(&mut out, r#"{"jsonrpc":"2.0","id":9,"result":{}}"#, 7).unwrap();
         assert!(resp.is_none());
         assert!(out.is_empty());
     }
 
     #[test]
-    fn handle_inbound_answers_agent_request() {
+    fn handle_inbound_answers_unknown_agent_request() {
         let mut out = Vec::new();
-        let resp = AcpClient::handle_inbound(
+        let resp = handle_inbound(
             &mut out,
-            r#"{"jsonrpc":"2.0","id":"agent-1","method":"session/request_permission","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"agent-1","method":"terminal/create","params":{}}"#,
             1,
         )
         .unwrap();
@@ -569,9 +741,113 @@ mod tests {
     }
 
     #[test]
+    fn handle_inbound_known_method_default_handler_is_method_not_found() {
+        let mut out = Vec::new();
+        let resp = handle_inbound(
+            &mut out,
+            r#"{"jsonrpc":"2.0","id":3,"method":"session/request_permission","params":{"sessionId":"s1","toolCall":{},"options":[]}}"#,
+            1,
+        )
+        .unwrap();
+        assert!(resp.is_none());
+        let written: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(written["id"], serde_json::json!(3));
+        assert_eq!(written["error"]["code"], serde_json::json!(-32601));
+    }
+
+    #[test]
+    fn handle_inbound_known_method_bad_params_is_invalid_params() {
+        let mut out = Vec::new();
+        let resp = handle_inbound(
+            &mut out,
+            r#"{"jsonrpc":"2.0","id":4,"method":"fs/read_text_file","params":{}}"#,
+            1,
+        )
+        .unwrap();
+        assert!(resp.is_none());
+        let written: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(written["id"], serde_json::json!(4));
+        assert_eq!(written["error"]["code"], serde_json::json!(-32602));
+    }
+
+    struct TestAgentHandler;
+
+    impl AgentRequestHandler for TestAgentHandler {
+        fn request_permission(
+            &self,
+            params: RequestPermissionParams,
+        ) -> std::result::Result<RequestPermissionResult, JsonRpcError> {
+            assert_eq!(params.session_id, "s1");
+            assert_eq!(params.options.len(), 1);
+            Ok(RequestPermissionResult {
+                outcome: PermissionOutcome {
+                    outcome: "selected".into(),
+                    option_id: Some("allow".into()),
+                },
+            })
+        }
+
+        fn read_text_file(
+            &self,
+            params: ReadTextFileParams,
+        ) -> std::result::Result<ReadTextFileResult, JsonRpcError> {
+            Ok(ReadTextFileResult {
+                content: format!("contents of {}", params.path),
+            })
+        }
+
+        fn write_text_file(
+            &self,
+            params: WriteTextFileParams,
+        ) -> std::result::Result<(), JsonRpcError> {
+            assert_eq!(params.content, "data");
+            Ok(())
+        }
+    }
+
+    fn handle_inbound_with(handler: &dyn AgentRequestHandler, line: &str) -> JsonRpcResponse {
+        let mut out = Vec::new();
+        AcpClient::handle_inbound(&mut out, line, 1, handler).unwrap();
+        serde_json::from_slice(out.trim_ascii()).unwrap()
+    }
+
+    #[test]
+    fn handle_inbound_dispatches_request_permission() {
+        let resp = handle_inbound_with(
+            &TestAgentHandler,
+            r#"{"jsonrpc":"2.0","id":"p1","method":"session/request_permission","params":{"sessionId":"s1","toolCall":{"title":"rm"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]}}"#,
+        );
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert_eq!(result["outcome"]["outcome"], "selected");
+        assert_eq!(result["outcome"]["optionId"], "allow");
+    }
+
+    #[test]
+    fn handle_inbound_dispatches_read_text_file() {
+        let resp = handle_inbound_with(
+            &TestAgentHandler,
+            r#"{"jsonrpc":"2.0","id":5,"method":"fs/read_text_file","params":{"sessionId":"s1","path":"/tmp/x.txt"}}"#,
+        );
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap()["content"], "contents of /tmp/x.txt");
+    }
+
+    #[test]
+    fn handle_inbound_dispatches_write_text_file() {
+        let resp = handle_inbound_with(
+            &TestAgentHandler,
+            r#"{"jsonrpc":"2.0","id":6,"method":"fs/write_text_file","params":{"sessionId":"s1","path":"/tmp/x.txt","content":"data"}}"#,
+        );
+        assert!(resp.error.is_none());
+        // `()` serializes to `"result":null`, which round-trips as `None`.
+        assert!(resp.result.is_none());
+    }
+
+    #[test]
     fn handle_inbound_ignores_agent_notification() {
         let mut out = Vec::new();
-        let resp = AcpClient::handle_inbound(
+        let resp = handle_inbound(
             &mut out,
             r#"{"jsonrpc":"2.0","method":"session/update","params":{}}"#,
             1,
@@ -588,7 +864,7 @@ mod tests {
         let capture = dir.join(format!("vikram-acp-capture-{}", std::process::id()));
         let script = format!(
             "read -r _req\n\
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":\"agent-1\",\"method\":\"fs/read_text_file\",\"params\":{{}}}}'\n\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":\"agent-1\",\"method\":\"fs/read_text_file\",\"params\":{{\"sessionId\":\"s\",\"path\":\"/tmp/x\"}}}}'\n\
              read -r _resp\n\
              printf '%s\\n' \"$_resp\" > {}\n\
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"ok\":true}}}}'\n",

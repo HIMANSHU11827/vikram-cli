@@ -35,9 +35,13 @@ const TYPE_CHARACTERS_TIMEOUT: Duration = Duration::from_secs(30);
 /// kilobytes; this only stops a wedged endpoint from filling memory.
 const MAX_HTTP_BYTES: usize = 4 * 1024 * 1024;
 
-/// One live page, kept in the process-global registry.
+/// The scope every session belongs to when the caller carries no entity identity — the
+/// operator's own pages. `crate::tools` maps a turn with no bot and no agent here, so the
+/// main agent keeps one shared set of sessions exactly as before.
+pub const DEFAULT_SCOPE: &str = "main";
+
+/// One live page, kept in the process-global registry under its owner's scope.
 struct Session {
-    id: String,
     /// The last URL this session navigated to.
     url: String,
     /// The DevTools WebSocket endpoint, for diagnostics.
@@ -163,8 +167,10 @@ impl Failure {
     }
 }
 
-fn registry() -> &'static Mutex<HashMap<String, Session>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, Session>>> = OnceLock::new();
+/// Sessions are keyed by `(owner, id)`: the owner is the entity that opened the page, so a
+/// guessed `browser-N` resolves only for callers inside that entity's scope.
+fn registry() -> &'static Mutex<HashMap<(String, String), Session>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<(String, String), Session>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -187,12 +193,23 @@ fn session_id(n: u64) -> String {
 /// and a throwaway profile, so it cannot collide with — or write to — a browser the user is
 /// already running.
 pub fn open(url: &str) -> Result<String, String> {
+    open_for(DEFAULT_SCOPE, url)
+}
+
+/// [`open`] under a named owner scope: the returned id resolves only for callers in the
+/// same scope, so one entity can never name another entity's page.
+pub fn open_for(owner: &str, url: &str) -> Result<String, String> {
     let bin = available().ok_or_else(|| MISSING_BROWSER.to_string())?;
-    open_with(&bin, url)
+    open_with_for(&bin, owner, url)
 }
 
 /// [`open`] against a named binary, so the failure paths can be exercised without a browser.
 pub fn open_with(bin: &Path, url: &str) -> Result<String, String> {
+    open_with_for(bin, DEFAULT_SCOPE, url)
+}
+
+/// [`open_with`] under a named owner scope.
+pub fn open_with_for(bin: &Path, owner: &str, url: &str) -> Result<String, String> {
     validate_url(url)?;
     let profile = profile_dir()?;
     let mut child = match spawn(bin, &profile) {
@@ -218,7 +235,6 @@ pub fn open_with(bin: &Path, url: &str) -> Result<String, String> {
     };
 
     let mut session = Session {
-        id: String::new(),
         url: url.to_string(),
         endpoint,
         child,
@@ -235,11 +251,10 @@ pub fn open_with(bin: &Path, url: &str) -> Result<String, String> {
     }
 
     let id = session_id(counter().fetch_add(1, Ordering::Relaxed) + 1);
-    session.id = id.clone();
     let mut reg = registry()
         .lock()
         .map_err(|_| "browser session registry poisoned".to_string())?;
-    reg.insert(id.clone(), session);
+    reg.insert((owner.to_string(), id.clone()), session);
     Ok(id)
 }
 
@@ -248,10 +263,15 @@ pub fn open_with(bin: &Path, url: &str) -> Result<String, String> {
 /// A string result comes back verbatim; anything else is serialized as JSON, so a script that
 /// returns an object or an array arrives as text the model can read.
 pub fn eval(session: &str, js: &str) -> Result<String, String> {
+    eval_for(DEFAULT_SCOPE, session, js)
+}
+
+/// [`eval`] resolving `session` only inside `owner`'s scope.
+pub fn eval_for(owner: &str, session: &str, js: &str) -> Result<String, String> {
     if js.trim().is_empty() {
         return Err("nothing to evaluate: `js` is empty".to_string());
     }
-    with_session(session, |s| {
+    with_session(owner, session, |s| {
         let result = s.evaluate(js, call_deadline())?;
         Ok(describe_value(result.get("result")))
     })
@@ -264,8 +284,17 @@ pub fn eval(session: &str, js: &str) -> Result<String, String> {
 /// page. The measurement is the input to a trusted mouse event, which is why an element with no
 /// area is an error rather than a click at a guess.
 pub fn element_center(session: &str, selector: &str) -> Result<(f64, f64), String> {
+    element_center_for(DEFAULT_SCOPE, session, selector)
+}
+
+/// [`element_center`] resolving `session` only inside `owner`'s scope.
+pub fn element_center_for(
+    owner: &str,
+    session: &str,
+    selector: &str,
+) -> Result<(f64, f64), String> {
     require_non_empty(selector, "selector")?;
-    with_session(session, |s| {
+    with_session(owner, session, |s| {
         let rect = measure(s, selector)?;
         Ok((rect.x, rect.y))
     })
@@ -279,8 +308,13 @@ pub fn element_center(session: &str, selector: &str) -> Result<(f64, f64), Strin
 /// dispatches `mousePressed` and `mouseReleased` at the element's own centre instead, which is
 /// the pair the browser turns into a click.
 pub fn click(session: &str, selector: &str) -> Result<String, String> {
+    click_for(DEFAULT_SCOPE, session, selector)
+}
+
+/// [`click`] resolving `session` only inside `owner`'s scope.
+pub fn click_for(owner: &str, session: &str, selector: &str) -> Result<String, String> {
     require_non_empty(selector, "selector")?;
-    with_session(session, |s| {
+    with_session(owner, session, |s| {
         // The coordinates are viewport-relative, so the element has to be on screen before it
         // can have any: scroll first, then measure what the scroll produced.
         scroll_into_view(s, selector)?;
@@ -305,6 +339,16 @@ pub fn click(session: &str, selector: &str) -> Result<String, String> {
 /// Vue, an input mask) sees every change. A contenteditable is left as it is rather than
 /// emptied, because clearing it would also throw away the caret the keystrokes need.
 pub fn type_text(session: &str, selector: &str, text: &str) -> Result<String, String> {
+    type_text_for(DEFAULT_SCOPE, session, selector, text)
+}
+
+/// [`type_text`] resolving `session` only inside `owner`'s scope.
+pub fn type_text_for(
+    owner: &str,
+    session: &str,
+    selector: &str,
+    text: &str,
+) -> Result<String, String> {
     require_non_empty(selector, "selector")?;
     let length = text.chars().count();
     if length > MAX_TYPED_CHARS {
@@ -312,7 +356,7 @@ pub fn type_text(session: &str, selector: &str, text: &str) -> Result<String, St
             "text is {length} characters; the limit for a single call is {MAX_TYPED_CHARS}"
         ));
     }
-    with_session(session, |s| {
+    with_session(owner, session, |s| {
         focus(s, selector)?;
         clear_value(s, selector)?;
         insert_text(s, text)?;
@@ -326,7 +370,12 @@ pub fn type_text(session: &str, selector: &str, text: &str) -> Result<String, St
 /// scroller, a virtualised list, a map — scrolls itself in response and can clamp, snap or
 /// refuse, all of which `scrollBy` flatly overrides.
 pub fn scroll(session: &str, x: i64, y: i64) -> Result<String, String> {
-    with_session(session, |s| {
+    scroll_for(DEFAULT_SCOPE, session, x, y)
+}
+
+/// [`scroll`] resolving `session` only inside `owner`'s scope.
+pub fn scroll_for(owner: &str, session: &str, x: i64, y: i64) -> Result<String, String> {
+    with_session(owner, session, |s| {
         s.call(
             "Input.dispatchMouseEvent",
             wheel_params(x, y),
@@ -343,10 +392,15 @@ pub fn scroll(session: &str, x: i64, y: i64) -> Result<String, String> {
 /// so a new key in a future browser costs nothing. Whether the *page* reacts is the caller's
 /// business: a key nothing listens for is not an error.
 pub fn key(session: &str, combo: &str) -> Result<String, String> {
+    key_for(DEFAULT_SCOPE, session, combo)
+}
+
+/// [`key`] resolving `session` only inside `owner`'s scope.
+pub fn key_for(owner: &str, session: &str, combo: &str) -> Result<String, String> {
     require_non_empty(combo, "combo")?;
     let stroke =
         parse_key_combo(combo).ok_or_else(|| format!("cannot parse key combo `{combo}`"))?;
-    with_session(session, |s| {
+    with_session(owner, session, |s| {
         s.call(
             "Input.dispatchKeyEvent",
             stroke.down_params(),
@@ -363,50 +417,84 @@ pub fn key(session: &str, combo: &str) -> Result<String, String> {
 
 /// The rendered, visible text of the page (`document.body.innerText`).
 pub fn text(session: &str) -> Result<String, String> {
-    eval(session, &js_text())
+    text_for(DEFAULT_SCOPE, session)
+}
+
+/// [`text`] resolving `session` only inside `owner`'s scope.
+pub fn text_for(owner: &str, session: &str) -> Result<String, String> {
+    eval_for(owner, session, &js_text())
 }
 
 /// Kill the browser behind `session` and forget it.
 pub fn close(session: &str) -> Result<(), String> {
+    close_for(DEFAULT_SCOPE, session)
+}
+
+/// [`close`] resolving `session` only inside `owner`'s scope.
+pub fn close_for(owner: &str, session: &str) -> Result<(), String> {
     let dead = {
         let mut reg = registry()
             .lock()
             .map_err(|_| "browser session registry poisoned".to_string())?;
-        reg.remove(session)
+        reg.remove(&(owner.to_string(), session.to_string()))
             .ok_or_else(|| format!("unknown browser session `{session}`"))?
     };
     dead.shutdown();
     Ok(())
 }
 
-/// The ids of every live session, sorted.
+/// The ids of every live session in the default scope, sorted.
 pub fn list_sessions() -> Vec<String> {
+    list_sessions_for(DEFAULT_SCOPE)
+}
+
+/// The ids of every live session `owner` holds, sorted.
+pub fn list_sessions_for(owner: &str) -> Vec<String> {
     let reg = match registry().lock() {
         Ok(reg) => reg,
         Err(_) => return Vec::new(),
     };
-    let mut ids: Vec<String> = reg.keys().cloned().collect();
+    let mut ids: Vec<String> = reg
+        .keys()
+        .filter(|(scope, _)| scope == owner)
+        .map(|(_, id)| id.clone())
+        .collect();
     ids.sort();
     ids
 }
 
-/// One line per live session: its id, the page it is on, and the debugger endpoint.
+/// One line per live session in the default scope: its id, the page it is on, and the
+/// debugger endpoint.
 pub fn describe_sessions() -> Vec<String> {
+    describe_sessions_for(DEFAULT_SCOPE)
+}
+
+/// One line per live session `owner` holds.
+pub fn describe_sessions_for(owner: &str) -> Vec<String> {
     let reg = match registry().lock() {
         Ok(reg) => reg,
         Err(_) => return Vec::new(),
     };
     let mut lines: Vec<String> = reg
-        .values()
-        .map(|session| format!("{} {} ({})", session.id, session.url, session.endpoint))
+        .iter()
+        .filter(|((scope, _), _)| scope == owner)
+        .map(|((_, id), session)| format!("{id} {} ({})", session.url, session.endpoint))
         .collect();
     lines.sort();
     lines
 }
 
-/// How many sessions are live. Cheap enough to call from a status line.
+/// How many sessions the default scope holds. Cheap enough to call from a status line.
 pub fn count() -> usize {
-    registry().lock().map(|reg| reg.len()).unwrap_or(0)
+    count_for(DEFAULT_SCOPE)
+}
+
+/// How many sessions `owner` holds.
+pub fn count_for(owner: &str) -> usize {
+    registry()
+        .lock()
+        .map(|reg| reg.keys().filter(|(scope, _)| scope == owner).count())
+        .unwrap_or(0)
 }
 
 // --- session plumbing ----------------------------------------------------------------------
@@ -517,28 +605,28 @@ fn no_element(selector: &str) -> Failure {
 /// socket is broken: the browser is killed and the session disappears, which the caller sees as
 /// a plain error rather than a session that fails forever.
 fn with_session<T>(
+    owner: &str,
     id: &str,
     f: impl FnOnce(&mut Session) -> Result<T, Failure>,
 ) -> Result<T, String> {
+    let key = (owner.to_string(), id.to_string());
     let mut session = {
         let mut reg = registry()
             .lock()
             .map_err(|_| "browser session registry poisoned".to_string())?;
-        reg.remove(id)
+        reg.remove(&key)
             .ok_or_else(|| format!("unknown browser session `{id}`"))?
     };
     match f(&mut session) {
         Ok(value) => {
-            let id = session.id.clone();
             if let Ok(mut reg) = registry().lock() {
-                reg.insert(id, session);
+                reg.insert(key, session);
             }
             Ok(value)
         }
         Err(Failure::Protocol(message)) => {
-            let id = session.id.clone();
             if let Ok(mut reg) = registry().lock() {
-                reg.insert(id, session);
+                reg.insert(key, session);
             }
             Err(message)
         }
@@ -1280,6 +1368,64 @@ fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or(text).trim().to_string()
 }
 
+/// A session whose socket is a real WebSocket loopback pair: the far end answers every CDP
+/// request with a fixed string result, enough to prove which owner may reach the session.
+#[cfg(test)]
+fn fake_session() -> Session {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake browser");
+    let port = listener.local_addr().expect("local addr").port();
+    std::thread::spawn(move || {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        let Ok(mut socket) = tungstenite::accept(stream) else {
+            return;
+        };
+        while let Ok(message) = socket.read() {
+            let tungstenite::Message::Text(text) = message else {
+                continue;
+            };
+            let Ok(request) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
+            let reply = json!({
+                "id": id,
+                "result": {"result": {"type": "string", "value": "pong"}}
+            });
+            if socket
+                .send(tungstenite::Message::text(reply.to_string()))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to fake browser");
+    let (socket, _) =
+        tungstenite::client(format!("ws://127.0.0.1:{port}/"), stream).expect("ws handshake");
+    Session {
+        url: "about:blank".to_string(),
+        endpoint: String::new(),
+        child: Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("fake child"),
+        socket,
+        next_id: 0,
+        profile: PathBuf::new(),
+    }
+}
+
+/// Register a fake session under `owner`, so scoping tests need no real browser.
+#[cfg(test)]
+pub(crate) fn insert_fake_session(owner: &str, id: &str) {
+    registry()
+        .lock()
+        .expect("registry")
+        .insert((owner.to_string(), id.to_string()), fake_session());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1943,7 +2089,9 @@ mod tests {
         // dropped rather than left to fail on every later call.
         let doomed = open(&url).unwrap();
         if let Ok(mut reg) = registry().lock() {
-            let browser = reg.get_mut(&doomed).expect("session in the registry");
+            let browser = reg
+                .get_mut(&(DEFAULT_SCOPE.to_string(), doomed.clone()))
+                .expect("session in the registry");
             browser
                 .child
                 .kill()
@@ -1993,5 +2141,73 @@ mod tests {
         let huge = "a".repeat(MAX_TYPED_CHARS + 1);
         let err = type_text("browser-1", "#q", &huge).unwrap_err();
         assert!(err.contains(&MAX_TYPED_CHARS.to_string()), "{err}");
+    }
+
+    // --- owner scoping ---------------------------------------------------------------------
+
+    #[test]
+    #[cfg(unix)]
+    fn a_session_is_invisible_and_unusable_outside_its_owners_scope() {
+        insert_fake_session("owner-a", "browser-scoped-a");
+
+        // Another owner can neither see nor touch it: every entry point reports the same
+        // "unknown session" a never-opened id would.
+        for err in [
+            eval_for("owner-b", "browser-scoped-a", "1+1").unwrap_err(),
+            text_for("owner-b", "browser-scoped-a").unwrap_err(),
+            click_for("owner-b", "browser-scoped-a", "#go").unwrap_err(),
+            type_text_for("owner-b", "browser-scoped-a", "#q", "x").unwrap_err(),
+            scroll_for("owner-b", "browser-scoped-a", 0, 10).unwrap_err(),
+            key_for("owner-b", "browser-scoped-a", "Enter").unwrap_err(),
+            element_center_for("owner-b", "browser-scoped-a", "#go").unwrap_err(),
+            close_for("owner-b", "browser-scoped-a").unwrap_err(),
+        ] {
+            assert!(err.contains("unknown browser session"), "{err}");
+            assert!(err.contains("browser-scoped-a"), "{err}");
+        }
+        assert!(!list_sessions_for("owner-b").contains(&"browser-scoped-a".to_string()));
+        assert!(describe_sessions_for("owner-b").is_empty());
+        assert_eq!(count_for("owner-b"), 0);
+
+        // The owner sees and drives it.
+        assert_eq!(
+            eval_for("owner-a", "browser-scoped-a", "1+1").unwrap(),
+            "pong"
+        );
+        assert!(list_sessions_for("owner-a").contains(&"browser-scoped-a".to_string()));
+        assert_eq!(count_for("owner-a"), 1);
+        assert!(
+            describe_sessions_for("owner-a")
+                .iter()
+                .any(|line| line.contains("browser-scoped-a"))
+        );
+
+        close_for("owner-a", "browser-scoped-a").unwrap();
+        assert!(list_sessions_for("owner-a").is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn two_owners_may_hold_the_same_session_id() {
+        insert_fake_session("owner-c", "browser-shared-id");
+        insert_fake_session("owner-d", "browser-shared-id");
+
+        // Closing one owner's page leaves the other's untouched.
+        close_for("owner-c", "browser-shared-id").unwrap();
+        assert_eq!(
+            eval_for("owner-d", "browser-shared-id", "1+1").unwrap(),
+            "pong"
+        );
+        close_for("owner-d", "browser-shared-id").unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_default_scope_does_not_reach_a_named_owners_session() {
+        insert_fake_session("bot:someone", "browser-named-owner");
+        let err = eval("browser-named-owner", "1+1").unwrap_err();
+        assert!(err.contains("unknown browser session"), "{err}");
+        assert!(!list_sessions().contains(&"browser-named-owner".to_string()));
+        close_for("bot:someone", "browser-named-owner").unwrap();
     }
 }

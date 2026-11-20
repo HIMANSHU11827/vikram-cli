@@ -394,14 +394,15 @@ impl Tool for BrowserOpen {
         ))
     }
 
-    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let url = arg_str(args, "url")?;
-        match crate::browser::open(&url) {
+        let owner = browser_owner(ctx);
+        match crate::browser::open_for(&owner, &url) {
             Ok(session) => Ok(ToolOutput {
                 content: format!(
                     "session {session} opened on {url}\n{} session(s) live; close it with \
                      browser.close when the page is no longer needed",
-                    crate::browser::count()
+                    crate::browser::count_for(&owner)
                 ),
                 ok: true,
             }),
@@ -447,10 +448,10 @@ impl Tool for BrowserEval {
         ))
     }
 
-    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let session = arg_str(args, "session")?;
         let js = arg_str(args, "js")?;
-        match crate::browser::eval(&session, &js) {
+        match crate::browser::eval_for(&browser_owner(ctx), &session, &js) {
             Ok(value) => Ok(ToolOutput {
                 content: truncated(value),
                 ok: true,
@@ -497,10 +498,10 @@ impl Tool for BrowserClick {
         ))
     }
 
-    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let session = arg_str(args, "session")?;
         let selector = arg_str(args, "selector")?;
-        match crate::browser::click(&session, &selector) {
+        match crate::browser::click_for(&browser_owner(ctx), &session, &selector) {
             Ok(report) => Ok(ToolOutput {
                 content: report,
                 ok: true,
@@ -548,11 +549,11 @@ impl Tool for BrowserType {
         ))
     }
 
-    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let session = arg_str(args, "session")?;
         let selector = arg_str(args, "selector")?;
         let text = arg_str(args, "text")?;
-        match crate::browser::type_text(&session, &selector, &text) {
+        match crate::browser::type_text_for(&browser_owner(ctx), &session, &selector, &text) {
             Ok(report) => Ok(ToolOutput {
                 content: report,
                 ok: true,
@@ -620,7 +621,7 @@ impl Tool for BrowserScroll {
         ))
     }
 
-    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let session = arg_str(args, "session")?;
         let x = args.get("x").and_then(Value::as_i64).unwrap_or(0);
         let y = args.get("y").and_then(Value::as_i64).unwrap_or(0);
@@ -630,7 +631,7 @@ impl Tool for BrowserScroll {
                 ok: false,
             });
         }
-        match crate::browser::scroll(&session, x, y) {
+        match crate::browser::scroll_for(&browser_owner(ctx), &session, x, y) {
             Ok(report) => Ok(ToolOutput {
                 content: report,
                 ok: true,
@@ -673,9 +674,9 @@ impl Tool for BrowserText {
         ))
     }
 
-    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let session = arg_str(args, "session")?;
-        match crate::browser::text(&session) {
+        match crate::browser::text_for(&browser_owner(ctx), &session) {
             Ok(text) if text.trim().is_empty() => Ok(ToolOutput {
                 content: "(the page has no visible text)".to_string(),
                 ok: true,
@@ -720,13 +721,14 @@ impl Tool for BrowserClose {
         ))
     }
 
-    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let session = arg_str(args, "session")?;
-        match crate::browser::close(&session) {
+        let owner = browser_owner(ctx);
+        match crate::browser::close_for(&owner, &session) {
             Ok(()) => Ok(ToolOutput {
                 content: format!(
                     "closed {session}; {} session(s) live",
-                    crate::browser::count()
+                    crate::browser::count_for(&owner)
                 ),
                 ok: true,
             }),
@@ -738,6 +740,19 @@ impl Tool for BrowserClose {
     }
 }
 
+/// The entity a browser session belongs to: a bot's pages are that bot's alone, an agent
+/// run's are that agent's, and everything else shares the operator's scope — the same split
+/// the memory scopes use, so one hive participant can never drive another's browser.
+fn browser_owner(ctx: &ToolContext) -> String {
+    if let Some(bot) = ctx.bot.as_deref().filter(|bot| !bot.is_empty()) {
+        return format!("bot:{bot}");
+    }
+    if let Some(agent) = ctx.agent.as_deref().filter(|agent| !agent.is_empty()) {
+        return format!("agent:{agent}");
+    }
+    crate::browser::DEFAULT_SCOPE.to_string()
+}
+
 /// Which sessions are live.
 pub struct BrowserSessions;
 
@@ -745,8 +760,7 @@ impl Tool for BrowserSessions {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "browser.sessions".into(),
-            description: "List the live browser sessions of this process and the page each is on."
-                .into(),
+            description: "List this caller's live browser sessions and the page each is on.".into(),
             schema: json!({"type": "object", "properties": {}}),
         }
     }
@@ -761,8 +775,8 @@ impl Tool for BrowserSessions {
         ))
     }
 
-    fn run(&self, _args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
-        let sessions = crate::browser::describe_sessions();
+    fn run(&self, _args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+        let sessions = crate::browser::describe_sessions_for(&browser_owner(ctx));
         if sessions.is_empty() {
             return Ok(ToolOutput {
                 content: format!(
@@ -900,3 +914,69 @@ pub type CodeReviewTool = CodeReview;
 // [`LspPool`]; a missing server is reported as a failed observation with the install hint, never as
 // a silent empty answer.
 // ---------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_owner_is_the_bot_then_the_agent_then_the_operator() {
+        let mut ctx = ToolContext::default();
+        assert_eq!(browser_owner(&ctx), crate::browser::DEFAULT_SCOPE);
+
+        ctx.agent = Some("Rudra".to_owned());
+        assert_eq!(browser_owner(&ctx), "agent:Rudra");
+
+        // A bot identity is the entity boundary and wins over the agent's profile name.
+        ctx.bot = Some("bot-a".to_owned());
+        assert_eq!(browser_owner(&ctx), "bot:bot-a");
+
+        // Empty identities fall through rather than producing an empty scope.
+        ctx.bot = Some(String::new());
+        assert_eq!(browser_owner(&ctx), "agent:Rudra");
+        ctx.agent = Some(String::new());
+        ctx.bot = None;
+        assert_eq!(browser_owner(&ctx), crate::browser::DEFAULT_SCOPE);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn browser_sessions_lists_only_the_callers_own_sessions() {
+        crate::browser::cdp::insert_fake_session("bot:list-a", "browser-list-a");
+
+        let ctx_a = ToolContext {
+            bot: Some("list-a".to_owned()),
+            ..ToolContext::default()
+        };
+        let out = BrowserSessions.run(&json!({}), &ctx_a).unwrap();
+        assert!(out.ok, "{}", out.content);
+        assert!(out.content.contains("browser-list-a"), "{}", out.content);
+
+        // Another bot sees none of them, and cannot drive the id either.
+        let ctx_b = ToolContext {
+            bot: Some("list-b".to_owned()),
+            ..ToolContext::default()
+        };
+        let out = BrowserSessions.run(&json!({}), &ctx_b).unwrap();
+        assert!(out.ok, "{}", out.content);
+        assert!(!out.content.contains("browser-list-a"), "{}", out.content);
+        let out = BrowserEval
+            .run(&json!({"session": "browser-list-a", "js": "1+1"}), &ctx_b)
+            .unwrap();
+        assert!(!out.ok, "{}", out.content);
+        assert!(
+            out.content.contains("unknown browser session"),
+            "{}",
+            out.content
+        );
+
+        // The owner can.
+        let out = BrowserEval
+            .run(&json!({"session": "browser-list-a", "js": "1+1"}), &ctx_a)
+            .unwrap();
+        assert!(out.ok, "{}", out.content);
+        assert_eq!(out.content, "pong");
+
+        crate::browser::close_for("bot:list-a", "browser-list-a").unwrap();
+    }
+}
