@@ -3,7 +3,9 @@
 //! Each configured platform gets one host loop: read events, map the chat to a session, submit a
 //! turn, then send the turn's text back. Configuration is environment-only for now, matching the
 //! variable names in `docs/gateway-platforms.md`; a platform with no credentials is skipped with a
-//! line explaining what is missing.
+//! line explaining what is missing. Credentials resolve from the process environment first, then
+//! `$VIKRAM_HOME/.env`, and `vikram gateway enable|disable` persists per-platform toggles in
+//! `gateway.json` — a platform with no entry stays "auto" and follows the environment as before.
 //!
 //! The gateway is a headless surface, so it runs unattended: anything needing approval is refused
 //! rather than waiting for a human who is not there.
@@ -11,6 +13,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::gateway_config::{self, env};
 use vikram_contracts::{ImageSource, Message, PermissionMode};
 use vikram_gateway::access::{
     AuthzInput, EnvLookup, PairingVerdict, PlatformAuthSpec, authorize_source,
@@ -83,14 +86,6 @@ fn a2a_text(request: &serde_json::Value) -> String {
         .to_string()
 }
 
-/// A gateway process reads one variable per credential; empty means "not configured".
-fn env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
 /// The process environment as [`EnvLookup`], through the same trim-and-drop-empty `env` helper
 /// every credential read uses.
 struct ProcessEnv;
@@ -157,8 +152,13 @@ pub async fn run(config: Config) -> Result<(), String> {
 
     let mut platforms: Vec<Arc<dyn GatewayPlatform>> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+    // Per-platform on/off from `vikram gateway enable|disable`; absence is "auto" and unchanged.
+    let toggles = gateway_config::load_for_run();
+    let mut disabled: Vec<&'static str> = Vec::new();
 
-    if let Some(token) = env("TELEGRAM_BOT_TOKEN") {
+    if toggles.is_disabled("telegram") {
+        disabled.push("telegram");
+    } else if let Some(token) = env("TELEGRAM_BOT_TOKEN") {
         let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
         let adapter = TelegramAdapter::new(transport.into_shared(), token);
         // A mirror or a local Bot API server; unset means the public endpoint.
@@ -171,7 +171,9 @@ pub async fn run(config: Config) -> Result<(), String> {
         skipped.push("telegram (TELEGRAM_BOT_TOKEN)".into());
     }
 
-    if let Some(token) = env("DISCORD_BOT_TOKEN") {
+    if toggles.is_disabled("discord") {
+        disabled.push("discord");
+    } else if let Some(token) = env("DISCORD_BOT_TOKEN") {
         let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
         let mut adapter = DiscordAdapter::new(transport.into_shared(), token.clone());
         if let Some(base) = env("DISCORD_API_BASE") {
@@ -189,8 +191,13 @@ pub async fn run(config: Config) -> Result<(), String> {
         skipped.push("discord (DISCORD_BOT_TOKEN)".into());
     }
 
-    match (env("SIGNAL_HTTP_URL"), env("SIGNAL_ACCOUNT")) {
-        (Some(base), Some(account)) => {
+    match (
+        toggles.is_disabled("signal"),
+        env("SIGNAL_HTTP_URL"),
+        env("SIGNAL_ACCOUNT"),
+    ) {
+        (true, _, _) => disabled.push("signal"),
+        (false, Some(base), Some(account)) => {
             let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
             platforms.push(Arc::new(SignalPlatform::new(SignalAdapter::new(
                 transport.into_shared(),
@@ -201,8 +208,9 @@ pub async fn run(config: Config) -> Result<(), String> {
         _ => skipped.push("signal (SIGNAL_HTTP_URL, SIGNAL_ACCOUNT)".into()),
     }
 
-    match env("NTFY_TOPIC") {
-        Some(topic) => {
+    match (toggles.is_disabled("ntfy"), env("NTFY_TOPIC")) {
+        (true, _) => disabled.push("ntfy"),
+        (false, Some(topic)) => {
             let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
             let server = env("NTFY_SERVER_URL").unwrap_or_else(|| "https://ntfy.sh".into());
             platforms.push(Arc::new(NtfyPlatform::new(NtfyAdapter::new(
@@ -212,11 +220,16 @@ pub async fn run(config: Config) -> Result<(), String> {
                 env("NTFY_TOKEN"),
             ))));
         }
-        None => skipped.push("ntfy (NTFY_TOPIC)".into()),
+        _ => skipped.push("ntfy (NTFY_TOPIC)".into()),
     }
 
-    match (env("WEIXIN_ACCOUNT_ID"), env("WEIXIN_TOKEN")) {
-        (Some(account), Some(token)) => {
+    match (
+        toggles.is_disabled("weixin"),
+        env("WEIXIN_ACCOUNT_ID"),
+        env("WEIXIN_TOKEN"),
+    ) {
+        (true, _, _) => disabled.push("weixin"),
+        (false, Some(account), Some(token)) => {
             let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
             let base =
                 env("WEIXIN_BASE_URL").unwrap_or_else(|| "https://ilinkai.weixin.qq.com".into());
@@ -230,7 +243,9 @@ pub async fn run(config: Config) -> Result<(), String> {
         _ => skipped.push("weixin (WEIXIN_ACCOUNT_ID, WEIXIN_TOKEN)".into()),
     }
 
-    if let Some(url) = env("SIMPLEX_WS_URL") {
+    if toggles.is_disabled("simplex") {
+        disabled.push("simplex");
+    } else if let Some(url) = env("SIMPLEX_WS_URL") {
         let socket = WsSocket::connect(&url).map_err(|err| err.to_string())?;
         platforms.push(Arc::new(SimplexPlatform::new(SimplexAdapter::new(
             socket.into_shared(),
@@ -239,8 +254,13 @@ pub async fn run(config: Config) -> Result<(), String> {
         skipped.push("simplex (SIMPLEX_WS_URL)".into());
     }
 
-    match (env("IRC_SERVER"), env("IRC_NICKNAME")) {
-        (Some(server), Some(nickname)) => {
+    match (
+        toggles.is_disabled("irc"),
+        env("IRC_SERVER"),
+        env("IRC_NICKNAME"),
+    ) {
+        (true, _, _) => disabled.push("irc"),
+        (false, Some(server), Some(nickname)) => {
             let port = env("IRC_PORT")
                 .and_then(|value| value.parse::<u16>().ok())
                 .unwrap_or(6667);
@@ -257,8 +277,13 @@ pub async fn run(config: Config) -> Result<(), String> {
         _ => skipped.push("irc (IRC_SERVER, IRC_NICKNAME)".into()),
     }
 
-    match (env("MATRIX_HOMESERVER"), env("MATRIX_ACCESS_TOKEN")) {
-        (Some(homeserver), Some(token)) => {
+    match (
+        toggles.is_disabled("matrix"),
+        env("MATRIX_HOMESERVER"),
+        env("MATRIX_ACCESS_TOKEN"),
+    ) {
+        (true, _, _) => disabled.push("matrix"),
+        (false, Some(homeserver), Some(token)) => {
             let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
             let adapter = MatrixAdapter::new(transport.into_shared(), homeserver, token);
             platforms.push(Arc::new(MatrixPlatform::new(adapter)));
@@ -267,11 +292,13 @@ pub async fn run(config: Config) -> Result<(), String> {
     }
 
     match (
+        toggles.is_disabled("mattermost"),
         env("MATTERMOST_URL"),
         env("MATTERMOST_TOKEN"),
         env("MATTERMOST_CHANNEL_ID"),
     ) {
-        (Some(base), Some(token), Some(channel)) => {
+        (true, _, _, _) => disabled.push("mattermost"),
+        (false, Some(base), Some(token), Some(channel)) => {
             let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
             let adapter = MattermostAdapter::new(transport.into_shared(), base, token);
             platforms.push(Arc::new(MattermostPlatform::new(adapter, channel)));
@@ -280,7 +307,9 @@ pub async fn run(config: Config) -> Result<(), String> {
             .push("mattermost (MATTERMOST_URL, MATTERMOST_TOKEN, MATTERMOST_CHANNEL_ID)".into()),
     }
 
-    if let Some(base) = env("WHATSAPP_BRIDGE_URL") {
+    if toggles.is_disabled("whatsapp") {
+        disabled.push("whatsapp");
+    } else if let Some(base) = env("WHATSAPP_BRIDGE_URL") {
         let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
         platforms.push(Arc::new(WhatsAppPlatform::new(WhatsAppAdapter::new(
             transport.into_shared(),
@@ -290,8 +319,13 @@ pub async fn run(config: Config) -> Result<(), String> {
         skipped.push("whatsapp (WHATSAPP_BRIDGE_URL)".into());
     }
 
-    match (env("WECOM_BOT_ID"), env("WECOM_SECRET")) {
-        (Some(bot_id), Some(secret)) => {
+    match (
+        toggles.is_disabled("wecom"),
+        env("WECOM_BOT_ID"),
+        env("WECOM_SECRET"),
+    ) {
+        (true, _, _) => disabled.push("wecom"),
+        (false, Some(bot_id), Some(secret)) => {
             let url = env("WECOM_WEBSOCKET_URL")
                 .unwrap_or_else(|| vikram_gateway::platforms::wecom::WECOM_WS_URL.to_string());
             let socket = WsSocket::connect(&url).map_err(|err| err.to_string())?;
@@ -307,11 +341,13 @@ pub async fn run(config: Config) -> Result<(), String> {
     }
 
     match (
+        toggles.is_disabled("email"),
         env("EMAIL_FROM"),
         env("EMAIL_SMTP_HOST"),
         env("EMAIL_IMAP_HOST"),
     ) {
-        (Some(from), Some(smtp_host), Some(imap_host)) => {
+        (true, _, _, _) => disabled.push("email"),
+        (false, Some(from), Some(smtp_host), Some(imap_host)) => {
             let tls = env("EMAIL_TLS").map(|v| v != "false").unwrap_or(true);
             let smtp_port = env("EMAIL_SMTP_PORT")
                 .and_then(|v| v.parse::<u16>().ok())
@@ -367,8 +403,13 @@ pub async fn run(config: Config) -> Result<(), String> {
         ),
     }
 
-    match (env("YUANBAO_APP_ID"), env("YUANBAO_APP_SECRET")) {
-        (Some(app_id), Some(app_secret)) => {
+    match (
+        toggles.is_disabled("yuanbao"),
+        env("YUANBAO_APP_ID"),
+        env("YUANBAO_APP_SECRET"),
+    ) {
+        (true, _, _) => disabled.push("yuanbao"),
+        (false, Some(app_id), Some(app_secret)) => {
             let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
             let base = YuanbaoConfig::default();
             let config = YuanbaoConfig {
@@ -396,8 +437,13 @@ pub async fn run(config: Config) -> Result<(), String> {
         ),
     }
 
-    match (env("BUZZ_RELAY_URL"), env("BUZZ_PRIVATE_KEY")) {
-        (Some(_), Some(_)) => match BuzzKeypair::from_env() {
+    match (
+        toggles.is_disabled("buzz"),
+        env("BUZZ_RELAY_URL"),
+        env("BUZZ_PRIVATE_KEY"),
+    ) {
+        (true, _, _) => disabled.push("buzz"),
+        (false, Some(_), Some(_)) => match BuzzKeypair::from_env() {
             Ok(keys) => match BuzzAdapter::dial(keys, BuzzConfig::from_env()) {
                 Ok(mut adapter) => {
                     if adapter.connect(false).await {
@@ -413,8 +459,13 @@ pub async fn run(config: Config) -> Result<(), String> {
         _ => skipped.push("buzz (BUZZ_RELAY_URL, BUZZ_PRIVATE_KEY)".into()),
     }
 
-    match (env("DINGTALK_CLIENT_ID"), env("DINGTALK_CLIENT_SECRET")) {
-        (Some(client_id), Some(client_secret)) => {
+    match (
+        toggles.is_disabled("dingtalk"),
+        env("DINGTALK_CLIENT_ID"),
+        env("DINGTALK_CLIENT_SECRET"),
+    ) {
+        (true, _, _) => disabled.push("dingtalk"),
+        (false, Some(client_id), Some(client_secret)) => {
             let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
             let stream = vikram_gateway::platforms::dingtalk_stream::DingTalkStream::new(
                 DingTalkCredential::new(client_id, client_secret),
@@ -430,8 +481,13 @@ pub async fn run(config: Config) -> Result<(), String> {
         _ => skipped.push("dingtalk stream (DINGTALK_CLIENT_ID, DINGTALK_CLIENT_SECRET)".into()),
     }
 
-    match (env("PHOTON_SIDECAR_URL"), env("PHOTON_SIDECAR_TOKEN")) {
-        (Some(url), Some(token)) => {
+    match (
+        toggles.is_disabled("photon"),
+        env("PHOTON_SIDECAR_URL"),
+        env("PHOTON_SIDECAR_TOKEN"),
+    ) {
+        (true, _, _) => disabled.push("photon"),
+        (false, Some(url), Some(token)) => {
             let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
             let adapter = PhotonAdapter::new(transport.into_shared(), url.clone(), token.clone());
             let stream_url = format!("{}/inbound", url.trim_end_matches('/'));
@@ -446,8 +502,13 @@ pub async fn run(config: Config) -> Result<(), String> {
     let mut webhook_hub = WebhookHub::new();
     let mut webhook_routes = 0usize;
 
-    match (env("BLUEBUBBLES_SERVER_URL"), env("BLUEBUBBLES_PASSWORD")) {
-        (Some(server), Some(password)) => {
+    match (
+        toggles.is_disabled("bluebubbles"),
+        env("BLUEBUBBLES_SERVER_URL"),
+        env("BLUEBUBBLES_PASSWORD"),
+    ) {
+        (true, _, _) => disabled.push("bluebubbles"),
+        (false, Some(server), Some(password)) => {
             let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
             let adapter = Arc::new(BlueBubblesAdapter::new(
                 transport.into_shared(),
@@ -495,12 +556,20 @@ pub async fn run(config: Config) -> Result<(), String> {
     }
 
     match (
+        toggles.is_disabled("whatsapp_cloud"),
         env("WHATSAPP_CLOUD_ACCESS_TOKEN"),
         env("WHATSAPP_CLOUD_PHONE_NUMBER_ID"),
         env("WHATSAPP_CLOUD_APP_SECRET"),
         env("WHATSAPP_CLOUD_VERIFY_TOKEN"),
     ) {
-        (Some(token), Some(phone_id), Some(app_secret), Some(verify_token)) => {
+        (true, _, _, _, _) => disabled.push("whatsapp_cloud"),
+        (
+            false,
+            Some(token),
+            Some(phone_id),
+            Some(app_secret),
+            Some(verify_token),
+        ) => {
             let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
             let adapter = Arc::new(
                 WhatsAppCloudAdapter::new(transport.into_shared(), token, phone_id)
@@ -563,12 +632,14 @@ pub async fn run(config: Config) -> Result<(), String> {
     }
 
     match (
+        toggles.is_disabled("sms"),
         env("TWILIO_ACCOUNT_SID"),
         env("TWILIO_AUTH_TOKEN"),
         env("TWILIO_FROM_NUMBER"),
         env("TWILIO_WEBHOOK_URL"),
     ) {
-        (Some(account_sid), Some(auth_token), Some(from), Some(webhook_url)) => {
+        (true, _, _, _, _) => disabled.push("sms"),
+        (false, Some(account_sid), Some(auth_token), Some(from), Some(webhook_url)) => {
             let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
             let adapter = Arc::new(SmsAdapter::new(
                 transport.into_shared(),
@@ -624,7 +695,11 @@ pub async fn run(config: Config) -> Result<(), String> {
     let webhook_bind = env("GATEWAY_WEBHOOK_BIND");
 
     if webhook_bind.is_some() {
-        if let (Some(app_id), Some(app_secret)) = (env("FEISHU_APP_ID"), env("FEISHU_APP_SECRET")) {
+        if toggles.is_disabled("feishu") {
+            disabled.push("feishu");
+        } else if let (Some(app_id), Some(app_secret)) =
+            (env("FEISHU_APP_ID"), env("FEISHU_APP_SECRET"))
+        {
             let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
             let mut adapter = FeishuAdapter::new(transport.into_shared(), app_id, app_secret);
             if let Some(token) = env("FEISHU_VERIFICATION_TOKEN") {
@@ -679,8 +754,13 @@ pub async fn run(config: Config) -> Result<(), String> {
             skipped.push("feishu webhook (FEISHU_APP_ID, FEISHU_APP_SECRET)".into());
         }
 
-        match (env("LINE_CHANNEL_ACCESS_TOKEN"), env("LINE_CHANNEL_SECRET")) {
-            (Some(token), Some(secret)) => {
+        match (
+            toggles.is_disabled("line"),
+            env("LINE_CHANNEL_ACCESS_TOKEN"),
+            env("LINE_CHANNEL_SECRET"),
+        ) {
+            (true, _, _) => disabled.push("line"),
+            (false, Some(token), Some(secret)) => {
                 let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
                 let adapter = Arc::new(LineAdapter::new(transport.into_shared(), token, secret));
                 let platform = WebhookPlatform::new("line", adapter.clone());
@@ -722,8 +802,13 @@ pub async fn run(config: Config) -> Result<(), String> {
             }
         }
 
-        match (env("SLACK_BOT_TOKEN"), env("SLACK_SIGNING_SECRET")) {
-            (Some(bot_token), Some(secret)) => {
+        match (
+            toggles.is_disabled("slack"),
+            env("SLACK_BOT_TOKEN"),
+            env("SLACK_SIGNING_SECRET"),
+        ) {
+            (true, _, _) => disabled.push("slack"),
+            (false, Some(bot_token), Some(secret)) => {
                 let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
                 let mut adapter = SlackAdapter::new(transport.into_shared(), bot_token)
                     .with_signing_secret(secret);
@@ -777,8 +862,13 @@ pub async fn run(config: Config) -> Result<(), String> {
         }
 
         // QQ Bot signs webhook POSTs with Ed25519 over `timestamp ++ body`.
-        match (env("QQ_BOT_APP_ID"), env("QQ_BOT_SECRET")) {
-            (Some(app_id), Some(secret)) => {
+        match (
+            toggles.is_disabled("qqbot"),
+            env("QQ_BOT_APP_ID"),
+            env("QQ_BOT_SECRET"),
+        ) {
+            (true, _, _) => disabled.push("qqbot"),
+            (false, Some(app_id), Some(secret)) => {
                 let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
                 let adapter = Arc::new(QqBotAdapter::new(transport.into_shared(), app_id, secret));
                 if !adapter.has_webhook_secret() {
@@ -832,8 +922,9 @@ pub async fn run(config: Config) -> Result<(), String> {
         // Raft is a wake-only local bridge: it answers HTTP and hands the host a content-free hint.
         // Opt in with a bridge token — the routes are served on the same bind as every other
         // webhook, so enabling it must be explicit.
-        match env("RAFT_BRIDGE_TOKEN") {
-            Some(token) => {
+        match (toggles.is_disabled("raft"), env("RAFT_BRIDGE_TOKEN")) {
+            (true, _) => disabled.push("raft"),
+            (false, Some(token)) => {
                 let mut raft = RaftAdapter::new(RaftConfig {
                     host: env("RAFT_HOST").unwrap_or_else(|| "127.0.0.1".into()),
                     port: env("RAFT_PORT")
@@ -868,7 +959,7 @@ pub async fn run(config: Config) -> Result<(), String> {
                 )));
                 webhook_routes += 4;
             }
-            None => skipped.push(
+            _ => skipped.push(
                 "raft (RAFT_BRIDGE_TOKEN; optional RAFT_RUNTIME_SESSION, RAFT_PATH, RAFT_HOST, RAFT_PORT)"
                     .into(),
             ),
@@ -876,10 +967,12 @@ pub async fn run(config: Config) -> Result<(), String> {
 
         // Google Chat signs its webhook POSTs with a Google JWT.
         match (
+            toggles.is_disabled("google_chat"),
             env("GOOGLE_CHAT_WEBHOOK_URL"),
             env("GOOGLE_CHAT_PROJECT_NUMBER"),
         ) {
-            (Some(webhook_url), Some(project)) => {
+            (true, _, _) => disabled.push("google_chat"),
+            (false, Some(webhook_url), Some(project)) => {
                 let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
                 let adapter = Arc::new(
                     GoogleChatAdapter::new(transport.into_shared(), webhook_url)
@@ -926,11 +1019,13 @@ pub async fn run(config: Config) -> Result<(), String> {
 
         // Teams posts Bot Framework activities signed with a Microsoft JWT.
         match (
+            toggles.is_disabled("teams"),
             env("TEAMS_TENANT_ID"),
             env("TEAMS_CLIENT_ID"),
             env("TEAMS_CLIENT_SECRET"),
         ) {
-            (Some(tenant), Some(client_id), Some(client_secret)) => {
+            (true, _, _, _) => disabled.push("teams"),
+            (false, Some(tenant), Some(client_id), Some(client_secret)) => {
                 let transport = ReqwestTransport::new().map_err(|err| err.to_string())?;
                 let adapter = Arc::new(TeamsAdapter::new(
                     transport.into_shared(),
@@ -981,95 +1076,122 @@ pub async fn run(config: Config) -> Result<(), String> {
         // submit turns to the runtime, so the route requires `A2A_TOKEN` as a bearer credential —
         // the same shared-secret shape the other webhook routes verify. Without it configured the
         // route refuses rather than running open.
-        let a2a_token = env("A2A_TOKEN");
-        let engine = Arc::new(vikram_gateway::platforms::a2a::A2aEngine::new());
-        let a2a = vikram_gateway::host::A2aPlatform::new(Arc::clone(&engine));
-        let sender = a2a.sender();
-        let route_engine = Arc::clone(&engine);
-        let route_platform = Arc::clone(&a2a);
-        webhook_hub = webhook_hub.route(
-            "/a2a",
-            event_route(move |request| {
-                let engine = Arc::clone(&route_engine);
-                let platform = Arc::clone(&route_platform);
-                let sender = sender.clone();
-                let a2a_token = a2a_token.clone();
-                Box::pin(async move {
-                    if request.method != "POST" {
-                        return (405, "method not allowed".to_string());
-                    }
-                    match a2a_token.as_deref() {
-                        Some(expected) => {
-                            let authorization = request.header("Authorization").unwrap_or_default();
-                            let presented =
-                                authorization.strip_prefix("Bearer ").unwrap_or_default();
-                            if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
-                                return (401, "bad token".to_string());
+        if toggles.is_disabled("a2a") {
+            disabled.push("a2a");
+        } else {
+            let a2a_token = env("A2A_TOKEN");
+            let engine = Arc::new(vikram_gateway::platforms::a2a::A2aEngine::new());
+            let a2a = vikram_gateway::host::A2aPlatform::new(Arc::clone(&engine));
+            let sender = a2a.sender();
+            let route_engine = Arc::clone(&engine);
+            let route_platform = Arc::clone(&a2a);
+            webhook_hub = webhook_hub.route(
+                "/a2a",
+                event_route(move |request| {
+                    let engine = Arc::clone(&route_engine);
+                    let platform = Arc::clone(&route_platform);
+                    let sender = sender.clone();
+                    let a2a_token = a2a_token.clone();
+                    Box::pin(async move {
+                        if request.method != "POST" {
+                            return (405, "method not allowed".to_string());
+                        }
+                        match a2a_token.as_deref() {
+                            Some(expected) => {
+                                let authorization =
+                                    request.header("Authorization").unwrap_or_default();
+                                let presented =
+                                    authorization.strip_prefix("Bearer ").unwrap_or_default();
+                                if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+                                    return (401, "bad token".to_string());
+                                }
+                            }
+                            None => return (403, "a2a is not configured".to_string()),
+                        }
+                        let Ok(text) = request.body_text() else {
+                            return (400, "body is not utf-8".to_string());
+                        };
+                        let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+                            return (400, "body is not json".to_string());
+                        };
+                        let response = engine.handle_jsonrpc(&value);
+                        if value.get("method").and_then(|m| m.as_str()) == Some("message/send")
+                            && let Some(task) = response.get("result")
+                        {
+                            let task_id = task.get("id").and_then(|v| v.as_str());
+                            let context_id = task.get("contextId").and_then(|v| v.as_str());
+                            if let (Some(task_id), Some(context_id)) = (task_id, context_id) {
+                                platform.remember(context_id, task_id);
+                                let prompt = a2a_text(&value);
+                                if !prompt.is_empty() {
+                                    let platform_name = vikram_gateway::event::Platform::new("a2a")
+                                        .expect("valid platform");
+                                    let mut source = vikram_gateway::event::SessionSource::new(
+                                        platform_name,
+                                        context_id,
+                                    );
+                                    source.chat_type = "dm".to_string();
+                                    let mut event =
+                                        vikram_gateway::event::MessageEvent::new(prompt, source);
+                                    event
+                                        .metadata
+                                        .insert("a2a_task".to_string(), serde_json::json!(task_id));
+                                    let _ = sender.send(event).await;
+                                }
                             }
                         }
-                        None => return (403, "a2a is not configured".to_string()),
-                    }
-                    let Ok(text) = request.body_text() else {
-                        return (400, "body is not utf-8".to_string());
-                    };
-                    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-                        return (400, "body is not json".to_string());
-                    };
-                    let response = engine.handle_jsonrpc(&value);
-                    if value.get("method").and_then(|m| m.as_str()) == Some("message/send")
-                        && let Some(task) = response.get("result")
-                    {
-                        let task_id = task.get("id").and_then(|v| v.as_str());
-                        let context_id = task.get("contextId").and_then(|v| v.as_str());
-                        if let (Some(task_id), Some(context_id)) = (task_id, context_id) {
-                            platform.remember(context_id, task_id);
-                            let prompt = a2a_text(&value);
-                            if !prompt.is_empty() {
-                                let platform_name = vikram_gateway::event::Platform::new("a2a")
-                                    .expect("valid platform");
-                                let mut source = vikram_gateway::event::SessionSource::new(
-                                    platform_name,
-                                    context_id,
-                                );
-                                source.chat_type = "dm".to_string();
-                                let mut event =
-                                    vikram_gateway::event::MessageEvent::new(prompt, source);
-                                event
-                                    .metadata
-                                    .insert("a2a_task".to_string(), serde_json::json!(task_id));
-                                let _ = sender.send(event).await;
-                            }
+                        (200, response.to_string())
+                    })
+                }),
+            );
+            let card_engine = Arc::clone(&engine);
+            webhook_hub = webhook_hub.route(
+                "/.well-known/agent.json",
+                event_route(move |request| {
+                    let engine = Arc::clone(&card_engine);
+                    Box::pin(async move {
+                        if request.method != "GET" {
+                            return (405, "method not allowed".to_string());
                         }
-                    }
-                    (200, response.to_string())
-                })
-            }),
-        );
-        let card_engine = Arc::clone(&engine);
-        webhook_hub = webhook_hub.route(
-            "/.well-known/agent.json",
-            event_route(move |request| {
-                let engine = Arc::clone(&card_engine);
-                Box::pin(async move {
-                    if request.method != "GET" {
-                        return (405, "method not allowed".to_string());
-                    }
-                    (200, engine.agent_card().to_string())
-                })
-            }),
-        );
-        platforms.push(a2a);
-        webhook_routes += 1;
+                        (200, engine.agent_card().to_string())
+                    })
+                }),
+            );
+            platforms.push(a2a);
+            webhook_routes += 1;
+        }
+    }
+
+    // An explicit `gateway enable` with missing credentials is worth saying out loud: the
+    // platform stays off, but silence would look like the toggle did nothing.
+    for spec in gateway_config::platform_specs() {
+        if toggles.toggle(spec.name) == Some(true) {
+            let missing = spec.missing();
+            if !missing.is_empty() {
+                eprintln!(
+                    "[gateway] {} is enabled but not configured; missing: {}",
+                    spec.name,
+                    missing.join(", ")
+                );
+            }
+        }
     }
 
     if platforms.is_empty() {
-        return Err(format!(
+        let mut message = format!(
             "no gateway platform is configured\nmissing: {}",
             skipped.join(", ")
-        ));
+        );
+        if !disabled.is_empty() {
+            message.push_str(&format!("\ndisabled: {}", disabled.join(", ")));
+        }
+        return Err(message);
     }
     for line in &skipped {
         eprintln!("[gateway] not configured: {line}");
+    }
+    for name in &disabled {
+        eprintln!("[gateway] {name} disabled (vikram gateway enable {name} re-enables)");
     }
 
     // A pipe has no human at it: approvals are refused, never auto-granted.

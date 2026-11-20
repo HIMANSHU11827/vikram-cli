@@ -6,6 +6,7 @@
 mod chat;
 mod doctor;
 mod gateway;
+mod gateway_config;
 mod modules;
 mod plugins;
 mod skills;
@@ -191,7 +192,10 @@ enum Command {
         action: Option<JobsAction>,
     },
     /// Run configured chat platforms against this runtime (env-configured credentials).
-    Gateway,
+    Gateway {
+        #[command(subcommand)]
+        action: Option<gateway_config::GatewayAction>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -876,7 +880,10 @@ fn main() -> std::process::ExitCode {
         Command::Heartbeat { action } => heartbeat(action.unwrap_or(HeartbeatAction::Status)),
         Command::Cron { action } => cron(action.unwrap_or(CronAction::List)),
         Command::Jobs { action } => jobs(action.unwrap_or(JobsAction::List { limit: 20 })),
-        Command::Gateway => run_async(gateway::run(config)),
+        Command::Gateway { action } => match action {
+            Some(action) => exit(gateway_config::run(action)),
+            None => run_async(gateway::run(config)),
+        },
     }
 }
 
