@@ -1751,20 +1751,13 @@ async fn hive(action: HiveAction) -> Result<(), String> {
             content,
         } => {
             let hid = vikram_contracts::HiveId::new(hive);
-            if store.get_hive(&hid).map_err(|e| e.to_string())?.is_none() {
-                return Err(format!("hive {hid} not found"));
-            }
+            // Route through the manager so `check_sender` applies: only a registered
+            // participant (or `vikram`) may speak in a hive, same as `hive_run` enforces.
+            let manager = vikram_runtime::HiveManager::new(std::sync::Arc::new(store.clone()));
             let now = vikram_runtime::types::now_ms();
-            let msg = vikram_store::HiveMessageRow {
-                id: vikram_contracts::HiveMessageId::generate(),
-                hive: hid,
-                sender: sender.clone(),
-                sender_kind: "user".to_owned(),
-                content,
-                task_ref: None,
-                ts_ms: now,
-            };
-            store.append_hive_message(&msg).map_err(|e| e.to_string())?;
+            manager
+                .append_message(&hid, &sender, "user", &content, None, now)
+                .map_err(|e| e.to_string())?;
             println!("sent");
         }
         HiveAction::Run {

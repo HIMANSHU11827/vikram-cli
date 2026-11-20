@@ -1199,3 +1199,176 @@ fn the_default_registry_lives_under_the_vikram_home() {
         registry_dir().display()
     );
 }
+
+// ---- provenance ------------------------------------------------------
+
+#[test]
+fn a_workspace_plugin_is_listed_but_never_executed() {
+    let home = tempfile::tempdir().unwrap();
+    let _guard = crate::config::lock_security_env();
+    unsafe { std::env::set_var("VIKRAM_HOME", home.path()) };
+    exec_plugin(&home.path().join("plugins"), "runner", r#"["process"]"#);
+    let workspace = tempfile::tempdir().unwrap();
+    exec_plugin(&workspace.path().join("plugins"), "evil", r#"["process"]"#);
+    exec_plugin(
+        &workspace.path().join(".vikram/plugins"),
+        "sneakier",
+        r#"["process"]"#,
+    );
+
+    let registry = PluginRegistry::for_workspace(workspace.path());
+    for name in ["evil", "sneakier"] {
+        let state = registry
+            .plugins()
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("{name} is listed"));
+        assert!(state.loaded, "{name} still loads");
+        assert!(!state.installed, "{name} is workspace provenance");
+        let err = registry.execute(name, "").unwrap_err();
+        assert!(err.contains("not installed"), "{name}: {err}");
+    }
+    let runner = registry
+        .plugins()
+        .iter()
+        .find(|p| p.name == "runner")
+        .expect("installed plugin is listed");
+    assert!(runner.installed);
+    assert!(registry.execute("runner", "").is_ok());
+    unsafe { std::env::remove_var("VIKRAM_HOME") };
+}
+
+#[test]
+fn lifecycle_operations_ignore_workspace_plugins() {
+    let home = tempfile::tempdir().unwrap();
+    let _guard = crate::config::lock_security_env();
+    unsafe { std::env::set_var("VIKRAM_HOME", home.path()) };
+    let workspace = tempfile::tempdir().unwrap();
+    exec_plugin(&workspace.path().join("plugins"), "evil", r#"["process"]"#);
+
+    let registry = PluginRegistry::for_workspace(workspace.path());
+    // A workspace plugin cannot be uninstalled, disabled or inspected through the registry:
+    // lifecycle targets the operator plugins dir only.
+    assert!(registry.uninstall("evil").is_err());
+    assert!(registry.disable("evil").is_err());
+    assert!(registry.inspect("evil").is_err());
+    assert!(workspace.path().join("plugins/evil/plugin.json").is_file());
+    unsafe { std::env::remove_var("VIKRAM_HOME") };
+}
+
+// ---- entry containment -----------------------------------------------
+
+#[test]
+fn an_entry_point_cannot_escape_the_plugin_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    write_plugin(
+        dir.path(),
+        "dotdot",
+        r#"{"name":"dotdot","version":"1.0.0","entry":"../escape.sh","permissions":["process"]}"#,
+    );
+    std::fs::write(dir.path().join("escape.sh"), "#!/bin/sh\necho pwned\n").unwrap();
+    write_plugin(
+        dir.path(),
+        "abs",
+        &format!(
+            r#"{{"name":"abs","version":"1.0.0","entry":"{}","permissions":["process"]}}"#,
+            dir.path().join("escape.sh").display()
+        ),
+    );
+
+    let registry = PluginRegistry::scan(dir.path());
+    for name in ["dotdot", "abs"] {
+        let state = registry.plugins().iter().find(|p| p.name == name).unwrap();
+        assert!(!state.loaded, "{name} must not load");
+        assert!(
+            state
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("inside the plugin directory")),
+            "{name}: {:?}",
+            state.error
+        );
+        // Execution refuses an unloaded plugin before it ever resolves the entry.
+        let err = registry.execute(name, "").unwrap_err();
+        assert!(err.contains("not loaded"), "{name}: {err}");
+    }
+
+    let installed = tempfile::tempdir().unwrap();
+    let registry = PluginRegistry::scan(installed.path());
+    let err = registry.install(&dir.path().join("dotdot")).unwrap_err();
+    assert!(err.contains("inside the plugin directory"), "{err}");
+    let issues = registry.validate(&dir.path().join("dotdot")).unwrap();
+    assert!(
+        issues
+            .iter()
+            .any(|i| i.starts_with("error:") && i.contains("inside the plugin directory")),
+        "{issues:?}"
+    );
+    assert!(!installed.path().join("dotdot").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_entry_cannot_point_outside_the_plugin_directory() {
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("evil.sh"), "#!/bin/sh\necho pwned\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    write_plugin(
+        dir.path(),
+        "link",
+        r#"{"name":"link","version":"1.0.0","entry":"link.sh","permissions":["process"]}"#,
+    );
+    std::os::unix::fs::symlink(
+        outside.path().join("evil.sh"),
+        dir.path().join("link/link.sh"),
+    )
+    .unwrap();
+
+    let registry = PluginRegistry::scan(dir.path());
+    let state = &registry.plugins()[0];
+    assert!(!state.loaded, "a symlink escape must not load");
+    assert!(
+        state
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("plugin directory")),
+        "{:?}",
+        state.error
+    );
+}
+
+// ---- environment -----------------------------------------------------
+
+#[test]
+fn execute_hides_the_environment_unless_env_is_declared() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, permissions) in [
+        ("quiet", r#"["process"]"#),
+        ("noisy", r#"["process","env"]"#),
+    ] {
+        write_plugin(
+            dir.path(),
+            name,
+            &format!(
+                r#"{{"name":"{name}","version":"1.0.0","entry":"main.sh","permissions":{permissions}}}"#
+            ),
+        );
+        std::fs::write(
+            dir.path().join(name).join("main.sh"),
+            "#!/bin/sh\nif [ -n \"$VIKRAM_PLUGIN_SECRET_TEST\" ]; then echo leak; else echo clean; fi\n",
+        )
+        .unwrap();
+    }
+    unsafe { std::env::set_var("VIKRAM_PLUGIN_SECRET_TEST", "sentinel") };
+
+    let registry = PluginRegistry::scan(dir.path());
+    let out = registry.execute("quiet", "").expect("quiet runs");
+    assert!(out.contains("clean"), "{out}");
+    assert!(!out.contains("leak"), "{out}");
+    let out = registry.execute("noisy", "").expect("noisy runs");
+    assert!(
+        out.contains("leak"),
+        "env permission restores inheritance: {out}"
+    );
+    unsafe { std::env::remove_var("VIKRAM_PLUGIN_SECRET_TEST") };
+}

@@ -27,6 +27,16 @@ pub(crate) struct LockBody {
 
 impl PluginRegistry {
     pub fn scan(dir: &Path) -> Self {
+        Self::scan_inner(dir, true)
+    }
+
+    /// Scan a workspace plugin directory (`<workspace>/plugins`, `.vikram/plugins`): entries are
+    /// discovered and listed but marked not installed, so they can never be executed or hooked.
+    fn scan_workspace(dir: &Path) -> Self {
+        Self::scan_inner(dir, false)
+    }
+
+    fn scan_inner(dir: &Path, installed: bool) -> Self {
         let mut plugins = Vec::new();
         let Ok(entries) = std::fs::read_dir(dir) else {
             return Self {
@@ -52,6 +62,7 @@ impl PluginRegistry {
                         version: None,
                         path,
                         loaded: false,
+                        installed,
                         error: Some(err.to_string()),
                         entry: None,
                     });
@@ -61,10 +72,14 @@ impl PluginRegistry {
             match PluginManifest::parse(&raw) {
                 Ok(manifest) => {
                     // A manifest without an entry point keeps the legacy "nothing to check" rule.
-                    let entry_exists = manifest
+                    let entry_check = manifest
                         .entry_point()
-                        .map(|entry| path.join(entry).exists())
-                        .unwrap_or(true);
+                        .map(|entry| entry_path(&path, entry).map(|resolved| resolved.exists()));
+                    let (entry_exists, entry_error) = match entry_check {
+                        Some(Ok(exists)) => (exists, None),
+                        Some(Err(reason)) => (false, Some(reason)),
+                        None => (true, None),
+                    };
                     let loaded = manifest.enabled && entry_exists;
                     let entry = manifest.entry_point().map(str::to_owned);
                     let name = if manifest.name.trim().is_empty() {
@@ -82,11 +97,12 @@ impl PluginRegistry {
                         version,
                         path,
                         loaded,
-                        error: if entry_exists {
+                        installed,
+                        error: entry_error.or(if entry_exists {
                             None
                         } else {
                             Some("declared entry point is missing".into())
-                        },
+                        }),
                         entry,
                     });
                 }
@@ -95,6 +111,7 @@ impl PluginRegistry {
                     version: None,
                     path,
                     loaded: false,
+                    installed,
                     error: Some(format!("manifest: {err}")),
                     entry: None,
                 }),
@@ -195,6 +212,12 @@ impl PluginRegistry {
                     .find(|p| p.name == plugin_name || dir_name(&p.path) == plugin_name)
             })
             .ok_or_else(|| format!("plugin not found: {plugin_name}"))?;
+        if !plugin.installed {
+            return Err(format!(
+                "plugin `{plugin_name}` is discovered in the workspace but not installed; \
+                 install it into the plugins directory to execute it"
+            ));
+        }
         if !plugin.loaded {
             return Err(format!("plugin not loaded: {plugin_name}"));
         }
@@ -205,7 +228,8 @@ impl PluginRegistry {
             .entry
             .clone()
             .ok_or_else(|| format!("plugin has no entry point: {plugin_name}"))?;
-        let entry_path = plugin.path.join(&entry);
+        let entry_path =
+            entry_path(&plugin.path, &entry).map_err(|e| format!("plugin `{plugin_name}`: {e}"))?;
         if !entry_path.exists() {
             return Err(format!(
                 "plugin entry point is missing: {}",
@@ -254,6 +278,9 @@ impl PluginRegistry {
         };
         cmd.args(&args);
         cmd.current_dir(&plugin.path);
+        let inherit_env =
+            parse_permissions(&manifest.permissions).contains(&PluginPermission::Environment);
+        apply_env_policy(&mut cmd, inherit_env);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -328,7 +355,7 @@ impl PluginRegistry {
         for sub in [".vikram/plugins", "plugins"] {
             let dir = workspace.join(sub);
             if dir.is_dir() {
-                reg.merge(Self::scan(&dir));
+                reg.merge(Self::scan_workspace(&dir));
             }
         }
         reg

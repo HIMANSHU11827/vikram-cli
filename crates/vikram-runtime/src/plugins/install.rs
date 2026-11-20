@@ -157,13 +157,14 @@ impl PluginRegistry {
         if id == "." || id == ".." || id.contains('/') || id.contains('\\') {
             return Err(format!("`{id}` is not a usable plugin id"));
         }
-        if let Some(entry) = manifest.entry_point()
-            && !source.join(entry).exists()
-        {
-            return Err(format!(
-                "declared entry point `{entry}` is missing from {}",
-                source.display()
-            ));
+        if let Some(entry) = manifest.entry_point() {
+            let resolved = entry_path(source, entry).map_err(|e| format!("plugin `{id}`: {e}"))?;
+            if !resolved.exists() {
+                return Err(format!(
+                    "declared entry point `{entry}` is missing from {}",
+                    source.display()
+                ));
+            }
         }
         verify_integrity(source, &id)?;
         Ok(manifest)

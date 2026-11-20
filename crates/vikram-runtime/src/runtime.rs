@@ -4460,12 +4460,19 @@ impl RuntimeHandle {
         initial: &str,
         parallel: bool,
     ) -> Result<Vec<vikram_store::HiveMessageRow>> {
-        let _ = self
+        self.inner
+            .hive
+            .manager
+            .ensure_runnable(hive)
+            .map_err(RuntimeError::InvalidState)?;
+        // One run per hive at a time: concurrent calls would otherwise interleave their
+        // transcript appends into a single shared log.
+        let _run_claim = self
             .inner
             .hive
-            .get(hive)
-            .map_err(RuntimeError::InvalidState)?
-            .ok_or_else(|| RuntimeError::InvalidState("hive not found".into()))?;
+            .manager
+            .claim_run(hive)
+            .map_err(RuntimeError::InvalidState)?;
 
         let now = now_ms();
         self.inner

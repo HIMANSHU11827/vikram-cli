@@ -4,18 +4,40 @@
 //! entity itself. This manager persists hive sessions, participants and messages through the store
 //! and exposes operations the runtime handle and tools can call.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use vikram_contracts::{EntityId, HiveId, HiveMessageId, SessionId, UserId};
 use vikram_store::{HiveMessageRow, HiveParticipantRow, HiveRow, Store};
 
 pub struct HiveManager {
     store: Arc<Store>,
+    /// Hives with a `hive_run` in flight, claimed atomically so two concurrent runs cannot
+    /// interleave their transcript appends. Released when the returned guard drops.
+    running: Mutex<HashSet<HiveId>>,
+}
+
+/// The right to run one hive, released on drop — the same claim-then-release shape a session's
+/// `turn_claimed` flag uses for its single turn slot.
+pub struct HiveRunGuard<'a> {
+    manager: &'a HiveManager,
+    hive: HiveId,
+}
+
+impl Drop for HiveRunGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut running) = self.manager.running.lock() {
+            running.remove(&self.hive);
+        }
+    }
 }
 
 impl HiveManager {
     pub fn new(store: Arc<Store>) -> Self {
-        Self { store }
+        Self {
+            store,
+            running: Mutex::new(HashSet::new()),
+        }
     }
 
     pub fn store(&self) -> Arc<Store> {
@@ -188,6 +210,38 @@ impl HiveManager {
         ))
     }
 
+    /// Claim the right to run `hive`. A second claim while a run is in flight is refused, so two
+    /// `hive_run` calls cannot interleave their transcript appends. The guard releases the claim.
+    pub fn claim_run(&self, hive: &HiveId) -> Result<HiveRunGuard<'_>, String> {
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        if !running.insert(hive.clone()) {
+            return Err(format!(
+                "hive {} already has a run in progress",
+                hive.as_str()
+            ));
+        }
+        drop(running);
+        Ok(HiveRunGuard {
+            manager: self,
+            hive: hive.clone(),
+        })
+    }
+
+    /// Only an `active` hive may be run; any other persisted state refuses new turns.
+    pub fn ensure_runnable(&self, hive: &HiveId) -> Result<(), String> {
+        let row = self
+            .get(hive)?
+            .ok_or_else(|| format!("hive {} not found", hive.as_str()))?;
+        if row.state != "active" {
+            return Err(format!(
+                "hive {} is {}, not active",
+                hive.as_str(),
+                row.state
+            ));
+        }
+        Ok(())
+    }
+
     pub fn messages(&self, hive: &HiveId) -> Result<Vec<HiveMessageRow>, String> {
         self.store
             .list_hive_messages(hive)
@@ -272,5 +326,32 @@ mod tests {
             m.append_message(&hive, "rudra", "agent", "hi", None, 6)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn ensure_runnable_refuses_non_active_hives() {
+        let m = manager();
+        let (hive, _) = hive_with_member(&m);
+        m.ensure_runnable(&hive).unwrap();
+        m.update_state(&hive, "paused", 2).unwrap();
+        assert!(m.ensure_runnable(&hive).is_err());
+        m.update_state(&hive, "active", 3).unwrap();
+        m.ensure_runnable(&hive).unwrap();
+        assert!(m.ensure_runnable(&HiveId::generate()).is_err());
+    }
+
+    #[test]
+    fn claim_run_serializes_runs_per_hive() {
+        let m = manager();
+        let (hive, _) = hive_with_member(&m);
+        let (other, _) = hive_with_member(&m);
+        let guard = m.claim_run(&hive).unwrap();
+        assert!(m.claim_run(&hive).is_err());
+        // A different hive is not blocked.
+        let other_guard = m.claim_run(&other).unwrap();
+        drop(other_guard);
+        drop(guard);
+        // Releasing the claim lets the next run start.
+        m.claim_run(&hive).unwrap();
     }
 }

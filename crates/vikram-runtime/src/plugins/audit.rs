@@ -35,10 +35,13 @@ impl PluginRegistry {
         }
         match manifest.entry_point() {
             None => issues.push("error: manifest declares no `entry` point".to_string()),
-            Some(entry) if !source.join(entry).exists() => issues.push(format!(
-                "error: declared entry point `{entry}` does not exist"
-            )),
-            Some(_) => {}
+            Some(entry) => match entry_path(source, entry) {
+                Err(reason) => issues.push(format!("error: {reason}")),
+                Ok(path) if !path.exists() => issues.push(format!(
+                    "error: declared entry point `{entry}` does not exist"
+                )),
+                Ok(_) => {}
+            },
         }
         // A shipped hash is checked; its absence is reported by [`Self::validate_integrity`] so
         // that a hand-authored plugin without a hash is not permanently noisy.
@@ -336,6 +339,7 @@ impl PluginRegistry {
     pub fn installed_version(&self, id: &str) -> Option<String> {
         self.plugins
             .iter()
+            .filter(|p| p.installed)
             .find(|p| p.name == id || dir_name(&p.path) == id || p.id() == id)
             .map(|p| p.version.clone().unwrap_or_default())
     }
@@ -357,11 +361,13 @@ impl PluginRegistry {
         }
         self.plugins
             .iter()
+            .filter(|p| p.installed)
             .find(|p| p.name == id || dir_name(&p.path) == id)
             .map(|p| p.path.clone())
             .or_else(|| {
                 self.plugins
                     .iter()
+                    .filter(|p| p.installed)
                     .find(|p| p.id() == id)
                     .map(|p| p.path.clone())
             })

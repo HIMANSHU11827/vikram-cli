@@ -99,6 +99,9 @@ pub struct PluginState {
     pub version: Option<String>,
     pub path: PathBuf,
     pub loaded: bool,
+    /// True only for plugins under the operator plugins dir. Workspace-discovered plugins are
+    /// listed but never executed or hooked: a cloned repo must not gain code execution for free.
+    pub installed: bool,
     pub error: Option<String>,
     pub entry: Option<String>,
 }

@@ -658,6 +658,7 @@ pub struct ProcessHook {
     points: Vec<HookPoint>,
     dir: std::path::PathBuf,
     entry: String,
+    inherit_env: bool,
 }
 
 impl ProcessHook {
@@ -674,18 +675,29 @@ impl ProcessHook {
             points,
             dir: dir.into(),
             entry: entry.into(),
+            inherit_env: false,
         }
     }
 
+    /// Let the hook subprocess inherit the full environment; only a manifest declaring `env`
+    /// may opt in. The default is the minimal allowlist.
+    pub fn with_inherited_env(mut self, inherit_env: bool) -> Self {
+        self.inherit_env = inherit_env;
+        self
+    }
+
     /// The command that runs `entry` for this plugin directory.
-    fn command(&self) -> Command {
-        let path = self.dir.join(self.entry.trim());
+    fn command(&self) -> Result<Command, String> {
+        let path = entry_path(&self.dir, self.entry.trim())
+            .map_err(|e| format!("plugin `{}`: {e}", self.plugin))?;
         let extension = path
             .extension()
             .and_then(|extension| extension.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
         let mut command = match extension.as_str() {
+            // Interpreter dispatch is deliberate: `.sh`/`.py` hooks run through `sh`/`python3`
+            // and do not need the executable bit.
             "sh" | "bash" => {
                 let mut command = Command::new(if extension == "bash" { "bash" } else { "sh" });
                 command.arg(&path);
@@ -698,8 +710,9 @@ impl ProcessHook {
             }
             _ => Command::new(&path),
         };
+        apply_env_policy(&mut command, self.inherit_env);
         command.current_dir(&self.dir);
-        command
+        Ok(command)
     }
 }
 
@@ -725,11 +738,22 @@ impl Hook for ProcessHook {
     }
 
     fn run(&self, ctx: &HookContext) -> Result<HookEffect, String> {
-        run_process_hook(self.command(), ctx)
+        run_process_hook(self.command()?, ctx)
     }
 }
 
+/// The largest serialized [`HookContext`] a process hook is sent. Bigger payloads are refused
+/// before spawn so a hook cannot be used to push unbounded data through the stdin pipe.
+const MAX_HOOK_PAYLOAD: usize = 256 * 1024;
+
 fn run_process_hook(mut command: Command, ctx: &HookContext) -> Result<HookEffect, String> {
+    let payload = ctx.to_json().to_string();
+    if payload.len() > MAX_HOOK_PAYLOAD {
+        return Err(format!(
+            "hook context is {} bytes, over the {MAX_HOOK_PAYLOAD}-byte limit",
+            payload.len()
+        ));
+    }
     command
         .arg(ctx.point.as_str())
         .stdin(Stdio::piped())
@@ -739,10 +763,12 @@ fn run_process_hook(mut command: Command, ctx: &HookContext) -> Result<HookEffec
         .spawn()
         .map_err(|e| format!("cannot start hook: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
-        let payload = ctx.to_json().to_string();
-        stdin
-            .write_all(payload.as_bytes())
-            .map_err(|e| format!("cannot write hook stdin: {e}"))?;
+        // Write on a helper thread: a hook that never reads stdin must not deadlock the turn
+        // once the payload outgrows the pipe buffer. The write ends when the child exits or is
+        // killed at the deadline and the pipe closes.
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(payload.as_bytes());
+        });
     }
     let mut stdout = child
         .stdout
@@ -753,6 +779,13 @@ fn run_process_hook(mut command: Command, ctx: &HookContext) -> Result<HookEffec
         let _ = stdout.read_to_end(&mut buffer);
         buffer
     });
+    if let Some(mut stderr) = child.stderr.take() {
+        // Drain stderr too: a hook that fills it must not block on the write either.
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = stderr.read_to_end(&mut buffer);
+        });
+    }
     let deadline = Instant::now() + HOOK_TIMEOUT;
     loop {
         match child.try_wait() {
@@ -763,7 +796,11 @@ fn run_process_hook(mut command: Command, ctx: &HookContext) -> Result<HookEffec
                 return Err(format!("hook timed out after {}s", HOOK_TIMEOUT.as_secs()));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-            Err(e) => return Err(format!("cannot wait for hook: {e}")),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("cannot wait for hook: {e}"));
+            }
         }
     }
     let bytes = reader.join().unwrap_or_default();
@@ -825,7 +862,9 @@ impl HookRegistry {
     pub fn from_plugins(plugins: &PluginRegistry) -> Self {
         let mut registry = Self::new();
         for state in plugins.plugins() {
-            if !state.loaded {
+            // Workspace-discovered plugins are listed but never trusted: only plugins installed
+            // into the operator plugins dir may modify a turn.
+            if !state.loaded || !state.installed {
                 continue;
             }
             let Ok(manifest) = PluginManifest::from_dir(&state.path) else {
@@ -916,13 +955,18 @@ impl HookRegistry {
                 self.rejected.push(HookRejection { plugin: id, reason });
                 return;
             }
-            self.register(Arc::new(ProcessHook::new(
-                id,
-                manifest.priority,
-                points,
-                dir,
-                entry,
-            )));
+            if let Err(reason) = entry_path(dir, entry) {
+                self.rejected.push(HookRejection {
+                    plugin: id,
+                    reason: format!("entry point: {reason}"),
+                });
+                return;
+            }
+            let inherit_env = granted.contains(&PluginPermission::Environment);
+            self.register(Arc::new(
+                ProcessHook::new(id, manifest.priority, points, dir, entry)
+                    .with_inherited_env(inherit_env),
+            ));
         }
     }
 
@@ -1247,5 +1291,120 @@ mod tests {
             ..HookRule::default()
         };
         assert!(rule.validate().is_err());
+    }
+
+    fn env_hook(dir: &Path, entry: &str) -> ProcessHook {
+        ProcessHook::new("envy", 10, vec![HookPoint::TurnStart], dir, entry)
+    }
+
+    #[test]
+    fn a_hook_that_never_reads_stdin_times_out_instead_of_deadlocking() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("hook.sh"), "#!/bin/sh\nsleep 30\n")
+            .expect("write hook script");
+        // ~100 KiB exceeds the 64 KiB pipe buffer, so a synchronous stdin write would block
+        // forever against a hook that never reads.
+        let ctx = HookContext::new(HookPoint::TurnStart).with_text("x".repeat(100_000));
+        let started = Instant::now();
+        let err = env_hook(dir.path(), "hook.sh").run(&ctx).unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the deadline still bounds the hook"
+        );
+    }
+
+    #[test]
+    fn an_oversized_hook_context_is_refused_before_spawn() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("hook.sh"),
+            "#!/bin/sh\ncat >/dev/null\nprintf '{}'\n",
+        )
+        .expect("write hook script");
+        let ctx = HookContext::new(HookPoint::TurnStart).with_text("x".repeat(300_000));
+        let err = env_hook(dir.path(), "hook.sh").run(&ctx).unwrap_err();
+        assert!(err.contains("byte limit"), "{err}");
+    }
+
+    #[test]
+    fn a_process_hook_does_not_inherit_secrets_without_the_env_permission() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("hook.sh"),
+            "#!/bin/sh\ncat >/dev/null\n\
+             if [ -n \"$VIKRAM_HOOK_SECRET_TEST\" ]; then printf '{\"append\":\"leaked\"}\\n'; \
+             else printf '{}\\n'; fi\n",
+        )
+        .expect("write hook script");
+        unsafe { std::env::set_var("VIKRAM_HOOK_SECRET_TEST", "sentinel") };
+
+        let ctx = HookContext::new(HookPoint::TurnStart);
+        let effect = env_hook(dir.path(), "hook.sh")
+            .run(&ctx)
+            .expect("restricted hook runs");
+        assert!(effect.append.is_empty(), "{effect:?}");
+
+        let effect = env_hook(dir.path(), "hook.sh")
+            .with_inherited_env(true)
+            .run(&ctx)
+            .expect("env-permitted hook runs");
+        assert_eq!(effect.append, vec!["leaked".to_owned()]);
+        unsafe { std::env::remove_var("VIKRAM_HOOK_SECRET_TEST") };
+    }
+
+    #[test]
+    fn a_process_hook_refuses_an_entry_outside_the_plugin_dir() {
+        let outside = tempfile::tempdir().expect("temp dir");
+        std::fs::write(outside.path().join("evil.sh"), "#!/bin/sh\nprintf '{}'\n")
+            .expect("write outside script");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ctx = HookContext::new(HookPoint::TurnStart);
+        for entry in [
+            "../outside.sh".to_owned(),
+            outside.path().join("evil.sh").display().to_string(),
+        ] {
+            let err = env_hook(dir.path(), &entry).run(&ctx).unwrap_err();
+            assert!(
+                err.contains("inside the plugin directory"),
+                "{entry}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_plugins_do_not_contribute_hooks() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let workspace = tempfile::tempdir().expect("temp dir");
+        let _guard = crate::config::lock_security_env();
+        unsafe { std::env::set_var("VIKRAM_HOME", home.path()) };
+        for (root, name) in [
+            (home.path().join("plugins"), "installed"),
+            (workspace.path().join("plugins"), "workspace"),
+        ] {
+            let plugin = root.join(name);
+            std::fs::create_dir_all(&plugin).expect("plugin dir");
+            std::fs::write(
+                plugin.join("plugin.json"),
+                json!({
+                    "id": name,
+                    "components": {"hooks": ["context_build"]},
+                    "permissions": ["agents", "process"],
+                    "entry": "hook.sh"
+                })
+                .to_string(),
+            )
+            .expect("manifest");
+            std::fs::write(
+                plugin.join("hook.sh"),
+                "#!/bin/sh\ncat >/dev/null\nprintf '{}'\n",
+            )
+            .expect("hook script");
+        }
+        let plugins = PluginRegistry::for_workspace(workspace.path());
+        let hooks = HookRegistry::from_plugins(&plugins);
+        assert_eq!(hooks.hooks().len(), 1, "only the installed plugin hooks");
+        assert_eq!(hooks.hooks()[0].plugin(), "installed");
+        unsafe { std::env::remove_var("VIKRAM_HOME") };
     }
 }

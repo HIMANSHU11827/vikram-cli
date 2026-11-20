@@ -82,7 +82,16 @@ impl Tool for PluginList {
         }
         let body = plugins
             .iter()
-            .map(|p| format!("{} (loaded={})", p.name, p.loaded))
+            .map(|p| {
+                if p.installed {
+                    format!("{} (loaded={})", p.name, p.loaded)
+                } else {
+                    format!(
+                        "{} (loaded={}, not installed — cannot be executed)",
+                        p.name, p.loaded
+                    )
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n");
         Ok(ToolOutput {

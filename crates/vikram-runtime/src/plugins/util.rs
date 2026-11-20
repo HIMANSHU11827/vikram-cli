@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 pub(crate) fn dir_name(path: &Path) -> String {
     path.file_name()
@@ -55,6 +56,71 @@ pub(crate) fn under_root(dir: &Path, root: &Path) -> bool {
     match (dir.canonicalize(), root.canonicalize()) {
         (Ok(dir), Ok(root)) => dir.starts_with(root),
         _ => dir.starts_with(root),
+    }
+}
+
+/// Resolve a manifest `entry` strictly inside `dir`.
+///
+/// Absolute paths and `..` are refused outright; when the resolved file exists it is also
+/// canonicalised and required to stay under `dir`, so a symlink cannot point outside either.
+pub(crate) fn entry_path(dir: &Path, entry: &str) -> Result<PathBuf, String> {
+    let entry = entry.trim();
+    let inside = Path::new(entry)
+        .components()
+        .all(|part| matches!(part, Component::Normal(_) | Component::CurDir));
+    if entry.is_empty() || !inside {
+        return Err(format!(
+            "entry `{entry}` must stay inside the plugin directory"
+        ));
+    }
+    let path = dir.join(entry);
+    if path.exists()
+        && let (Ok(resolved), Ok(root)) = (path.canonicalize(), dir.canonicalize())
+        && !resolved.starts_with(&root)
+    {
+        return Err(format!(
+            "entry `{entry}` escapes the plugin directory through a symlink"
+        ));
+    }
+    Ok(path)
+}
+
+/// The only environment variables a plugin or hook subprocess inherits unless its manifest
+/// declares the `env` permission.
+const SAFE_ENV_VARS: &[&str] = &[
+    "PATH",
+    "HOME",
+    "LANG",
+    "TERM",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    // Windows needs these for process creation and locale.
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+];
+
+/// Restrict `command` to [`SAFE_ENV_VARS`] (plus `LC_*`) unless `inherit_env` is set.
+pub(crate) fn apply_env_policy(command: &mut Command, inherit_env: bool) {
+    if inherit_env {
+        return;
+    }
+    command.env_clear();
+    for (key, value) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.to_ascii_uppercase().starts_with("LC_")
+            || SAFE_ENV_VARS
+                .iter()
+                .any(|safe| safe.eq_ignore_ascii_case(&name))
+        {
+            command.env(key, value);
+        }
     }
 }
 
