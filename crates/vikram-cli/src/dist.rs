@@ -1060,7 +1060,7 @@ fn install_transforms(src: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn confirm(question: &str) -> Result<(), String> {
+pub(crate) fn confirm(question: &str) -> Result<(), String> {
     use std::io::Write;
     let stdin = std::io::stdin();
     if !stdin.is_terminal() {

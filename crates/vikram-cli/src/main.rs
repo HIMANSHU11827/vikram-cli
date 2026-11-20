@@ -14,6 +14,7 @@ mod gateway_config;
 mod module_sdk;
 mod modules;
 mod plugins;
+mod presets;
 mod skills;
 mod terminal;
 mod tools;
@@ -109,6 +110,11 @@ enum Command {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// Manage presets: named bundles of config-relevant settings.
+    Presets {
+        #[command(subcommand)]
+        action: presets::PresetsAction,
     },
     /// Check the runtime's local prerequisites.
     Doctor,
@@ -879,6 +885,7 @@ fn main() -> std::process::ExitCode {
         Command::Files { action } => files(action),
         Command::Bots { action } => bots(action.unwrap_or(BotsAction::List)),
         Command::Config { action } => config_command(action, config),
+        Command::Presets { action } => exit(presets::run(action)),
         Command::Doctor => run_async(doctor::run(config)),
         Command::Init { path } => init(path),
         Command::Allow { action } => allow_command(action, &config),
