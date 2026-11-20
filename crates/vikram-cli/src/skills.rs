@@ -81,9 +81,9 @@ pub enum SkillsAction {
     Export { name: String, dest: PathBuf },
     /// Import a skill directory into the user skills directory.
     Import { path: PathBuf },
-    /// Install a skill from a local directory or a git repository.
+    /// Install a skill from a local directory, a `.tar.gz` archive, or a git repository.
     Install {
-        /// Local directory, or the repository URL with --git.
+        /// Local directory or `.tar.gz` archive, or the repository URL with --git.
         source: String,
         /// Treat the source as a git URL.
         #[arg(long)]
@@ -489,6 +489,11 @@ fn install(
     subdir: Option<String>,
     yes: bool,
 ) -> Result<(), String> {
+    // A `.tar.gz` from `vikram module pack` extracts to a temp dir and then takes the same
+    // directory install path; the temp dir is removed when `extracted` drops.
+    if !git && crate::archive::looks_like_archive(Path::new(&source)) {
+        return install_archive(Path::new(&source), subdir.as_deref());
+    }
     let mut allow_network = false;
     let install_source = if git {
         println!("source:      {source}");
@@ -529,6 +534,93 @@ fn install(
     println!("  path:     {}", outcome.path.display());
     println!("  replaced: {}", yes_no(outcome.replaced));
     Ok(())
+}
+
+/// `vikram skills install <file.tar.gz>`: extract the archive, then run the same directory
+/// install for the skill it holds — or for every skill a skill-pack holds. Like a plain
+/// directory install this does not prompt.
+fn install_archive(archive: &Path, subdir: Option<&str>) -> Result<(), String> {
+    let extracted = crate::archive::extract_module_dir(archive)?;
+    let root = extracted.path();
+    let base = match subdir {
+        Some(rel) => subdir_within(root, rel)?,
+        None => root.to_path_buf(),
+    };
+    let mut dirs = Vec::new();
+    if has_skill_file(&base) {
+        dirs.push(base.clone());
+    } else {
+        let entries =
+            std::fs::read_dir(&base).map_err(|e| format!("cannot read {}: {e}", base.display()))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && has_skill_file(&path) {
+                dirs.push(path);
+            }
+        }
+    }
+    dirs.sort();
+    if dirs.is_empty() {
+        return Err(format!(
+            "{} contains no skill (no SKILL.md found)",
+            archive.display()
+        ));
+    }
+    let installer = Installer {
+        manager: Manager::new(),
+        allow_network: false,
+    };
+    let mut failures = Vec::new();
+    for dir in &dirs {
+        match installer.install(&InstallSource::Directory(dir.clone())) {
+            Ok(outcome) => {
+                println!("installed {} from {}", outcome.name, archive.display());
+                println!("  hash:     {}", outcome.content_hash);
+                println!("  path:     {}", outcome.path.display());
+                println!("  replaced: {}", yes_no(outcome.replaced));
+            }
+            Err(err) => failures.push(format!("{}: {err}", dir.display())),
+        }
+    }
+    if !failures.is_empty() {
+        return Err(format!(
+            "{} installed, {} not: {}",
+            dirs.len() - failures.len(),
+            failures.len(),
+            failures.join("; ")
+        ));
+    }
+    Ok(())
+}
+
+fn has_skill_file(dir: &Path) -> bool {
+    dir.join("SKILL.md").is_file() || dir.join("skill.md").is_file()
+}
+
+/// `--subdir` inside an extracted archive: relative, no traversal, and canonicalized to
+/// prove a symlink cannot point outside the extraction.
+fn subdir_within(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let rel = rel.trim().trim_matches('/');
+    if rel.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+    let inside = Path::new(rel).components().all(|part| {
+        matches!(
+            part,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    });
+    if !inside {
+        return Err(format!("--subdir `{rel}` must stay inside the archive"));
+    }
+    let canon_root = std::fs::canonicalize(root)
+        .map_err(|e| format!("cannot resolve {}: {e}", root.display()))?;
+    let canon = std::fs::canonicalize(root.join(rel))
+        .map_err(|_| format!("--subdir `{rel}` does not exist in the archive"))?;
+    if !canon.starts_with(&canon_root) {
+        return Err(format!("--subdir `{rel}` resolves outside the archive"));
+    }
+    Ok(canon)
 }
 
 fn bundles() -> Result<(), String> {
@@ -1132,5 +1224,129 @@ mod tests {
         assert_eq!(yes_no(false), "no");
         assert_eq!(optional(None), "-");
         assert_eq!(optional(Some("x")), "x");
+    }
+
+    fn tar_dir(dir: &Path, out: &Path) {
+        let name = dir.file_name().unwrap();
+        let parent = dir.parent().unwrap();
+        let status = std::process::Command::new("tar")
+            .args(["-czf"])
+            .arg(out)
+            .arg("-C")
+            .arg(parent)
+            .arg(name)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn write_skill(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: test skill {name}\n---\n\nBody of {name}.\n"),
+        )
+        .unwrap();
+    }
+
+    /// `skills install module.tar.gz` extracts and runs the same directory install.
+    #[test]
+    fn install_archive_installs_a_single_skill() {
+        if std::process::Command::new("tar")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = vikram_runtime::config::lock_security_env();
+        unsafe { std::env::set_var("VIKRAM_HOME", tmp.path().join("home")) };
+        let skill = tmp.path().join("src").join("demo-skill");
+        write_skill(&skill, "demo-skill");
+        let archive = tmp.path().join("demo-skill.tar.gz");
+        tar_dir(&skill, &archive);
+        install(archive.display().to_string(), false, None, None, true).unwrap();
+        assert!(
+            user_skills_dir()
+                .join("demo-skill")
+                .join("SKILL.md")
+                .is_file()
+        );
+    }
+
+    /// A packed skill-pack installs every skill it holds.
+    #[test]
+    fn install_archive_installs_every_skill_in_a_pack() {
+        if std::process::Command::new("tar")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = vikram_runtime::config::lock_security_env();
+        unsafe { std::env::set_var("VIKRAM_HOME", tmp.path().join("home")) };
+        let pack = tmp.path().join("src").join("my-pack");
+        write_skill(&pack.join("skill-one"), "skill-one");
+        write_skill(&pack.join("skill-two"), "skill-two");
+        let archive = tmp.path().join("my-pack.tar.gz");
+        tar_dir(&pack, &archive);
+        install(archive.display().to_string(), false, None, None, true).unwrap();
+        for name in ["skill-one", "skill-two"] {
+            assert!(
+                user_skills_dir().join(name).join("SKILL.md").is_file(),
+                "{name} was not installed"
+            );
+        }
+    }
+
+    #[test]
+    fn install_archive_refuses_a_corrupt_or_skill_less_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = vikram_runtime::config::lock_security_env();
+        unsafe { std::env::set_var("VIKRAM_HOME", tmp.path().join("home")) };
+        let corrupt = tmp.path().join("bad.tar.gz");
+        std::fs::write(&corrupt, b"not a tarball").unwrap();
+        let err = install(corrupt.display().to_string(), false, None, None, true).unwrap_err();
+        assert!(err.contains("cannot extract"), "{err}");
+
+        if std::process::Command::new("tar")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tmp.path().join("not-a-skill");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plugin.json"), "{}").unwrap();
+        let archive = tmp.path().join("module.tar.gz");
+        tar_dir(&dir, &archive);
+        let err = install(archive.display().to_string(), false, None, None, true).unwrap_err();
+        assert!(err.contains("no skill"), "{err}");
+    }
+
+    #[test]
+    fn install_archive_honors_subdir_and_rejects_traversal() {
+        if std::process::Command::new("tar")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = vikram_runtime::config::lock_security_env();
+        unsafe { std::env::set_var("VIKRAM_HOME", tmp.path().join("home")) };
+        let pack = tmp.path().join("src").join("pack");
+        write_skill(&pack.join("inner").join("picked"), "picked");
+        let archive = tmp.path().join("pack.tar.gz");
+        tar_dir(&pack, &archive);
+        let err = install_archive(&archive, Some("../escape")).unwrap_err();
+        assert!(err.contains("must stay inside"), "{err}");
+        install_archive(&archive, Some("inner/picked")).unwrap();
+        assert!(user_skills_dir().join("picked").join("SKILL.md").is_file());
     }
 }

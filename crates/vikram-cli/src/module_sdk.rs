@@ -14,6 +14,7 @@ use vikram_runtime::hooks::HookPoint;
 use vikram_runtime::plugins::{
     PLUGIN_COMPONENT_TYPES, PluginManifest, is_semver, parse_permission,
 };
+use vikram_store::EntityKind;
 
 #[derive(Debug, Subcommand)]
 pub enum ModuleAction {
@@ -179,6 +180,8 @@ fn scaffold_skill_pack(dir: &Path, slug: &str) -> Result<(), String> {
         "# Skill pack\n\n\
          Every immediate subdirectory containing a `SKILL.md` is one skill.\n\n\
          Install a single skill:\n\n    vikram skills install <this-dir>/<skill-name>\n\n\
+         or pack the directory and install every skill in it:\n\n\
+         vikram module pack <this-dir>\n    vikram skills install <name>-<version>.tar.gz\n\n\
          or copy a skill directory into the user skills directory\n\
          (`vikram skills doctor` shows where that is).\n",
     )?;
@@ -233,13 +236,13 @@ fn scaffold_agent_pack(dir: &Path, slug: &str) -> Result<(), String> {
         "# Agent pack\n\n\
          These are the context files the runtime loads for an entity (SOUL.md,\n\
          INSTRUCTIONS.md, MEMORY.md, TOOLS.md — see `ContextFile` in\n\
-         `crates/vikram-runtime/src/context.rs`). `entity.example.json` mirrors the\n\
-         `EntityRow` fields `vikram entities new` stores; it is a template, not an import\n\
-         format.\n\n\
-         To install: register the entity, then place these files where the runtime reads\n\
-         them — `$VIKRAM_HOME/agents/<slug>/` for an agent, `$VIKRAM_HOME/bots/<slug>/`\n\
-         for a bot:\n\n    vikram entities new agent {slug} {slug}\n\n\
-         then copy this directory's *.md files into the printed location.\n",
+         `crates/vikram-runtime/src/context.rs`). `entity.example.json` templates the\n\
+         `entity.json` manifest `vikram entities install-pack` reads; copy it to\n\
+         `entity.json` and fill in the fields (all optional — the directory name is the\n\
+         default slug and kind is `agent`).\n\n\
+         Install:\n\n    vikram entities install-pack <this-dir>\n\n\
+         or pack first and install the archive:\n\n    vikram module pack <this-dir>\n\
+         vikram entities install-pack <name>-<version>.tar.gz\n",
     )?;
     Ok(())
 }
@@ -325,20 +328,117 @@ fn pack(path: &Path, out: Option<PathBuf>) -> Result<(), String> {
     }
     println!("packed {} -> {}", path.display(), out.display());
     match kind.as_str() {
-        "plugin" => println!(
-            "install: tar -xzf {} && vikram plugins install <dir>/<name>",
-            out.display()
-        ),
-        "skill" => println!(
-            "install: tar -xzf {} then vikram skills install <dir>/<skill>",
-            out.display()
-        ),
-        _ => println!(
-            "install: tar -xzf {} and place the files per its README",
-            out.display()
-        ),
+        "plugin" => println!("install: vikram plugins install {}", out.display()),
+        "skill" => println!("install: vikram skills install {}", out.display()),
+        _ => println!("install: vikram entities install-pack {}", out.display()),
     }
     Ok(())
+}
+
+/// The entity an agent-pack installs as, read from its optional `entity.json` manifest.
+/// Every field defaults so a bare scaffolded pack installs under its directory name.
+#[derive(Debug)]
+pub struct AgentPackSpec {
+    pub kind: EntityKind,
+    pub name: String,
+    pub slug: String,
+    pub title: String,
+    pub role: String,
+    pub specialization: String,
+    pub description: String,
+}
+
+/// `entity.json` in an agent-pack: the real import format `entity.example.json` templates.
+/// Strict — unknown fields are refused rather than silently ignored.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EntityManifest {
+    kind: Option<String>,
+    name: Option<String>,
+    slug: Option<String>,
+    title: Option<String>,
+    role: Option<String>,
+    specialization: Option<String>,
+    description: Option<String>,
+}
+
+/// Read and validate an agent-pack directory the way `vikram entities install-pack`
+/// consumes it: the same checks `validate` runs (all four context files present), plus a
+/// strictly-parsed `entity.json` when one exists.
+pub fn agent_pack(path: &Path) -> Result<AgentPackSpec, String> {
+    let (kind, issues) = check_dir(path)?;
+    if kind != "agent-pack" {
+        return Err(format!(
+            "{} is a {kind} module, not an agent-pack",
+            path.display()
+        ));
+    }
+    let errors: Vec<&str> = issues
+        .iter()
+        .filter(|issue| issue.starts_with("error:"))
+        .map(String::as_str)
+        .collect();
+    if !errors.is_empty() {
+        return Err(format!("{}: {}", path.display(), errors.join("; ")));
+    }
+    let manifest_path = path.join("entity.json");
+    let manifest: Option<EntityManifest> = if manifest_path.is_file() {
+        let text = std::fs::read_to_string(&manifest_path)
+            .map_err(|e| format!("cannot read {}: {e}", manifest_path.display()))?;
+        Some(
+            serde_json::from_str(&text)
+                .map_err(|e| format!("{}: invalid entity.json: {e}", manifest_path.display()))?,
+        )
+    } else {
+        None
+    };
+    let dir_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let slug = manifest
+        .as_ref()
+        .and_then(|m| m.slug.clone())
+        .unwrap_or(dir_name);
+    if slug.is_empty()
+        || slug == "."
+        || slug == ".."
+        || slug.contains('/')
+        || slug.contains('\\')
+        || slug.contains('\0')
+    {
+        return Err(format!("`{slug}` is not a usable entity slug"));
+    }
+    let kind = match manifest.as_ref().and_then(|m| m.kind.as_deref()) {
+        Some(raw) => EntityKind::parse(raw).map_err(|e| e.to_string())?,
+        None => EntityKind::Agent,
+    };
+    let name = manifest
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| slug.clone());
+    Ok(AgentPackSpec {
+        kind,
+        name,
+        slug,
+        title: manifest
+            .as_ref()
+            .and_then(|m| m.title.clone())
+            .unwrap_or_default(),
+        role: manifest
+            .as_ref()
+            .and_then(|m| m.role.clone())
+            .unwrap_or_default(),
+        specialization: manifest
+            .as_ref()
+            .and_then(|m| m.specialization.clone())
+            .unwrap_or_default(),
+        description: manifest
+            .as_ref()
+            .and_then(|m| m.description.clone())
+            .unwrap_or_default(),
+    })
 }
 
 /// What a directory is, and every problem found in it. `Err` means it is not a module at all.
@@ -669,5 +769,60 @@ mod tests {
             .unwrap();
         let text = String::from_utf8_lossy(&listing.stdout);
         assert!(text.contains("pack-me/plugin.json"), "{text}");
+    }
+
+    #[test]
+    fn agent_pack_defaults_to_the_directory_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        init("Bot Three", Kind::AgentPack, Some(tmp.path().to_path_buf())).unwrap();
+        let spec = agent_pack(&tmp.path().join("bot-three")).unwrap();
+        assert_eq!(spec.kind, EntityKind::Agent);
+        assert_eq!(spec.slug, "bot-three");
+        assert_eq!(spec.name, "bot-three");
+        assert!(spec.title.is_empty() && spec.role.is_empty());
+    }
+
+    #[test]
+    fn agent_pack_reads_entity_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        init("Bot Four", Kind::AgentPack, Some(tmp.path().to_path_buf())).unwrap();
+        let dir = tmp.path().join("bot-four");
+        std::fs::write(
+            dir.join("entity.json"),
+            r#"{"kind":"bot","name":"Four","slug":"four-bot","title":"Lead","role":"bot","specialization":"ops","description":"does bot things"}"#,
+        )
+        .unwrap();
+        let spec = agent_pack(&dir).unwrap();
+        assert_eq!(spec.kind, EntityKind::Bot);
+        assert_eq!(spec.slug, "four-bot");
+        assert_eq!(spec.name, "Four");
+        assert_eq!(spec.title, "Lead");
+        assert_eq!(spec.specialization, "ops");
+        assert_eq!(spec.description, "does bot things");
+    }
+
+    #[test]
+    fn agent_pack_rejects_bad_manifests_and_non_packs() {
+        let tmp = tempfile::tempdir().unwrap();
+        init("Bot Five", Kind::AgentPack, Some(tmp.path().to_path_buf())).unwrap();
+        let dir = tmp.path().join("bot-five");
+        // Unknown fields are refused, not ignored.
+        std::fs::write(dir.join("entity.json"), r#"{"bogus":1}"#).unwrap();
+        assert!(agent_pack(&dir).unwrap_err().contains("entity.json"));
+        // An unknown kind is refused.
+        std::fs::write(dir.join("entity.json"), r#"{"kind":"wizard"}"#).unwrap();
+        assert!(agent_pack(&dir).unwrap_err().contains("entity kind"));
+        // A traversal slug is refused.
+        std::fs::write(dir.join("entity.json"), r#"{"slug":"../x"}"#).unwrap();
+        assert!(agent_pack(&dir).unwrap_err().contains("slug"));
+        // A plugin directory is not an agent-pack.
+        init("Not A Pack", Kind::Plugin, Some(tmp.path().to_path_buf())).unwrap();
+        let err = agent_pack(&tmp.path().join("not-a-pack")).unwrap_err();
+        assert!(err.contains("not an agent-pack"), "{err}");
+        // Missing context files still fail validation.
+        std::fs::remove_file(dir.join("MEMORY.md")).unwrap();
+        std::fs::remove_file(dir.join("entity.json")).unwrap();
+        let err = agent_pack(&dir).unwrap_err();
+        assert!(err.contains("MEMORY.md"), "{err}");
     }
 }

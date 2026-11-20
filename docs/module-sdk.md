@@ -48,15 +48,18 @@ vikram skills validate <skill-dir>
 
 The four context files the runtime loads for an entity — `SOUL.md`, `INSTRUCTIONS.md`,
 `MEMORY.md`, `TOOLS.md` (the `ContextFile` filenames in
-`crates/vikram-runtime/src/context.rs`) — plus `entity.example.json`, a template mirroring
-the `EntityRow` fields `vikram entities new` stores. It is a reference, not an import
-format: entity metadata lives in the store.
+`crates/vikram-runtime/src/context.rs`) — plus `entity.example.json`, a template for the
+`entity.json` manifest `vikram entities install-pack` reads. Copy it to `entity.json` and
+fill in what you need; every field is optional (kind defaults to `agent`, slug to the
+directory name). Unknown fields are refused.
 
 ```
-vikram entities new agent <name> <slug>
-# then copy the pack's *.md files into $VIKRAM_HOME/agents/<slug>/
-# (bots use $VIKRAM_HOME/bots/<slug>/)
+vikram entities install-pack <dir>        # or <name>-<version>.tar.gz
+# entity lives at $VIKRAM_HOME/agents/<slug>/ (bots: $VIKRAM_HOME/bots/<slug>/)
 ```
+
+`install-pack` registers the entity in the store and copies the four context files into
+place — the same row `vikram entities new` writes, with the pack's metadata.
 
 There is no packaged "workflow" kind: scheduled workflow jobs are store rows that name a
 Hive (`vikram cron add --job-mode workflow --agent <hive>`), not files, so there is nothing
@@ -142,13 +145,18 @@ Errors print as `error: ...`, advisories as `warning: ...`; any error exits nonz
 
 Requires the directory to validate first, then shells out to
 `tar --sort=name --owner=0 --group=0 --numeric-owner --use-compress-program='gzip -n'`,
-producing a deterministic `.tar.gz` containing the module directory. The installer
-consumes directories, not archives:
+producing a deterministic `.tar.gz` containing the module directory. The installers
+accept the archive directly — each extracts it to a temp dir (removed afterwards) and
+runs the same directory path, so validation is identical:
 
 ```
-tar -xzf my-plugin-0.1.0.tar.gz
-vikram plugins install my-plugin --yes     # plugin
-vikram skills install my-pack/<skill>     # skill-pack member
+vikram plugins install my-plugin-0.1.0.tar.gz --yes   # plugin
+vikram skills install my-pack-0.1.0.tar.gz            # skill or every skill in a pack
+vikram modules install my-plugin-0.1.0.tar.gz --yes   # catalog-style install
+vikram entities install-pack my-agent-0.1.0.tar.gz    # agent-pack
 ```
+
+`skills install` also honors `--subdir <path>` inside the archive to pick one skill out
+of a pack. Non-tar input is refused rather than guessed at.
 
 If `tar`/`gzip` are missing, `pack` says so instead of writing a partial file.

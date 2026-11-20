@@ -11,19 +11,28 @@
 //! fails the stage and the turn reports it. Falling back to the default would hide a broken
 //! module behind behaviour that only looks healthy.
 //!
-//! Process plugins cannot register stages — they are out-of-process — but they reach the same
-//! seams through the hook chain (`context_build`, `memory_recall`, `model_request`,
-//! `tool_call`, `tool_result`), which every builtin handler still dispatches.
+//! Process plugins reach the same seams two ways: a plugin declaring `components.hooks` runs
+//! inside the builtin handlers through the hook chain, and a plugin declaring
+//! `components.stages` registers a [`ProcessStageHandler`] that wraps the builtin default —
+//! the default does the stage's real work first, then the plugin's entry may deny or amend the
+//! result through the same effect fields a hook replies with.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use serde_json::{Value, json};
 use vikram_contracts::{CancellationToken, Message, ToolCall, ToolCallId, TurnId};
 
+use crate::hooks::{HookContext, HookEffect, HookPoint};
+use crate::plugins::{
+    PluginManifest, PluginPermission, PluginRegistry, ensure_execution_permitted, entry_path,
+    parse_permissions,
+};
 use crate::provider::CompletionRequest;
 use crate::runtime::RuntimeInner;
 use crate::session::SessionRuntime;
@@ -96,6 +105,21 @@ impl StagePoint {
             }
             "turn_end" | "turn" => Some(StagePoint::TurnEnd),
             _ => None,
+        }
+    }
+
+    /// The hook point at the same seam. Stage permissions reuse the hook point's surface
+    /// mapping, so a `tool_dispatch` stage needs `tools` exactly like a `tool_call` hook.
+    pub fn hook_point(self) -> HookPoint {
+        match self {
+            StagePoint::ContextBuild => HookPoint::ContextBuild,
+            StagePoint::MemoryRecall => HookPoint::MemoryRecall,
+            StagePoint::ProviderRequest => HookPoint::ModelRequest,
+            StagePoint::ToolDispatch => HookPoint::ToolCall,
+            StagePoint::ResultCommit => HookPoint::ToolResult,
+            StagePoint::UserInput => HookPoint::UserInput,
+            StagePoint::ResponseCommit => HookPoint::ResponseDelivery,
+            StagePoint::TurnEnd => HookPoint::TurnEnd,
         }
     }
 }
@@ -219,9 +243,8 @@ impl StagePayload {
 /// Everything a stage handler is given at one point: the runtime objects it may need, the turn's
 /// prose, and the point's payload — inputs on the way in, outputs on the way out.
 ///
-/// `inner`, `session` and `turn` are crate-internal: stage registration is for in-process/native
-/// modules, which live in this crate. A payload-only handler in another crate can still rewrite
-/// what a stage produces through the public fields.
+/// `inner`, `session` and `turn` are crate-internal: native stage modules live in this crate,
+/// and a process plugin only ever sees the serialized form of this context — never the objects.
 pub struct StageContext {
     pub(crate) inner: Arc<RuntimeInner>,
     pub(crate) session: Arc<SessionRuntime>,
@@ -313,12 +336,308 @@ pub trait StageHandler: Send + Sync + 'static {
     fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a>;
 }
 
+/// A process plugin acting as a stage handler.
+///
+/// The builtin default runs first — a subprocess cannot assemble a context or dispatch tools —
+/// then the plugin's entry is spawned with the stage point as `argv[1]` and a hook-shaped JSON
+/// context on stdin carrying the stage payload (its inputs plus the outputs the builtin just
+/// produced, inside `details`). The reply is a [`HookEffect`] JSON object: `deny` refuses the
+/// stage and the remaining fields amend the payload. Spawn failure, non-zero exit, timeout or a
+/// malformed reply is a [`StageError`]: the stage fails, it does not silently fall back.
+pub struct ProcessStageHandler {
+    plugin: String,
+    dir: PathBuf,
+    entry: String,
+    inherit_env: bool,
+}
+
+impl ProcessStageHandler {
+    pub fn new(
+        plugin: impl Into<String>,
+        dir: impl Into<PathBuf>,
+        entry: impl Into<String>,
+    ) -> Self {
+        Self {
+            plugin: plugin.into(),
+            dir: dir.into(),
+            entry: entry.into(),
+            inherit_env: false,
+        }
+    }
+
+    /// Let the stage subprocess inherit the full environment; only a manifest declaring `env`
+    /// may opt in. The default is the minimal allowlist.
+    pub fn with_inherited_env(mut self, inherit_env: bool) -> Self {
+        self.inherit_env = inherit_env;
+        self
+    }
+
+    /// The stage dispatch as the plugin receives it: the usual hook context fields, with the
+    /// point spelled as the stage name and the whole payload under `details`.
+    fn request_payload(&self, ctx: &StageContext) -> String {
+        let mut value = HookContext::new(ctx.point.hook_point())
+            .with_session(ctx.session.id.as_str())
+            .with_turn(ctx.turn.as_str())
+            .with_workspace(ctx.inner.workspace_root.display().to_string())
+            .with_model(ctx.inner.model())
+            .with_text(ctx.request_text.clone())
+            .with_details(stage_payload_details(&ctx.payload))
+            .to_json();
+        if let Value::Object(map) = &mut value {
+            map.insert(
+                "point".to_owned(),
+                Value::String(ctx.point.as_str().to_owned()),
+            );
+        }
+        value.to_string()
+    }
+}
+
+impl StageHandler for ProcessStageHandler {
+    fn name(&self) -> &'static str {
+        "plugin-stage"
+    }
+
+    fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+        Box::pin(async move {
+            if let Some(builtin) = crate::turn::default_stage_handler(ctx.point) {
+                match builtin.handle(ctx).await? {
+                    StageOutcome::Done => {}
+                    StageOutcome::Refused(reason) => return Ok(StageOutcome::Refused(reason)),
+                }
+            }
+            let command = crate::hooks::plugin_command(
+                &self.plugin,
+                &self.dir,
+                &self.entry,
+                self.inherit_env,
+            )
+            .map_err(|reason| StageError::new(ctx.point, self.name(), reason))?;
+            let payload = self.request_payload(ctx);
+            let point = ctx.point.as_str();
+            let reply = tokio::task::spawn_blocking(move || {
+                crate::hooks::run_plugin_process(command, point, &payload)
+            })
+            .await
+            .map_err(|err| {
+                StageError::new(
+                    ctx.point,
+                    self.name(),
+                    format!("stage plugin task failed: {err}"),
+                )
+            })?
+            .map_err(|reason| StageError::new(ctx.point, self.name(), reason))?;
+            if !reply.status.success() {
+                return Err(StageError::new(
+                    ctx.point,
+                    self.name(),
+                    format!(
+                        "plugin `{}` exited with {}",
+                        self.plugin,
+                        reply
+                            .status
+                            .code()
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "no status".to_owned())
+                    ),
+                ));
+            }
+            let text = reply.stdout;
+            if text.trim().is_empty() {
+                return Ok(StageOutcome::Done);
+            }
+            let value: Value = serde_json::from_str(text.trim()).map_err(|err| {
+                StageError::new(
+                    ctx.point,
+                    self.name(),
+                    format!("stage reply is not JSON: {err}"),
+                )
+            })?;
+            let effect = HookEffect::from_json(&value)
+                .map_err(|reason| StageError::new(ctx.point, self.name(), reason))?;
+            apply_stage_effect(ctx, &self.plugin, &effect)
+        })
+    }
+}
+
+/// The stage payload as the process plugin sees it: inputs and the outputs already produced,
+/// serialized into the hook context's `details` slot. Fields a subprocess cannot usefully
+/// carry (`cancel`, `agent`) are omitted.
+fn stage_payload_details(payload: &StagePayload) -> Value {
+    match payload {
+        StagePayload::MemoryRecall(payload) => json!({ "text": payload.text }),
+        StagePayload::ContextBuild(payload) => json!({
+            "hook_injected": payload.hook_injected,
+            "profile": payload.profile,
+            "memory_text": payload.memory_text,
+            "prefix": payload.prefix,
+            "labels": payload.labels,
+        }),
+        StagePayload::ProviderRequest(payload) => json!({
+            "messages": payload.messages,
+            "request": payload.request.as_ref().map(|request| json!({
+                "model": request.model,
+                "messages": request.messages,
+                "tools": request.tools,
+                "max_output_tokens": request.max_output_tokens,
+            })),
+        }),
+        StagePayload::ToolDispatch(payload) => json!({
+            "calls": payload.calls,
+            "outcomes": payload.outcomes,
+        }),
+        StagePayload::ResultCommit(payload) => json!({
+            "results": payload.results,
+        }),
+        StagePayload::UserInput(payload) => json!({
+            "message": payload.message,
+            "deny": payload.deny,
+            "prepend": payload.prepend,
+            "append": payload.append,
+        }),
+        StagePayload::ResponseCommit(payload) => json!({
+            "text": payload.text,
+            "reasoning": payload.reasoning,
+            "calls": payload.calls,
+        }),
+        StagePayload::TurnEnd(payload) => json!({
+            "outcome": payload.outcome,
+            "steps": payload.steps,
+            "output_tokens": payload.output_tokens,
+        }),
+    }
+}
+
+/// Apply a process stage's [`HookEffect`] to the payload the builtin produced. Effect fields
+/// with no carrier at this point are ignored, matching how hooks treat inapplicable effects.
+fn apply_stage_effect(
+    ctx: &mut StageContext,
+    plugin: &str,
+    effect: &HookEffect,
+) -> Result<StageOutcome, StageError> {
+    let point = ctx.point;
+    if let Some(reason) = &effect.deny {
+        if let StagePayload::UserInput(payload) = &mut ctx.payload {
+            // The same path the builtin's hook denial takes: the message stays durable and the
+            // turn reports the refusal through `payload.deny`.
+            payload.deny = Some(reason.clone());
+            return Ok(StageOutcome::Done);
+        }
+        return Ok(StageOutcome::Refused(reason.clone()));
+    }
+    match &mut ctx.payload {
+        StagePayload::UserInput(payload) => {
+            if let Some(text) = &effect.text {
+                crate::turn::rewrite_message_text(&mut payload.message, text.clone());
+            }
+            payload.prepend.extend(effect.prepend.iter().cloned());
+            payload.append.extend(effect.append.iter().cloned());
+        }
+        StagePayload::MemoryRecall(payload) => {
+            let mut parts = effect.prepend.clone();
+            if let Some(text) = effect.text.clone().or_else(|| payload.text.take()) {
+                parts.push(text);
+            }
+            parts.extend(effect.append.iter().cloned());
+            if !parts.is_empty() {
+                payload.text = Some(parts.join("\n"));
+            }
+        }
+        StagePayload::ContextBuild(payload) => {
+            for (index, text) in effect.prepend.iter().enumerate() {
+                payload.prefix.insert(index, Message::system(text.clone()));
+                payload.labels.insert(index, "plugin");
+            }
+            for text in effect.append.iter().chain(effect.text.iter()) {
+                payload.prefix.push(Message::system(text.clone()));
+                payload.labels.push("plugin");
+            }
+        }
+        StagePayload::ProviderRequest(payload) => {
+            let Some(request) = &mut payload.request else {
+                return Err(StageError::new(
+                    point,
+                    plugin,
+                    "provider_request produced no request to amend".to_owned(),
+                ));
+            };
+            if let Some(max) = effect.max_output_tokens {
+                request.max_output_tokens = Some(max);
+            }
+            for (index, text) in effect.prepend.iter().enumerate() {
+                request
+                    .messages
+                    .insert(index, Message::system(text.clone()));
+            }
+            for text in effect.append.iter().chain(effect.text.iter()) {
+                request.messages.push(Message::system(text.clone()));
+            }
+        }
+        StagePayload::ToolDispatch(payload) => {
+            // The calls already ran inside the builtin; what a stage plugin can still amend is
+            // what will be committed, through the outcomes.
+            if let Some(content) = &effect.content {
+                for (text, _) in payload.outcomes.iter_mut() {
+                    *text = content.clone();
+                }
+            }
+            if let Some(ok) = effect.ok {
+                for (_, flag) in payload.outcomes.iter_mut() {
+                    *flag = ok;
+                }
+            }
+        }
+        StagePayload::ResultCommit(payload) => {
+            if let Some(content) = &effect.content {
+                for (_, text, _) in payload.results.iter_mut() {
+                    *text = content.clone();
+                }
+            }
+            if let Some(ok) = effect.ok {
+                for (_, _, flag) in payload.results.iter_mut() {
+                    *flag = ok;
+                }
+            }
+        }
+        StagePayload::ResponseCommit(payload) => {
+            if !effect.prepend.is_empty() {
+                let mut joined = effect.prepend.join("\n");
+                if !payload.text.is_empty() {
+                    joined.push('\n');
+                }
+                joined.push_str(&payload.text);
+                payload.text = joined;
+            }
+            if let Some(text) = &effect.text {
+                payload.text = text.clone();
+            }
+            for text in &effect.append {
+                payload.text.push('\n');
+                payload.text.push_str(text);
+            }
+        }
+        StagePayload::TurnEnd(_) => {}
+    }
+    Ok(StageOutcome::Done)
+}
+
 struct StageRegistration {
-    name: &'static str,
+    name: String,
     handler: Arc<dyn StageHandler>,
     priority: i32,
     /// Registration order; earlier wins a priority tie so dispatch stays deterministic.
     sequence: u64,
+    /// Plugin registrations are rebuilt by [`StageRegistry::reload_plugin_stages`]; native
+    /// `register` entries survive a plugin reload.
+    from_plugin: bool,
+}
+
+/// A stage registration that was refused, kept so the operator can see why a plugin is not
+/// handling a point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageRejection {
+    pub plugin: String,
+    pub reason: String,
 }
 
 /// The stage registry: named points mapped to their winning handler.
@@ -343,8 +662,18 @@ impl StageRegistry {
     /// Register a native handler for `point`. Higher `priority` wins dispatch; ties go to the
     /// earlier registration. The builtin default runs only while nothing is registered.
     pub fn register(&self, point: StagePoint, handler: Arc<dyn StageHandler>, priority: i32) {
+        self.push_registration(point, handler.name().to_owned(), handler, priority, false);
+    }
+
+    fn push_registration(
+        &self,
+        point: StagePoint,
+        name: String,
+        handler: Arc<dyn StageHandler>,
+        priority: i32,
+        from_plugin: bool,
+    ) {
         let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
-        let name = handler.name();
         let mut registrations = self
             .registrations
             .write()
@@ -355,12 +684,113 @@ impl StageRegistry {
             handler,
             priority,
             sequence,
+            from_plugin,
         });
         entries.sort_by(|a, b| {
             b.priority
                 .cmp(&a.priority)
                 .then_with(|| a.sequence.cmp(&b.sequence))
         });
+    }
+
+    /// Rebuild every process-plugin stage registration from `plugins`, returning the
+    /// declarations that were refused. Native registrations are untouched; a plugin that no
+    /// longer declares a point — or was disabled — loses its handler, so the builtin default
+    /// (or a native registration) runs for it again.
+    pub fn reload_plugin_stages(&self, plugins: &PluginRegistry) -> Vec<StageRejection> {
+        {
+            let mut registrations = self
+                .registrations
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for entries in registrations.values_mut() {
+                entries.retain(|entry| !entry.from_plugin);
+            }
+            registrations.retain(|_, entries| !entries.is_empty());
+        }
+        let mut rejected = Vec::new();
+        for state in plugins.plugins() {
+            // Same trust rule as hooks: only installed plugins may act inside a turn.
+            if !state.loaded || !state.installed {
+                continue;
+            }
+            let Ok(manifest) = PluginManifest::from_dir(&state.path) else {
+                continue;
+            };
+            rejected.extend(self.absorb_stage_manifest(&manifest, &state.path));
+        }
+        rejected
+    }
+
+    /// Register one plugin's declared stage points. Mirrors `HookRegistry::absorb_manifest`:
+    /// every refusal is reported through the returned [`StageRejection`]s, never dropped.
+    fn absorb_stage_manifest(
+        &self,
+        manifest: &PluginManifest,
+        dir: &std::path::Path,
+    ) -> Vec<StageRejection> {
+        let id = manifest.id().trim().to_owned();
+        let mut rejected = Vec::new();
+        let (points, unknown) = manifest.declared_stages();
+        for raw in unknown {
+            rejected.push(StageRejection {
+                plugin: id.clone(),
+                reason: format!("unknown stage point `{raw}`"),
+            });
+        }
+        if points.is_empty() {
+            return rejected;
+        }
+        let granted = parse_permissions(&manifest.permissions);
+        if let Some(missing) = points
+            .iter()
+            .find(|point| !granted.contains(&point.hook_point().permission()))
+        {
+            rejected.push(StageRejection {
+                plugin: id.clone(),
+                reason: format!(
+                    "stage point `{}` requires the `{}` permission",
+                    missing.as_str(),
+                    missing.hook_point().permission().as_str()
+                ),
+            });
+            return rejected;
+        }
+        let Some(entry) = manifest.entry_point() else {
+            rejected.push(StageRejection {
+                plugin: id.clone(),
+                reason: "stage points are declared but no entry point is".to_owned(),
+            });
+            return rejected;
+        };
+        if let Err(reason) = ensure_execution_permitted(&id, manifest) {
+            rejected.push(StageRejection {
+                plugin: id.clone(),
+                reason,
+            });
+            return rejected;
+        }
+        if let Err(reason) = entry_path(dir, entry) {
+            rejected.push(StageRejection {
+                plugin: id.clone(),
+                reason: format!("entry point: {reason}"),
+            });
+            return rejected;
+        }
+        let inherit_env = granted.contains(&PluginPermission::Environment);
+        let handler: Arc<dyn StageHandler> = Arc::new(
+            ProcessStageHandler::new(id.clone(), dir, entry).with_inherited_env(inherit_env),
+        );
+        for point in points {
+            self.push_registration(
+                point,
+                format!("plugin:{id}"),
+                Arc::clone(&handler),
+                manifest.priority,
+                true,
+            );
+        }
+        rejected
     }
 
     /// Whether a native handler is registered for `point` (the builtin default does not count).
@@ -396,13 +826,13 @@ impl StageRegistry {
             registrations
                 .get(&point)
                 .and_then(|entries| entries.first())
-                .map(|entry| (Arc::clone(&entry.handler), entry.name))
+                .map(|entry| (Arc::clone(&entry.handler), entry.name.clone()))
         };
         let (handler, name) = match selected {
             Some(selected) => selected,
             None => match crate::turn::default_stage_handler(point) {
                 Some(handler) => {
-                    let name = handler.name();
+                    let name = handler.name().to_owned();
                     (handler, name)
                 }
                 None => {
@@ -951,5 +1381,237 @@ mod tests {
             assert_eq!(StagePoint::parse(raw), Some(point));
             assert_eq!(StagePoint::parse(point.as_str()), Some(point));
         }
+    }
+
+    /// Write a plugin that declares `stages` under `components` plus an executable `stage.sh`.
+    fn stage_plugin(root: &std::path::Path, id: &str, manifest: serde_json::Value, script: &str) {
+        let dir = root.join(id);
+        std::fs::create_dir_all(&dir).expect("plugin dir");
+        std::fs::write(dir.join("plugin.json"), manifest.to_string()).expect("manifest");
+        std::fs::write(dir.join("stage.sh"), script).expect("entry");
+    }
+
+    fn stage_manifest(
+        id: &str,
+        stages: &[&str],
+        permissions: &[&str],
+        priority: i32,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "components": {"stages": stages},
+            "permissions": permissions,
+            "entry": "stage.sh",
+            "priority": priority,
+        })
+    }
+
+    /// The effect script every stage test shares shape with: consume the context, print one
+    /// hook-effect object.
+    const EFFECT_SCRIPT: &str =
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"append\":\"MARKER\"}'\n";
+
+    #[tokio::test]
+    async fn a_process_stage_plugin_rewrites_context_build_for_the_turn() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let plugins = dir.path().join("home").join("plugins");
+        stage_plugin(
+            &plugins,
+            "ctxy",
+            stage_manifest("ctxy", &["context_build"], &["agents", "process"], 10),
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"append\":\"PLUGIN-STAGE-MARKER\"}'\n",
+        );
+        let recorder = Arc::new(RecordingProvider {
+            requests: Mutex::new(Vec::new()),
+        });
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::clone(&recorder) as Arc<dyn Provider>,
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        let session = handle.snapshot().sessions[0].id.clone();
+        handle
+            .rename_session(&session, "stage test".into())
+            .expect("name the session");
+
+        run_one_turn(&handle, &session, "hello").await;
+
+        let requests = recorder.requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 1, "exactly one provider round ran");
+        let marker = requests[0].iter().any(|message| {
+            message
+                .blocks
+                .iter()
+                .any(|block| matches!(block, vikram_contracts::Block::Text { text, .. } if text == "PLUGIN-STAGE-MARKER"))
+        });
+        assert!(
+            marker,
+            "the plugin's context amendment reached the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_crashing_stage_plugin_fails_the_stage_instead_of_falling_back() {
+        let (_dir, _home, runtime, _session, live) = runtime_and_session().await;
+        let handle = runtime.handle();
+        let plugins = _dir.path().join("plugins");
+        stage_plugin(
+            &plugins,
+            "crashy",
+            stage_manifest("crashy", &["memory_recall"], &["tools", "process"], 10),
+            "#!/bin/sh\nexit 3\n",
+        );
+        let registry = StageRegistry::new();
+        let scanned = PluginRegistry::scan(&plugins);
+        let rejected = registry.reload_plugin_stages(&scanned);
+        assert!(
+            rejected.is_empty(),
+            "the manifest itself is valid: {rejected:?}"
+        );
+        assert!(registry.is_registered(StagePoint::MemoryRecall));
+
+        let mut ctx = context_for(&handle.inner, &live, recall_payload());
+        let err = registry
+            .run(StagePoint::MemoryRecall, &mut ctx)
+            .await
+            .expect_err("a crashed plugin fails the stage");
+        assert_eq!(err.point, StagePoint::MemoryRecall);
+        assert_eq!(err.handler, "plugin:crashy");
+        assert!(
+            err.to_string().contains("exited with 3"),
+            "the failure names the plugin and its exit: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stage_point_without_its_permission_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let plugins = dir.path().join("plugins");
+        // tool_dispatch maps to the tool_call hook surface, which requires `tools`.
+        stage_plugin(
+            &plugins,
+            "sneaky",
+            stage_manifest("sneaky", &["tool_dispatch"], &["agents", "process"], 10),
+            EFFECT_SCRIPT,
+        );
+        stage_plugin(
+            &plugins,
+            "typo",
+            stage_manifest("typo", &["not_a_point"], &["agents", "process"], 10),
+            EFFECT_SCRIPT,
+        );
+        let registry = StageRegistry::new();
+        let scanned = PluginRegistry::scan(&plugins);
+        let rejected = registry.reload_plugin_stages(&scanned);
+        assert!(
+            !registry.is_registered(StagePoint::ToolDispatch),
+            "the under-privileged plugin never registers"
+        );
+        assert!(
+            rejected
+                .iter()
+                .any(|rejection| rejection.reason.contains("requires the `tools` permission")),
+            "the permission refusal is reported: {rejected:?}"
+        );
+        assert!(
+            rejected
+                .iter()
+                .any(|rejection| rejection.reason.contains("unknown stage point")),
+            "the unknown point is reported: {rejected:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_higher_priority_stage_plugin_wins_dispatch() {
+        let (_dir, _home, runtime, _session, live) = runtime_and_session().await;
+        let handle = runtime.handle();
+        let plugins = _dir.path().join("plugins");
+        for (id, priority, marker) in [("low", 1, "LOW-MARKER"), ("high", 9, "HIGH-MARKER")] {
+            stage_plugin(
+                &plugins,
+                id,
+                stage_manifest(id, &["memory_recall"], &["tools", "process"], priority),
+                &format!("#!/bin/sh\ncat >/dev/null\nprintf '%s' '{{\"append\":\"{marker}\"}}'\n"),
+            );
+        }
+        let registry = StageRegistry::new();
+        let scanned = PluginRegistry::scan(&plugins);
+        registry.reload_plugin_stages(&scanned);
+        assert!(registry.is_registered(StagePoint::MemoryRecall));
+
+        let mut ctx = context_for(&handle.inner, &live, recall_payload());
+        registry
+            .run(StagePoint::MemoryRecall, &mut ctx)
+            .await
+            .expect("dispatch succeeds");
+        let StagePayload::MemoryRecall(payload) = ctx.payload else {
+            panic!("wrong payload");
+        };
+        let text = payload.text.unwrap_or_default();
+        assert!(text.contains("HIGH-MARKER"), "{text}");
+        assert!(!text.contains("LOW-MARKER"), "the loser never ran: {text}");
+    }
+
+    #[tokio::test]
+    async fn a_plugin_stage_handler_is_removed_when_the_plugin_is() {
+        let (_dir, _home, runtime, _session, live) = runtime_and_session().await;
+        let handle = runtime.handle();
+        let registry = StageRegistry::new();
+        let plugins = _dir.path().join("plugins");
+        stage_plugin(
+            &plugins,
+            "gone",
+            stage_manifest("gone", &["context_build"], &["agents", "process"], 10),
+            EFFECT_SCRIPT,
+        );
+        let scanned = PluginRegistry::scan(&plugins);
+        registry.reload_plugin_stages(&scanned);
+        assert!(registry.is_registered(StagePoint::ContextBuild));
+
+        // A rescan with the plugin gone drops the plugin registration; native ones survive.
+        let native_calls = Arc::new(AtomicUsize::new(0));
+        registry.register(
+            StagePoint::ContextBuild,
+            Arc::new(Marker {
+                text: "native",
+                calls: Arc::clone(&native_calls),
+            }),
+            1,
+        );
+        let empty = PluginRegistry::scan(&_dir.path().join("elsewhere"));
+        registry.reload_plugin_stages(&empty);
+        assert!(registry.is_registered(StagePoint::ContextBuild));
+
+        // The plugin handler is gone: the surviving native registration wins the dispatch.
+        let mut ctx = context_for(
+            &handle.inner,
+            &live,
+            StagePayload::ContextBuild(ContextBuildPayload {
+                hook_injected: Vec::new(),
+                profile: None,
+                memory_text: None,
+                prefix: Vec::new(),
+                labels: Vec::new(),
+            }),
+        );
+        registry
+            .run(StagePoint::ContextBuild, &mut ctx)
+            .await
+            .expect("the native handler still dispatches");
+        assert_eq!(native_calls.load(Ordering::SeqCst), 1);
+        let StagePayload::ContextBuild(payload) = ctx.payload else {
+            panic!("wrong payload");
+        };
+        assert!(
+            payload
+                .prefix
+                .iter()
+                .any(|message| message.text_body() == "native"),
+            "the native marker is what the stage produced"
+        );
     }
 }

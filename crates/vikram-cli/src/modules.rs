@@ -19,9 +19,9 @@ pub enum ModulesAction {
         #[arg(long)]
         from: Option<PathBuf>,
     },
-    /// Install one module, or all of them.
+    /// Install one module, or all of them. The id may also name a `.tar.gz` archive.
     Install {
-        /// Module id to install.
+        /// Module id to install, or a path to a `.tar.gz` archive.
         id: Option<String>,
         /// Install every module in the catalog.
         #[arg(long)]
@@ -55,6 +55,13 @@ pub fn run(action: ModulesAction) -> Result<(), String> {
     match action {
         ModulesAction::List { from } => list(&catalog_dir(from)),
         ModulesAction::Install { id, all, yes, from } => {
+            // `id` doubles as an archive path: `vikram modules install module.tar.gz`.
+            if let Some(id) = id.as_deref()
+                && !all
+                && crate::archive::looks_like_archive(Path::new(id))
+            {
+                return install_archive(Path::new(id), yes);
+            }
             install(&catalog_dir(from), id.as_deref(), all, yes)
         }
         ModulesAction::Update { id, all, from, yes } => {
@@ -132,6 +139,12 @@ fn install(dir: &Path, id: Option<&str>, all: bool, yes: bool) -> Result<(), Str
             return Err("name a module id, or pass --all".to_owned());
         }
     };
+    install_selected(dir, selected, yes)
+}
+
+/// Install already-selected catalog entries through the same registry path a directory
+/// install uses.
+fn install_selected(dir: &Path, selected: Vec<ModuleEntry>, yes: bool) -> Result<(), String> {
     if !yes {
         confirm_install(dir, &selected)?;
     }
@@ -154,6 +167,29 @@ fn install(dir: &Path, id: Option<&str>, all: bool, yes: bool) -> Result<(), Str
     }
     println!("{} module(s) installed", selected.len());
     Ok(())
+}
+
+/// `vikram modules install <file.tar.gz>`: the archive holds one module directory (or a
+/// directory of them, like a catalog); each plugin inside installs through the same
+/// registry path. The extracted temp dir is removed when `extracted` drops.
+fn install_archive(archive: &Path, yes: bool) -> Result<(), String> {
+    let extracted = crate::archive::extract_module_dir(archive)?;
+    let root = extracted.path();
+    let selected = if root.join("plugin.json").is_file() {
+        let manifest =
+            PluginManifest::from_dir(root).map_err(|e| format!("{}: {e}", root.display()))?;
+        vec![(root.to_path_buf(), manifest)]
+    } else {
+        let found = modules(root)?;
+        if found.is_empty() {
+            return Err(format!(
+                "{} contains no plugin module (no plugin.json found)",
+                archive.display()
+            ));
+        }
+        found
+    };
+    install_selected(archive, selected, yes)
 }
 
 /// Reinstall modules that are already installed; the catalog is the only source, so catalog
@@ -336,5 +372,68 @@ mod tests {
                 .join("good-mod")
                 .exists()
         );
+    }
+
+    /// `modules install module.tar.gz` extracts and installs through the same registry path.
+    #[test]
+    fn install_archive_extracts_and_installs() {
+        if std::process::Command::new("tar")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = vikram_runtime::config::lock_security_env();
+        unsafe { std::env::set_var("VIKRAM_HOME", tmp.path().join("home")) };
+        let source = tmp.path().join("packed");
+        write_module(&source, "packed-mod", "packed-mod");
+        let archive = tmp.path().join("packed.tar.gz");
+        let status = std::process::Command::new("tar")
+            .args(["-czf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&source)
+            .arg("packed-mod")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        install_archive(&archive, true).unwrap();
+        assert!(
+            vikram_runtime::config::plugins_dir()
+                .join("packed-mod")
+                .join("plugin.json")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn install_archive_refuses_contents_without_a_plugin() {
+        if std::process::Command::new("tar")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = vikram_runtime::config::lock_security_env();
+        unsafe { std::env::set_var("VIKRAM_HOME", tmp.path().join("home")) };
+        let source = tmp.path().join("empty-mod");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("README.md"), "hi").unwrap();
+        let archive = tmp.path().join("empty.tar.gz");
+        let status = std::process::Command::new("tar")
+            .args(["-czf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(tmp.path())
+            .arg("empty-mod")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let err = install_archive(&archive, true).unwrap_err();
+        assert!(err.contains("no plugin module"), "{err}");
     }
 }

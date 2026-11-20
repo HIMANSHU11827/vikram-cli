@@ -678,8 +678,8 @@ impl RuntimeInner {
     }
 
     /// Register a native stage handler. Higher `priority` wins dispatch for the point; the
-    /// builtin default runs only while nothing is registered. Process plugins cannot register
-    /// stages — they reach the same seams through the hook chain instead.
+    /// builtin default runs only while nothing is registered. Process plugins register stages
+    /// through `components.stages` and are rebuilt by [`Self::reload_plugin_stages`].
     pub fn register_stage(
         &self,
         point: crate::pipeline::StagePoint,
@@ -687,6 +687,17 @@ impl RuntimeInner {
         priority: i32,
     ) {
         self.stages.register(point, handler, priority);
+    }
+
+    /// Rebuild the process-plugin stage registrations from the loaded plugin set and return the
+    /// declarations that were refused. Called at boot and after every plugin mutation, so a
+    /// disabled plugin's stage handler stops dispatching on the next turn.
+    pub(crate) fn reload_plugin_stages(&self) -> Vec<crate::pipeline::StageRejection> {
+        let plugins = self.plugins.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: plugins lock mutex poisoned; recovering");
+            e.into_inner()
+        });
+        self.stages.reload_plugin_stages(&plugins)
     }
 
     /// Dispatch one hook context through the chain. Blocking work (a process hook) happens on the
@@ -2245,6 +2256,18 @@ impl Runtime {
             review_tasks: Arc::new(AtomicU64::new(0)),
             activity_seq: AtomicU64::new(0),
         });
+
+        // Plugins declaring `components.stages` become stage handlers, competing with native
+        // registrations by manifest priority; each still wraps the builtin default.
+        for rejection in inner.reload_plugin_stages() {
+            inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!(
+                    "plugin `{}` stage refused: {}",
+                    rejection.plugin, rejection.reason
+                ),
+            });
+        }
 
         // Reload previously derived dialectic insights so the user model survives restarts.
         // Best-effort: a fresh store simply means an empty model.
@@ -4060,6 +4083,17 @@ impl RuntimeHandle {
                 level: NoticeLevel::Warn,
                 text: format!(
                     "plugin `{}` hook refused: {}",
+                    rejection.plugin, rejection.reason
+                ),
+            });
+        }
+        // Plugin stage handlers are rebuilt on the same trigger, so a disabled plugin's stage
+        // stops dispatching here rather than at the next restart.
+        for rejection in self.inner.reload_plugin_stages() {
+            self.inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!(
+                    "plugin `{}` stage refused: {}",
                     rejection.plugin, rejection.reason
                 ),
             });

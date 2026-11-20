@@ -3,6 +3,7 @@
 //! `vikram` with no subcommand is the terminal interface. Everything else is an operator command
 //! that works on the same durable store, so there is no second source of truth.
 
+mod archive;
 mod chat;
 mod doctor;
 mod gateway;
@@ -16,7 +17,7 @@ mod tools;
 mod transforms;
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use vikram_runtime::config::{Config, database_path, vikram_home};
 use vikram_store::Store;
@@ -268,6 +269,8 @@ enum EntitiesAction {
         #[arg(default_value = "")]
         description: String,
     },
+    /// Install an agent-pack directory (or its `.tar.gz`) as an entity.
+    InstallPack { path: PathBuf },
     /// Delete an entity.
     Rm { id: String },
     /// Enable an entity (status becomes active).
@@ -1615,6 +1618,7 @@ fn entities(action: EntitiesAction) -> std::process::ExitCode {
                 store.save_entity(&row).map_err(|e| e.to_string())?;
                 println!("{}", row.id);
             }
+            EntitiesAction::InstallPack { path } => install_entity_pack(&store, &path)?,
             EntitiesAction::Rm { id } => {
                 let id = vikram_contracts::EntityId::new(id);
                 let Some(row) = store.get_entity(&id).map_err(|e| e.to_string())? else {
@@ -1635,6 +1639,92 @@ fn entities(action: EntitiesAction) -> std::process::ExitCode {
         Ok(())
     })();
     exit(result)
+}
+
+/// `vikram entities install-pack`: register an agent-pack's entity in the store and place
+/// its four context files where `ContextLoader` reads them (`$VIKRAM_HOME/<kind>/<slug>/`).
+/// Accepts the pack directory or the `.tar.gz` `vikram module pack` produced.
+fn install_entity_pack(store: &Store, path: &Path) -> Result<(), String> {
+    use vikram_runtime::context::ContextFile;
+    let _extracted = if crate::archive::looks_like_archive(path) {
+        Some(crate::archive::extract_module_dir(path)?)
+    } else {
+        None
+    };
+    let dir = _extracted
+        .as_ref()
+        .map(|extracted| extracted.path().to_path_buf())
+        .unwrap_or_else(|| path.to_path_buf());
+    let spec = module_sdk::agent_pack(&dir)?;
+    let ek = spec.kind;
+    let already = store
+        .list_entities()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|row| row.kind == ek && row.slug == spec.slug);
+    if already {
+        return Err(format!(
+            "entity `{}` ({}) is already installed",
+            spec.slug,
+            ek.as_str()
+        ));
+    }
+    let now = vikram_runtime::types::now_ms();
+    // Same defaults `entities new` applies: an empty role becomes the kind, an empty
+    // description is derived from name and title.
+    let row = vikram_store::EntityRow {
+        id: vikram_contracts::EntityId::generate(),
+        owner_user: None,
+        kind: ek,
+        name: spec.name.clone(),
+        slug: spec.slug.clone(),
+        title: spec.title.clone(),
+        role: if spec.role.is_empty() {
+            ek.as_str().to_owned()
+        } else {
+            spec.role.clone()
+        },
+        specialization: spec.specialization.clone(),
+        description: if spec.description.is_empty() {
+            if spec.title.is_empty() {
+                format!("{} ({})", spec.name, ek.as_str())
+            } else {
+                format!("{} — {}", spec.name, spec.title)
+            }
+        } else {
+            spec.description.clone()
+        },
+        icon: None,
+        model: None,
+        profile_id: None,
+        status: "active".to_owned(),
+        created_ms: now,
+        updated_ms: now,
+    };
+    // Files first, then the row — same ordering `entities new` uses: a row without its
+    // context files is a worse failure than files without a row.
+    let entity_dir = vikram_runtime::config::vikram_home()
+        .join(ek.folder())
+        .join(&spec.slug);
+    std::fs::create_dir_all(&entity_dir)
+        .map_err(|e| format!("cannot create {}: {e}", entity_dir.display()))?;
+    for file in [
+        ContextFile::Soul,
+        ContextFile::Instructions,
+        ContextFile::Memory,
+        ContextFile::Tools,
+    ] {
+        std::fs::copy(dir.join(file.filename()), entity_dir.join(file.filename()))
+            .map_err(|e| format!("cannot install {}: {e}", file.filename()))?;
+    }
+    store.save_entity(&row).map_err(|e| e.to_string())?;
+    println!(
+        "installed entity {} ({}) at {}",
+        row.id,
+        ek.as_str(),
+        entity_dir.display()
+    );
+    Ok(())
 }
 
 fn entity_set_status(store: &Store, id: &str, enabled: bool) -> Result<(), String> {
@@ -3172,5 +3262,110 @@ fn exit(result: Result<(), String>) -> std::process::ExitCode {
             eprintln!("vikram: {err}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_pack(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        for file in ["SOUL.md", "INSTRUCTIONS.md", "MEMORY.md", "TOOLS.md"] {
+            std::fs::write(dir.join(file), format!("# {file}\ncontent\n")).unwrap();
+        }
+    }
+
+    fn open_test_store(home: &Path) -> Store {
+        std::fs::create_dir_all(home).unwrap();
+        Store::open(&home.join("vikram.db")).unwrap()
+    }
+
+    #[test]
+    fn install_entity_pack_registers_the_entity_and_its_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = vikram_runtime::config::lock_security_env();
+        let home = tmp.path().join("home");
+        unsafe { std::env::set_var("VIKRAM_HOME", &home) };
+        let pack = tmp.path().join("my-bot");
+        write_pack(&pack);
+        std::fs::write(
+            pack.join("entity.json"),
+            r#"{"kind":"bot","name":"My Bot","title":"Lead","role":"bot","specialization":"ops","description":"does bot things"}"#,
+        )
+        .unwrap();
+        let store = open_test_store(&home);
+        install_entity_pack(&store, &pack).unwrap();
+        let entities = store.list_entities().unwrap();
+        assert_eq!(entities.len(), 1);
+        let row = &entities[0];
+        assert_eq!(row.slug, "my-bot");
+        assert_eq!(row.name, "My Bot");
+        assert_eq!(row.kind, vikram_store::EntityKind::Bot);
+        assert_eq!(row.role, "bot");
+        assert_eq!(row.specialization, "ops");
+        let dir = home.join("bots").join("my-bot");
+        for file in ["SOUL.md", "INSTRUCTIONS.md", "MEMORY.md", "TOOLS.md"] {
+            assert!(dir.join(file).is_file(), "{file} missing");
+        }
+        // entity.example.json and README.md are pack scaffolding, not context files.
+        assert!(!dir.join("entity.json").exists());
+        // A second install of the same pack is refused, not duplicated.
+        let err = install_entity_pack(&store, &pack).unwrap_err();
+        assert!(err.contains("already installed"), "{err}");
+        assert_eq!(store.list_entities().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn install_entity_pack_accepts_a_packed_archive() {
+        if std::process::Command::new("tar")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = vikram_runtime::config::lock_security_env();
+        let home = tmp.path().join("home");
+        unsafe { std::env::set_var("VIKRAM_HOME", &home) };
+        let pack = tmp.path().join("src").join("pack-agent");
+        write_pack(&pack);
+        let archive = tmp.path().join("pack-agent.tar.gz");
+        let status = std::process::Command::new("tar")
+            .args(["-czf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(tmp.path().join("src"))
+            .arg("pack-agent")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let store = open_test_store(&home);
+        install_entity_pack(&store, &archive).unwrap();
+        let entities = store.list_entities().unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].slug, "pack-agent");
+        assert_eq!(entities[0].kind, vikram_store::EntityKind::Agent);
+        assert!(
+            home.join("agents")
+                .join("pack-agent")
+                .join("SOUL.md")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn install_entity_pack_refuses_a_non_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = vikram_runtime::config::lock_security_env();
+        let home = tmp.path().join("home");
+        unsafe { std::env::set_var("VIKRAM_HOME", &home) };
+        let dir = tmp.path().join("random");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("README.md"), "hi").unwrap();
+        let store = open_test_store(&home);
+        let err = install_entity_pack(&store, &dir).unwrap_err();
+        assert!(err.contains("not a module directory"), "{err}");
     }
 }

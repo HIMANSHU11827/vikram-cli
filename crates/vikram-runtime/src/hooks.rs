@@ -782,32 +782,128 @@ impl ProcessHook {
 
     /// The command that runs `entry` for this plugin directory.
     fn command(&self) -> Result<Command, String> {
-        let path = entry_path(&self.dir, self.entry.trim())
-            .map_err(|e| format!("plugin `{}`: {e}", self.plugin))?;
-        let extension = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let mut command = match extension.as_str() {
-            // Interpreter dispatch is deliberate: `.sh`/`.py` hooks run through `sh`/`python3`
-            // and do not need the executable bit.
-            "sh" | "bash" => {
-                let mut command = Command::new(if extension == "bash" { "bash" } else { "sh" });
-                command.arg(&path);
-                command
-            }
-            "py" => {
-                let mut command = Command::new("python3");
-                command.arg(&path);
-                command
-            }
-            _ => Command::new(&path),
-        };
-        apply_env_policy(&mut command, self.inherit_env);
-        command.current_dir(&self.dir);
-        Ok(command)
+        plugin_command(&self.plugin, &self.dir, &self.entry, self.inherit_env)
     }
+}
+
+/// The command that runs `entry` inside `dir` under the env policy. Shared by process hooks and
+/// process stage handlers so both spawn plugin entries identically.
+pub(crate) fn plugin_command(
+    plugin: &str,
+    dir: &Path,
+    entry: &str,
+    inherit_env: bool,
+) -> Result<Command, String> {
+    let path = entry_path(dir, entry.trim()).map_err(|e| format!("plugin `{plugin}`: {e}"))?;
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut command = match extension.as_str() {
+        // Interpreter dispatch is deliberate: `.sh`/`.py` hooks run through `sh`/`python3`
+        // and do not need the executable bit.
+        "sh" | "bash" => {
+            let mut command = Command::new(if extension == "bash" { "bash" } else { "sh" });
+            command.arg(&path);
+            command
+        }
+        "py" => {
+            let mut command = Command::new("python3");
+            command.arg(&path);
+            command
+        }
+        _ => Command::new(&path),
+    };
+    apply_env_policy(&mut command, inherit_env);
+    command.current_dir(dir);
+    Ok(command)
+}
+
+/// What a plugin subprocess answered: whether it exited cleanly and what it wrote to stdout.
+pub(crate) struct PluginReply {
+    pub status: std::process::ExitStatus,
+    pub stdout: String,
+}
+
+/// The largest serialized plugin payload a subprocess is sent. Bigger payloads are refused
+/// before spawn so a plugin cannot be used to push unbounded data through the stdin pipe.
+const MAX_PLUGIN_PAYLOAD: usize = 256 * 1024;
+
+/// Spawn `command` with `point` as `argv[1]`, feed `payload` on stdin and collect stdout.
+///
+/// Shared by process hooks and process stage handlers. A non-zero exit is reported through
+/// [`PluginReply::status`], not as an error: hooks treat a failed hook as "no effect" while a
+/// stage handler fails the stage, so the policy stays with the caller.
+pub(crate) fn run_plugin_process(
+    mut command: Command,
+    point: &str,
+    payload: &str,
+) -> Result<PluginReply, String> {
+    if payload.len() > MAX_PLUGIN_PAYLOAD {
+        return Err(format!(
+            "plugin payload is {} bytes, over the {MAX_PLUGIN_PAYLOAD}-byte limit",
+            payload.len()
+        ));
+    }
+    let payload = payload.to_owned();
+    command
+        .arg(point)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("cannot start plugin process: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // Write on a helper thread: a plugin that never reads stdin must not deadlock the turn
+        // once the payload outgrows the pipe buffer. The write ends when the child exits or is
+        // killed at the deadline and the pipe closes.
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(payload.as_bytes());
+        });
+    }
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "plugin has no stdout".to_owned())?;
+    let reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stdout.read_to_end(&mut buffer);
+        buffer
+    });
+    if let Some(mut stderr) = child.stderr.take() {
+        // Drain stderr too: a plugin that fills it must not block on the write either.
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = stderr.read_to_end(&mut buffer);
+        });
+    }
+    let deadline = Instant::now() + HOOK_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "plugin timed out after {}s",
+                    HOOK_TIMEOUT.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("cannot wait for plugin: {e}"));
+            }
+        }
+    };
+    let bytes = reader.join().unwrap_or_default();
+    Ok(PluginReply {
+        status,
+        stdout: String::from_utf8_lossy(&bytes).into_owned(),
+    })
 }
 
 impl Hook for ProcessHook {
@@ -836,69 +932,9 @@ impl Hook for ProcessHook {
     }
 }
 
-/// The largest serialized [`HookContext`] a process hook is sent. Bigger payloads are refused
-/// before spawn so a hook cannot be used to push unbounded data through the stdin pipe.
-const MAX_HOOK_PAYLOAD: usize = 256 * 1024;
-
-fn run_process_hook(mut command: Command, ctx: &HookContext) -> Result<HookEffect, String> {
-    let payload = ctx.to_json().to_string();
-    if payload.len() > MAX_HOOK_PAYLOAD {
-        return Err(format!(
-            "hook context is {} bytes, over the {MAX_HOOK_PAYLOAD}-byte limit",
-            payload.len()
-        ));
-    }
-    command
-        .arg(ctx.point.as_str())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("cannot start hook: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        // Write on a helper thread: a hook that never reads stdin must not deadlock the turn
-        // once the payload outgrows the pipe buffer. The write ends when the child exits or is
-        // killed at the deadline and the pipe closes.
-        std::thread::spawn(move || {
-            let _ = stdin.write_all(payload.as_bytes());
-        });
-    }
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "hook has no stdout".to_owned())?;
-    let reader = std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = stdout.read_to_end(&mut buffer);
-        buffer
-    });
-    if let Some(mut stderr) = child.stderr.take() {
-        // Drain stderr too: a hook that fills it must not block on the write either.
-        std::thread::spawn(move || {
-            let mut buffer = Vec::new();
-            let _ = stderr.read_to_end(&mut buffer);
-        });
-    }
-    let deadline = Instant::now() + HOOK_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("hook timed out after {}s", HOOK_TIMEOUT.as_secs()));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("cannot wait for hook: {e}"));
-            }
-        }
-    }
-    let bytes = reader.join().unwrap_or_default();
-    let text = String::from_utf8_lossy(&bytes);
+fn run_process_hook(command: Command, ctx: &HookContext) -> Result<HookEffect, String> {
+    let reply = run_plugin_process(command, ctx.point.as_str(), &ctx.to_json().to_string())?;
+    let text = reply.stdout;
     if text.trim().is_empty() {
         return Ok(HookEffect::default());
     }

@@ -1,4 +1,5 @@
 use crate::hooks::HookRule;
+use crate::pipeline::StagePoint;
 use std::path::{Path, PathBuf};
 
 /// A declared dependency: another plugin by name, and the version requirement it must satisfy.
@@ -111,6 +112,29 @@ impl PluginManifest {
     pub fn entry_point(&self) -> Option<&str> {
         let entry = self.entry.trim();
         if entry.is_empty() { None } else { Some(entry) }
+    }
+
+    /// The stage points this plugin asks to handle, from `components.stages`.
+    ///
+    /// Names parse with [`StagePoint::parse`]; spellings that do not parse come back in the
+    /// second list so the loader reports them rather than dropping them silently.
+    pub fn declared_stages(&self) -> (Vec<StagePoint>, Vec<String>) {
+        let mut points = Vec::new();
+        let mut unknown = Vec::new();
+        let declared: &[String] = self
+            .components
+            .as_ref()
+            .and_then(|components| components.get("stages"))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for raw in declared {
+            match StagePoint::parse(raw) {
+                Some(point) if !points.contains(&point) => points.push(point),
+                Some(_) => {}
+                None => unknown.push(raw.clone()),
+            }
+        }
+        (points, unknown)
     }
 }
 

@@ -65,11 +65,12 @@ pub type PluginComponents = BTreeMap<String, Vec<String>>;
 ///
 /// A key outside this list is reported by [`PluginRegistry::validate`] as a warning; it never
 /// blocks installation.
-pub const PLUGIN_COMPONENT_TYPES: [&str; 10] = [
+pub const PLUGIN_COMPONENT_TYPES: [&str; 11] = [
     "tools",
     "skills",
     "agents",
     "hooks",
+    "stages",
     "commands",
     "mcp",
     "providers",

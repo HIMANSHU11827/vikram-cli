@@ -18,7 +18,7 @@ pub enum PluginsAction {
     Show { id: String },
     /// Validate a plugin directory before installing it.
     Validate { path: PathBuf },
-    /// Install a plugin from a local directory.
+    /// Install a plugin from a local directory or a `.tar.gz` from `vikram module pack`.
     Install {
         path: PathBuf,
         /// Skip the confirmation prompt.
@@ -184,13 +184,28 @@ fn list(registry: &PluginRegistry) -> Result<(), String> {
 }
 
 fn install(registry: &PluginRegistry, path: &Path, yes: bool) -> Result<(), String> {
+    // A `.tar.gz` from `vikram module pack` extracts to a temp dir and then takes the exact
+    // same directory path; the temp dir is removed when `extracted` drops.
+    if crate::archive::looks_like_archive(path) {
+        let extracted = crate::archive::extract_module_dir(path)?;
+        return install_dir(registry, extracted.path(), yes, path);
+    }
+    install_dir(registry, path, yes, path)
+}
+
+fn install_dir(
+    registry: &PluginRegistry,
+    path: &Path,
+    yes: bool,
+    shown: &Path,
+) -> Result<(), String> {
     let manifest =
         PluginManifest::from_dir(path).map_err(|err| format!("not a plugin directory: {err}"))?;
     let id = manifest.id();
     if !yes {
         confirm(&format!(
             "install plugin `{id}` from {}? [y/N] ",
-            path.display()
+            shown.display()
         ))?;
     }
     let installed = registry.install(path)?;
@@ -412,5 +427,72 @@ mod tests {
         let registry = PluginRegistry::scan(tmp.path());
         let err = update(&registry, Some("ghost"), false, None, true).unwrap_err();
         assert!(err.contains("no recorded source"), "{err}");
+    }
+
+    fn tar_dir(dir: &Path, out: &Path) {
+        let name = dir.file_name().unwrap();
+        let parent = dir.parent().unwrap();
+        let status = std::process::Command::new("tar")
+            .args(["-czf"])
+            .arg(out)
+            .arg("-C")
+            .arg(parent)
+            .arg(name)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// `plugins install module.tar.gz` extracts and then runs the unchanged directory path.
+    #[test]
+    fn install_accepts_a_packed_archive() {
+        if std::process::Command::new("tar")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("src");
+        write_plugin(&source, "acme", "1.0.0");
+        let archive = tmp.path().join("acme.tar.gz");
+        tar_dir(&source.join("acme"), &archive);
+        let installed = tmp.path().join("installed");
+        let registry = PluginRegistry::scan(&installed);
+        install(&registry, &archive, true).unwrap();
+        assert!(installed.join("acme/plugin.json").is_file());
+    }
+
+    #[test]
+    fn install_refuses_a_corrupt_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("bad.tar.gz");
+        std::fs::write(&archive, b"not a tarball").unwrap();
+        let registry = PluginRegistry::scan(&tmp.path().join("installed"));
+        let err = install(&registry, &archive, true).unwrap_err();
+        assert!(err.contains("cannot extract"), "{err}");
+    }
+
+    /// Validation is not skipped for archives: a tarball whose contents are not a plugin
+    /// is refused exactly like the directory would be.
+    #[test]
+    fn install_validates_the_extracted_directory() {
+        if std::process::Command::new("tar")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("not-a-plugin");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("README.md"), "hello").unwrap();
+        let archive = tmp.path().join("module.tar.gz");
+        tar_dir(&source, &archive);
+        let registry = PluginRegistry::scan(&tmp.path().join("installed"));
+        let err = install(&registry, &archive, true).unwrap_err();
+        assert!(err.contains("not a plugin directory"), "{err}");
     }
 }

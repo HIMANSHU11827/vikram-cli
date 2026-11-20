@@ -1246,7 +1246,7 @@ impl RepeatGuard {
 /// Replace a message's prose, keeping every non-text block (images) in place. The first text
 /// block takes the rewrite and the rest are dropped, so a multi-paragraph input collapses to the
 /// single text a hook produced.
-fn rewrite_message_text(message: &mut Message, text: String) {
+pub(crate) fn rewrite_message_text(message: &mut Message, text: String) {
     let mut rewritten = false;
     let mut blocks = Vec::with_capacity(message.blocks.len());
     for block in message.blocks.drain(..) {
