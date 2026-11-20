@@ -41,6 +41,16 @@
 //! [`ExecutionResult::overall_success`] is `true` only for a non-empty plan in
 //! which every action was remediated, so a cycle never reports "executed" for
 //! work that was only written down. See [`ExecutionResult::failure_reason`].
+//!
+//! # Reachability
+//!
+//! PARTIALLY LIVE: [`MapekLoop::monitor`] and [`MapekLoop::analyze`] are
+//! read-only store probes called by the runtime's hourly self-check and by
+//! `vikram evolution mapek`. [`MapekLoop::plan`],
+//! [`MapekLoop::execute`], [`MapekLoop::run_cycle`] and the `KnowledgeBase`
+//! are dormant — nothing schedules a mutating cycle, `knowledge`/`cycle_count`
+//! are process-local (lost on restart), and only failed-cycle events reach
+//! the durable store.
 
 use crate::error::Result;
 use crate::metrics;

@@ -15,6 +15,27 @@
 //! - Autonomy Manager: Implement autonomy levels and safety controls
 //! - Conversational Control: Natural language interface for evolution control
 //!
+//! # Surface status (what is actually reachable)
+//!
+//! Not every subsystem on [`EvolutionEngine`] is wired to a caller. The
+//! honest classification, mirrored in `docs/evolution-surface.md`:
+//!
+//! - **Live via runtime**: `experience`, `memory`, `reflection` (turn-end
+//!   recording + boot drain), `mapek.monitor`/`analyze` (hourly read-only
+//!   self-check), and `self_improvement.identify_improvement_opportunities`
+//!   (same self-check).
+//! - **Live via `vikram evolution` CLI (read-only)**: `dashboard.snapshot`,
+//!   plus store listings of experiences, proposals, memory, skills, events.
+//! - **Store-backed but dormant**: `hive` — lessons persist to the store,
+//!   but no production path calls `HiveLearning::record`, so the table
+//!   stays empty outside tests.
+//! - **Process-local analysis**: the `self_*` engines, `mapek`'s mutating
+//!   half (`plan`/`execute`/`run_cycle` + `KnowledgeBase`), `autonomy`,
+//!   and `conversational`. Their analyses read the durable store, but
+//!   their own state (`Vec`s, in-memory knowledge, approval queues) is
+//!   lost on restart and nothing in the runtime schedules or calls the
+//!   mutating paths. They are kept as honest scaffolding, not wired fakes.
+//!
 //! # Concurrency model
 //!
 //! [`EvolutionStore`] is the single shared handle (an `Arc<Mutex<Connection>>`)

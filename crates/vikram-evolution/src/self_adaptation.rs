@@ -24,6 +24,10 @@
 //! entry in [`AdaptationResult::not_applied`]. `AdaptationResult::applied` is
 //! `true` only when an action was actually carried out, so a strategy that was
 //! merely recorded never reads as applied.
+//!
+//! DORMANT / process-local: no runtime or CLI path calls this engine today.
+//! Its detection reads the durable store, but `adaptation_history` is an
+//! in-memory `Vec` — applied/attempted results are lost on restart.
 
 use crate::error::{EvolutionError, Result};
 use crate::metrics;

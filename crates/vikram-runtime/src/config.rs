@@ -85,6 +85,13 @@ pub struct Config {
     /// `security.tool_permissions`; both are honoured.)
     #[serde(default)]
     pub tool_permissions: std::collections::HashMap<String, String>,
+    /// Structural admission gate on learned skill proposals: before a create/patch/improve
+    /// lands, the SKILL.md it would write must pass the skills crate's own
+    /// frontmatter/metadata validation, and a patch's target must still exist and parse.
+    /// `false` restores apply-without-preflight. This is structural only — whether the
+    /// skill is any good is a behavioral question the gate does not answer.
+    #[serde(default = "default_true")]
+    pub skill_proposal_gate: bool,
 }
 
 /// Restrictions on mode *availability*, as distinct from the mode itself. `mode` says what this
@@ -467,6 +474,7 @@ impl Default for Config {
             security: SecurityConfig::default(),
             theme: ThemeConfig::default(),
             tool_permissions: std::collections::HashMap::new(),
+            skill_proposal_gate: true,
         }
     }
 }

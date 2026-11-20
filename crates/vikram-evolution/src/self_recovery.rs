@@ -1,7 +1,9 @@
 //! Self-Recovery Engine: Recover from failed changes and operational problems.
 //!
-//! SCAFFOLD: nothing in the workspace calls this engine yet; snapshots capture
-//! no real state and rollbacks record intent without restoring anything.
+//! SCAFFOLD / dormant-awaiting-caller: nothing in the runtime or CLI calls
+//! this engine; snapshots capture no real state, rollbacks record intent
+//! without restoring anything, and `snapshots`/`recovery_operations`/
+//! `failed_changes` are in-memory `Vec`s lost on restart.
 
 use crate::error::{EvolutionError, Result};
 use crate::store::EvolutionStore;

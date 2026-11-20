@@ -2,6 +2,11 @@
 //!
 //! This engine allows Vikram to independently manage models, providers, runtime
 //! settings, context, interface, agents, tools, and MCP integrations.
+//!
+//! DORMANT / process-local: nothing in the runtime or CLI calls this engine,
+//! and `change_history` is an in-memory `Vec` — a restart loses every
+//! recorded change. The engine only ever records *intent*; see
+//! [`ConfigChange::applied`].
 
 use crate::error::{EvolutionError, Result};
 use crate::store::EvolutionStore;

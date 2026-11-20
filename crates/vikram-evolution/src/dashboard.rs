@@ -1,3 +1,8 @@
+//! Read-only aggregate view over the [`EvolutionStore`].
+//!
+//! LIVE via CLI: [`Dashboard::snapshot`] is a pure store read reachable
+//! through `vikram evolution status`. It mutates nothing.
+
 use crate::error::Result;
 use crate::store::EvolutionStore;
 use serde::Serialize;

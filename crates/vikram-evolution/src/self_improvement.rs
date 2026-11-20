@@ -9,6 +9,13 @@
 //! reflection jobs. With no such evidence it returns an empty list and records
 //! *why* in [`SelfImprovementEngine::last_opportunity_note`] — it never
 //! invents "high token usage detected"-style findings.
+//!
+//! PARTIALLY LIVE: the opportunity scan is wired — the runtime's hourly
+//! self-check and `vikram evolution evaluate` both call
+//! [`SelfImprovementEngine::identify_improvement_opportunities`]. The
+//! execution half (`execute_improvement`, `track_improvement`,
+//! `get_improvement_history`) is dormant: `opportunities`/`executions` are
+//! in-memory `Vec`s lost on restart and no caller schedules execution.
 
 use crate::error::Result;
 use crate::metrics;

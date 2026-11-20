@@ -1,8 +1,11 @@
 //! Conversational Control: Natural language interface for evolution control.
 //!
-//! SCAFFOLD: nothing in the workspace calls this engine yet, and several
-//! handlers report canned outcomes ("rolled back", "queued") without doing the
-//! work. Do not surface its responses as fact until the actions are real.
+//! SCAFFOLD / dormant-awaiting-caller: nothing in the runtime, CLI or other
+//! crates calls this engine — there is no entry point that feeds it user
+//! text. Several handlers also report canned outcomes ("rolled back",
+//! "queued") without doing the work. `autonomous_enabled` and
+//! `command_history` are process-local. Do not surface its responses as
+//! fact until the actions are real and a caller exists.
 
 use crate::error::Result;
 use crate::store::EvolutionStore;

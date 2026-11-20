@@ -11,6 +11,11 @@
 //! cannot answer — per-model/per-agent performance, resource consumption,
 //! recovery/regression rates, skill effectiveness — are reported as `0.0` and
 //! named in `notes` as *not measured*, never estimated.
+//!
+//! DORMANT / process-local: nothing in the runtime or CLI calls this engine.
+//! `metrics_history`, `benchmarks` and `evaluation_results` are in-memory
+//! `Vec`s — a restart loses every tracked metric, benchmark and result.
+//! Only the store-derived parts of a benchmark run reflect durable data.
 
 use crate::error::{EvolutionError, Result};
 use crate::metrics;

@@ -1,8 +1,10 @@
 //! Runtime inspection and self-model maintenance.
 //!
-//! SCAFFOLD: nothing in the workspace calls this engine yet, and its inspect_*
-//! methods return representative constants rather than live runtime state. Do
-//! not surface its output as fact until it is wired to real inspection.
+//! SCAFFOLD / dormant-awaiting-caller: nothing in the workspace calls this
+//! engine, its inspect_* methods return representative constants rather than
+//! live runtime state, and `current_model` is process-local (lost on
+//! restart). Do not surface its output as fact until it is wired to real
+//! inspection and a caller exists.
 
 use crate::error::{EvolutionError, Result};
 use crate::store::EvolutionStore;

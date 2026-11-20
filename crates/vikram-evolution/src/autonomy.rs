@@ -1,6 +1,12 @@
 //! Autonomy Manager: Implement autonomy levels and safety controls.
 //!
 //! This engine classifies actions by risk and determines approval requirements.
+//!
+//! DORMANT / process-local: nothing in the runtime, CLI or other crates calls
+//! this engine — the self-check path does not consult it before acting.
+//! `action_history` and `pending_approvals` are in-memory `Vec`s, so
+//! approvals granted in one process are gone after a restart and an operator
+//! cannot answer a pending request from another process.
 
 use crate::error::{EvolutionError, Result};
 use crate::store::EvolutionStore;

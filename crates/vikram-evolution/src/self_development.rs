@@ -2,6 +2,11 @@
 //!
 //! This engine handles skill creation, tool development, agent development,
 //! and controlled source code modifications through a safe lifecycle.
+//!
+//! SCAFFOLD / dormant-awaiting-caller: nothing in the runtime or CLI calls
+//! this engine, and `projects` is an in-memory `Vec` — every
+//! [`DevelopmentProject`] is lost on restart. Stage advancement records
+//! intent; it does not produce deployable artifacts on its own.
 
 use crate::error::{EvolutionError, Result};
 use crate::store::EvolutionStore;

@@ -71,7 +71,7 @@ pub struct LearningProposal {
     pub key: String,
     pub content: String,
     pub reason: String,
-    pub status: String, // "pending" | "approved" | "rejected" | "applied"
+    pub status: String, // "pending" | "approved" | "rejected" | "applied" | "failed"
     pub created_ms: u64,
     pub before: Option<String>,
     pub after: Option<String>,
@@ -846,7 +846,12 @@ pub(crate) fn apply_or_stage(
             .map(|_| format!("auto-applied{}", tail(&proposal.reason)))
             .unwrap_or_else(|err| format!("could not save memory: {err}"))
     } else {
-        apply_skill_proposal(&proposal)
+        let gate = inner
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .skill_proposal_gate;
+        apply_skill_proposal_gated(&proposal, gate)
             .map(|_| format!("auto-applied{}", tail(&proposal.reason)))
             .unwrap_or_else(|err| format!("could not apply skill: {err}"))
     };
@@ -874,13 +879,25 @@ pub fn scope_of(target: &str, session: &SessionId) -> String {
 /// the proposal content is still the best available draft); every other action creates.
 /// The manager's error is returned verbatim so callers can audit exactly what refused.
 pub fn apply_skill_proposal(proposal: &LearningProposal) -> Result<(), String> {
-    apply_skill_with(&vikram_skills::Manager::new(), proposal)
+    apply_skill_proposal_gated(proposal, true)
+}
+
+/// [`apply_skill_proposal`] with the structural admission gate switchable. `gate: false`
+/// is the pre-gate behavior, kept for operators who set `skill_proposal_gate: false`;
+/// the manager's own write-time validation still applies either way.
+pub fn apply_skill_proposal_gated(proposal: &LearningProposal, gate: bool) -> Result<(), String> {
+    apply_skill_with(&vikram_skills::Manager::new(), proposal, gate)
 }
 
 fn apply_skill_with(
     manager: &vikram_skills::Manager,
     proposal: &LearningProposal,
+    gate: bool,
 ) -> Result<(), String> {
+    if gate {
+        skill_gate(manager, proposal)
+            .map_err(|err| format!("skill gate rejected the proposal: {err}"))?;
+    }
     let name = {
         let target = proposal.target.trim();
         if target.is_empty() {
@@ -912,6 +929,71 @@ fn apply_skill_with(
         },
         _ => create(),
     }
+}
+
+/// Structural admission gate for skill proposals: renders the SKILL.md the manager would
+/// write and runs it through the skills crate's own frontmatter/metadata validation —
+/// the same check `Manager::create`/`edit` apply before touching the filesystem —
+/// without writing anything. A patch must also find its target on disk and still parse.
+/// This is deliberately *structural*: it proves the artifact is loadable, not that the
+/// skill is any good. Behavioral gating (benchmarks, review) is future work; nothing
+/// here runs a model.
+fn skill_gate(manager: &vikram_skills::Manager, proposal: &LearningProposal) -> Result<(), String> {
+    let name = {
+        let target = proposal.target.trim();
+        if target.is_empty() {
+            "learned-skill"
+        } else {
+            target
+        }
+    };
+    let id = vikram_skills::SkillId::new(name).map_err(|err| err.to_string())?;
+    let dir = manager.root.join(id.as_str());
+    let existing = ["SKILL.md", "skill.md"]
+        .iter()
+        .map(|file| dir.join(file))
+        .find(|path| path.is_file());
+    let patch = matches!(proposal.action.as_str(), "patch" | "improve" | "replace");
+    let candidate = match (patch, existing) {
+        (true, Some(path)) => {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|err| format!("could not read {}: {err}", path.display()))?;
+            let fm = vikram_skills::Frontmatter::parse(&text).map_err(|err| err.to_string())?;
+            render_skill_document(&fm, &proposal.content)
+        }
+        _ => {
+            let reason = proposal.reason.trim();
+            let description = if reason.is_empty() {
+                id.as_str().to_owned()
+            } else {
+                reason
+                    .chars()
+                    .take(vikram_skills::DESCRIPTION_MAX)
+                    .collect::<String>()
+            };
+            let metadata = vikram_skills::SkillMetadata::new(id.as_str(), &description);
+            let fm = metadata.to_frontmatter(&proposal.content);
+            render_skill_document(&fm, &proposal.content)
+        }
+    };
+    let parsed = vikram_skills::Frontmatter::parse(&candidate).map_err(|err| err.to_string())?;
+    vikram_skills::SkillMetadata::from_frontmatter(&parsed, id.as_str())
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+/// `vikram_skills::frontmatter::render_document` is crate-private; this mirrors it so the
+/// gate can validate the exact bytes the manager would write.
+fn render_skill_document(fm: &vikram_skills::Frontmatter, body: &str) -> String {
+    let yaml = fm.to_yaml();
+    let mut document = String::from("---\n");
+    document.push_str(&yaml);
+    if !yaml.is_empty() && !yaml.ends_with('\n') {
+        document.push('\n');
+    }
+    document.push_str("---\n");
+    document.push_str(body);
+    document
 }
 
 /// How much of a correcting user message is kept as a correction note: the note points at
@@ -1218,7 +1300,7 @@ mod tests {
 
         let mut proposal = surface_proposal("skill", "patch", "audit-flow");
         proposal.content = "new body".to_owned();
-        apply_skill_with(&manager, &proposal).unwrap();
+        apply_skill_with(&manager, &proposal, true).unwrap();
 
         let doc = std::fs::read_to_string(tmp.path().join("skills/audit-flow/SKILL.md")).unwrap();
         assert!(doc.contains("new body"));
@@ -1233,7 +1315,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let manager = vikram_skills::Manager::at(tmp.path().join("skills"));
         let proposal = surface_proposal("skill", "improve", "learned-workflow");
-        apply_skill_with(&manager, &proposal).unwrap();
+        apply_skill_with(&manager, &proposal, true).unwrap();
         assert!(
             tmp.path()
                 .join("skills/learned-workflow/SKILL.md")
@@ -1246,10 +1328,90 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let manager = vikram_skills::Manager::at(tmp.path().join("skills"));
         let proposal = surface_proposal("skill", "create", "fresh-skill");
-        apply_skill_with(&manager, &proposal).unwrap();
+        apply_skill_with(&manager, &proposal, true).unwrap();
         assert!(tmp.path().join("skills/fresh-skill/SKILL.md").is_file());
         // A second create of the same name is refused, not silently overwritten.
-        assert!(apply_skill_with(&manager, &proposal).is_err());
+        assert!(apply_skill_with(&manager, &proposal, true).is_err());
+    }
+
+    #[test]
+    fn the_gate_rejects_a_proposal_whose_name_cannot_be_a_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = vikram_skills::Manager::at(tmp.path().join("skills"));
+        let too_long = "x".repeat(vikram_skills::NAME_MAX + 1);
+        for bad in ["Bad Name", "../escape", "double--dash", too_long.as_str()] {
+            let proposal = surface_proposal("skill", "create", bad);
+            let err = apply_skill_with(&manager, &proposal, true)
+                .expect_err("the gate must refuse an invalid name");
+            assert!(
+                err.contains("skill gate rejected"),
+                "rejection must be attributed to the gate, got: {err}"
+            );
+        }
+        assert!(
+            !tmp.path().join("skills").exists(),
+            "rejected proposals must not leave a skill behind"
+        );
+    }
+
+    #[test]
+    fn an_empty_target_still_falls_back_to_a_valid_skill_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = vikram_skills::Manager::at(tmp.path().join("skills"));
+        let proposal = surface_proposal("skill", "create", "  ");
+        apply_skill_with(&manager, &proposal, true).unwrap();
+        assert!(tmp.path().join("skills/learned-skill/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn the_gate_rejects_a_patch_when_the_existing_skill_no_longer_parses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = vikram_skills::Manager::at(tmp.path().join("skills"));
+        let skill_dir = tmp.path().join("skills/broken-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        // Duplicate `name` keys make the frontmatter unparseable.
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: broken-skill\ndescription: d\nname: broken-skill\n---\nbody\n",
+        )
+        .unwrap();
+
+        let proposal = surface_proposal("skill", "patch", "broken-skill");
+        let err = apply_skill_with(&manager, &proposal, true)
+            .expect_err("a patch onto an unloadable skill must be refused");
+        assert!(err.contains("skill gate rejected"), "got: {err}");
+        // The broken file is untouched: the gate rejected before any write.
+        let doc = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        assert!(doc.contains("body"));
+    }
+
+    #[test]
+    fn a_valid_patch_passes_the_gate_and_applies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = vikram_skills::Manager::at(tmp.path().join("skills"));
+        manager
+            .create("audit-flow", "audit desc", "old body")
+            .unwrap();
+        let mut proposal = surface_proposal("skill", "patch", "audit-flow");
+        proposal.content = "new body".to_owned();
+        apply_skill_with(&manager, &proposal, true).unwrap();
+        let doc = std::fs::read_to_string(tmp.path().join("skills/audit-flow/SKILL.md")).unwrap();
+        assert!(doc.contains("new body"));
+    }
+
+    #[test]
+    fn disabling_the_gate_skips_the_preflight_but_not_the_managers_own_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = vikram_skills::Manager::at(tmp.path().join("skills"));
+        let mut proposal = surface_proposal("skill", "create", "gate-off-skill");
+        proposal.content = "body".to_owned();
+        apply_skill_with(&manager, &proposal, false).unwrap();
+        assert!(tmp.path().join("skills/gate-off-skill/SKILL.md").is_file());
+
+        // Gate off does not mean garbage lands: the manager still refuses a bad name.
+        let bad = surface_proposal("skill", "create", "Bad Name");
+        let err = apply_skill_with(&manager, &bad, false).expect_err("manager still validates");
+        assert!(!err.contains("skill gate rejected"), "got: {err}");
     }
 
     #[test]

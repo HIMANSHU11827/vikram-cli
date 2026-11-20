@@ -2219,8 +2219,29 @@ fn learning(action: LearningAction) -> std::process::ExitCode {
                         )
                         .map_err(|e| e.to_string())?;
                     } else if p.kind == "skill" {
-                        vikram_runtime::learning::apply_skill_proposal(&p)
-                            .map_err(|e| e.to_string())?;
+                        // Same gate the auto-apply path runs: `skill_proposal_gate` in
+                        // config.json, on by default and on when the config cannot be read.
+                        let gate = vikram_runtime::Config::load()
+                            .map(|config| config.skill_proposal_gate)
+                            .unwrap_or(true);
+                        if let Err(err) =
+                            vikram_runtime::learning::apply_skill_proposal_gated(&p, gate)
+                        {
+                            // A refused skill must not stay "pending" looking approvable:
+                            // the same proposal would fail the same gate on every retry.
+                            mgr.set_proposal_status(&id, "failed");
+                            mgr.audit(vikram_runtime::LearningAuditEntry {
+                                ts_ms: vikram_runtime::types::now_ms(),
+                                session: p.session.clone(),
+                                kind: p.kind.clone(),
+                                action: p.action.clone(),
+                                target: p.target.clone(),
+                                outcome: "failed".to_owned(),
+                                detail: format!("skill proposal refused: {err}"),
+                            });
+                            mgr.save();
+                            return Err(format!("proposal `{id}` failed: {err}"));
+                        }
                     }
                     mgr.set_proposal_status(&id, "applied");
                     mgr.audit(vikram_runtime::LearningAuditEntry {

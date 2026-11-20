@@ -25,6 +25,11 @@
 //! Producers are *not required* to record `duration_ms`/`tokens_used`; when
 //! they do not, the corresponding average is `None` and every engine that
 //! would have used it reports "not recorded" instead of guessing.
+//!
+//! Reachability: every function here is a pure store read. Live callers are
+//! the runtime's hourly self-check (via `mapek.monitor`/`analyze` and the
+//! `self_improvement` opportunity scan) and the `vikram evolution` CLI.
+//! The dormant `self_*` engines also consume these aggregates when invoked.
 
 use crate::error::{EvolutionError, Result};
 use crate::store::EvolutionStore;
