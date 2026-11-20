@@ -1237,51 +1237,6 @@ impl RuntimeInner {
         {
             return None;
         }
-        let transcript = session.messages();
-        let query = transcript
-            .iter()
-            .rev()
-            .find(|m| m.role == vikram_contracts::Role::User)
-            .map(|m| m.text_body())
-            .unwrap_or_default();
-        if query.trim().is_empty() {
-            return None;
-        }
-        let terms = Self::retrieval_terms(&query);
-        // A conversation may draw on shared `global` notes and its own; nothing else in the shared
-        // table. Entity/user-scoped recall waits until the host, not the model, assigns those scopes.
-        let scopes = vec!["global".to_owned(), session.id.as_str().to_owned()];
-        // Hybrid recall: BM25 (FTS5) + token overlap + recency/importance, MMR-reranked. No local
-        // query embedding is available to the runtime (no cloud API is used), so the cosine
-        // signal is skipped unless a future embedder supplies one via HybridOptions.
-        let opts = crate::HybridOptions::default();
-        let Ok(scored) = self.memory.hybrid_recall(&terms, &scopes, 8, &opts) else {
-            return None;
-        };
-        let entries: Vec<(String, String, String)> = scored
-            .into_iter()
-            .map(|s| (s.scope, s.key, s.value))
-            .collect();
-        // Also pull free-form notes from MEMORY.md / USER.md (Hermes-style), matching terms.
-        let mut file_entries: Vec<(String, String, String)> = Vec::new();
-        let home = crate::config::vikram_home();
-        let mf = crate::memory_files::memory_file(&home);
-        let uf = crate::memory_files::user_file(&home);
-        for (scope, e) in [("memory", mf), ("user", uf)] {
-            for entry in e.load() {
-                let lower = entry.to_lowercase();
-                if terms.iter().any(|t| lower.contains(&t.to_lowercase())) {
-                    file_entries.push((scope.to_owned(), scope.to_owned(), entry));
-                }
-            }
-        }
-        let mut all_entries = entries;
-        all_entries.extend(file_entries);
-        if all_entries.is_empty() {
-            return None;
-        }
-        // use all_entries below
-        let entries = all_entries;
         let estimator = session.estimator();
         let budget_tokens = self
             .config
@@ -1289,25 +1244,111 @@ impl RuntimeInner {
             .unwrap_or_else(|e| e.into_inner())
             .context
             .memory_budget_tokens;
-        let mut block = String::from(
-            "Relevant memory (durable notes from earlier sessions; may be stale, verify before relying on it):\n",
-        );
-        let mut spent = estimator.estimate_text(&block);
-        let mut used = 0usize;
-        for (scope, key, value) in entries {
-            let line = format!("- [{scope}] {key}: {value}\n");
-            let cost = estimator.estimate_text(&line);
-            if spent + cost > budget_tokens {
-                break;
+        let mut block = String::new();
+        let mut spent = 0u64;
+        let transcript = session.messages();
+        let query = transcript
+            .iter()
+            .rev()
+            .find(|m| m.role == vikram_contracts::Role::User)
+            .map(|m| m.text_body())
+            .unwrap_or_default();
+        if !query.trim().is_empty() {
+            let terms = Self::retrieval_terms(&query);
+            // A conversation may draw on shared `global` notes and its own; nothing else in the
+            // shared table. Entity/user-scoped recall waits until the host assigns those scopes.
+            let scopes = vec!["global".to_owned(), session.id.as_str().to_owned()];
+            // Hybrid recall: BM25 (FTS5) + token overlap + recency/importance, MMR-reranked.
+            // No local query embedding is available to the runtime (no cloud API is used), so
+            // the cosine signal is skipped unless a future embedder supplies one.
+            let opts = crate::HybridOptions::default();
+            if let Ok(scored) = self.memory.hybrid_recall(&terms, &scopes, 8, &opts) {
+                let mut entries: Vec<(String, String, String)> = scored
+                    .into_iter()
+                    .map(|s| (s.scope, s.key, s.value))
+                    .collect();
+                // Also pull free-form notes from MEMORY.md / USER.md (Hermes-style).
+                let home = crate::config::vikram_home();
+                let mf = crate::memory_files::memory_file(&home);
+                let uf = crate::memory_files::user_file(&home);
+                for (scope, e) in [("memory", mf), ("user", uf)] {
+                    for entry in e.load() {
+                        let lower = entry.to_lowercase();
+                        if terms.iter().any(|t| lower.contains(&t.to_lowercase())) {
+                            entries.push((scope.to_owned(), scope.to_owned(), entry));
+                        }
+                    }
+                }
+                if !entries.is_empty() {
+                    let mut memory_block = String::from(
+                        "Relevant memory (durable notes from earlier sessions; may be stale, verify before relying on it):\n",
+                    );
+                    let mut memory_spent = estimator.estimate_text(&memory_block);
+                    let mut used = 0usize;
+                    for (scope, key, value) in entries {
+                        let line = format!("- [{scope}] {key}: {value}\n");
+                        let cost = estimator.estimate_text(&line);
+                        if memory_spent + cost > budget_tokens {
+                            break;
+                        }
+                        memory_spent += cost;
+                        used += 1;
+                        memory_block.push_str(&line);
+                    }
+                    if used > 0 {
+                        block.push_str(&memory_block);
+                        spent = memory_spent;
+                    }
+                }
             }
-            spent += cost;
-            used += 1;
-            block.push_str(&line);
         }
-        if used == 0 {
-            return None;
+        // Experiences are write-mostly without this: the last few outcomes for this agent,
+        // budgeted against whatever the memory lines left.
+        let experience_lines = self.recent_experiences(session);
+        if !experience_lines.is_empty() {
+            let section = format!(
+                "Recent experience (what earlier turns for this agent did; outcomes, not guarantees):\n{}\n",
+                experience_lines.join("\n")
+            );
+            let cost = estimator.estimate_text(&section);
+            if spent + cost <= budget_tokens {
+                block.push_str(&section);
+            }
         }
-        Some(block)
+        if block.is_empty() { None } else { Some(block) }
+    }
+
+    /// The last few experiences recorded for this session's agent, as compact outcome lines,
+    /// or nothing when the evolution store has none to offer.
+    fn recent_experiences(&self, session: &Arc<SessionRuntime>) -> Vec<String> {
+        let agent_id = session
+            .bot()
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "main".to_owned());
+        let engine = self.learning.evolution.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: runtime evolution lock mutex poisoned; recovering");
+            e.into_inner()
+        });
+        let Ok(experiences) = engine.experience.list(Some(&agent_id), 3) else {
+            return Vec::new();
+        };
+        drop(engine);
+        experiences
+            .iter()
+            .map(|exp| {
+                let request: String = exp.user_request.chars().take(120).collect();
+                let mut line = format!(
+                    "- {}: {request} -> {}",
+                    exp.task_category,
+                    exp.outcome.as_str()
+                );
+                if let Some(error) = exp.errors.first() {
+                    let error: String = error.chars().take(120).collect();
+                    line.push_str(&format!(" ({error})"));
+                }
+                line
+            })
+            .collect()
     }
 
     /// The instructions this conversation runs under: the active entity's own files when there is
@@ -2274,16 +2315,19 @@ impl Runtime {
             );
         }
         let evolution_db = crate::config::vikram_home().join("evolution.db");
+        let mut evolution_fallback: Option<String> = None;
         let evolution = match vikram_evolution::EvolutionEngine::open(
             evolution_db.clone(),
             evolution_skills_root,
         ) {
             Ok(engine) => engine,
             Err(e) => {
+                let reason = e.to_string();
                 eprintln!(
-                    "vikram: evolution store at {} failed ({e}); running on in-memory fallback — evolution history will not persist",
+                    "vikram: evolution store at {} failed ({reason}); running on in-memory fallback — evolution history will not persist",
                     evolution_db.display()
                 );
+                evolution_fallback = Some(reason);
                 match vikram_evolution::EvolutionEngine::open_in_memory(
                     crate::config::vikram_home().join("skills"),
                 ) {
@@ -2351,6 +2395,15 @@ impl Runtime {
             review_tasks: Arc::new(AtomicU64::new(0)),
             activity_seq: AtomicU64::new(0),
         });
+
+        if let Some(reason) = evolution_fallback {
+            inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!(
+                    "evolution store unavailable ({reason}); running on in-memory fallback — evolution history will not persist"
+                ),
+            });
+        }
 
         // Plugins declaring `components.stages` become stage handlers, competing with native
         // registrations by manifest priority; each still wraps the builtin default.
@@ -2457,6 +2510,42 @@ impl Runtime {
         let handle = RuntimeHandle {
             inner: Arc::clone(&inner),
         };
+
+        // Reflection jobs queued before a crash are durable; drain them off the boot path so a
+        // backlog cannot hold the first frame. Idempotent, so every boot runs it.
+        let recovery = Arc::clone(&inner);
+        tokio::spawn(async move {
+            let worker = Arc::clone(&recovery);
+            let drained = tokio::task::spawn_blocking(move || {
+                let engine = worker
+                    .learning
+                    .evolution
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                engine.recover_and_process()
+            })
+            .await;
+            match drained {
+                Ok(Ok((recovered, processed))) => {
+                    if recovered + processed > 0 {
+                        recovery.emit(RuntimeEvent::Notice {
+                            level: NoticeLevel::Info,
+                            text: format!(
+                                "evolution: recovered {recovered} interrupted reflection job(s), drained {processed}"
+                            ),
+                        });
+                    }
+                }
+                Ok(Err(err)) => recovery.emit(RuntimeEvent::Notice {
+                    level: NoticeLevel::Warn,
+                    text: format!("evolution job recovery failed: {err}"),
+                }),
+                Err(err) => recovery.emit(RuntimeEvent::Notice {
+                    level: NoticeLevel::Warn,
+                    text: format!("evolution job recovery task failed: {err}"),
+                }),
+            }
+        });
 
         // MCP probing and plugin discovery are independent of the UI's first frame.
         let mcp_inner = Arc::clone(&inner);

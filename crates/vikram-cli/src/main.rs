@@ -2184,24 +2184,24 @@ fn learning(action: LearningAction) -> std::process::ExitCode {
                         ));
                     }
                     if p.kind == "memory" {
-                        let scope = if p.target == "user" { "user" } else { "memory" };
                         let mem = vikram_runtime::MemoryStore::open(
                             vikram_runtime::config::database_path(),
                         )
                         .map_err(|e| e.to_string())?;
-                        mem.save(&p.key, &p.content, scope)
-                            .map_err(|e| e.to_string())?;
+                        // Same scope rule auto-apply uses: recall only reads `global` +
+                        // the proposal's session id, so a literal `user`/`memory` scope
+                        // would write a memory nothing can ever retrieve.
+                        mem.save(
+                            &p.key,
+                            &p.content,
+                            vikram_runtime::learning::scope_of(&p.target, &p.session),
+                        )
+                        .map_err(|e| e.to_string())?;
                     } else if p.kind == "skill" {
-                        let m = vikram_skills::Manager::new();
-                        let name = if p.target.is_empty() {
-                            "learned-skill"
-                        } else {
-                            &p.target
-                        };
-                        m.create(name, &p.reason, &p.content)
+                        vikram_runtime::learning::apply_skill_proposal(&p)
                             .map_err(|e| e.to_string())?;
                     }
-                    mgr.set_proposal_status(&id, "approved");
+                    mgr.set_proposal_status(&id, "applied");
                     mgr.audit(vikram_runtime::LearningAuditEntry {
                         ts_ms: vikram_runtime::types::now_ms(),
                         session: p.session.clone(),

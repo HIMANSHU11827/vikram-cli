@@ -267,6 +267,17 @@ pub(crate) async fn run_turn(
     };
 
     session.begin_turn(now_ms());
+    // The user message is already durable, so the count of user-role messages is this turn's
+    // ordinal. Providers that mirror the conversation hear about the turn here; the builtin
+    // ignores it.
+    let turn_number = session
+        .messages()
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .count();
+    inner
+        .memory_providers()
+        .on_turn_start(turn_number, &request_text);
     inner.emit(RuntimeEvent::StreamStarted {
         session: session.id.clone(),
         turn: turn.clone(),
@@ -1510,6 +1521,31 @@ impl Drop for TurnGuard {
     }
 }
 
+/// The assistant prose a finished turn committed, for providers that sync the exchange. Only
+/// assistant messages after the turn's own user message count; anything earlier belongs to a
+/// previous turn. An empty string means the turn produced no prose.
+fn last_turn_assistant_text(session: &SessionRuntime, request: &str) -> String {
+    let messages = session.messages();
+    let start = messages
+        .iter()
+        .rposition(|m| m.role == Role::User && m.text_body() == request)
+        .map(|index| index + 1)
+        .or_else(|| {
+            messages
+                .iter()
+                .rposition(|m| m.role == Role::User)
+                .map(|index| index + 1)
+        })
+        .unwrap_or(0);
+    messages[start..]
+        .iter()
+        .filter(|m| m.role == Role::Assistant)
+        .map(|m| m.text_body())
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// What a finished turn is worth telling the rest of the runtime: how it ended, what it cost, what
 /// the operator asked for, and what the turn actually did.
 struct TurnReport<'a> {
@@ -1545,6 +1581,15 @@ fn finish(
     *inner.last_tokens_per_sec.lock().expect("tps metric") = tps;
 
     session.finish_turn(outcome, now_ms());
+    // Providers that mirror the conversation get the exchange after it is durable; the builtin
+    // ignores it, so this changes nothing for the default backend. A turn that failed before
+    // any prose exists has nothing to mirror.
+    let assistant_text = last_turn_assistant_text(session, request);
+    if !(outcome == TurnState::Failed && assistant_text.is_empty()) {
+        inner
+            .memory_providers()
+            .sync_all(request, &assistant_text, session.id.as_str());
+    }
     // Dialectic user modeling: derive preferences/habits/goals from this turn's user
     // request (heuristic, local, deterministic) for future turns' supplement layer.
     if outcome != TurnState::Cancelled {

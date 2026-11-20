@@ -402,7 +402,46 @@ impl Daemon {
         self.reconcile_lost(now)?;
         self.sweep_state()?;
         self.beat(now, &mut report).await;
+        self.maintenance(now, &mut report).await;
         Ok(report)
+    }
+
+    /// The one piece of runtime housekeeping the daemon can do without a model: memory
+    /// consolidation, against the same `vikram.db` the scheduler store opened and with the same
+    /// defaults the `memory.consolidate` tool uses. Hourly, stamped before the work starts so a
+    /// slow pass cannot overlap the next tick's, and failures are reported rather than retried
+    /// hot.
+    async fn maintenance(&mut self, now: Millis, report: &mut TickReport) {
+        const KEY: &str = "maintenance.consolidate.last_ms";
+        const INTERVAL: Millis = 60 * 60_000;
+        let last = self.store.state_ms(KEY).ok().flatten().unwrap_or(0);
+        if now.saturating_sub(last) < INTERVAL {
+            return;
+        }
+        if let Err(err) = self.store.set_state_ms(KEY, now) {
+            report.refused.push(format!("maintenance: {err}"));
+            return;
+        }
+        let database = self.home.join("vikram.db");
+        let outcome = tokio::task::spawn_blocking(move || {
+            let store = vikram_runtime::consolidation::ConsolidationStore::open(&database)?;
+            store.run_consolidation(
+                None,
+                &vikram_runtime::consolidation::ConsolidationPolicy::default(),
+            )
+        })
+        .await;
+        match outcome {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                eprintln!("[vikram] memory consolidation failed: {err}");
+                report.refused.push(format!("maintenance: {err}"));
+            }
+            Err(err) => {
+                eprintln!("[vikram] memory consolidation task failed: {err}");
+                report.refused.push(format!("maintenance: {err}"));
+            }
+        }
     }
 
     /// A `running` row older than its job's timeout is a lost Finished, not a slow job: the work

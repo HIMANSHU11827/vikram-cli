@@ -566,8 +566,13 @@ pub(crate) fn on_turn_end(
         return;
     }
     let turns = inner.learning.surface.note_turn(&session.id);
-    if growth.had_tools() || !growth.errors.is_empty() || outcome == TurnState::Failed {
-        record_and_reflect(inner, session, request, outcome, growth);
+    let corrections = detect_corrections(request);
+    if growth.had_tools()
+        || !growth.errors.is_empty()
+        || outcome == TurnState::Failed
+        || !corrections.is_empty()
+    {
+        record_and_reflect(inner, session, request, outcome, growth, &corrections);
     }
     let nudge_due = inner.memory_nudge_due(session);
     if review_is_due(
@@ -592,6 +597,7 @@ fn record_and_reflect(
     request: &str,
     outcome: crate::types::TurnState,
     growth: &TurnGrowth,
+    corrections: &[String],
 ) {
     use crate::types::TurnState;
     let failed = outcome == TurnState::Failed;
@@ -618,7 +624,7 @@ fn record_and_reflect(
         },
         tools_used: growth.tools.clone(),
         errors: growth.errors.clone(),
-        corrections: Vec::new(),
+        corrections: corrections.to_vec(),
         feedback: None,
         reusable: !failed && growth.errors.is_empty() && growth.tools.len() >= 2,
         sensitivity: vikram_evolution::Sensitivity::Private,
@@ -709,15 +715,9 @@ pub(crate) fn apply_or_stage(
             .map(|_| format!("auto-applied{}", tail(&proposal.reason)))
             .unwrap_or_else(|err| format!("could not save memory: {err}"))
     } else {
-        let name = if proposal.target.is_empty() {
-            "learned-skill"
-        } else {
-            &proposal.target
-        };
-        vikram_skills::Manager::new()
-            .create(name, &proposal.reason, &proposal.content)
+        apply_skill_proposal(&proposal)
             .map(|_| format!("auto-applied{}", tail(&proposal.reason)))
-            .unwrap_or_else(|err| format!("could not create skill: {err}"))
+            .unwrap_or_else(|err| format!("could not apply skill: {err}"))
     };
     let applied = outcome.starts_with("auto-applied");
     audit(
@@ -732,9 +732,107 @@ pub(crate) fn apply_or_stage(
 /// Memory writes land in the session's own scope: automatic recall only reads `global` +
 /// the session id, and the shared store has no user dimension — a literal `user`/`memory`
 /// scope would be both invisible to recall and readable by every other session.
-fn scope_of(target: &str, session: &SessionId) -> String {
+pub fn scope_of(target: &str, session: &SessionId) -> String {
     let _ = target;
     session.as_str().to_owned()
+}
+
+/// Applies one staged skill proposal through the skills [`vikram_skills::Manager`], honoring
+/// `action`: "patch"/"improve"/"replace" rewrite an existing skill's body while keeping its
+/// frontmatter (a patch naming a skill that does not exist yet falls back to create, since
+/// the proposal content is still the best available draft); every other action creates.
+/// The manager's error is returned verbatim so callers can audit exactly what refused.
+pub fn apply_skill_proposal(proposal: &LearningProposal) -> Result<(), String> {
+    apply_skill_with(&vikram_skills::Manager::new(), proposal)
+}
+
+fn apply_skill_with(
+    manager: &vikram_skills::Manager,
+    proposal: &LearningProposal,
+) -> Result<(), String> {
+    let name = {
+        let target = proposal.target.trim();
+        if target.is_empty() {
+            "learned-skill"
+        } else {
+            target
+        }
+    };
+    let create = || {
+        let reason = proposal.reason.trim();
+        let description = if reason.is_empty() {
+            name.to_owned()
+        } else {
+            reason
+                .chars()
+                .take(vikram_skills::DESCRIPTION_MAX)
+                .collect::<String>()
+        };
+        manager
+            .create(name, &description, &proposal.content)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    };
+    match proposal.action.as_str() {
+        "patch" | "improve" | "replace" => match manager.edit(name, &proposal.content) {
+            Ok(()) => Ok(()),
+            Err(vikram_skills::SkillError::NotFound { .. }) => create(),
+            Err(err) => Err(err.to_string()),
+        },
+        _ => create(),
+    }
+}
+
+/// How much of a correcting user message is kept as a correction note: the note points at
+/// what the user said, it is not a transcript copy.
+pub const MAX_CORRECTION_LEN: usize = 500;
+
+/// Phrases that only appear when the user is pushing back on what just happened. The list is
+/// deliberately narrow — a false positive records an ordinary request as a correction, and
+/// under an auto policy that writes it into memory unsupervised.
+const CORRECTION_STARTS: &[&str] = &[
+    "no,",
+    "no.",
+    "nope",
+    "wrong,",
+    "wrong.",
+    "incorrect",
+    "not quite",
+    "that's wrong",
+    "thats wrong",
+    "actually,",
+    "actually ",
+    "i meant",
+    "you should have",
+];
+
+const CORRECTION_ANYWHERE: &[&str] = &[
+    ", not ",
+    " instead",
+    " rather than",
+    " should have ",
+    " you should have ",
+    " i meant ",
+];
+
+/// Correction detection for the growth pipeline. The turn's user request is the only signal
+/// available without touching the turn loop: when it reads as a correction, the bounded text
+/// itself becomes the note. This is a heuristic, not a classifier — it misses corrections
+/// phrased without these markers and can fire on a request that merely mentions "instead".
+/// Both failure modes are why the note goes through the same approval policy as every other
+/// proposal rather than being written directly.
+pub(crate) fn detect_corrections(request: &str) -> Vec<String> {
+    let text = request.trim();
+    if text.chars().count() < 8 {
+        return Vec::new();
+    }
+    let lower = text.to_lowercase();
+    let hit = CORRECTION_STARTS.iter().any(|s| lower.starts_with(s))
+        || CORRECTION_ANYWHERE.iter().any(|s| lower.contains(s));
+    if !hit {
+        return Vec::new();
+    }
+    vec![text.chars().take(MAX_CORRECTION_LEN).collect()]
 }
 
 fn tail(reason: &str) -> String {
@@ -908,6 +1006,119 @@ mod tests {
         assert_eq!(mgr.note_turn(&a), 1);
         assert_eq!(mgr.note_turn(&a), 2);
         assert_eq!(mgr.note_turn(&b), 1);
+    }
+
+    fn surface_proposal(kind: &str, action: &str, target: &str) -> LearningProposal {
+        LearningProposal {
+            id: "lrn-test".to_owned(),
+            session: session(),
+            kind: kind.to_owned(),
+            target: target.to_owned(),
+            action: action.to_owned(),
+            key: "k".to_owned(),
+            content: "body content".to_owned(),
+            reason: "because".to_owned(),
+            status: "pending".to_owned(),
+            created_ms: 1,
+            before: None,
+            after: None,
+        }
+    }
+
+    #[test]
+    fn correction_detection_fires_on_real_pushback() {
+        for text in [
+            "no, use pnpm not npm",
+            "No. the config lives in src/",
+            "actually, the endpoint is /v2",
+            "that's wrong — it should have used the cache",
+            "run the build instead",
+            "I meant the other file, not this one",
+        ] {
+            let found = detect_corrections(text);
+            assert_eq!(found.len(), 1, "{text:?} should read as a correction");
+            assert_eq!(found[0], text.trim());
+        }
+    }
+
+    #[test]
+    fn correction_detection_ignores_ordinary_requests() {
+        for text in [
+            "please refactor the parser",
+            "add a test for the login flow",
+            "no",
+            "what does this function do?",
+            "the build finished successfully",
+        ] {
+            assert!(
+                detect_corrections(text).is_empty(),
+                "{text:?} must not be recorded as a correction"
+            );
+        }
+    }
+
+    #[test]
+    fn correction_notes_are_bounded() {
+        let long = format!("no, {}", "x".repeat(5_000));
+        let found = detect_corrections(&long);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].chars().count() <= MAX_CORRECTION_LEN);
+    }
+
+    #[test]
+    fn approved_memory_scope_is_one_recall_reads() {
+        let s = session();
+        let scope = scope_of("user", &s);
+        assert_eq!(scope, s.as_str());
+        assert_ne!(scope, "user");
+        assert_ne!(scope, "memory");
+        // Recall reads exactly `global` + the session id (runtime.rs retrieved_memory).
+        let scopes = ["global".to_owned(), s.as_str().to_owned()];
+        assert!(scopes.contains(&scope));
+    }
+
+    #[test]
+    fn skill_patch_updates_the_existing_skill_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = vikram_skills::Manager::at(tmp.path().join("skills"));
+        manager
+            .create("audit-flow", "audit desc", "old body")
+            .unwrap();
+
+        let mut proposal = surface_proposal("skill", "patch", "audit-flow");
+        proposal.content = "new body".to_owned();
+        apply_skill_with(&manager, &proposal).unwrap();
+
+        let doc = std::fs::read_to_string(tmp.path().join("skills/audit-flow/SKILL.md")).unwrap();
+        assert!(doc.contains("new body"));
+        assert!(!doc.contains("old body"));
+        // edit keeps the frontmatter the create wrote.
+        assert!(doc.contains("description: audit desc"));
+        assert!(doc.contains("name: audit-flow"));
+    }
+
+    #[test]
+    fn skill_patch_for_a_missing_skill_creates_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = vikram_skills::Manager::at(tmp.path().join("skills"));
+        let proposal = surface_proposal("skill", "improve", "learned-workflow");
+        apply_skill_with(&manager, &proposal).unwrap();
+        assert!(
+            tmp.path()
+                .join("skills/learned-workflow/SKILL.md")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn skill_create_still_creates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = vikram_skills::Manager::at(tmp.path().join("skills"));
+        let proposal = surface_proposal("skill", "create", "fresh-skill");
+        apply_skill_with(&manager, &proposal).unwrap();
+        assert!(tmp.path().join("skills/fresh-skill/SKILL.md").is_file());
+        // A second create of the same name is refused, not silently overwritten.
+        assert!(apply_skill_with(&manager, &proposal).is_err());
     }
 
     #[test]

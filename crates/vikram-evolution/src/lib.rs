@@ -26,11 +26,13 @@
 //! # Background runner
 //!
 //! There is no implicit thread: [`EvolutionEngine::recover_and_process`]
-//! drains reflection jobs synchronously. A host that wants a background
-//! loop can `spawn` a task that calls it periodically — nothing calls it
-//! today, so queued reflection jobs wait for an explicit caller.
-//! `learning::on_turn_end` is the one wired path: it records experience
-//! and runs reflection synchronously on every tool-bearing turn.
+//! drains reflection jobs synchronously. The runtime calls it once on
+//! boot from a spawned blocking task (`Runtime::start`), which is the
+//! only wired caller — queued jobs still wait for an explicit caller
+//! between boots.
+//! `learning::on_turn_end` is the other wired path: it records
+//! experience and runs reflection synchronously on every tool-bearing
+//! turn (and on turns where the user pushed back).
 //!
 //! # Store trait
 //!

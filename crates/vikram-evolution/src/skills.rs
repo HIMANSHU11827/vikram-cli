@@ -63,6 +63,12 @@ impl SkillEvolution {
 
     /// Write `content` as the skill's `SKILL.md`.
     ///
+    /// `skills_root` is the same directory `vikram-skills` discovery scans, so the file
+    /// must carry the frontmatter discovery requires (`name` + `description`) or the skill
+    /// is written but never loads. Content that already opens with a frontmatter block is
+    /// written verbatim — the caller owns its validity; bare content is wrapped with a
+    /// generated header.
+    ///
     /// Goes through a sibling temp file + rename so a failed write never
     /// leaves a truncated `SKILL.md` behind (rename is atomic on the same
     /// filesystem), which is what makes [`Self::commit_version`]'s
@@ -71,9 +77,10 @@ impl SkillEvolution {
         let dir = self.skill_dir(name)?;
         fs::create_dir_all(&dir).map_err(|e| EvolutionError::Io(e.to_string()))?;
         let target = dir.join("SKILL.md");
+        let document = skill_document(name, content);
         let seq = SKILL_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = dir.join(format!(".SKILL.md.tmp-{}-{seq}", std::process::id()));
-        fs::write(&tmp, content).map_err(|e| EvolutionError::Io(e.to_string()))?;
+        fs::write(&tmp, document).map_err(|e| EvolutionError::Io(e.to_string()))?;
         if let Err(e) = fs::rename(&tmp, &target) {
             let _ = fs::remove_file(&tmp);
             return Err(EvolutionError::Io(e.to_string()));
@@ -216,8 +223,40 @@ impl SkillEvolution {
     }
 }
 
-/// Reject names that could escape `skills_root` (or collide after
-/// sanitisation). Names must be a single, non-empty path component.
+/// Wrap bare skill content in the frontmatter block discovery requires. Content that already
+/// opens with `---` is returned unchanged: it is a full document and its frontmatter is the
+/// caller's responsibility.
+fn skill_document(name: &str, content: &str) -> String {
+    let trimmed = content.trim_start();
+    if trimmed.starts_with("---\n") || trimmed.starts_with("---\r\n") {
+        return content.to_string();
+    }
+    let description = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .unwrap_or(name);
+    let description: String = description
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    let description = if description.trim().is_empty() {
+        format!("{name} workflow")
+    } else {
+        // Double-quoted YAML scalar: safe for any single-line text after escaping.
+        format!(
+            "\"{}\"",
+            description.replace('\\', "\\\\").replace('"', "\\\"")
+        )
+    };
+    format!("---\nname: {name}\ndescription: {description}\n---\n{content}")
+}
+
+/// Reject names that could escape `skills_root` — or that skill discovery would refuse anyway:
+/// the rules mirror `vikram-skills`' `SkillMetadata::validate_name` (lowercase ASCII
+/// alphanumerics and `-`, starting alphanumeric, no `--`, at most 64 bytes) so a skill
+/// evolution accepts is one discovery can actually load.
 pub fn validate_skill_name(name: &str) -> Result<()> {
     let name = name.trim();
     if name.is_empty() {
@@ -225,16 +264,29 @@ pub fn validate_skill_name(name: &str) -> Result<()> {
             "skill name must not be empty".to_string(),
         ));
     }
-    if name.contains('/')
-        || name.contains('\\')
-        || name.contains('\0')
-        || name == "."
-        || name == ".."
-        || name.contains("..")
+    let invalid = |reason: &str| {
+        Err(EvolutionError::Validation(format!(
+            "invalid skill name {name:?}: {reason}"
+        )))
+    };
+    if name.len() > 64 {
+        return invalid("longer than 64 bytes");
+    }
+    let first = name.chars().next().unwrap_or(' ');
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return invalid("must start with a lowercase ASCII letter or a digit");
+    }
+    if name.ends_with('-') {
+        return invalid("must not end with '-'");
+    }
+    if name.contains("--") {
+        return invalid("must not contain '--'");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
-        return Err(EvolutionError::Security(format!(
-            "invalid skill name (path traversal): {name:?}"
-        )));
+        return invalid("only lowercase letters, digits and '-' are allowed");
     }
     Ok(())
 }
@@ -258,18 +310,78 @@ mod tests {
         let (engine, _tmp) = engine();
         let v1 = engine.create_skill("demo", "step1", "init").unwrap();
         assert_eq!(v1.version, 1);
-        assert_eq!(engine.read_skill("demo").unwrap(), "step1");
+        assert_eq!(
+            engine.read_skill("demo").unwrap(),
+            skill_document("demo", "step1")
+        );
 
         let v2 = engine
             .improve_skill("demo", "step1\nstep2", "add step")
             .unwrap();
         assert_eq!(v2.version, 2);
-        assert_eq!(engine.read_skill("demo").unwrap(), "step1\nstep2");
+        assert_eq!(
+            engine.read_skill("demo").unwrap(),
+            skill_document("demo", "step1\nstep2")
+        );
 
         let restored = engine.rollback("demo", 1).unwrap();
         assert_eq!(restored.version, 3);
-        assert_eq!(engine.read_skill("demo").unwrap(), "step1");
+        assert_eq!(
+            engine.read_skill("demo").unwrap(),
+            skill_document("demo", "step1")
+        );
         assert_eq!(engine.list_versions("demo").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn written_skill_carries_discoverable_frontmatter() {
+        let (engine, _tmp) = engine();
+        engine
+            .create_skill("audit-flow", "run the audit checklist", "init")
+            .unwrap();
+        let doc = engine.read_skill("audit-flow").unwrap();
+        assert!(doc.starts_with("---\nname: audit-flow\ndescription: "));
+        assert!(doc.contains("\n---\nrun the audit checklist"));
+        // The description line must be a single valid YAML scalar.
+        let fm = doc.split("\n---\n").next().unwrap();
+        assert!(fm.contains("description: \"run the audit checklist\""));
+    }
+
+    #[test]
+    fn frontmatter_content_is_written_verbatim() {
+        let full = "---\nname: demo\ndescription: caller-owned\n---\nbody\n";
+        assert_eq!(skill_document("demo", full), full);
+        // Leading whitespace before the fence still counts as a document.
+        assert_eq!(
+            skill_document("demo", &format!("  \n{full}")),
+            format!("  \n{full}")
+        );
+    }
+
+    #[test]
+    fn skill_names_match_what_discovery_accepts() {
+        for ok in ["demo", "audit-flow", "v2", "a1-b2"] {
+            assert!(validate_skill_name(ok).is_ok(), "{ok} should be valid");
+        }
+        for bad in [
+            "",
+            "  ",
+            "../escape",
+            "a/b",
+            "My_Skill",
+            "UPPER",
+            "a--b",
+            "-lead",
+            "trail-",
+            "with space",
+            "dot.name",
+        ] {
+            assert!(
+                validate_skill_name(bad).is_err(),
+                "{bad:?} must be rejected before it reaches disk"
+            );
+        }
+        assert!(validate_skill_name(&"a".repeat(65)).is_err());
     }
 
     #[test]
