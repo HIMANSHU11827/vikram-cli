@@ -12,6 +12,7 @@ mod plugins;
 mod skills;
 mod terminal;
 mod tools;
+mod transforms;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -135,6 +136,11 @@ enum Command {
     Plugins {
         #[command(subcommand)]
         action: Option<plugins::PluginsAction>,
+    },
+    /// Apply, inspect, and roll back plugin-declared file transforms.
+    Transforms {
+        #[command(subcommand)]
+        action: Option<transforms::TransformsAction>,
     },
     /// Browse and install the bundled hook-module catalog.
     Modules {
@@ -865,6 +871,10 @@ fn main() -> std::process::ExitCode {
         Command::Plugins { action } => {
             let action = action.unwrap_or(plugins::PluginsAction::List);
             exit(plugins::run(action))
+        }
+        Command::Transforms { action } => {
+            let action = action.unwrap_or(transforms::TransformsAction::List);
+            exit(transforms::run(action))
         }
         Command::Modules { action } => {
             let action = action.unwrap_or(modules::ModulesAction::List { from: None });

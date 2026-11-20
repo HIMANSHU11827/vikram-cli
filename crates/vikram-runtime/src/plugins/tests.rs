@@ -1372,3 +1372,33 @@ fn execute_hides_the_environment_unless_env_is_declared() {
     );
     unsafe { std::env::remove_var("VIKRAM_PLUGIN_SECRET_TEST") };
 }
+
+// ---- transforms ----------------------------------------------------------
+
+#[test]
+fn manifest_without_transforms_parses_with_empty_list() {
+    let manifest = PluginManifest::parse(r#"{"name":"old","version":"1.0.0","entry":"x.sh"}"#)
+        .expect("legacy manifest still parses");
+    assert!(manifest.transforms.is_empty());
+}
+
+#[test]
+fn manifest_transforms_round_trip() {
+    let raw = r##"{
+        "name":"packer","version":"1.0.0","entry":"x.sh",
+        "transforms":[
+            {"op":"add_file","path":"skills/demo/SKILL.md","content":"# hi"},
+            {"op":"write_file","path":"skills/demo/data.bin","content_b64":"AAEC"}
+        ]
+    }"##;
+    let manifest = PluginManifest::parse(raw).expect("manifest parses");
+    assert_eq!(manifest.transforms.len(), 2);
+    assert_eq!(manifest.transforms[0].op, "add_file");
+    assert_eq!(manifest.transforms[0].path, "skills/demo/SKILL.md");
+    assert_eq!(manifest.transforms[0].content.as_deref(), Some("# hi"));
+    assert_eq!(manifest.transforms[1].content_b64.as_deref(), Some("AAEC"));
+
+    let rendered = serde_json::to_string(&manifest).expect("serializes");
+    let reparsed = PluginManifest::parse(&rendered).expect("reparses");
+    assert_eq!(manifest, reparsed);
+}

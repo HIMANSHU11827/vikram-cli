@@ -193,6 +193,7 @@ impl PluginRegistry {
         let dir = self
             .plugin_dir(id)
             .ok_or_else(|| format!("plugin not found: {id}"))?;
+        warn_active_transforms(&dir, id);
         std::fs::remove_dir_all(&dir).map_err(|e| format!("cannot remove {}: {e}", dir.display()))
     }
 
@@ -225,7 +226,42 @@ impl PluginRegistry {
             "{}\n",
             serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
         );
-        write_atomic(&manifest_path, &body)
+        write_atomic(&manifest_path, &body)?;
+        if !enabled {
+            warn_active_transforms(&dir, id);
+        }
+        Ok(())
+    }
+}
+
+/// Warn on stderr when the plugin has applied file transforms recorded in `transforms.json`.
+///
+/// The state file is owned by the CLI's transform manager; this is a read-only peek so disabling
+/// or uninstalling a plugin never silently orphans files it wrote under the managed roots. The
+/// manifest id is preferred over the directory name because that is the key transforms.json uses.
+fn warn_active_transforms(dir: &Path, fallback_id: &str) {
+    let id = PluginManifest::from_dir(dir)
+        .map(|manifest| manifest.id().to_owned())
+        .unwrap_or_else(|_| fallback_id.to_owned());
+    let path = crate::config::vikram_home().join("transforms.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(state) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    let applied = state
+        .get("plugins")
+        .and_then(|plugins| plugins.get(&id))
+        .and_then(|record| record.get("ops"))
+        .and_then(|ops| ops.as_array())
+        .map(|ops| !ops.is_empty())
+        .unwrap_or(false);
+    if applied {
+        eprintln!(
+            "warning: plugin `{id}` has applied file transforms; \
+             run `vikram transforms rollback {id}` to revert them"
+        );
     }
 }
 

@@ -613,6 +613,9 @@ pub(crate) struct RuntimeInner {
     pub config: std::sync::RwLock<Config>,
     pub store: Store,
     pub memory: crate::MemoryStore,
+    /// The memory backend `config.memory_provider` selected at boot. Lifecycle events fan out to
+    /// its providers; a mutex because an external provider may register after boot.
+    pub memory_providers: Mutex<crate::MemoryProviderManager>,
     pub context: Arc<crate::context::ContextLoader>,
     pub hive: HiveState,
     pub learning: LearningState,
@@ -809,6 +812,13 @@ impl RuntimeInner {
                 e.into_inner()
             })
             .clone()
+    }
+
+    pub fn memory_providers(&self) -> std::sync::MutexGuard<'_, crate::MemoryProviderManager> {
+        self.memory_providers.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: memory providers lock mutex poisoned; recovering");
+            e.into_inner()
+        })
     }
 
     pub fn publish_session(&self, session: &SessionRuntime) {
@@ -1694,6 +1704,7 @@ impl RuntimeInner {
             .lock()
             .expect("sessions lock")
             .push(Arc::clone(&session));
+        self.memory_providers().initialize_all(session.id.as_str());
         self.emit(RuntimeEvent::SessionCreated(session.snapshot()));
         Ok(session)
     }
@@ -2113,6 +2124,10 @@ impl Runtime {
             Some(provider) => Some(provider),
             None => crate::provider::for_config(&config)?,
         };
+        let memory_providers = Mutex::new(crate::MemoryProviderManager::from_config(
+            &config,
+            memory.clone(),
+        )?);
 
         // Visibility state persists next to the MCP config so `toggle_mcp_visibility`
         // and `set_exposed_tools` survive restarts; the manager loads existing
@@ -2172,6 +2187,7 @@ impl Runtime {
             config: std::sync::RwLock::new(config),
             store,
             memory,
+            memory_providers,
             context,
             hive: HiveState { manager: hive },
             tickets: TicketState { manager: tickets },
@@ -2244,6 +2260,7 @@ impl Runtime {
                     e.into_inner()
                 }) = messages;
             }
+            inner.memory_providers().initialize_all(session.id.as_str());
             inner
                 .sessions
                 .lock()
@@ -2456,6 +2473,7 @@ impl RuntimeHandle {
             || old.api_key() != new_config.api_key()
             || old.fallback_model != new_config.fallback_model
             || old.memory_provider != new_config.memory_provider;
+        let memory_provider_changed = old.memory_provider != new_config.memory_provider;
         // Drop the read guard before taking the write lock.
         drop(old);
 
@@ -2483,6 +2501,23 @@ impl RuntimeHandle {
                         level: NoticeLevel::Warn,
                         text: format!("provider reload failed: {err}"),
                     });
+                }
+            }
+            if memory_provider_changed {
+                match crate::MemoryProviderManager::from_config(
+                    &new_config,
+                    self.inner.memory.clone(),
+                ) {
+                    Ok(manager) => {
+                        self.inner.memory_providers().shutdown_all();
+                        *self.inner.memory_providers() = manager;
+                    }
+                    Err(err) => {
+                        self.inner.emit(RuntimeEvent::Notice {
+                            level: NoticeLevel::Warn,
+                            text: format!("memory provider reload failed: {err}"),
+                        });
+                    }
                 }
             }
         }
@@ -3220,6 +3255,13 @@ impl RuntimeHandle {
                 .with_text(session.title())
                 .with_details(serde_json::json!({"title": session.title()})),
         );
+        self.inner.memory_providers().on_session_end(
+            session
+                .messages()
+                .iter()
+                .filter_map(|m| serde_json::to_value(m).ok())
+                .collect(),
+        );
         self.inner.publish_metrics();
         Ok(())
     }
@@ -3243,6 +3285,11 @@ impl RuntimeHandle {
                     .map(|row| row.title)
             })
             .unwrap_or_default();
+        let ended_messages = self
+            .inner
+            .session(session)
+            .map(|live| live.messages())
+            .unwrap_or_default();
         self.inner
             .store
             .delete_session(session)
@@ -3262,6 +3309,12 @@ impl RuntimeHandle {
                 .with_model(self.inner.model())
                 .with_text(&title)
                 .with_details(serde_json::json!({"title": title, "deleted": true})),
+        );
+        self.inner.memory_providers().on_session_end(
+            ended_messages
+                .iter()
+                .filter_map(|m| serde_json::to_value(m).ok())
+                .collect(),
         );
         self.inner.publish_metrics();
         Ok(())
@@ -3317,6 +3370,9 @@ impl RuntimeHandle {
             .lock()
             .expect("sessions lock")
             .push(Arc::clone(&live));
+        self.inner
+            .memory_providers()
+            .initialize_all(live.id.as_str());
         self.inner
             .emit(RuntimeEvent::SessionUpdated(live.snapshot()));
         self.inner.publish_metrics();
@@ -4765,10 +4821,15 @@ impl RuntimeHandle {
         V: AsRef<str>,
         S: AsRef<str>,
     {
+        let (key, value, scope) = (key.as_ref(), value.as_ref(), scope.as_ref());
         self.inner
             .memory
             .save(key, value, scope)
-            .map_err(|e| RuntimeError::Store(e.to_string()))
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        self.inner
+            .memory_providers()
+            .on_memory_write("save", key, value);
+        Ok(())
     }
 
     pub fn memory_search<Q, S>(&self, query: Q, scope: S) -> Result<Vec<(String, String)>>
@@ -4797,10 +4858,24 @@ impl RuntimeHandle {
         K: AsRef<str>,
         S: AsRef<str>,
     {
-        self.inner
+        let (key, scope) = (key.as_ref(), scope.as_ref());
+        let deleted = self
+            .inner
             .memory
             .delete(key, scope)
-            .map_err(|e| RuntimeError::Store(e.to_string()))
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        if deleted {
+            self.inner
+                .memory_providers()
+                .on_memory_write("delete", key, "");
+        }
+        Ok(deleted)
+    }
+
+    /// The memory backend manager this runtime booted with: which provider
+    /// `config.memory_provider` selected, and where an external one registers.
+    pub fn memory_providers(&self) -> std::sync::MutexGuard<'_, crate::MemoryProviderManager> {
+        self.inner.memory_providers()
     }
 
     pub fn skill_list(&self) -> Vec<Skill> {
@@ -5076,6 +5151,94 @@ mod tests {
         );
         handle.close_session(&id).unwrap();
         assert!(!handle.snapshot().sessions.iter().any(|s| s.id == id));
+    }
+
+    /// A memory provider that only counts the lifecycle events the runtime fans out, so a test can
+    /// prove the seam is live without depending on what any real backend does with them.
+    struct RecordingMemoryProvider {
+        session_ends: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        memory_writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::MemoryProvider for RecordingMemoryProvider {
+        fn name(&self) -> &str {
+            "recorder"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn initialize(&self, _session_id: &str) {}
+        fn on_session_end(&self, _messages: Vec<serde_json::Value>) {
+            self.session_ends
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn on_memory_write(&self, _action: &str, _target: &str, _content: &str) {
+            self.memory_writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn boot_builds_the_memory_provider_the_config_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        assert!(
+            handle.memory_providers().get_provider("builtin").is_some(),
+            "the default config must boot the builtin memory provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_memory_provider_fails_boot_instead_of_falling_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let config = Config {
+            memory_provider: "bogus".into(),
+            ..config_for(dir.path())
+        };
+        let err = Runtime::start(config)
+            .await
+            .err()
+            .expect("an unknown memory provider must fail boot");
+        assert!(
+            err.to_string().contains("unknown memory provider"),
+            "unexpected boot error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_close_and_memory_writes_reach_registered_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let session_ends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let memory_writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        handle
+            .memory_providers()
+            .add_external(Box::new(RecordingMemoryProvider {
+                session_ends: std::sync::Arc::clone(&session_ends),
+                memory_writes: std::sync::Arc::clone(&memory_writes),
+            }))
+            .expect("no external memory provider is registered yet");
+
+        let id = handle.snapshot().sessions[0].id.clone();
+        handle.close_session(&id).unwrap();
+        assert_eq!(
+            session_ends.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "closing a session must notify memory providers once"
+        );
+
+        handle.memory_save("k", "v", "global").unwrap();
+        handle.memory_delete("k", "global").unwrap();
+        assert_eq!(
+            memory_writes.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a save and a successful delete are the two memory writes"
+        );
     }
 
     #[tokio::test]

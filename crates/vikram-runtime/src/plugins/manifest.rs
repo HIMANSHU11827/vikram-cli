@@ -38,6 +38,26 @@ pub struct PluginManifest {
     pub priority: i32,
     /// Declarative hook rules, evaluated in-process for every loaded plugin.
     pub hook_rules: Vec<HookRule>,
+    /// File operations the plugin asks the operator to apply under a managed root.
+    ///
+    /// Applied explicitly by `vikram transforms apply`, tracked in `~/.vikram/transforms.json`
+    /// and reversible with `vikram transforms rollback`. An absent or empty list means the plugin
+    /// declares no transforms.
+    pub transforms: Vec<TransformOp>,
+}
+
+/// One file a plugin asks to place under a managed transform root.
+///
+/// `path` is relative to the root (`skills/` is the only root v1 allows) and must stay inside it.
+/// Content is either inline UTF-8 `content` or base64 `content_b64`; exactly one must be set.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TransformOp {
+    /// `add_file` refuses a target that already exists unowned; `write_file` creates or replaces.
+    pub op: String,
+    pub path: String,
+    pub content: Option<String>,
+    pub content_b64: Option<String>,
 }
 
 impl Default for PluginManifest {
@@ -60,6 +80,7 @@ impl Default for PluginManifest {
             enabled: true,
             priority: 0,
             hook_rules: Vec::new(),
+            transforms: Vec::new(),
         }
     }
 }
