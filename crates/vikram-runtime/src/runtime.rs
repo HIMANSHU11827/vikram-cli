@@ -639,6 +639,10 @@ pub(crate) struct RuntimeInner {
     /// The hook chain built from the loaded plugins. Rebuilt after every plugin mutation, so
     /// disabling a plugin removes its hooks without restarting the runtime.
     pub hooks: std::sync::RwLock<crate::hooks::HookRegistry>,
+    /// The turn pipeline's stage registry: named, ordered, replaceable steps the turn loop
+    /// dispatches through. Every [`crate::pipeline::StagePoint`] has a builtin default; a
+    /// `register_stage` call adds or overrides a native handler by priority.
+    pub stages: std::sync::Arc<crate::pipeline::StageRegistry>,
     pub skills: std::sync::Mutex<SkillRegistry>,
     // `evolution` field moved into `LearningState` (see `learning` above).
     pub workspace: WorkspaceManager,
@@ -668,6 +672,23 @@ pub(crate) struct RuntimeInner {
 }
 
 impl RuntimeInner {
+    /// The turn pipeline's stage registry.
+    pub fn stages(&self) -> &Arc<crate::pipeline::StageRegistry> {
+        &self.stages
+    }
+
+    /// Register a native stage handler. Higher `priority` wins dispatch for the point; the
+    /// builtin default runs only while nothing is registered. Process plugins cannot register
+    /// stages — they reach the same seams through the hook chain instead.
+    pub fn register_stage(
+        &self,
+        point: crate::pipeline::StagePoint,
+        handler: Arc<dyn crate::pipeline::StageHandler>,
+        priority: i32,
+    ) {
+        self.stages.register(point, handler, priority);
+    }
+
     /// Dispatch one hook context through the chain. Blocking work (a process hook) happens on the
     /// caller's thread, which is why call sites use `spawn_blocking`.
     pub fn dispatch_hook(&self, ctx: &crate::hooks::HookContext) -> crate::hooks::HookOutcome {
@@ -2138,6 +2159,7 @@ impl Runtime {
         let mcp_visibility = VisibilityManager::with_persist_path(mcp_visibility_path);
         let plugins = PluginRegistry::from_default_dir();
         let hooks = std::sync::RwLock::new(crate::hooks::HookRegistry::from_plugins(&plugins));
+        let stages = std::sync::Arc::new(crate::pipeline::StageRegistry::new());
         let skills = std::sync::Mutex::new(SkillRegistry::for_workspace(&workspace_root));
         let evolution_skills_root = crate::config::vikram_home().join("skills");
         if let Err(e) = std::fs::create_dir_all(&evolution_skills_root) {
@@ -2207,6 +2229,7 @@ impl Runtime {
             mcp_visibility: std::sync::Arc::new(Mutex::new(mcp_visibility)),
             plugins: Mutex::new(plugins),
             hooks,
+            stages,
             skills,
             workspace,
             approvals: Mutex::new(HashMap::new()),
@@ -2401,6 +2424,17 @@ impl Runtime {
 }
 
 impl RuntimeHandle {
+    /// Register a native stage handler on the running pipeline. See
+    /// [`RuntimeInner::register_stage`].
+    pub fn register_stage(
+        &self,
+        point: crate::pipeline::StagePoint,
+        handler: Arc<dyn crate::pipeline::StageHandler>,
+        priority: i32,
+    ) {
+        self.inner.register_stage(point, handler, priority);
+    }
+
     pub fn tool_context(&self) -> ToolContext {
         self.inner.tool_context()
     }

@@ -33,6 +33,20 @@ pub enum ModulesAction {
         #[arg(long)]
         from: Option<PathBuf>,
     },
+    /// Reinstall installed modules from the catalog, keeping the old copy for rollback.
+    Update {
+        /// Module id to update.
+        id: Option<String>,
+        /// Update every installed module found in the catalog.
+        #[arg(long)]
+        all: bool,
+        /// Catalog directory (defaults to $VIKRAM_MODULES_DIR, then ./modules).
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Show the hooks the installed plugins contribute, in execution order.
     Hooks,
 }
@@ -42,6 +56,9 @@ pub fn run(action: ModulesAction) -> Result<(), String> {
         ModulesAction::List { from } => list(&catalog_dir(from)),
         ModulesAction::Install { id, all, yes, from } => {
             install(&catalog_dir(from), id.as_deref(), all, yes)
+        }
+        ModulesAction::Update { id, all, from, yes } => {
+            update(&catalog_dir(from), id.as_deref(), all, yes)
         }
         ModulesAction::Hooks => hooks(),
     }
@@ -136,6 +153,68 @@ fn install(dir: &Path, id: Option<&str>, all: bool, yes: bool) -> Result<(), Str
         ));
     }
     println!("{} module(s) installed", selected.len());
+    Ok(())
+}
+
+/// Reinstall modules that are already installed; the catalog is the only source, so catalog
+/// entries that were never installed are not touched.
+fn update(dir: &Path, id: Option<&str>, all: bool, yes: bool) -> Result<(), String> {
+    if all && id.is_some() {
+        return Err("pass either a module id or --all, not both".to_owned());
+    }
+    if !all && id.is_none() {
+        return Err("name a module id, or pass --all".to_owned());
+    }
+    let found = modules(dir)?;
+    let registry = PluginRegistry::from_default_dir();
+    let selected: Vec<ModuleEntry> = match (id, all) {
+        (Some(id), false) => {
+            if registry.installed_version(id).is_none() {
+                return Err(format!("module `{id}` is not installed"));
+            }
+            let entry = found
+                .into_iter()
+                .find(|(_, manifest)| manifest.id() == id)
+                .ok_or_else(|| format!("no module `{id}` in {}", dir.display()))?;
+            vec![entry]
+        }
+        (None, true) => found
+            .into_iter()
+            .filter(|(_, manifest)| registry.installed_version(manifest.id()).is_some())
+            .collect(),
+        _ => unreachable!(),
+    };
+    if selected.is_empty() {
+        println!("no installed modules found in {}", dir.display());
+        return Ok(());
+    }
+    if !yes {
+        confirm_install(dir, &selected)?;
+    }
+    let mut failures: Vec<String> = Vec::new();
+    for (path, manifest) in &selected {
+        let id = manifest.id();
+        let before = registry.installed_version(id).unwrap_or_default();
+        match registry.update(path, id) {
+            Ok(_) => {
+                if before.is_empty() || before == manifest.version {
+                    println!("updated {id}");
+                } else {
+                    println!("updated {id}: {before} -> {}", manifest.version);
+                }
+            }
+            Err(error) => failures.push(format!("{id}: {error}")),
+        }
+    }
+    if !failures.is_empty() {
+        return Err(format!(
+            "{} updated, {} not: {}",
+            selected.len() - failures.len(),
+            failures.len(),
+            failures.join("; ")
+        ));
+    }
+    println!("{} module(s) updated", selected.len());
     Ok(())
 }
 

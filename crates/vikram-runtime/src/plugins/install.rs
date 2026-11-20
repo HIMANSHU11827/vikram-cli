@@ -188,6 +188,129 @@ impl PluginRegistry {
         Ok(id)
     }
 
+    /// Reinstall the installed plugin `id` from `source`, keeping the replaced copy for
+    /// [`Self::rollback`].
+    ///
+    /// The source manifest must pass the same checks [`Self::install`] applies and must declare
+    /// the id the plugin is installed under. Declared dependencies are resolved first from the
+    /// local sources, exactly as at install time. The current directory is moved to
+    /// `<root>/.backups/<id>` before the new copy lands; if the copy fails the previous install
+    /// is moved back. As with install there is no cross-plugin rollback: a dependency this
+    /// update pulled in stays installed.
+    pub fn update(&self, source: &Path, id: &str) -> Result<String, String> {
+        let manifest = self.candidate_manifest(source)?;
+        let new_id = manifest.id().trim().to_owned();
+        let dir = self
+            .plugin_dir(id)
+            .ok_or_else(|| format!("plugin not found: {id}"))?;
+        let installed_id = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if new_id != installed_id {
+            return Err(format!(
+                "source is plugin `{new_id}` but `{id}` is installed as `{installed_id}`"
+            ));
+        }
+        if manifest
+            .dependencies
+            .iter()
+            .any(|dep| dep.name.trim() == new_id)
+        {
+            return Err(format!(
+                "dependency cycle detected: {}",
+                quote_chain(&[new_id.clone(), new_id.clone()])
+            ));
+        }
+        let mut chain = vec![new_id.clone()];
+        self.install_dependencies_of(source, &manifest, &new_id, &mut chain)?;
+        warn_active_transforms(&dir, &new_id);
+        let backup = self.backup_dir(&installed_id);
+        if backup.exists() {
+            std::fs::remove_dir_all(&backup)
+                .map_err(|e| format!("cannot replace backup {}: {e}", backup.display()))?;
+        }
+        std::fs::create_dir_all(self.root().join(".backups"))
+            .map_err(|e| format!("cannot create {}: {e}", self.root().display()))?;
+        std::fs::rename(&dir, &backup)
+            .map_err(|e| format!("cannot move {} aside for update: {e}", dir.display()))?;
+        match copy_dir(source, &dir) {
+            Ok(()) => Ok(new_id),
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                if std::fs::rename(&backup, &dir).is_ok() {
+                    Err(format!("cannot install {}: {err}", source.display()))
+                } else {
+                    Err(format!(
+                        "cannot install {}: {err}; the previous version is preserved at {}",
+                        source.display(),
+                        backup.display()
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Restore the copy [`Self::update`] parked under `.backups`, replacing the current install.
+    ///
+    /// The parked copy is kept, so rollback is repeatable; the next [`Self::update`] overwrites
+    /// it. `Err` when the plugin is unknown or no backup exists — a plugin that was only ever
+    /// installed has nothing to roll back to. Returns the restored manifest's version.
+    pub fn rollback(&self, id: &str) -> Result<String, String> {
+        let dir = self
+            .plugin_dir(id)
+            .ok_or_else(|| format!("plugin not found: {id}"))?;
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let backup = self.backup_dir(&name);
+        if !backup.join("plugin.json").is_file() {
+            return Err(format!("no previous version recorded for `{id}`"));
+        }
+        warn_active_transforms(&dir, &name);
+        let aside = self.backup_dir(&format!(".{name}.pre-rollback"));
+        if aside.exists() {
+            std::fs::remove_dir_all(&aside)
+                .map_err(|e| format!("cannot clear {}: {e}", aside.display()))?;
+        }
+        std::fs::rename(&dir, &aside)
+            .map_err(|e| format!("cannot move {} aside for rollback: {e}", dir.display()))?;
+        match copy_dir(&backup, &dir) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir_all(&aside);
+                PluginManifest::from_dir(&dir)
+                    .map(|manifest| manifest.version)
+                    .map_err(|e| {
+                        format!(
+                            "restored {} but cannot read its manifest: {e}",
+                            dir.display()
+                        )
+                    })
+            }
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                if std::fs::rename(&aside, &dir).is_ok() {
+                    Err(format!("cannot restore {}: {err}", backup.display()))
+                } else {
+                    Err(format!(
+                        "cannot restore {}: {err}; the current version is preserved at {}",
+                        backup.display(),
+                        aside.display()
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Where [`Self::update`] parks the replaced plugin directory for [`Self::rollback`].
+    ///
+    /// `.backups` sits one level below the plugins root and holds no `plugin.json` of its own,
+    /// so the one-level-deep scanner never lists it as a plugin.
+    fn backup_dir(&self, id: &str) -> PathBuf {
+        self.root().join(".backups").join(id)
+    }
+
     /// Remove an installed plugin's directory.
     pub fn uninstall(&self, id: &str) -> Result<(), String> {
         let dir = self
@@ -266,3 +389,126 @@ fn warn_active_transforms(dir: &Path, fallback_id: &str) {
 }
 
 use crate::plugins::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn plugin_source(root: &Path, name: &str, version: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("plugin.json"),
+            format!(r#"{{"id":"{name}","name":"{name}","version":"{version}","entry":"main.sh"}}"#),
+        )
+        .unwrap();
+        std::fs::write(dir.join("main.sh"), "#!/bin/sh\necho hi\n").unwrap();
+    }
+
+    fn installed_version(dir: &Path, id: &str) -> String {
+        PluginManifest::from_dir(&dir.join(id)).unwrap().version
+    }
+
+    #[test]
+    fn update_swaps_the_plugin_and_rollback_restores_the_previous_version() {
+        let source = tempfile::tempdir().unwrap();
+        plugin_source(source.path(), "acme", "1.0.0");
+        let installed = tempfile::tempdir().unwrap();
+        let registry = PluginRegistry::scan(installed.path());
+        registry.install(&source.path().join("acme")).unwrap();
+        assert_eq!(installed_version(installed.path(), "acme"), "1.0.0");
+
+        // A second source revision with an extra file.
+        plugin_source(source.path(), "acme", "2.0.0");
+        std::fs::write(source.path().join("acme/new.txt"), "new").unwrap();
+        let updated = registry
+            .update(&source.path().join("acme"), "acme")
+            .expect("update works");
+        assert_eq!(updated, "acme");
+        assert_eq!(installed_version(installed.path(), "acme"), "2.0.0");
+        assert!(installed.path().join("acme/new.txt").is_file());
+        // The parked copy still holds the old manifest, and the scanner ignores `.backups`.
+        assert_eq!(
+            installed_version(&installed.path().join(".backups"), "acme"),
+            "1.0.0"
+        );
+        assert_eq!(PluginRegistry::scan(installed.path()).installed(), 1);
+
+        let restored = PluginRegistry::scan(installed.path());
+        let version = restored.rollback("acme").expect("rollback works");
+        assert_eq!(version, "1.0.0");
+        assert_eq!(installed_version(installed.path(), "acme"), "1.0.0");
+        assert!(!installed.path().join("acme/new.txt").exists());
+        // The backup is kept, so rollback stays repeatable.
+        assert_eq!(restored.rollback("acme").unwrap(), "1.0.0");
+    }
+
+    #[test]
+    fn rollback_without_a_previous_version_is_refused() {
+        let source = tempfile::tempdir().unwrap();
+        plugin_source(source.path(), "acme", "1.0.0");
+        let installed = tempfile::tempdir().unwrap();
+        let registry = PluginRegistry::scan(installed.path());
+        registry.install(&source.path().join("acme")).unwrap();
+        let err = registry.rollback("acme").unwrap_err();
+        assert!(err.contains("no previous version"), "{err}");
+        assert_eq!(installed_version(installed.path(), "acme"), "1.0.0");
+    }
+
+    #[test]
+    fn update_and_rollback_report_unknown_plugins() {
+        let installed = tempfile::tempdir().unwrap();
+        let registry = PluginRegistry::scan(installed.path());
+        let source = tempfile::tempdir().unwrap();
+        plugin_source(source.path(), "acme", "1.0.0");
+        assert!(
+            registry
+                .update(&source.path().join("acme"), "ghost")
+                .unwrap_err()
+                .contains("plugin not found")
+        );
+        assert!(
+            registry
+                .rollback("ghost")
+                .unwrap_err()
+                .contains("plugin not found")
+        );
+    }
+
+    #[test]
+    fn update_rejects_a_source_declaring_a_different_id() {
+        let source = tempfile::tempdir().unwrap();
+        plugin_source(source.path(), "acme", "1.0.0");
+        let installed = tempfile::tempdir().unwrap();
+        let registry = PluginRegistry::scan(installed.path());
+        registry.install(&source.path().join("acme")).unwrap();
+        plugin_source(source.path(), "other", "9.9.9");
+        let err = registry
+            .update(&source.path().join("other"), "acme")
+            .unwrap_err();
+        assert!(err.contains("installed as `acme`"), "{err}");
+        assert_eq!(installed_version(installed.path(), "acme"), "1.0.0");
+    }
+
+    #[test]
+    fn a_failed_update_restores_the_previous_install() {
+        let source = tempfile::tempdir().unwrap();
+        plugin_source(source.path(), "acme", "1.0.0");
+        let installed = tempfile::tempdir().unwrap();
+        let registry = PluginRegistry::scan(installed.path());
+        registry.install(&source.path().join("acme")).unwrap();
+        // v2 declares an entry point that does not exist, so the candidate check fails
+        // before anything on disk is touched.
+        std::fs::write(
+            source.path().join("acme/plugin.json"),
+            r#"{"id":"acme","name":"acme","version":"2.0.0","entry":"missing.sh"}"#,
+        )
+        .unwrap();
+        let err = registry
+            .update(&source.path().join("acme"), "acme")
+            .unwrap_err();
+        assert!(err.contains("entry point"), "{err}");
+        assert_eq!(installed_version(installed.path(), "acme"), "1.0.0");
+    }
+}

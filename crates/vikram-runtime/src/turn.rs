@@ -18,6 +18,11 @@ use vikram_contracts::{
 
 use crate::bots::ManagedBot;
 use crate::learning::TurnGrowth;
+use crate::pipeline::{
+    ContextBuildPayload, MemoryRecallPayload, ProviderRequestPayload, ResultCommitPayload,
+    StageContext, StageError, StageFuture, StageHandler, StageOutcome, StagePayload, StagePoint,
+    ToolDispatchPayload,
+};
 use crate::provider::{CompletionRequest, ProviderEvent};
 use crate::runtime::{PendingApproval, RuntimeInner};
 use crate::session::SessionRuntime;
@@ -357,35 +362,44 @@ pub(crate) async fn run_turn(
             break;
         }
 
-        // Inject the budgeted skill catalogue (metadata only) as an External-trust
-        // system message. Skill bodies are never loaded here; they are read on demand
-        // through skill.load / skill.read.
-        let reg = SkillRegistry::for_workspace(&inner.workspace_root);
-        let skills = reg.skills();
-        let discovered = skills.len();
-        let loaded = skills.iter().filter(|s| s.loaded).count();
-        inner.emit(RuntimeEvent::SkillsChanged { discovered, loaded });
-        let (catalog_text, _) = reg.catalog_listing();
-        // Every part of the request is labelled in the order it is assembled, so the inspector
-        // prices what is actually being sent rather than guessing at the shape afterwards.
-        let mut prefix: Vec<Message> = Vec::new();
-        let mut labels: Vec<&'static str> = Vec::new();
+        // Stage: memory_recall — durable memory for this step. A native module can replace
+        // retrieval wholesale; the builtin still runs the memory_recall hooks.
+        let mut recall_ctx = StageContext::new(
+            &inner,
+            &session,
+            &turn,
+            &request_text,
+            StagePayload::MemoryRecall(MemoryRecallPayload::default()),
+        );
+        if run_stage(
+            &inner,
+            &session,
+            &agent,
+            &turn,
+            &request_text,
+            &growth,
+            started,
+            output_tokens,
+            steps_used,
+            StagePoint::MemoryRecall,
+            &mut recall_ctx,
+        )
+        .await
+        {
+            claim_guard.disarm();
+            return;
+        }
+        let memory_text = match recall_ctx.payload {
+            StagePayload::MemoryRecall(payload) => payload.text,
+            _ => None,
+        };
+
         // What the input and turn-start hooks asked to add goes in front of everything the host
         // assembled, in the order the hooks ran.
-        let mut injected_prefix: Vec<String> = user_input.effect.prepend.clone();
-        injected_prefix.extend(user_input.effect.append.iter().cloned());
-        injected_prefix.extend(turn_start.effect.prepend.iter().cloned());
-        injected_prefix.extend(turn_start.effect.append.iter().cloned());
-        if !catalog_text.trim().is_empty() {
-            labels.push("skill catalogue");
-            prefix.push(Message::text(Role::System, catalog_text, Trust::External));
-        }
-        // Project and entity instructions are context, not decoration: they arrive on every turn so
-        // the model does not have to re-read the same AGENTS.md to remember the rules it works under.
-        if let Some(project_text) = inner.project_context() {
-            labels.push("project instructions");
-            prefix.push(Message::text(Role::System, project_text, Trust::External));
-        }
+        let mut hook_injected: Vec<String> = user_input.effect.prepend.clone();
+        hook_injected.extend(user_input.effect.append.iter().cloned());
+        hook_injected.extend(turn_start.effect.prepend.iter().cloned());
+        hook_injected.extend(turn_start.effect.append.iter().cloned());
         // Who is speaking. A bot carries its own identity — the profile's name, tags and
         // description — and must not be told it is the app. Resolved from the delegated run when
         // there is one, otherwise from the session's own bot, so an operator typing straight into a
@@ -399,148 +413,42 @@ pub(crate) async fn run_turn(
                     .and_then(|id| inner.bots.get(&id))
                     .map(|bot| bot.profile.clone())
             });
-        labels.push("turn voice");
-        match profile {
-            Some(profile) => {
-                labels.push("bot identity");
-                prefix.push(Message::text(
-                    Role::System,
-                    bot_preamble(&profile),
-                    Trust::External,
-                ));
-            }
-            // The operator sees the model's own words between the tool rows, so the model has to be
-            // told that those words exist and what shape they take.
-            None => prefix.push(Message::text(Role::System, PREAMBLE, Trust::External)),
-        }
-        // Memory and project context are assembled against the budget that is left after the
-        // transcript, not on top of it.
-        // Two-layer context injection:
-        //   Layer 1 (base context) — durable retrieved memory, project/agent identity.
-        //   Layer 2 (dialectic supplement) — the heuristic user model derived from earlier
-        //   turns (preferences/habits/goals). Labelled separately so the meter can price each.
-        // Retrieval is a SQLite query plus disk reads; like the code-index fallback below it runs
-        // on the blocking pool so it cannot hold an executor thread the stream loop shares.
-        let memory_text = {
-            let inner = Arc::clone(&inner);
-            let session = Arc::clone(&session);
-            tokio::task::spawn_blocking(move || inner.retrieved_memory(&session))
-                .await
-                .unwrap_or_default()
-        };
-        // A recall hook sees what the store is about to inject — and may withhold it or rewrite
-        // it — before the prefix is assembled. It fires once per step because retrieval does.
-        let memory_text = match memory_text {
-            Some(text) => {
-                let recall = run_hook(
-                    &inner,
-                    &session,
-                    crate::hooks::HookContext::new(crate::hooks::HookPoint::MemoryRecall)
-                        .with_session(session.id.as_str())
-                        .with_turn(turn.as_str())
-                        .with_workspace(inner.workspace_root.display().to_string())
-                        .with_model(inner.model())
-                        .with_text(&text),
-                )
-                .await;
-                if recall.effect.deny.is_some() {
-                    None
-                } else {
-                    Some(recall.effect.text.unwrap_or(text))
-                }
-            }
-            None => None,
-        };
-        if let Some(memory_text) = memory_text {
-            labels.insert(0, "retrieved memory");
-            prefix.insert(0, Message::text(Role::System, memory_text, Trust::External));
-        }
-        if let Some(dialectic_text) = inner.dialectic_supplement() {
-            labels.insert(1.min(labels.len()), "dialectic supplement");
-            prefix.insert(
-                1.min(prefix.len()),
-                Message::text(Role::System, dialectic_text, Trust::External),
-            );
-        }
-        // Code-index ranked context: definitions/references for the user's request,
-        // falling back to a grep slice when no index exists. Bounded and labelled.
-        {
-            let q = codeindex_query(&request_text);
-            if !q.is_empty() {
-                // The fallback scan reads files, so it runs on the blocking pool: even bounded,
-                // it must not hold an executor thread the stream loop and tools share.
-                let root = inner.workspace_root.clone();
-                let ctx = tokio::task::spawn_blocking(move || {
-                    crate::tools::codeindex::codeindex_context(&root, &q)
-                })
-                .await
-                .unwrap_or_default();
-                if !ctx.trim().is_empty() {
-                    // Only inject when something useful was found (index hits or grep hits).
-                    if ctx.contains("no index") {
-                        // Degraded: tell the model a grep fallback ran, without flooding.
-                        if let Some(marker) = ctx.find("grep fallback") {
-                            let slice = bounded_prefix(&ctx[marker..], 600);
-                            labels.push("code index (grep fallback)");
-                            prefix.push(Message::text(Role::System, slice, Trust::External));
-                        }
-                    } else {
-                        labels.push("code index");
-                        prefix.push(Message::text(Role::System, ctx, Trust::External));
-                    }
-                }
-            }
-        }
-        let context_hook = run_hook(
+        // Stage: context_build — the system prefix for this provider round.
+        let mut build_ctx = StageContext::new(
             &inner,
             &session,
-            crate::hooks::HookContext::new(crate::hooks::HookPoint::ContextBuild)
-                .with_session(session.id.as_str())
-                .with_turn(turn.as_str())
-                .with_workspace(inner.workspace_root.display().to_string())
-                .with_model(inner.model())
-                .with_text(&request_text),
+            &turn,
+            &request_text,
+            StagePayload::ContextBuild(ContextBuildPayload {
+                hook_injected,
+                profile,
+                memory_text,
+                prefix: Vec::new(),
+                labels: Vec::new(),
+            }),
+        );
+        if run_stage(
+            &inner,
+            &session,
+            &agent,
+            &turn,
+            &request_text,
+            &growth,
+            started,
+            output_tokens,
+            steps_used,
+            StagePoint::ContextBuild,
+            &mut build_ctx,
         )
-        .await;
-        if let Some(reason) = &context_hook.effect.deny {
-            inner.emit(RuntimeEvent::Error {
-                text: format!("a plugin refused this turn's context: {reason}"),
-            });
-            turn_end_hook(
-                &inner,
-                &session,
-                &turn,
-                TurnState::Failed,
-                steps_used,
-                output_tokens,
-            )
-            .await;
-            finish(
-                &inner,
-                &session,
-                &agent,
-                turn,
-                TurnReport {
-                    outcome: TurnState::Failed,
-                    started,
-                    output_tokens,
-                    request: &request_text,
-                    growth: &growth,
-                },
-            );
+        .await
+        {
             claim_guard.disarm();
             return;
         }
-        let mut injected: Vec<String> = injected_prefix.clone();
-        injected.extend(context_hook.effect.prepend.iter().cloned());
-        for (offset, text) in injected.into_iter().enumerate() {
-            prefix.insert(offset, Message::text(Role::System, text, Trust::External));
-            labels.insert(offset, "plugin context");
-        }
-        for text in &context_hook.effect.append {
-            prefix.push(Message::text(Role::System, text.clone(), Trust::External));
-            labels.push("plugin context");
-        }
+        let (prefix, labels) = match build_ctx.payload {
+            StagePayload::ContextBuild(payload) => (payload.prefix, payload.labels),
+            _ => (Vec::new(), Vec::new()),
+        };
         let (transcript, budget) = inner.prepare_context(&session, &prefix);
         let estimator = session.estimator();
         let mut parts: Vec<ContextPart> = labels
@@ -596,20 +504,45 @@ pub(crate) async fn run_turn(
         // estimator learns this model's real cost per character.
         let estimated_input = estimator.estimate_messages(&request_messages);
         last_estimated_input = estimated_input;
-        let model_hook = run_hook(
+        // Stage: provider_request — the model_request hooks and the request itself. A native
+        // module can replace request assembly; the builtin still runs the hooks.
+        let mut request_ctx = StageContext::new(
             &inner,
             &session,
-            crate::hooks::HookContext::new(crate::hooks::HookPoint::ModelRequest)
-                .with_session(session.id.as_str())
-                .with_turn(turn.as_str())
-                .with_workspace(inner.workspace_root.display().to_string())
-                .with_model(inner.model())
-                .with_text(&request_text),
+            &turn,
+            &request_text,
+            StagePayload::ProviderRequest(ProviderRequestPayload {
+                messages: request_messages,
+                request: None,
+            }),
+        );
+        if run_stage(
+            &inner,
+            &session,
+            &agent,
+            &turn,
+            &request_text,
+            &growth,
+            started,
+            output_tokens,
+            steps_used,
+            StagePoint::ProviderRequest,
+            &mut request_ctx,
         )
-        .await;
-        if let Some(reason) = &model_hook.effect.deny {
+        .await
+        {
+            claim_guard.disarm();
+            return;
+        }
+        let request = match request_ctx.payload {
+            StagePayload::ProviderRequest(payload) => payload.request,
+            _ => None,
+        };
+        let Some(request) = request else {
+            // A stage that reports Done without a request is a bug, not a fallback case: the
+            // turn fails honestly rather than sending nothing.
             inner.emit(RuntimeEvent::Error {
-                text: format!("a plugin refused the model request: {reason}"),
+                text: "the `provider_request` stage produced no request".into(),
             });
             turn_end_hook(
                 &inner,
@@ -635,36 +568,6 @@ pub(crate) async fn run_turn(
             );
             claim_guard.disarm();
             return;
-        }
-        for text in model_hook.effect.prepend.iter().rev() {
-            request_messages.insert(
-                0,
-                Message::text(Role::System, text.clone(), Trust::External),
-            );
-        }
-        for text in &model_hook.effect.append {
-            request_messages.push(Message::text(Role::System, text.clone(), Trust::External));
-        }
-        let request = CompletionRequest {
-            model: inner.model(),
-            messages: request_messages,
-            tools: inner.tools.specs(),
-            max_output_tokens: model_hook
-                .effect
-                .max_output_tokens
-                .or_else(|| {
-                    inner
-                        .config
-                        .read()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .max_output_tokens
-                })
-                // Nothing explicit: the registry's per-model figure, so Anthropic stops
-                // hard-capping every turn at its 4096 default. Unknown models send no cap —
-                // the assumed floor is a budgeting guess, not a provider limit.
-                .or_else(|| {
-                    crate::context_engine::ModelLimits::declared_output_cap(&inner.model())
-                }),
         };
 
         let mut stream = provider.stream(request);
@@ -925,57 +828,80 @@ pub(crate) async fn run_turn(
             });
         }
 
-        let mut lanes: Vec<Vec<usize>> = Vec::new();
-        let mut lane_for: HashMap<String, usize> = HashMap::new();
-        for (index, call) in calls.iter().enumerate() {
-            match conflict_key(&inner, call) {
-                Some(key) => match lane_for.get(&key) {
-                    Some(&lane) => lanes[lane].push(index),
-                    None => {
-                        lane_for.insert(key, lanes.len());
-                        lanes.push(vec![index]);
-                    }
+        // Stage: tool_dispatch — fan the round's calls out across conflict lanes and collect
+        // their outcomes. Policy, approvals and the per-call hook chain stay inside `run_tool`.
+        let mut dispatch_ctx = StageContext::new(
+            &inner,
+            &session,
+            &turn,
+            &request_text,
+            StagePayload::ToolDispatch(ToolDispatchPayload {
+                calls: calls.clone(),
+                cancel: cancel.clone(),
+                agent: agent.as_ref().map(|run| AgentRun {
+                    agent: Arc::clone(&run.agent),
+                    task_id: run.task_id.clone(),
+                }),
+                outcomes: Vec::new(),
+            }),
+        );
+        if run_stage(
+            &inner,
+            &session,
+            &agent,
+            &turn,
+            &request_text,
+            &growth,
+            started,
+            output_tokens,
+            steps_used,
+            StagePoint::ToolDispatch,
+            &mut dispatch_ctx,
+        )
+        .await
+        {
+            claim_guard.disarm();
+            return;
+        }
+        let outcomes = match dispatch_ctx.payload {
+            StagePayload::ToolDispatch(payload) => payload.outcomes,
+            _ => Vec::new(),
+        };
+        if outcomes.len() != calls.len() {
+            // A stage that reports Done with the wrong arity is a bug, not a fallback case.
+            inner.emit(RuntimeEvent::Error {
+                text: format!(
+                    "the `tool_dispatch` stage returned {} outcomes for {} calls",
+                    outcomes.len(),
+                    calls.len()
+                ),
+            });
+            turn_end_hook(
+                &inner,
+                &session,
+                &turn,
+                TurnState::Failed,
+                steps_used,
+                output_tokens,
+            )
+            .await;
+            finish(
+                &inner,
+                &session,
+                &agent,
+                turn,
+                TurnReport {
+                    outcome: TurnState::Failed,
+                    started,
+                    output_tokens,
+                    request: &request_text,
+                    growth: &growth,
                 },
-                None => lanes.push(vec![index]),
-            }
+            );
+            claim_guard.disarm();
+            return;
         }
-
-        let calls_ref = &calls;
-        let inner_ref = &inner;
-        let session_ref = &session;
-        let cancel_ref = &cancel;
-        let agent_ref = &agent;
-        let lane_results = futures_util::future::join_all(lanes.iter().map(|lane| async move {
-            let mut out: Vec<(usize, String, bool)> = Vec::with_capacity(lane.len());
-            for &index in lane {
-                if cancel_ref.is_cancelled() {
-                    out.push((index, "cancelled before completion".to_owned(), false));
-                    continue;
-                }
-                let (content, ok) = run_tool(
-                    inner_ref,
-                    session_ref,
-                    &calls_ref[index],
-                    cancel_ref,
-                    agent_ref,
-                    Origin::Model,
-                )
-                .await;
-                out.push((index, content, ok));
-            }
-            out
-        }))
-        .await;
-
-        let mut by_index: Vec<Option<(String, bool)>> = (0..calls.len()).map(|_| None).collect();
-        for lane in lane_results {
-            for (index, content, ok) in lane {
-                by_index[index] = Some((content, ok));
-            }
-        }
-        for (call, slot) in calls.iter().zip(by_index) {
-            let (content, ok) =
-                slot.unwrap_or_else(|| ("cancelled before completion".to_owned(), false));
+        for (call, (content, ok)) in calls.iter().zip(outcomes) {
             guard.record(call, ok);
             growth.record_call(&call.name);
             if !ok {
@@ -985,16 +911,32 @@ pub(crate) async fn run_turn(
         }
         let cancelled_mid_tools = cancel.is_cancelled();
 
-        for (call_id, content, ok) in results {
-            let result = Message::tool_result(call_id, content, ok);
-            session.push_message(result.clone(), now_ms());
-            let mut journaled = serde_json::json!({"message": result});
-            crate::redact::redact_json(&mut journaled);
-            inner.journal(&session.id, RecordKind::ToolResult, journaled);
-            inner.emit(RuntimeEvent::MessageCommitted {
-                session: session.id.clone(),
-                message: result,
-            });
+        // Stage: result_commit — tool results become transcript messages, journal records and
+        // events. A native module can replace what a result means to the conversation.
+        let mut commit_ctx = StageContext::new(
+            &inner,
+            &session,
+            &turn,
+            &request_text,
+            StagePayload::ResultCommit(ResultCommitPayload { results }),
+        );
+        if run_stage(
+            &inner,
+            &session,
+            &agent,
+            &turn,
+            &request_text,
+            &growth,
+            started,
+            output_tokens,
+            steps_used,
+            StagePoint::ResultCommit,
+            &mut commit_ctx,
+        )
+        .await
+        {
+            claim_guard.disarm();
+            return;
         }
 
         // The guards above only see repetition. A model that rewords its query and rotates its
@@ -2111,6 +2053,519 @@ async fn run_hook(
     };
     inner.journal_hook(&session.id, point, &outcome);
     outcome
+}
+
+/// The operator-facing text for a stage's refusal, matching the wording the point's hooks had.
+fn stage_refusal(point: StagePoint, reason: &str) -> String {
+    match point {
+        StagePoint::ContextBuild => format!("a plugin refused this turn's context: {reason}"),
+        StagePoint::ProviderRequest => format!("a plugin refused the model request: {reason}"),
+        _ => format!("the `{}` stage refused: {reason}", point.as_str()),
+    }
+}
+
+/// Dispatch one pipeline stage. Returns `true` when the stage refused the turn or its handler
+/// failed — the turn is already ended honestly (the reason is published, `turn_end` dispatched
+/// and `finish` run) and the caller only unwinds. A stage failure is never swallowed into a
+/// silent fallback: a broken handler fails the turn.
+#[allow(clippy::too_many_arguments)]
+async fn run_stage(
+    inner: &Arc<RuntimeInner>,
+    session: &Arc<SessionRuntime>,
+    agent: &Option<AgentRun>,
+    turn: &TurnId,
+    request_text: &str,
+    growth: &TurnGrowth,
+    started: Instant,
+    output_tokens: u64,
+    steps_used: u64,
+    point: StagePoint,
+    ctx: &mut StageContext,
+) -> bool {
+    let failed = match inner.stages().run(point, ctx).await {
+        Ok(StageOutcome::Done) => return false,
+        Ok(StageOutcome::Refused(reason)) => stage_refusal(point, &reason),
+        Err(err) => err.to_string(),
+    };
+    inner.emit(RuntimeEvent::Error { text: failed });
+    turn_end_hook(
+        inner,
+        session,
+        turn,
+        TurnState::Failed,
+        steps_used,
+        output_tokens,
+    )
+    .await;
+    finish(
+        inner,
+        session,
+        agent,
+        turn.clone(),
+        TurnReport {
+            outcome: TurnState::Failed,
+            started,
+            output_tokens,
+            request: request_text,
+            growth,
+        },
+    );
+    true
+}
+
+/// The `memory_recall` stage's builtin body: retrieve durable memory for this step and let the
+/// `memory_recall` hooks withhold or rewrite it before it is injected.
+async fn recall_memory(
+    inner: &Arc<RuntimeInner>,
+    session: &Arc<SessionRuntime>,
+    turn: &TurnId,
+) -> Option<String> {
+    // Retrieval is a SQLite query plus disk reads; like the code-index fallback in context
+    // assembly it runs on the blocking pool so it cannot hold an executor thread the stream
+    // loop shares.
+    let memory_text = {
+        let inner = Arc::clone(inner);
+        let session = Arc::clone(session);
+        tokio::task::spawn_blocking(move || inner.retrieved_memory(&session))
+            .await
+            .unwrap_or_default()
+    };
+    // A recall hook sees what the store is about to inject — and may withhold it or rewrite
+    // it — before the prefix is assembled. It fires once per step because retrieval does.
+    match memory_text {
+        Some(text) => {
+            let recall = run_hook(
+                inner,
+                session,
+                crate::hooks::HookContext::new(crate::hooks::HookPoint::MemoryRecall)
+                    .with_session(session.id.as_str())
+                    .with_turn(turn.as_str())
+                    .with_workspace(inner.workspace_root.display().to_string())
+                    .with_model(inner.model())
+                    .with_text(&text),
+            )
+            .await;
+            if recall.effect.deny.is_some() {
+                None
+            } else {
+                Some(recall.effect.text.unwrap_or(text))
+            }
+        }
+        None => None,
+    }
+}
+
+/// The `context_build` stage's builtin body: assemble the system prefix for one provider round
+/// and apply the `context_build` hooks. `Err(reason)` is the hook's refusal of the turn's
+/// context, surfaced as [`StageOutcome::Refused`].
+async fn assemble_context(
+    inner: &Arc<RuntimeInner>,
+    session: &Arc<SessionRuntime>,
+    turn: &TurnId,
+    request_text: &str,
+    hook_injected: Vec<String>,
+    profile: Option<crate::types::BotProfile>,
+    memory_text: Option<String>,
+) -> Result<(Vec<Message>, Vec<&'static str>), String> {
+    // Inject the budgeted skill catalogue (metadata only) as an External-trust
+    // system message. Skill bodies are never loaded here; they are read on demand
+    // through skill.load / skill.read.
+    let reg = SkillRegistry::for_workspace(&inner.workspace_root);
+    let skills = reg.skills();
+    let discovered = skills.len();
+    let loaded = skills.iter().filter(|s| s.loaded).count();
+    inner.emit(RuntimeEvent::SkillsChanged { discovered, loaded });
+    let (catalog_text, _) = reg.catalog_listing();
+    // Every part of the request is labelled in the order it is assembled, so the inspector
+    // prices what is actually being sent rather than guessing at the shape afterwards.
+    let mut prefix: Vec<Message> = Vec::new();
+    let mut labels: Vec<&'static str> = Vec::new();
+    if !catalog_text.trim().is_empty() {
+        labels.push("skill catalogue");
+        prefix.push(Message::text(Role::System, catalog_text, Trust::External));
+    }
+    // Project and entity instructions are context, not decoration: they arrive on every turn so
+    // the model does not have to re-read the same AGENTS.md to remember the rules it works under.
+    if let Some(project_text) = inner.project_context() {
+        labels.push("project instructions");
+        prefix.push(Message::text(Role::System, project_text, Trust::External));
+    }
+    labels.push("turn voice");
+    // The operator sees the model's own words between the tool rows, so the model has to be
+    // told that those words exist and what shape they take — unless a bot profile says who the
+    // voice actually is.
+    match profile {
+        Some(profile) => {
+            labels.push("bot identity");
+            prefix.push(Message::text(
+                Role::System,
+                bot_preamble(&profile),
+                Trust::External,
+            ));
+        }
+        None => prefix.push(Message::text(Role::System, PREAMBLE, Trust::External)),
+    }
+    // Memory and project context are assembled against the budget that is left after the
+    // transcript, not on top of it.
+    // Two-layer context injection:
+    //   Layer 1 (base context) — durable retrieved memory, project/agent identity.
+    //   Layer 2 (dialectic supplement) — the heuristic user model derived from earlier
+    //   turns (preferences/habits/goals). Labelled separately so the meter can price each.
+    if let Some(memory_text) = memory_text {
+        labels.insert(0, "retrieved memory");
+        prefix.insert(0, Message::text(Role::System, memory_text, Trust::External));
+    }
+    if let Some(dialectic_text) = inner.dialectic_supplement() {
+        labels.insert(1.min(labels.len()), "dialectic supplement");
+        prefix.insert(
+            1.min(prefix.len()),
+            Message::text(Role::System, dialectic_text, Trust::External),
+        );
+    }
+    // Code-index ranked context: definitions/references for the user's request,
+    // falling back to a grep slice when no index exists. Bounded and labelled.
+    {
+        let q = codeindex_query(request_text);
+        if !q.is_empty() {
+            // The fallback scan reads files, so it runs on the blocking pool: even bounded,
+            // it must not hold an executor thread the stream loop and tools share.
+            let root = inner.workspace_root.clone();
+            let ctx = tokio::task::spawn_blocking(move || {
+                crate::tools::codeindex::codeindex_context(&root, &q)
+            })
+            .await
+            .unwrap_or_default();
+            if !ctx.trim().is_empty() {
+                // Only inject when something useful was found (index hits or grep hits).
+                if ctx.contains("no index") {
+                    // Degraded: tell the model a grep fallback ran, without flooding.
+                    if let Some(marker) = ctx.find("grep fallback") {
+                        let slice = bounded_prefix(&ctx[marker..], 600);
+                        labels.push("code index (grep fallback)");
+                        prefix.push(Message::text(Role::System, slice, Trust::External));
+                    }
+                } else {
+                    labels.push("code index");
+                    prefix.push(Message::text(Role::System, ctx, Trust::External));
+                }
+            }
+        }
+    }
+    let context_hook = run_hook(
+        inner,
+        session,
+        crate::hooks::HookContext::new(crate::hooks::HookPoint::ContextBuild)
+            .with_session(session.id.as_str())
+            .with_turn(turn.as_str())
+            .with_workspace(inner.workspace_root.display().to_string())
+            .with_model(inner.model())
+            .with_text(request_text),
+    )
+    .await;
+    if let Some(reason) = &context_hook.effect.deny {
+        return Err(reason.clone());
+    }
+    let mut injected: Vec<String> = hook_injected;
+    injected.extend(context_hook.effect.prepend.iter().cloned());
+    for (offset, text) in injected.into_iter().enumerate() {
+        prefix.insert(offset, Message::text(Role::System, text, Trust::External));
+        labels.insert(offset, "plugin context");
+    }
+    for text in &context_hook.effect.append {
+        prefix.push(Message::text(Role::System, text.clone(), Trust::External));
+        labels.push("plugin context");
+    }
+    Ok((prefix, labels))
+}
+
+/// The `provider_request` stage's builtin body: apply the `model_request` hooks to the assembled
+/// messages and build the [`CompletionRequest`] the provider is sent. `Err(reason)` is the
+/// hook's refusal, surfaced as [`StageOutcome::Refused`].
+async fn build_completion_request(
+    inner: &Arc<RuntimeInner>,
+    session: &Arc<SessionRuntime>,
+    turn: &TurnId,
+    request_text: &str,
+    mut messages: Vec<Message>,
+) -> Result<CompletionRequest, String> {
+    let model_hook = run_hook(
+        inner,
+        session,
+        crate::hooks::HookContext::new(crate::hooks::HookPoint::ModelRequest)
+            .with_session(session.id.as_str())
+            .with_turn(turn.as_str())
+            .with_workspace(inner.workspace_root.display().to_string())
+            .with_model(inner.model())
+            .with_text(request_text),
+    )
+    .await;
+    if let Some(reason) = &model_hook.effect.deny {
+        return Err(reason.clone());
+    }
+    for text in model_hook.effect.prepend.iter().rev() {
+        messages.insert(
+            0,
+            Message::text(Role::System, text.clone(), Trust::External),
+        );
+    }
+    for text in &model_hook.effect.append {
+        messages.push(Message::text(Role::System, text.clone(), Trust::External));
+    }
+    Ok(CompletionRequest {
+        model: inner.model(),
+        messages,
+        tools: inner.tools.specs(),
+        max_output_tokens: model_hook
+            .effect
+            .max_output_tokens
+            .or_else(|| {
+                inner
+                    .config
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .max_output_tokens
+            })
+            // Nothing explicit: the registry's per-model figure, so Anthropic stops
+            // hard-capping every turn at its 4096 default. Unknown models send no cap —
+            // the assumed floor is a budgeting guess, not a provider limit.
+            .or_else(|| crate::context_engine::ModelLimits::declared_output_cap(&inner.model())),
+    })
+}
+
+/// The `tool_dispatch` stage's builtin body: run one round of calls across conflict lanes —
+/// reads and calls on different resources proceed side by side, calls that could observe or
+/// overwrite each other keep their order — and return `(content, ok)` per call, in call order.
+async fn dispatch_tool_calls(
+    inner: &Arc<RuntimeInner>,
+    session: &Arc<SessionRuntime>,
+    calls: &[ToolCall],
+    cancel: &vikram_contracts::CancellationToken,
+    agent: &Option<AgentRun>,
+) -> Vec<(String, bool)> {
+    let mut lanes: Vec<Vec<usize>> = Vec::new();
+    let mut lane_for: HashMap<String, usize> = HashMap::new();
+    for (index, call) in calls.iter().enumerate() {
+        match conflict_key(inner, call) {
+            Some(key) => match lane_for.get(&key) {
+                Some(&lane) => lanes[lane].push(index),
+                None => {
+                    lane_for.insert(key, lanes.len());
+                    lanes.push(vec![index]);
+                }
+            },
+            None => lanes.push(vec![index]),
+        }
+    }
+
+    let lane_results = futures_util::future::join_all(lanes.iter().map(|lane| async move {
+        let mut out: Vec<(usize, String, bool)> = Vec::with_capacity(lane.len());
+        for &index in lane {
+            if cancel.is_cancelled() {
+                out.push((index, "cancelled before completion".to_owned(), false));
+                continue;
+            }
+            let (content, ok) =
+                run_tool(inner, session, &calls[index], cancel, agent, Origin::Model).await;
+            out.push((index, content, ok));
+        }
+        out
+    }))
+    .await;
+
+    let mut by_index: Vec<Option<(String, bool)>> = (0..calls.len()).map(|_| None).collect();
+    for lane in lane_results {
+        for (index, content, ok) in lane {
+            by_index[index] = Some((content, ok));
+        }
+    }
+    by_index
+        .into_iter()
+        .map(|slot| slot.unwrap_or_else(|| ("cancelled before completion".to_owned(), false)))
+        .collect()
+}
+
+/// The `result_commit` stage's builtin body: tool results become transcript messages, journal
+/// records and events.
+fn commit_tool_results(
+    inner: &Arc<RuntimeInner>,
+    session: &Arc<SessionRuntime>,
+    results: Vec<(ToolCallId, String, bool)>,
+) {
+    for (call_id, content, ok) in results {
+        let result = Message::tool_result(call_id, content, ok);
+        session.push_message(result.clone(), now_ms());
+        let mut journaled = serde_json::json!({"message": result});
+        crate::redact::redact_json(&mut journaled);
+        inner.journal(&session.id, RecordKind::ToolResult, journaled);
+        inner.emit(RuntimeEvent::MessageCommitted {
+            session: session.id.clone(),
+            message: result,
+        });
+    }
+}
+
+struct DefaultMemoryRecall;
+
+impl StageHandler for DefaultMemoryRecall {
+    fn name(&self) -> &'static str {
+        "builtin:memory_recall"
+    }
+
+    fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+        Box::pin(async move {
+            let StagePayload::MemoryRecall(payload) = &mut ctx.payload else {
+                return Err(StageError::new(
+                    ctx.point,
+                    self.name(),
+                    "memory_recall stage received a different payload",
+                ));
+            };
+            payload.text = recall_memory(&ctx.inner, &ctx.session, &ctx.turn).await;
+            Ok(StageOutcome::Done)
+        })
+    }
+}
+
+struct DefaultContextBuild;
+
+impl StageHandler for DefaultContextBuild {
+    fn name(&self) -> &'static str {
+        "builtin:context_build"
+    }
+
+    fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+        Box::pin(async move {
+            let StagePayload::ContextBuild(payload) = &mut ctx.payload else {
+                return Err(StageError::new(
+                    ctx.point,
+                    self.name(),
+                    "context_build stage received a different payload",
+                ));
+            };
+            let hook_injected = std::mem::take(&mut payload.hook_injected);
+            let profile = payload.profile.take();
+            let memory_text = payload.memory_text.take();
+            match assemble_context(
+                &ctx.inner,
+                &ctx.session,
+                &ctx.turn,
+                &ctx.request_text,
+                hook_injected,
+                profile,
+                memory_text,
+            )
+            .await
+            {
+                Ok((prefix, labels)) => {
+                    payload.prefix = prefix;
+                    payload.labels = labels;
+                    Ok(StageOutcome::Done)
+                }
+                Err(reason) => Ok(StageOutcome::Refused(reason)),
+            }
+        })
+    }
+}
+
+struct DefaultProviderRequest;
+
+impl StageHandler for DefaultProviderRequest {
+    fn name(&self) -> &'static str {
+        "builtin:provider_request"
+    }
+
+    fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+        Box::pin(async move {
+            let StagePayload::ProviderRequest(payload) = &mut ctx.payload else {
+                return Err(StageError::new(
+                    ctx.point,
+                    self.name(),
+                    "provider_request stage received a different payload",
+                ));
+            };
+            let messages = std::mem::take(&mut payload.messages);
+            match build_completion_request(
+                &ctx.inner,
+                &ctx.session,
+                &ctx.turn,
+                &ctx.request_text,
+                messages,
+            )
+            .await
+            {
+                Ok(request) => {
+                    payload.request = Some(request);
+                    Ok(StageOutcome::Done)
+                }
+                Err(reason) => Ok(StageOutcome::Refused(reason)),
+            }
+        })
+    }
+}
+
+struct DefaultToolDispatch;
+
+impl StageHandler for DefaultToolDispatch {
+    fn name(&self) -> &'static str {
+        "builtin:tool_dispatch"
+    }
+
+    fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+        Box::pin(async move {
+            let StagePayload::ToolDispatch(payload) = &mut ctx.payload else {
+                return Err(StageError::new(
+                    ctx.point,
+                    self.name(),
+                    "tool_dispatch stage received a different payload",
+                ));
+            };
+            let outcomes = dispatch_tool_calls(
+                &ctx.inner,
+                &ctx.session,
+                &payload.calls,
+                &payload.cancel,
+                &payload.agent,
+            )
+            .await;
+            payload.outcomes = outcomes;
+            Ok(StageOutcome::Done)
+        })
+    }
+}
+
+struct DefaultResultCommit;
+
+impl StageHandler for DefaultResultCommit {
+    fn name(&self) -> &'static str {
+        "builtin:result_commit"
+    }
+
+    fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+        Box::pin(async move {
+            let StagePayload::ResultCommit(payload) = &mut ctx.payload else {
+                return Err(StageError::new(
+                    ctx.point,
+                    self.name(),
+                    "result_commit stage received a different payload",
+                ));
+            };
+            let results = std::mem::take(&mut payload.results);
+            commit_tool_results(&ctx.inner, &ctx.session, results);
+            Ok(StageOutcome::Done)
+        })
+    }
+}
+
+/// The builtin handler for `point`. Called by [`crate::pipeline::StageRegistry::run`] whenever
+/// nothing is registered for the point.
+pub(crate) fn default_stage_handler(point: StagePoint) -> Option<Arc<dyn StageHandler>> {
+    Some(match point {
+        StagePoint::ContextBuild => Arc::new(DefaultContextBuild),
+        StagePoint::MemoryRecall => Arc::new(DefaultMemoryRecall),
+        StagePoint::ProviderRequest => Arc::new(DefaultProviderRequest),
+        StagePoint::ToolDispatch => Arc::new(DefaultToolDispatch),
+        StagePoint::ResultCommit => Arc::new(DefaultResultCommit),
+    })
 }
 
 async fn wait_for_approval(

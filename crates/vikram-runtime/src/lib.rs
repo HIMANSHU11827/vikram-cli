@@ -38,6 +38,7 @@ pub mod memory;
 pub mod memory_files;
 pub mod memory_provider;
 pub mod openai;
+pub mod pipeline;
 pub mod plugins;
 pub mod provider;
 pub mod pty;

@@ -39,6 +39,14 @@ pub(crate) fn numeric_parts(raw: &str) -> Option<(u64, u64, u64)> {
     Some((numbers[0], numbers[1], numbers[2]))
 }
 
+/// Compare two version strings by numeric core, ignoring pre-release and build metadata.
+///
+/// `None` when either side is not a dotted-numeric version [`numeric_parts`] accepts, so
+/// callers report the raw strings instead of guessing an order.
+pub fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    Some(numeric_parts(a)?.cmp(&numeric_parts(b)?))
+}
+
 /// Does `version` satisfy the requirement `req`?
 ///
 /// Supported forms: exact (`1.2.3`, optional `=` prefix), caret (`^1.2.3`), tilde (`~1.2.3`) and
@@ -79,4 +87,34 @@ pub fn requirement_satisfied(version: &str, req: &str) -> bool {
     numeric_parts(exact)
         .map(|want| found == want)
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compare_versions;
+    use std::cmp::Ordering::*;
+
+    #[test]
+    fn compare_versions_orders_numeric_cores() {
+        assert_eq!(compare_versions("1.2.3", "1.2.10"), Some(Less));
+        assert_eq!(compare_versions("2.0.0", "1.9.9"), Some(Greater));
+        assert_eq!(compare_versions("1.0", "1.0.0"), Some(Equal));
+        assert_eq!(compare_versions("10.0.0", "9.9.9"), Some(Greater));
+    }
+
+    #[test]
+    fn compare_versions_ignores_pre_release_and_build_metadata() {
+        assert_eq!(compare_versions("1.2.3-rc.1", "1.2.3"), Some(Equal));
+        assert_eq!(compare_versions("1.2.3+build.7", "1.2.3"), Some(Equal));
+        assert_eq!(compare_versions("1.2.4-rc.1", "1.2.3"), Some(Greater));
+    }
+
+    #[test]
+    fn compare_versions_rejects_non_versions() {
+        assert_eq!(compare_versions("", "1.0.0"), None);
+        assert_eq!(compare_versions("abc", "1.0.0"), None);
+        assert_eq!(compare_versions("1.2.3.4", "1.0.0"), None);
+        assert_eq!(compare_versions("1.x.0", "1.0.0"), None);
+        assert_eq!(compare_versions("1.0.0", "not-a-version"), None);
+    }
 }
