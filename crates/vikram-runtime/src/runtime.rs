@@ -4545,15 +4545,24 @@ impl RuntimeHandle {
                 request_messages.push(vikram_contracts::Message::system(system_text));
             }
             for m in kept {
-                let role = if m.sender == ent.name || m.sender == ent.slug {
+                let own = m.sender == ent.name || m.sender == ent.slug;
+                let role = if own {
                     vikram_contracts::Role::Assistant
                 } else {
                     vikram_contracts::Role::User
                 };
+                // Only the operator's prompt — relayed as `vikram` — is user-trusted.
+                // Peer participants speak through their own models, so their words
+                // carry model trust and can never read as user instruction.
+                let trust = if own || m.sender == "vikram" {
+                    vikram_contracts::Trust::User
+                } else {
+                    vikram_contracts::Trust::Model
+                };
                 request_messages.push(vikram_contracts::Message::text(
                     role,
                     m.content.clone(),
-                    vikram_contracts::Trust::User,
+                    trust,
                 ));
             }
             let request = crate::provider::CompletionRequest {
@@ -5447,6 +5456,91 @@ mod tests {
         assert_eq!(handle.hive_messages(&hive_id).unwrap().len(), 1);
         handle.hive_delete(&hive_id).unwrap();
         assert!(handle.hive_get(&hive_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn hive_run_marks_peer_output_as_model_trust_not_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let (runtime, provider) = named_runtime(dir.path(), "ack").await;
+        let handle = runtime.handle();
+
+        let user = handle.inner.store.create_user("U", now_ms()).unwrap();
+        let hive_id = handle
+            .hive_create(
+                user.id.clone(),
+                None,
+                "Forge".to_string(),
+                "build".to_string(),
+                "cooperative".to_string(),
+            )
+            .unwrap();
+        for (name, slug) in [("Rudra", "rudra"), ("Meera", "meera")] {
+            let ent = vikram_store::EntityRow {
+                id: vikram_contracts::EntityId::generate(),
+                owner_user: None,
+                kind: vikram_store::EntityKind::Agent,
+                name: name.into(),
+                slug: slug.into(),
+                title: String::new(),
+                role: String::new(),
+                specialization: String::new(),
+                description: String::new(),
+                icon: None,
+                model: None,
+                profile_id: None,
+                status: "active".into(),
+                created_ms: now_ms(),
+                updated_ms: now_ms(),
+            };
+            handle.inner.store.save_entity(&ent).unwrap();
+            handle
+                .hive_add_participant(&hive_id, &ent.id, vikram_store::EntityKind::Agent, "member")
+                .unwrap();
+        }
+
+        handle
+            .hive_run(&hive_id, "initial prompt", false)
+            .await
+            .unwrap();
+
+        let requests = provider.asked();
+        let hive_requests: Vec<_> = requests
+            .iter()
+            .filter(|msgs| msgs.iter().any(|m| m.text_body() == "initial prompt"))
+            .collect();
+        assert_eq!(hive_requests.len(), 2, "one request per participant");
+        // The second participant's request carries the first participant's reply;
+        // only that request can contain an `ack` transcript line.
+        let second = hive_requests
+            .iter()
+            .find(|msgs| msgs.iter().any(|m| m.text_body() == "ack"))
+            .expect("a later participant sees the earlier reply");
+        let peer = second
+            .iter()
+            .find(|m| m.text_body() == "ack")
+            .expect("the peer reply is in the transcript");
+        assert_eq!(peer.role, vikram_contracts::Role::User);
+        assert_eq!(
+            peer.blocks.iter().find_map(|b| match b {
+                Block::Text { trust, .. } => Some(*trust),
+                _ => None,
+            }),
+            Some(Trust::Model),
+            "another participant's model output must not carry user trust"
+        );
+        let prompt = second
+            .iter()
+            .find(|m| m.text_body() == "initial prompt")
+            .expect("the relayed operator prompt is in the transcript");
+        assert_eq!(
+            prompt.blocks.iter().find_map(|b| match b {
+                Block::Text { trust, .. } => Some(*trust),
+                _ => None,
+            }),
+            Some(Trust::User),
+            "the operator's own prompt stays user-trusted"
+        );
     }
 
     #[tokio::test]

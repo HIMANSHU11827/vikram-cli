@@ -44,20 +44,19 @@ fn session_key_namespace(profile: Option<&str>) -> String {
     }
 }
 
-/// Strip whitespace, one leading `+`, then drop the device suffix (`:`)
-/// and the domain (`@`). Port of hermes
-/// `normalize_whatsapp_identifier` (whatsapp_identity.py).
+/// Strip whitespace and one leading `+`, then drop the domain (`@`). Phone
+/// forms also drop the device suffix (`:`); a `@lid` keeps it, because
+/// `6012:9@lid` and `6012:10@lid` are different principals and must not merge
+/// into one session key or allowlist identity. Port of hermes
+/// `normalize_whatsapp_identifier` (whatsapp_identity.py), narrowed to the lid
+/// case hermes never distinguished.
 fn normalize_whatsapp_identifier(value: &str) -> String {
-    value
-        .trim()
-        .replacen('+', "", 1)
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .split('@')
-        .next()
-        .unwrap_or("")
-        .to_string()
+    let value = value.trim().replacen('+', "", 1);
+    let (local, domain) = value.split_once('@').unwrap_or((value.as_str(), ""));
+    if domain == "lid" {
+        return local.to_string();
+    }
+    local.split(':').next().unwrap_or("").to_string()
 }
 
 /// True for a >=7-digit local part (jid or bare phone).
@@ -337,6 +336,38 @@ mod tests {
         assert_eq!(
             build_session_key(&s, &SessionKeyOptions::default(), None),
             "agent:main:whatsapp:dm:6012"
+        );
+    }
+
+    #[test]
+    fn whatsapp_lid_device_suffixes_stay_distinct() {
+        assert_eq!(canonical_whatsapp_identifier("6012:9@lid"), "6012:9");
+        assert_eq!(canonical_whatsapp_identifier("6012:10@lid"), "6012:10");
+        assert_ne!(
+            canonical_whatsapp_identifier("6012:9@lid"),
+            canonical_whatsapp_identifier("6012:10@lid")
+        );
+        assert_eq!(canonical_whatsapp_identifier("+6012:9@lid"), "6012:9");
+        assert_eq!(canonical_whatsapp_identifier("6012@lid"), "6012");
+        assert_eq!(canonical_whatsapp_identifier("6012@s.whatsapp.net"), "6012");
+        // Phone JIDs keep the hermes device collapse: same number, same principal.
+        assert_eq!(
+            canonical_whatsapp_identifier("6012:47@s.whatsapp.net"),
+            "6012"
+        );
+    }
+
+    #[test]
+    fn whatsapp_lid_devices_do_not_share_a_session_key() {
+        let a = src("whatsapp", "dm", "6012:9@lid");
+        let b = src("whatsapp", "dm", "6012:10@lid");
+        assert_ne!(
+            build_session_key(&a, &SessionKeyOptions::default(), None),
+            build_session_key(&b, &SessionKeyOptions::default(), None)
+        );
+        assert_eq!(
+            build_session_key(&a, &SessionKeyOptions::default(), None),
+            "agent:main:whatsapp:dm:6012:9"
         );
     }
 

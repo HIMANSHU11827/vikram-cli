@@ -161,8 +161,12 @@ pub(crate) fn whatsapp_auth_aliases(id: &str) -> HashSet<String> {
     let mut out = HashSet::new();
     out.insert(normalized.clone());
     if !normalized.contains('@') {
-        out.insert(format!("{normalized}@s.whatsapp.net"));
-        out.insert(format!("{normalized}@lid"));
+        // A `:device` local part only has meaning on a `@lid`; expanding it into
+        // `number:device@s.whatsapp.net` would alias a different phone principal.
+        if !normalized.contains(':') {
+            out.insert(format!("{normalized}@s.whatsapp.net"));
+            out.insert(format!("{normalized}@lid"));
+        }
     } else {
         let local = normalized.split('@').next().unwrap_or_default().to_string();
         out.insert(local);

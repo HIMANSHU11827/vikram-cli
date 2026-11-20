@@ -56,6 +56,7 @@ use vikram_gateway::platforms::weixin::WeixinAdapter;
 use vikram_gateway::platforms::whatsapp::WhatsAppAdapter;
 use vikram_gateway::platforms::whatsapp_cloud::WhatsAppCloudAdapter;
 use vikram_gateway::platforms::yuanbao::{YuanbaoAdapter, YuanbaoConfig};
+use vikram_gateway::routing::{SessionKeyOptions, build_session_key};
 use vikram_gateway::socket::{TcpLineSocket, TlsLineSocket, WsBinarySocket, WsSocket};
 use vikram_gateway::transport::{ReqwestTransport, SharedTransport};
 use vikram_runtime::config::{Config, vikram_home};
@@ -1082,9 +1083,11 @@ pub async fn run(config: Config) -> Result<(), String> {
     }
 
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    // Sessions are keyed by (platform, chat id): two platforms can hand out the same chat id, and
-    // a shared key would merge their transcripts into one session.
-    let sessions: Arc<Mutex<HashMap<(String, String), vikram_contracts::SessionId>>> =
+    // Sessions are keyed by the routing session key: it already encodes the platform, the chat,
+    // and — for group chats under the default per-user isolation — the sender, so authorized
+    // members of one group no longer share a transcript. Two platforms can still hand out the
+    // same chat id, and the platform segment keeps their keys distinct.
+    let sessions: Arc<Mutex<HashMap<String, vikram_contracts::SessionId>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
     // Inbound authorization (access::authorize_source) runs on every event before a turn exists.
@@ -1215,7 +1218,7 @@ fn message_for_event(text: &str, images: Vec<ImageSource>) -> Message {
 /// produced inside this process, not by a chat peer.
 fn turn(
     handle: RuntimeHandle,
-    sessions: Arc<Mutex<HashMap<(String, String), vikram_contracts::SessionId>>>,
+    sessions: Arc<Mutex<HashMap<String, vikram_contracts::SessionId>>>,
     media_transport: SharedTransport,
     auth: Arc<IngressAuth>,
     spec: PlatformAuthSpec,
@@ -1243,7 +1246,11 @@ fn turn(
             }
         }
         let chat = event.source.chat_id.clone();
-        let session_key = (event.source.platform.as_str().to_string(), chat.clone());
+        let session_key = build_session_key(
+            &event.source,
+            &SessionKeyOptions::default(),
+            event.source.profile.as_deref(),
+        );
         let existing = sessions
             .lock()
             .ok()
