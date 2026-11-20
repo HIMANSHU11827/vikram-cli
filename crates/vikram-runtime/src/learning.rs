@@ -365,6 +365,18 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// What the `verify` tool concluded when it ran during a turn. Verification is stronger
+/// evidence than tool count alone: a green build+test means the workflow produced a working
+/// artifact, a red one means it did not — even when every individual tool call "succeeded".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verification {
+    Passed,
+    Failed {
+        step: Option<String>,
+        kind: Option<String>,
+    },
+}
+
 /// What one turn did, as the growth pipeline sees it: which tools it reached for and which of
 /// them came back failing. The turn loop feeds it, so a turn that never ran a tool produces an
 /// empty record rather than a guess.
@@ -372,6 +384,8 @@ pub fn now_ms() -> u64 {
 pub struct TurnGrowth {
     pub tools: Vec<String>,
     pub errors: Vec<String>,
+    /// The `verify` tool's verdict this turn; `None` when verification never ran.
+    pub verification: Option<Verification>,
 }
 
 /// A failure note points at a result; it does not copy it.
@@ -398,9 +412,87 @@ impl TurnGrowth {
         }
     }
 
+    /// The `verify` tool finished. Its output leads with a `verify: PASS` / `verify: FAIL
+    /// step=… kind=…` verdict line (see `tools::verify`), so the verdict survives truncation and
+    /// spooling; content without that line falls back to the JSON report's `ok`, then to the
+    /// call's own `ok`. A failure also lands in `errors` as a bounded note, so reflection sees
+    /// "the work finished but did not verify" distinctly from a tool error. The recorded verdict
+    /// is `ok && reported`: a plugin that flips the call's `ok` cannot make a failed verification
+    /// pass, and a withheld pass is still a failure the turn saw.
+    pub fn record_verification(&mut self, ok: bool, content: &str) {
+        let (reported, step, kind) = verification_signal(content);
+        let passed = ok && reported.unwrap_or(true);
+        let detail = match (&step, &kind) {
+            (Some(step), Some(kind)) => format!(" {step}:{kind}"),
+            (Some(step), None) => format!(" {step}"),
+            (None, Some(kind)) => format!(" {kind}"),
+            (None, None) => String::new(),
+        };
+        self.verification = Some(if passed {
+            Verification::Passed
+        } else {
+            Verification::Failed { step, kind }
+        });
+        if !passed {
+            if !detail.is_empty() {
+                self.errors.push(format!("verify: FAIL{detail}"));
+            } else if reported == Some(false) {
+                self.errors.push("verify: FAIL".to_owned());
+            } else {
+                self.record_failure("verify", content);
+            }
+        }
+    }
+
     pub fn had_tools(&self) -> bool {
         !self.tools.is_empty()
     }
+}
+
+/// Read the `verify` tool's verdict out of its output: the leading verdict line first, then the
+/// JSON report's `ok`/`failure` fields, else `None` (caller falls back to the call's `ok`).
+fn verification_signal(content: &str) -> (Option<bool>, Option<String>, Option<String>) {
+    let verdict = content.lines().next().unwrap_or_default();
+    if verdict == "verify: PASS" {
+        return (Some(true), None, None);
+    }
+    if let Some(detail) = verdict.strip_prefix("verify: FAIL") {
+        return (
+            Some(false),
+            verdict_field(detail, "step"),
+            verdict_field(detail, "kind"),
+        );
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
+        && let Some(reported) = value.get("ok").and_then(serde_json::Value::as_bool)
+    {
+        let (step, kind) = value
+            .get("failure")
+            .filter(|f| !f.is_null())
+            .map(|f| {
+                (
+                    f.get("step")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    f.get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                )
+            })
+            .unwrap_or((None, None));
+        return (Some(reported), step, kind);
+    }
+    (None, None, None)
+}
+
+/// Pull `key=value` out of the `verify: FAIL …` detail text.
+fn verdict_field(detail: &str, key: &str) -> Option<String> {
+    detail
+        .split_whitespace()
+        .filter_map(|token| token.split_once('='))
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v.to_owned())
+        .filter(|v| !v.is_empty())
 }
 
 /// What a reflection proposal is worth on the approval surface. Only kinds the surface can act on
@@ -599,8 +691,6 @@ fn record_and_reflect(
     growth: &TurnGrowth,
     corrections: &[String],
 ) {
-    use crate::types::TurnState;
-    let failed = outcome == TurnState::Failed;
     let experience = vikram_evolution::Experience {
         id: String::new(),
         timestamp_ms: 0,
@@ -615,20 +705,14 @@ fn record_and_reflect(
             .cloned()
             .unwrap_or_else(|| "conversation".to_owned()),
         user_request: request.chars().take(2_000).collect(),
-        outcome: if failed {
-            vikram_evolution::ExperienceOutcome::Failure
-        } else if growth.errors.is_empty() {
-            vikram_evolution::ExperienceOutcome::Success
-        } else {
-            vikram_evolution::ExperienceOutcome::Partial
-        },
+        outcome: experience_outcome(outcome, growth),
         tools_used: growth.tools.clone(),
         errors: growth.errors.clone(),
         corrections: corrections.to_vec(),
         feedback: None,
-        reusable: !failed && growth.errors.is_empty() && growth.tools.len() >= 2,
+        reusable: experience_reusable(growth, outcome),
         sensitivity: vikram_evolution::Sensitivity::Private,
-        metadata: serde_json::json!({"session": session.id.as_str()}),
+        metadata: experience_metadata(&session.id, growth),
     };
     let proposals = {
         let engine = inner.learning.evolution.lock().recover();
@@ -646,6 +730,53 @@ fn record_and_reflect(
             apply_or_stage(inner, mapped);
         }
     }
+}
+
+// `Experience` has no dedicated verification field and the evolution crate is not ours to
+// extend, so the verdict rides in `metadata` — free-form JSON the store already round-trips.
+fn experience_metadata(session: &SessionId, growth: &TurnGrowth) -> serde_json::Value {
+    let mut metadata = serde_json::json!({"session": session.as_str()});
+    if let Some(verification) = &growth.verification {
+        metadata["verification"] = match verification {
+            Verification::Passed => serde_json::json!({"ran": true, "passed": true}),
+            Verification::Failed { step, kind } => serde_json::json!({
+                "ran": true,
+                "passed": false,
+                "step": step,
+                "kind": kind,
+            }),
+        };
+    }
+    metadata
+}
+
+/// The coarse outcome the experience records: a failed turn is a failure, a turn whose tools
+/// all returned ok but whose verification went red is partial — "the work finished but did not
+/// verify" is not a success — and anything else with clean errors is a success.
+fn experience_outcome(
+    outcome: crate::types::TurnState,
+    growth: &TurnGrowth,
+) -> vikram_evolution::ExperienceOutcome {
+    use crate::types::TurnState;
+    if outcome == TurnState::Failed {
+        vikram_evolution::ExperienceOutcome::Failure
+    } else if growth.errors.is_empty() {
+        vikram_evolution::ExperienceOutcome::Success
+    } else {
+        vikram_evolution::ExperienceOutcome::Partial
+    }
+}
+
+/// Whether the turn is reusable workflow evidence. Two clean tools was the old bar; a passed
+/// `verify` is stronger evidence than a second tool call, so a verified turn with any tool use
+/// qualifies even below the count. A failed verification keeps `errors` non-empty, so it can
+/// never be reusable.
+fn experience_reusable(growth: &TurnGrowth, outcome: crate::types::TurnState) -> bool {
+    use crate::types::TurnState;
+    let verified = matches!(growth.verification, Some(Verification::Passed));
+    outcome != TurnState::Failed
+        && growth.errors.is_empty()
+        && (growth.tools.len() >= 2 || (verified && !growth.tools.is_empty()))
 }
 
 /// One gate for every proposal source. The policy for the proposal's kind decides whether the
@@ -1131,5 +1262,183 @@ mod tests {
         assert!(poisoned.is_err());
         assert!(mgr.pending_proposals().is_empty());
         assert!(mgr.all_proposals().is_empty());
+    }
+
+    fn verify_growth(content: &str, ok: bool) -> TurnGrowth {
+        let mut growth = TurnGrowth::default();
+        growth.record_call("verify");
+        growth.record_verification(ok, content);
+        growth
+    }
+
+    #[test]
+    fn a_verify_pass_is_recorded_without_touching_errors() {
+        let growth = verify_growth(
+            "verify: PASS\n{\"ok\":true,\"attempts\":1,\"steps\":[]}",
+            true,
+        );
+        assert_eq!(growth.verification, Some(Verification::Passed));
+        assert!(growth.errors.is_empty());
+    }
+
+    #[test]
+    fn a_verify_fail_names_the_step_and_kind_and_lands_in_errors() {
+        let growth = verify_growth(
+            "verify: FAIL step=test kind=test_failure\n{\"ok\":false}",
+            false,
+        );
+        assert_eq!(
+            growth.verification,
+            Some(Verification::Failed {
+                step: Some("test".to_owned()),
+                kind: Some("test_failure".to_owned()),
+            })
+        );
+        assert_eq!(
+            growth.errors,
+            vec!["verify: FAIL test:test_failure".to_owned()]
+        );
+    }
+
+    #[test]
+    fn verify_signal_falls_back_to_the_json_report() {
+        let growth = verify_growth(
+            "{\"ok\":false,\"failure\":{\"step\":\"build\",\"kind\":\"compile_error\"}}",
+            false,
+        );
+        assert_eq!(
+            growth.verification,
+            Some(Verification::Failed {
+                step: Some("build".to_owned()),
+                kind: Some("compile_error".to_owned()),
+            })
+        );
+        assert_eq!(
+            growth.errors,
+            vec!["verify: FAIL build:compile_error".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_unparseable_verify_result_still_records_the_failure() {
+        let growth = verify_growth("spawn failed: no such file", false);
+        assert_eq!(
+            growth.verification,
+            Some(Verification::Failed {
+                step: None,
+                kind: None
+            })
+        );
+        assert_eq!(
+            growth.errors,
+            vec!["verify: spawn failed: no such file".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_plugin_cannot_flip_a_failed_verdict_to_a_pass() {
+        let growth = verify_growth("verify: FAIL step=test kind=timeout\n{}", true);
+        assert!(matches!(
+            growth.verification,
+            Some(Verification::Failed { .. })
+        ));
+        assert!(!growth.errors.is_empty());
+    }
+
+    #[test]
+    fn a_verify_fail_reads_as_partial_not_success() {
+        let growth = verify_growth("verify: FAIL step=test kind=test_failure", false);
+        assert_eq!(
+            experience_outcome(crate::types::TurnState::Idle, &growth),
+            vikram_evolution::ExperienceOutcome::Partial
+        );
+        assert!(!experience_reusable(&growth, crate::types::TurnState::Idle));
+    }
+
+    #[test]
+    fn a_verified_pass_makes_reusable_below_the_two_tool_bar() {
+        let growth = verify_growth("verify: PASS", true);
+        assert_eq!(growth.tools, vec!["verify".to_owned()]);
+        assert!(experience_reusable(&growth, crate::types::TurnState::Idle));
+        assert_eq!(
+            experience_outcome(crate::types::TurnState::Idle, &growth),
+            vikram_evolution::ExperienceOutcome::Success
+        );
+    }
+
+    #[test]
+    fn verification_metadata_carries_the_verdict() {
+        let failed = verify_growth("verify: FAIL step=test kind=lint_failure", false);
+        let metadata = experience_metadata(&session(), &failed);
+        assert_eq!(metadata["verification"]["passed"], false);
+        assert_eq!(metadata["verification"]["step"], "test");
+        assert_eq!(metadata["verification"]["kind"], "lint_failure");
+
+        let clean = TurnGrowth::default();
+        let metadata = experience_metadata(&session(), &clean);
+        assert!(metadata.get("verification").is_none());
+    }
+
+    #[test]
+    fn reflection_sees_a_verify_fail_as_an_issue_pattern() {
+        use vikram_evolution::Reflector;
+        let growth = verify_growth("verify: FAIL step=test kind=test_failure", false);
+        let experience = vikram_evolution::Experience {
+            id: "exp-verify".to_owned(),
+            timestamp_ms: 0,
+            agent_id: "main".to_owned(),
+            project_id: None,
+            task_category: "verify".to_owned(),
+            user_request: "fix the build".to_owned(),
+            outcome: experience_outcome(crate::types::TurnState::Idle, &growth),
+            tools_used: growth.tools.clone(),
+            errors: growth.errors.clone(),
+            corrections: Vec::new(),
+            feedback: None,
+            reusable: experience_reusable(&growth, crate::types::TurnState::Idle),
+            sensitivity: vikram_evolution::Sensitivity::Private,
+            metadata: experience_metadata(&session(), &growth),
+        };
+        let proposals = vikram_evolution::HeuristicReflector
+            .reflect(&experience)
+            .unwrap();
+        assert!(
+            proposals
+                .iter()
+                .any(|p| p.kind == vikram_evolution::ProposalKind::RecordIssue),
+            "a failed verification must surface as an issue pattern, got {proposals:?}"
+        );
+        assert!(!experience.reusable);
+    }
+
+    #[test]
+    fn reflection_proposes_a_skill_for_a_verified_reusable_turn() {
+        use vikram_evolution::Reflector;
+        let growth = verify_growth("verify: PASS", true);
+        let experience = vikram_evolution::Experience {
+            id: "exp-verified".to_owned(),
+            timestamp_ms: 0,
+            agent_id: "main".to_owned(),
+            project_id: None,
+            task_category: "verify".to_owned(),
+            user_request: "add the endpoint".to_owned(),
+            outcome: experience_outcome(crate::types::TurnState::Idle, &growth),
+            tools_used: growth.tools.clone(),
+            errors: growth.errors.clone(),
+            corrections: Vec::new(),
+            feedback: None,
+            reusable: experience_reusable(&growth, crate::types::TurnState::Idle),
+            sensitivity: vikram_evolution::Sensitivity::Private,
+            metadata: experience_metadata(&session(), &growth),
+        };
+        let proposals = vikram_evolution::HeuristicReflector
+            .reflect(&experience)
+            .unwrap();
+        assert!(
+            proposals
+                .iter()
+                .any(|p| p.kind == vikram_evolution::ProposalKind::CreateSkill),
+            "a verified reusable turn should earn a skill candidate, got {proposals:?}"
+        );
     }
 }

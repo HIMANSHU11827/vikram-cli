@@ -3207,8 +3207,10 @@ dependencies = [
  "tempfile",
  "vikram-codeindex",
  "vikram-contracts",
+ "vikram-evolution",
  "vikram-gateway",
  "vikram-runtime",
+ "vikram-skills",
  "vikram-store",
 ]
 
@@ -3225,6 +3227,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "vikram-bench",
  "vikram-contracts",
  "vikram-daemon",
  "vikram-evolution",

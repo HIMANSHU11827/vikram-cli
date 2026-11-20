@@ -21,6 +21,7 @@ vikram-daemon.workspace = true
 vikram-policy.workspace = true
 vikram-gateway = { path = "../vikram-gateway" }
 vikram-evolution = { path = "../vikram-evolution" }
+vikram-bench = { path = "../vikram-bench" }
 clap.workspace = true
 tokio.workspace = true
 futures-util.workspace = true

@@ -63,6 +63,12 @@ struct Row {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // `vikram-bench learning [--baseline F] [--save-baseline F]` runs the
+    // learning-system store benchmarks instead of the timing suite.
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("learning") {
+        return vikram_bench::learning::cli(&args.collect::<Vec<_>>()).map_err(Into::into);
+    }
     print_header();
 
     let mut rows: Vec<Row> = Vec::new();

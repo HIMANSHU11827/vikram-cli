@@ -998,7 +998,9 @@ pub(crate) async fn run_turn(
         for (call, (content, ok)) in calls.iter().zip(outcomes) {
             guard.record(call, ok);
             growth.record_call(&call.name);
-            if !ok {
+            if call.name == "verify" {
+                growth.record_verification(ok, &content);
+            } else if !ok {
                 growth.record_failure(&call.name, &content);
             }
             results.push((call.id.clone(), content, ok));

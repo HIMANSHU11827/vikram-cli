@@ -4,6 +4,7 @@
 //! that works on the same durable store, so there is no second source of truth.
 
 mod archive;
+mod bench;
 mod chat;
 mod dist;
 mod doctor;
@@ -215,6 +216,11 @@ enum Command {
     Gateway {
         #[command(subcommand)]
         action: Option<gateway_config::GatewayAction>,
+    },
+    /// Run benchmark suites (deterministic, offline).
+    Bench {
+        #[command(subcommand)]
+        action: bench::BenchAction,
     },
     /// Export and import bundles of user-modifiable state.
     Dist {
@@ -917,6 +923,7 @@ fn main() -> std::process::ExitCode {
             Some(action) => exit(gateway_config::run(action)),
             None => run_async(gateway::run(config)),
         },
+        Command::Bench { action } => exit(bench::run(action)),
         Command::Dist { action } => exit(dist::run(action)),
     }
 }

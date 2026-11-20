@@ -14,6 +14,8 @@ vikram-store.workspace = true
 vikram-runtime.workspace = true
 vikram-gateway.workspace = true
 vikram-codeindex.workspace = true
+vikram-evolution = { path = "../vikram-evolution" }
+vikram-skills.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 tempfile.workspace = true

@@ -66,8 +66,20 @@ impl Tool for VerifyRun {
                 .map(|s| truncated(s.output.clone())),
             "steps": steps,
         });
+        // The verdict leads the output on its own line: the growth pipeline reads it even when
+        // the JSON report below is truncated or spooled.
+        let verdict = if outcome.ok {
+            "verify: PASS".to_owned()
+        } else {
+            match &outcome.failure {
+                Some((step, kind)) => {
+                    format!("verify: FAIL step={step} kind={}", kind.as_str())
+                }
+                None => "verify: FAIL".to_owned(),
+            }
+        };
         Ok(ToolOutput {
-            content: truncated(payload.to_string()),
+            content: truncated(format!("{verdict}\n{}", payload)),
             ok: outcome.ok,
         })
     }
