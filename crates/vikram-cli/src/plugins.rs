@@ -226,7 +226,7 @@ fn save_sources(sources: &BTreeMap<String, String>) -> Result<(), String> {
 
 /// Record the canonical source path so a later `plugins update` finds it again. Relative
 /// paths are made absolute because the update may run from another directory.
-fn record_source(id: &str, source: &Path) -> Result<(), String> {
+pub(crate) fn record_source(id: &str, source: &Path) -> Result<(), String> {
     let mut sources = load_sources()?;
     let canonical = source
         .canonicalize()

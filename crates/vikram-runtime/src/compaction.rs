@@ -714,6 +714,12 @@ fn condense(text: &str, limit: usize) -> String {
 /// marker drops the `folded_messages` entries it folded and substitutes its summary. The count is
 /// the forget range: replay reaches exactly the transcript the fold was computed from, so removing
 /// that many from the front reproduces the agent's live context rather than the raw history.
+///
+/// Journal seqs are contiguous from 1 and `prune_journal` only ever deletes a prefix, so a
+/// first surviving seq above 1 means the covered prefix is gone by design. A marker whose
+/// `folded` count exceeds what replayed then applies its summary without draining; with the
+/// rows still present it drains exactly as before, and a marker that lines up with neither is
+/// still refused.
 pub fn project_from_journal(
     records: impl IntoIterator<Item = (u64, RecordKind, serde_json::Value)>,
 ) -> Vec<Message> {
@@ -721,7 +727,16 @@ pub fn project_from_journal(
     // Calls the journal says were started. A process can die between the record and the result, and
     // a replay that loses the call loses the fact that anything happened at all.
     let mut unanswered: Vec<vikram_contracts::ToolCallId> = Vec::new();
+    // Pruning removes a prefix, never a middle: only the first surviving seq tells the two
+    // apart. A corrupt row dropped mid-journal leaves a gap too, but seq 1 still leads, so it
+    // cannot masquerade as a prune.
+    let mut first_seq: Option<u64> = None;
+    let mut prefix_pruned = false;
     for (seq, kind, payload) in records {
+        if first_seq.is_none() {
+            first_seq = Some(seq);
+            prefix_pruned = seq > 1;
+        }
         if kind == RecordKind::Compaction {
             let Some(raw) = payload.get(COMPACTION_SUMMARY_KEY) else {
                 continue;
@@ -733,9 +748,22 @@ pub fn project_from_journal(
                 .get(COMPACTION_FOLDED_KEY)
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as usize;
-            if folded == 0 || folded > messages.len() {
-                // A marker that does not line up with what we replayed is not safe to apply;
-                // keeping the full transcript beats silently losing turns.
+            if folded == 0 {
+                continue;
+            }
+            if folded > messages.len() {
+                // The folded originals should be here. They are only absent when the journal's
+                // covered prefix was pruned — the journal starting past seq 1 proves rows were
+                // deleted, and only `prune_journal` deletes a prefix, only under a compaction
+                // marker. Anything else (a hand-truncated journal, a foreign writer) keeps the
+                // full transcript rather than silently trusting a summary.
+                if !prefix_pruned {
+                    continue;
+                }
+                if messages.first().is_some_and(is_compaction_summary) {
+                    messages.remove(0);
+                }
+                messages.insert(0, summary);
                 continue;
             }
             let _ = seq;
@@ -1242,6 +1270,203 @@ mod tests {
         ]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text_body(), "good");
+    }
+
+    #[test]
+    fn projection_applies_a_marker_whose_folded_prefix_was_pruned() {
+        use serde_json::json;
+        let summary = Message::text(
+            Role::System,
+            fold_summary(3, 0, 4, "pruned fold"),
+            Trust::Host,
+        );
+        // The journal begins at the marker: seqs 1-4 were deleted under
+        // `session_compaction.prunable_through_seq = 4`, so the folded originals
+        // are gone by design and the summary is the whole prefix.
+        let out = project_from_journal(vec![
+            (
+                5,
+                RecordKind::Compaction,
+                json!({
+                COMPACTION_SUMMARY_KEY: summary,
+                COMPACTION_THROUGH_KEY: 4,
+                COMPACTION_FOLDED_KEY: 3}),
+            ),
+            (
+                6,
+                RecordKind::Message,
+                json!({"message": Message::user("after")}),
+            ),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert!(is_compaction_summary(&out[0]));
+        assert!(out[0].text_body().contains("pruned fold"));
+        assert_eq!(out[1].text_body(), "after");
+    }
+
+    #[test]
+    fn a_mid_journal_gap_is_not_a_prune() {
+        use serde_json::json;
+        let summary = Message::text(
+            Role::System,
+            "[VIKRAM context summary] bogus range",
+            Trust::Host,
+        );
+        // Seq 2 is missing but seq 1 leads: a dropped corrupt row, not a pruned
+        // prefix. A marker that cannot line up must still be refused.
+        let out = project_from_journal(vec![
+            (
+                1,
+                RecordKind::Message,
+                json!({"message": Message::user("a")}),
+            ),
+            (
+                3,
+                RecordKind::Message,
+                json!({"message": Message::user("b")}),
+            ),
+            (
+                4,
+                RecordKind::Compaction,
+                json!({
+                COMPACTION_SUMMARY_KEY: summary, COMPACTION_FOLDED_KEY: 5}),
+            ),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].text_body(), "a");
+        assert_eq!(out[1].text_body(), "b");
+    }
+
+    #[test]
+    fn projection_after_a_prune_still_drains_a_later_marker_normally() {
+        use serde_json::json;
+        let first = Message::text(
+            Role::System,
+            fold_summary(3, 0, 4, "first fold"),
+            Trust::Host,
+        );
+        let second = Message::text(
+            Role::System,
+            fold_summary(2, 0, 7, "second fold"),
+            Trust::Host,
+        );
+        // Seqs 1-4 pruned under the first marker; the second fold's originals
+        // (seqs 6-7) survived, so its marker drains them exactly as before.
+        let out = project_from_journal(vec![
+            (
+                5,
+                RecordKind::Compaction,
+                json!({
+                COMPACTION_SUMMARY_KEY: first,
+                COMPACTION_THROUGH_KEY: 4,
+                COMPACTION_FOLDED_KEY: 3}),
+            ),
+            (
+                6,
+                RecordKind::Message,
+                json!({"message": Message::user("c")}),
+            ),
+            (
+                7,
+                RecordKind::Message,
+                json!({"message": Message::user("d")}),
+            ),
+            (
+                8,
+                RecordKind::Compaction,
+                json!({
+                COMPACTION_SUMMARY_KEY: second,
+                COMPACTION_THROUGH_KEY: 7,
+                COMPACTION_FOLDED_KEY: 2}),
+            ),
+            (
+                9,
+                RecordKind::Message,
+                json!({"message": Message::user("e")}),
+            ),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].text_body().contains("second fold"));
+        assert!(!out[0].text_body().contains("first fold"));
+        assert_eq!(out[1].text_body(), "e");
+    }
+
+    #[test]
+    fn a_pruned_journal_replays_to_the_same_folded_transcript() {
+        use serde_json::json;
+        use vikram_contracts::{JournalSink, NewRecord};
+        use vikram_store::Store;
+
+        let store = Store::open_in_memory().unwrap();
+        let session = store
+            .create_session("folded", std::path::Path::new("/work"), None, 1)
+            .unwrap();
+        let journal = store.journal();
+        for (i, text) in ["a", "b", "c"].iter().enumerate() {
+            journal
+                .append(
+                    &NewRecord::new(
+                        session.id.clone(),
+                        RecordKind::Message,
+                        json!({"message": Message::user(*text)}),
+                    )
+                    .at(100 + i as u64),
+                )
+                .unwrap();
+        }
+        let summary = Message::text(Role::System, fold_summary(3, 0, 3, "e2e fold"), Trust::Host);
+        journal
+            .append(
+                &NewRecord::new(
+                    session.id.clone(),
+                    RecordKind::Compaction,
+                    json!({
+                    COMPACTION_SUMMARY_KEY: summary,
+                    COMPACTION_THROUGH_KEY: 3,
+                    COMPACTION_FOLDED_KEY: 3}),
+                )
+                .at(200),
+            )
+            .unwrap();
+        journal
+            .append(
+                &NewRecord::new(
+                    session.id.clone(),
+                    RecordKind::Message,
+                    json!({"message": Message::user("after")}),
+                )
+                .at(300),
+            )
+            .unwrap();
+        store.note_session_compaction(&session.id, 3).unwrap();
+
+        let project = |records: Vec<vikram_contracts::JournalRecord>| {
+            project_from_journal(
+                records
+                    .into_iter()
+                    .map(|record| (record.seq, record.kind, record.payload)),
+            )
+        };
+        let before = project(store.replay_messages(&session.id).unwrap());
+        assert_eq!(before.len(), 2);
+
+        store.prune_journal(1_000_000, 1).unwrap();
+        let records = store.replay_messages(&session.id).unwrap();
+        assert_eq!(
+            records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![4, 5],
+            "the covered prefix is gone; the marker and the tail remain"
+        );
+        let after = project(records);
+        assert_eq!(after.len(), 2);
+        assert!(is_compaction_summary(&after[0]));
+        assert!(after[0].text_body().contains("e2e fold"));
+        assert_eq!(after[1].text_body(), "after");
+        assert_eq!(
+            after[0].text_body(),
+            before[0].text_body(),
+            "pruning must not change what replay reconstructs"
+        );
     }
 
     #[test]

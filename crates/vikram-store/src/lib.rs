@@ -462,24 +462,19 @@ pub struct TicketEventRow {
 
 /// Recommended retention window for append-only side tables (hive messages, ticket events, usage,
 /// file changes). The journal is exempt from this sweep: `read_after` cursors, crash recovery and
-/// compaction replay all depend on it staying whole. [`Store::prune_journal`] is the only journal
-/// prune, and it removes only rows no session can reach.
+/// compaction replay all depend on it. [`Store::prune_journal`] is the only journal
+/// prune: it removes rows no session can reach, plus prefixes a compaction marker covers.
 pub const RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
-/// What [`Store::prune_journal`] removed and what it deliberately kept. The journal is the replay
-/// substrate, so the kept counts are the interesting half of the report: every row belonging to a
-/// live session survives on purpose.
+/// What [`Store::prune_journal`] removed and what it deliberately kept.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct JournalPruneReport {
     /// Journal rows deleted: entries whose `session` has no `sessions` row and whose `ts_ms` is
-    /// older than the cutoff. Every read path — replay, export, recovery, `read_after` — is keyed
-    /// by a `SessionId` that only `sessions` can hand out, so these rows are unreachable.
+    /// older than the cutoff (unreachable), plus entries at or below a session's
+    /// `session_compaction.prunable_through_seq` (covered by a journalled compaction marker).
     pub deleted: u64,
-    /// Rows kept because their session still exists. This includes rows a compaction marker
-    /// already folded: `project_from_journal` applies a marker by draining `folded` messages out
-    /// of the journal's own history, so deleting the folded prefix would make the marker stop
-    /// lining up and silently drop its summary. Archived sessions keep their journal too —
-    /// unarchiving resumes the same transcript.
+    /// Rows kept because their session still exists and no compaction marker covers them.
+    /// Archived sessions keep their journal too — unarchiving resumes the same transcript.
     pub kept_sessions: u64,
     /// Orphaned rows younger than the cutoff: unreachable like `deleted`, but too fresh to touch.
     pub kept_recent_orphans: u64,
@@ -1065,6 +1060,13 @@ impl Store {
              SELECT ?2, seq, ts_ms, kind, effect, payload FROM journal WHERE session = ?1 ORDER BY seq ASC",
             params![id.as_str(), fork.id.as_str()],
         )?;
+        // The copied journal carries the same compaction coverage, so the fork inherits the
+        // prune authorization too — `prune_journal` may drop the same covered prefix there.
+        tx.execute(
+            "INSERT INTO session_compaction (session, prunable_through_seq)
+             SELECT ?2, prunable_through_seq FROM session_compaction WHERE session = ?1",
+            params![id.as_str(), fork.id.as_str()],
+        )?;
         // The fork inherits the conversation, so its search index, workspace binding and usage
         // history move with it. FTS5 is best-effort like everywhere else it is touched.
         let _ = tx.execute(
@@ -1363,6 +1365,10 @@ impl Store {
         let tx = conn.transaction()?;
         tx.execute(
             "DELETE FROM journal WHERE session = ?1",
+            params![id.as_str()],
+        )?;
+        tx.execute(
+            "DELETE FROM session_compaction WHERE session = ?1",
             params![id.as_str()],
         )?;
         tx.execute(
@@ -2154,6 +2160,10 @@ impl Store {
             for sid in &prof_session_ids {
                 tx.execute("DELETE FROM journal WHERE session = ?1", params![sid])?;
                 tx.execute(
+                    "DELETE FROM session_compaction WHERE session = ?1",
+                    params![sid],
+                )?;
+                tx.execute(
                     "UPDATE hive_rosters SET session_id = NULL WHERE session_id = ?1",
                     params![sid],
                 )?;
@@ -2269,6 +2279,10 @@ impl Store {
         };
         for sid in &session_ids {
             tx.execute("DELETE FROM journal WHERE session = ?1", params![sid])?;
+            tx.execute(
+                "DELETE FROM session_compaction WHERE session = ?1",
+                params![sid],
+            )?;
             tx.execute(
                 "UPDATE hive_rosters SET session_id = NULL WHERE session_id = ?1",
                 params![sid],
@@ -2414,6 +2428,10 @@ impl Store {
         };
         for sid in &session_ids {
             tx.execute("DELETE FROM journal WHERE session = ?1", params![sid])?;
+            tx.execute(
+                "DELETE FROM session_compaction WHERE session = ?1",
+                params![sid],
+            )?;
             tx.execute(
                 "UPDATE hive_rosters SET session_id = NULL WHERE session_id = ?1",
                 params![sid],
@@ -3654,8 +3672,8 @@ impl Store {
 
     /// Bounded variant of [`Self::replay_messages`]: `limit`/`offset` map to SQL
     /// `LIMIT`/`OFFSET` over `seq` order. `None` for `limit` replays the whole journal, same as
-    /// [`Self::replay_messages`]. Live-session journal rows are never retention-pruned
-    /// ([`Self::prune_journal`] removes only rows no `sessions` row can reach), so this is the
+    /// [`Self::replay_messages`]. [`Self::prune_journal`] only ever removes a compaction-covered
+    /// prefix or rows no `sessions` row can reach, so this is the
     /// read most likely to need a bound on long-lived sessions.
     pub fn replay_messages_page(
         &self,
@@ -3734,6 +3752,36 @@ impl Store {
             .collect())
     }
 
+    /// Record that a compaction marker covering `through_seq` is durable, authorizing
+    /// [`Self::prune_journal`] to delete the journal prefix it summarizes. Call only after
+    /// the marker append commits: a row here with no marker would let the prune destroy
+    /// originals nothing replaces. The value never moves backwards — a later fold covers
+    /// a later seq.
+    pub fn note_session_compaction(&self, session: &SessionId, through_seq: u64) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO session_compaction (session, prunable_through_seq)
+             VALUES (?1, ?2)
+             ON CONFLICT(session) DO UPDATE SET
+                 prunable_through_seq = MAX(prunable_through_seq, excluded.prunable_through_seq)",
+            params![session.as_str(), through_seq as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The seq up to which this session's journal prefix is covered by a compaction
+    /// summary and safe to prune, when a fold has been journalled.
+    pub fn prunable_through_seq(&self, session: &SessionId) -> Result<Option<u64>> {
+        let conn = self.lock();
+        let seq: Option<i64> = conn
+            .query_row(
+                "SELECT prunable_through_seq FROM session_compaction WHERE session = ?1",
+                params![session.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(seq.map(|s| s as u64))
+    }
+
     pub fn session_count(&self) -> Result<u64> {
         let conn = self.lock();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
@@ -3757,24 +3805,30 @@ impl Store {
         Ok(deleted)
     }
 
-    /// The only safe journal prune: delete rows older than `max_age_ms` before `now_ms` whose
-    /// `session` has no `sessions` row. Orphans are unreachable — replay, export, crash recovery
-    /// and `read_after` are all keyed by a `SessionId` only `sessions` can produce — and the age
-    /// floor keeps a late append to a just-deleted session from being swept while its runtime
-    /// still holds the id.
+    /// The safe journal prune, in two parts. Orphaned rows older than `max_age_ms` before
+    /// `now_ms` are deleted: `session` has no `sessions` row, so replay, export, crash recovery
+    /// and `read_after` — all keyed by a `SessionId` only `sessions` can produce — can never
+    /// reach them, and the age floor keeps a late append to a just-deleted session from being
+    /// swept while its runtime still holds the id.
     ///
-    /// Everything else stays, by design. A compaction marker replays by draining `folded`
-    /// messages out of the journal's own prefix, so the folded rows must remain for the marker
-    /// to line up; archived sessions resume from the same journal; and `effect` ids dedupe
-    /// retried appends. Pruning any of those needs a compaction-marker redesign in the runtime,
-    /// not a store-side sweep.
+    /// The second part is the deep prune: rows with `seq <= session_compaction.prunable_through_seq`
+    /// are deleted for any session that has one. That marker is written only after its compaction
+    /// record commits, so every deleted row is covered by a summary the surviving marker row
+    /// (always at a higher seq) replays. Journal seqs are contiguous from 1, so the deleted
+    /// prefix shows up as a gap on replay and `project_from_journal` applies the summary without
+    /// draining originals that no longer exist. Everything else stays: `effect` ids still dedupe
+    /// retried appends, and sessions without a compaction marker keep their whole journal.
     pub fn prune_journal(&self, now_ms: u64, max_age_ms: u64) -> Result<JournalPruneReport> {
         let cutoff = now_ms.saturating_sub(max_age_ms) as i64;
         let conn = self.lock();
         let deleted = conn.execute(
             "DELETE FROM journal
-             WHERE ts_ms < ?1
-               AND session NOT IN (SELECT id FROM sessions)",
+             WHERE (ts_ms < ?1 AND session NOT IN (SELECT id FROM sessions))
+                OR EXISTS (
+                    SELECT 1 FROM session_compaction sc
+                    WHERE sc.session = journal.session
+                      AND journal.seq <= sc.prunable_through_seq
+                )",
             params![cutoff],
         )? as u64;
         let kept_sessions = count_where(
@@ -4054,6 +4108,14 @@ fn migrate(conn: &Connection) -> Result<()> {
 
         CREATE UNIQUE INDEX IF NOT EXISTS journal_effect
             ON journal(session, effect) WHERE effect IS NOT NULL;
+
+        -- Deep-prune authorization: the journal seq up to which a compaction marker's
+        -- summary covers the prefix. A row is written only after the marker commits, so
+        -- its presence implies the marker exists; `prune_journal` deletes seq <= this.
+        CREATE TABLE IF NOT EXISTS session_compaction (
+            session               TEXT PRIMARY KEY,
+            prunable_through_seq  INTEGER NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS usage (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5733,6 +5795,126 @@ mod tests {
         let records = store.replay_messages(&session.id).unwrap();
         assert_eq!(records.len(), 5);
         assert_eq!(records[4].kind, RecordKind::Compaction);
+    }
+
+    #[test]
+    fn prune_journal_drops_only_the_compaction_covered_prefix() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store
+            .create_session("folded", Path::new("/work"), None, 1)
+            .unwrap();
+        let plain = store
+            .create_session("plain", Path::new("/work"), None, 1)
+            .unwrap();
+        let journal = store.journal();
+        // seqs 1-4: folded originals. seq 5: the marker covering through_seq 4.
+        // seqs 6-7: the kept tail.
+        for i in 0..4u64 {
+            journal
+                .append(
+                    &NewRecord::new(
+                        session.id.clone(),
+                        RecordKind::Message,
+                        serde_json::json!({"i": i}),
+                    )
+                    .at(100 + i),
+                )
+                .unwrap();
+        }
+        journal
+            .append(
+                &NewRecord::new(
+                    session.id.clone(),
+                    RecordKind::Compaction,
+                    serde_json::json!({
+                        "summary": {"role": "system", "blocks": []},
+                        "through_seq": 4,
+                        "folded_messages": 3,
+                    }),
+                )
+                .at(200),
+            )
+            .unwrap();
+        for i in 0..2u64 {
+            journal
+                .append(
+                    &NewRecord::new(
+                        session.id.clone(),
+                        RecordKind::Message,
+                        serde_json::json!({"tail": i}),
+                    )
+                    .at(300 + i),
+                )
+                .unwrap();
+        }
+        for i in 0..2u64 {
+            journal
+                .append(
+                    &NewRecord::new(
+                        plain.id.clone(),
+                        RecordKind::Message,
+                        serde_json::json!({"i": i}),
+                    )
+                    .at(100 + i),
+                )
+                .unwrap();
+        }
+
+        // Without the note the marker alone authorizes nothing.
+        let report = store.prune_journal(1_000_000, 1).unwrap();
+        assert_eq!(report.deleted, 0);
+        assert_eq!(store.replay_messages(&session.id).unwrap().len(), 7);
+
+        store.note_session_compaction(&session.id, 4).unwrap();
+        assert_eq!(store.prunable_through_seq(&session.id).unwrap(), Some(4));
+        assert_eq!(store.prunable_through_seq(&plain.id).unwrap(), None);
+
+        let report = store.prune_journal(1_000_000, 1).unwrap();
+        assert_eq!(report.deleted, 4, "only the covered prefix goes");
+        let records = store.replay_messages(&session.id).unwrap();
+        assert_eq!(
+            records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![5, 6, 7]
+        );
+        assert_eq!(records[0].kind, RecordKind::Compaction);
+        assert_eq!(store.replay_messages(&plain.id).unwrap().len(), 2);
+
+        // A second, earlier note cannot move the prune point backwards.
+        store.note_session_compaction(&session.id, 2).unwrap();
+        assert_eq!(store.prunable_through_seq(&session.id).unwrap(), Some(4));
+        let report = store.prune_journal(1_000_000, 1).unwrap();
+        assert_eq!(report.deleted, 0, "nothing left inside the covered span");
+    }
+
+    #[test]
+    fn session_compaction_dies_with_its_session_and_forks_with_its_journal() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store
+            .create_session("folded", Path::new("/work"), None, 1)
+            .unwrap();
+        let journal = store.journal();
+        journal
+            .append(
+                &NewRecord::new(
+                    session.id.clone(),
+                    RecordKind::Message,
+                    serde_json::json!({"i": 0}),
+                )
+                .at(1),
+            )
+            .unwrap();
+        store.note_session_compaction(&session.id, 1).unwrap();
+
+        let fork = store.fork_session(&session.id, 2).unwrap().unwrap();
+        assert_eq!(
+            store.prunable_through_seq(&fork.id).unwrap(),
+            Some(1),
+            "the fork's copied journal carries the same coverage"
+        );
+
+        store.delete_session(&session.id).unwrap();
+        assert_eq!(store.prunable_through_seq(&session.id).unwrap(), None);
+        assert_eq!(store.prunable_through_seq(&fork.id).unwrap(), Some(1));
     }
 
     #[test]

@@ -1139,15 +1139,20 @@ mod tests {
             "{lines:?}"
         );
 
-        let err = dispatch(
+        let lines = dispatch(
             &mut engine,
             &EvolutionAction::Ask {
                 text: "do my laundry".into(),
             },
         )
-        .unwrap_err();
+        .unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("No recorded activity")),
+            "{lines:?}"
+        );
+
+        let err = dispatch(&mut engine, &EvolutionAction::Ask { text: "   ".into() }).unwrap_err();
         assert!(err.contains("unrecognized command"), "{err}");
-        assert!(err.contains("analyze yourself"), "{err}");
     }
 
     #[test]
@@ -1182,8 +1187,15 @@ mod tests {
             );
         }
         assert!(
-            engine.conversational.parse_command("status").is_none(),
-            "`status` is not a conversational phrase — it is a subcommand"
+            matches!(
+                engine.conversational.parse_command("status"),
+                Some(vikram_evolution::conversational::ConversationalCommand::Ask { .. })
+            ),
+            "`status` falls through to free-form retrieval, not a canned phrase"
+        );
+        assert!(
+            engine.conversational.parse_command("   ").is_none(),
+            "whitespace still has no command"
         );
     }
 

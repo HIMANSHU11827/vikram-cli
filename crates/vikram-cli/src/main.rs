@@ -15,6 +15,7 @@ mod module_sdk;
 mod modules;
 mod plugins;
 mod presets;
+mod registry;
 mod skills;
 mod terminal;
 mod tools;
@@ -157,6 +158,11 @@ enum Command {
     Modules {
         #[command(subcommand)]
         action: Option<modules::ModulesAction>,
+    },
+    /// Browse registry indexes and install modules from them.
+    Registry {
+        #[command(subcommand)]
+        action: Option<registry::RegistryAction>,
     },
     /// Scaffold, validate, and pack module/plugin projects (the authoring SDK).
     Module {
@@ -913,6 +919,10 @@ fn main() -> std::process::ExitCode {
         Command::Modules { action } => {
             let action = action.unwrap_or(modules::ModulesAction::List { from: None });
             exit(modules::run(action))
+        }
+        Command::Registry { action } => {
+            let action = action.unwrap_or(registry::RegistryAction::List);
+            exit(registry::run(action))
         }
         Command::Module { action } => exit(module_sdk::run(action)),
         Command::Users { action } => users(action),

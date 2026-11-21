@@ -1644,6 +1644,17 @@ impl RuntimeInner {
             "after_tokens": report.after_tokens,
         });
         self.journal(session, RecordKind::Compaction, payload);
+        // Only after the marker is durable may the store prune the prefix it covers; a failure
+        // here just means the journal keeps its folded originals a little longer.
+        if let Err(err) = self
+            .store
+            .note_session_compaction(session, report.through_seq)
+        {
+            self.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!("could not record the compaction prune point: {err}"),
+            });
+        }
     }
 
     /// The live context figure for the interface: the busiest session, with the provenance of both
