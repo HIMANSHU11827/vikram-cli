@@ -867,7 +867,6 @@ fn navigate_to(session: &mut Session, url: &str, deadline: Instant) -> Result<()
     if let Some(problem) = result.get("errorText").and_then(Value::as_str) {
         return Err(format!("the browser could not load {url}: {problem}"));
     }
-    session.url = url.to_string();
     // Not an event subscription: `Page.navigate` resolves before subresources are done, so the
     // page is polled until it says it is complete. A page that never gets there is not an error
     // — it may be waiting on something only a later call can supply.
@@ -884,6 +883,16 @@ fn navigate_to(session: &mut Session, url: &str, deadline: Instant) -> Result<()
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+    // A redirect is the page's choice, not the caller's: what it ended on must pass the same
+    // scheme policy the requested URL did, or an allowed https:// page could land the session
+    // on a file: page nobody approved. The landed URL is also what the session reports.
+    let landed = session
+        .evaluate("location.href", call_deadline())
+        .map_err(Failure::into_message)?;
+    let landed = describe_value(landed.get("result"));
+    validate_url(&landed)
+        .map_err(|e| format!("the page navigated somewhere policy forbids: {e}"))?;
+    session.url = landed;
     Ok(())
 }
 
@@ -1372,6 +1381,13 @@ fn first_line(text: &str) -> String {
 /// request with a fixed string result, enough to prove which owner may reach the session.
 #[cfg(test)]
 fn fake_session() -> Session {
+    fake_session_with(|_| json!({"result": {"type": "string", "value": "pong"}}))
+}
+
+/// [`fake_session`] whose far end builds each reply's `result` from the request, so a test can
+/// script what the browser answers.
+#[cfg(test)]
+fn fake_session_with(answer: impl Fn(&Value) -> Value + Send + 'static) -> Session {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake browser");
     let port = listener.local_addr().expect("local addr").port();
     std::thread::spawn(move || {
@@ -1389,10 +1405,7 @@ fn fake_session() -> Session {
                 continue;
             };
             let id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
-            let reply = json!({
-                "id": id,
-                "result": {"result": {"type": "string", "value": "pong"}}
-            });
+            let reply = json!({"id": id, "result": answer(&request)});
             if socket
                 .send(tungstenite::Message::text(reply.to_string()))
                 .is_err()
@@ -1424,6 +1437,30 @@ pub(crate) fn insert_fake_session(owner: &str, id: &str) {
         .lock()
         .expect("registry")
         .insert((owner.to_string(), id.to_string()), fake_session());
+}
+
+/// A fake session that reports a finished load and `location.href` as `location`, so
+/// [`navigate_to`]'s redirect check can be exercised without a browser.
+#[cfg(test)]
+fn fake_session_landing_on(location: &str) -> Session {
+    let location = location.to_string();
+    fake_session_with(move |request| {
+        if request.get("method").and_then(Value::as_str) == Some("Runtime.evaluate") {
+            let expression = request
+                .pointer("/params/expression")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let value = if expression.contains("readyState") {
+                "complete"
+            } else if expression.contains("location.href") {
+                location.as_str()
+            } else {
+                "pong"
+            };
+            return json!({"result": {"type": "string", "value": value}});
+        }
+        json!({})
+    })
 }
 
 #[cfg(test)]
@@ -1536,6 +1573,16 @@ mod tests {
         let body = parse_http_response(raw).unwrap();
         assert_eq!(body, "\u{FFFD}\u{FFFD}a\u{FFFD}");
         assert_eq!(dechunk(b"1\r\n\xc3\r\n0\r\n\r\n").unwrap(), "\u{FFFD}");
+    }
+
+    #[test]
+    fn a_chunk_size_that_overflows_the_reply_is_an_error_not_a_panic() {
+        // `ffffffffffffffff` parses as a valid hex usize; the bounds check must catch the
+        // addition rather than wrap the slice range.
+        let err = dechunk(b"ffffffffffffffff\r\n").unwrap_err();
+        assert!(err.contains("past the end"), "{err}");
+        let err = dechunk(b"7fffffffffffffff\r\n").unwrap_err();
+        assert!(err.contains("past the end"), "{err}");
     }
 
     #[test]
@@ -1959,6 +2006,35 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_over_the_size_cap_is_a_protocol_error_the_session_survives() {
+        // The browser answered; the answer was just unusable. That must surface as an explicit
+        // error — not a dropped message the caller waits on forever — and must not kill the
+        // session, because the next call can still be answered.
+        let huge = "x".repeat(MAX_REPLY_BYTES);
+        let calls = AtomicU64::new(0);
+        let mut session = fake_session_with(move |_request| {
+            if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                json!({"result": {"type": "string", "value": huge.as_str()}})
+            } else {
+                json!({"result": {"type": "string", "value": "pong"}})
+            }
+        });
+        let err = session
+            .call("Runtime.evaluate", json!({}), call_deadline())
+            .expect_err("an oversized reply must fail the call");
+        assert!(
+            matches!(&err, Failure::Protocol(_)),
+            "an oversized reply is the browser's fault, not the transport's"
+        );
+        assert!(err.into_message().contains("exceeded"));
+        // The session is still usable: the oversized reply was consumed, not left pending.
+        session
+            .call("Runtime.evaluate", json!({}), call_deadline())
+            .map_err(Failure::into_message)
+            .expect("the session survives an oversized reply");
+    }
+
+    #[test]
     fn a_cdp_error_carries_its_code() {
         let error = json!({"code": -32602, "message": "Invalid parameters"});
         assert_eq!(describe_cdp_error(&error), "-32602: Invalid parameters");
@@ -2132,6 +2208,32 @@ mod tests {
             );
         }
         assert_eq!(count(), before);
+    }
+
+    #[test]
+    fn a_page_that_lands_off_the_allowed_schemes_fails_the_navigation() {
+        // The requested URL passed validation; the redirect target did not. The session must
+        // not keep a page policy never allowed.
+        let mut session = fake_session_landing_on("file:///etc/passwd");
+        let err = navigate_to(&mut session, "https://example.com", call_deadline())
+            .expect_err("a file: landing must be refused");
+        assert!(err.contains("not a URL the browser may load"), "{err}");
+
+        let mut session = fake_session_landing_on("data:text/html,<p>x</p>");
+        let err = navigate_to(&mut session, "https://example.com", call_deadline())
+            .expect_err("a data: landing must be refused");
+        assert!(err.contains("not a URL the browser may load"), "{err}");
+    }
+
+    #[test]
+    fn an_allowed_landing_is_remembered_as_the_sessions_page() {
+        let mut session = fake_session_landing_on("https://example.com/final");
+        navigate_to(&mut session, "http://example.com", call_deadline()).unwrap();
+        assert_eq!(session.url, "https://example.com/final");
+
+        let mut session = fake_session_landing_on("about:blank");
+        navigate_to(&mut session, "https://example.com", call_deadline()).unwrap();
+        assert_eq!(session.url, "about:blank");
     }
 
     #[test]

@@ -2,7 +2,9 @@
 //!
 //! EXPERIMENTAL — no crate in the workspace depends on this yet. Known gaps before use:
 //! `new_session` cannot pass `mcpServers`, and agent→client `terminal/*` requests are
-//! answered with `-32601` rather than actually handled.
+//! answered with `-32601` rather than actually handled. `WorkspaceAgentRequestHandler`
+//! implements `session/request_permission`, `fs/read_text_file`, and `fs/write_text_file`
+//! for real, confined to a workspace root.
 //!
 //! ACP connects a *client* (IDE/host) to an *agent* (Vikram or another compatible agent).
 //! It is distinct from MCP (agent↔tools) and A2A (agent↔agent).
@@ -10,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -175,6 +178,29 @@ pub struct RequestPermissionResult {
     pub outcome: PermissionOutcome,
 }
 
+impl RequestPermissionResult {
+    /// The agent asked and the answer was no — either a policy refusal or a dismissed prompt.
+    /// Per the ACP spec this carries no `optionId`.
+    pub fn cancelled() -> Self {
+        Self {
+            outcome: PermissionOutcome {
+                outcome: "cancelled".into(),
+                option_id: None,
+            },
+        }
+    }
+
+    /// The agent asked and one of its offered options was chosen.
+    pub fn selected(option_id: impl Into<String>) -> Self {
+        Self {
+            outcome: PermissionOutcome {
+                outcome: "selected".into(),
+                option_id: Some(option_id.into()),
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReadTextFileParams {
     #[serde(rename = "sessionId")]
@@ -233,6 +259,199 @@ pub trait AgentRequestHandler {
 pub struct NoopAgentRequestHandler;
 
 impl AgentRequestHandler for NoopAgentRequestHandler {}
+
+/// Largest payload `fs/write_text_file` will put on disk in one call — mirrors the
+/// runtime's `MAX_WRITE_BYTES` in `tools/fs.rs`.
+const MAX_WRITE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Largest file `fs/read_text_file` will return. Reads are cheaper than writes but an
+/// agent asking for a multi-gigabyte file is still a memory event, so the read is capped.
+const MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
+
+/// JSON-RPC implementation-defined error for a request the handler understood but refused
+/// on policy grounds (path outside the workspace, oversize payload).
+const ERR_REQUEST_DENIED: i64 = -32001;
+
+fn request_denied(message: &str) -> JsonRpcError {
+    JsonRpcError {
+        code: ERR_REQUEST_DENIED,
+        message: format!("Request denied: {message}"),
+        data: None,
+    }
+}
+
+/// Decide an agent's `session/request_permission` request. The ACP crate cannot reach the
+/// runtime's policy engine, so the host installs a decider; the default refuses everything.
+pub type PermissionDecider =
+    Box<dyn Fn(&RequestPermissionParams) -> RequestPermissionResult + Send + Sync>;
+
+/// A real [`AgentRequestHandler`] for hosts that want filesystem and permission requests
+/// answered instead of `-32601`.
+///
+/// `fs/read_text_file` and `fs/write_text_file` are confined to `workspace_root` with the
+/// same symlink-aware resolution the runtime uses (`resolve_within` in
+/// `vikram-runtime/src/config.rs`, duplicated here because this crate cannot depend on it).
+/// `session/request_permission` is deny-first: without an installed
+/// [`Self::with_permission_decider`] every request resolves to `cancelled`, which the agent
+/// must treat as a refusal — never a fake approval.
+pub struct WorkspaceAgentRequestHandler {
+    workspace_root: PathBuf,
+    permission_decider: PermissionDecider,
+}
+
+impl WorkspaceAgentRequestHandler {
+    /// `workspace_root` must exist and be resolvable; the canonical root is stored so every
+    /// later confinement check compares against the real path, not a symlink spelling.
+    pub fn new(workspace_root: impl AsRef<Path>) -> Result<Self> {
+        let root = resolve_symlinks(workspace_root.as_ref())
+            .ok_or_else(|| AcpError::Protocol("workspace root cannot be resolved".into()))?;
+        Ok(Self {
+            workspace_root: root,
+            permission_decider: Box::new(|_| RequestPermissionResult::cancelled()),
+        })
+    }
+
+    /// Install the function that turns an agent permission request into a decision. The host
+    /// wires its own policy (or an interactive prompt) here; whatever it returns is sent back
+    /// verbatim, so a decider that cannot decide should return [`RequestPermissionResult::cancelled`].
+    pub fn with_permission_decider(
+        mut self,
+        decider: impl Fn(&RequestPermissionParams) -> RequestPermissionResult + Send + Sync + 'static,
+    ) -> Self {
+        self.permission_decider = Box::new(decider);
+        self
+    }
+
+    fn confined_path(&self, raw: &str) -> std::result::Result<PathBuf, JsonRpcError> {
+        resolve_within(&self.workspace_root, Path::new(raw))
+            .ok_or_else(|| request_denied(&format!("`{raw}` is outside the workspace root")))
+    }
+}
+
+impl AgentRequestHandler for WorkspaceAgentRequestHandler {
+    fn request_permission(
+        &self,
+        params: RequestPermissionParams,
+    ) -> std::result::Result<RequestPermissionResult, JsonRpcError> {
+        Ok((self.permission_decider)(&params))
+    }
+
+    fn read_text_file(
+        &self,
+        params: ReadTextFileParams,
+    ) -> std::result::Result<ReadTextFileResult, JsonRpcError> {
+        let path = self.confined_path(&params.path)?;
+        let metadata = std::fs::metadata(&path)
+            .map_err(|e| internal_error(&format!("cannot stat `{}`: {e}", path.display())))?;
+        if !metadata.is_file() {
+            return Err(internal_error(&format!(
+                "`{}` is not a file",
+                path.display()
+            )));
+        }
+        if metadata.len() > MAX_READ_BYTES {
+            return Err(request_denied(&format!(
+                "`{}` is {} bytes, over the {MAX_READ_BYTES} byte read limit",
+                params.path,
+                metadata.len()
+            )));
+        }
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| internal_error(&format!("cannot read `{}`: {e}", path.display())))?;
+        Ok(ReadTextFileResult {
+            content: apply_line_window(&content, params.line, params.limit),
+        })
+    }
+
+    fn write_text_file(
+        &self,
+        params: WriteTextFileParams,
+    ) -> std::result::Result<(), JsonRpcError> {
+        if params.content.len() > MAX_WRITE_BYTES {
+            return Err(request_denied(&format!(
+                "content is {} bytes, over the {MAX_WRITE_BYTES} byte write limit",
+                params.content.len()
+            )));
+        }
+        let path = self.confined_path(&params.path)?;
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            return Err(internal_error(&format!(
+                "cannot create `{}`: {e}",
+                parent.display()
+            )));
+        }
+        std::fs::write(&path, &params.content)
+            .map_err(|e| internal_error(&format!("cannot write `{}`: {e}", path.display())))
+    }
+}
+
+/// `line` is 1-indexed per the ACP spec; `limit` caps the number of lines returned. Both
+/// absent means the whole file.
+fn apply_line_window(content: &str, line: Option<u64>, limit: Option<u64>) -> String {
+    if line.is_none() && limit.is_none() {
+        return content.to_string();
+    }
+    let start = line.unwrap_or(1).saturating_sub(1) as usize;
+    let mut lines: Vec<&str> = content.lines().skip(start).collect();
+    if let Some(limit) = limit {
+        lines.truncate(limit as usize);
+    }
+    let mut out = lines.join("\n");
+    if content.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// Resolve a path against a root and refuse escapes — same semantics as the runtime's
+/// `resolve_within`, duplicated here because this crate cannot depend on it.
+fn resolve_within(root: &Path, candidate: &Path) -> Option<PathBuf> {
+    let canonical_root = resolve_symlinks(root)?;
+    let resolved = if candidate.is_absolute() {
+        resolve_symlinks(candidate)?
+    } else {
+        resolve_symlinks(&canonical_root.join(candidate))?
+    };
+    (resolved == canonical_root || resolved.starts_with(&canonical_root)).then_some(resolved)
+}
+
+/// Resolve `path` one component at a time, canonicalizing every component that exists so symlink
+/// targets — including the parent a `..` climbs to — are the real ones. A component that exists
+/// but cannot be canonicalized refuses the whole path; a not-yet-existing tail is kept verbatim
+/// because it cannot contain symlinks.
+fn resolve_symlinks(path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        use std::path::Component;
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                current.pop();
+            }
+            Component::Normal(name) => {
+                current.push(name);
+                match current.canonicalize() {
+                    Ok(canonical) => current = canonical,
+                    Err(_) => {
+                        if current.symlink_metadata().is_ok() {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some(current)
+}
 
 fn method_not_found() -> JsonRpcError {
     JsonRpcError {
@@ -911,6 +1130,181 @@ mod tests {
         let resp: Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(resp["error"]["code"], serde_json::json!(-32600));
         assert_eq!(resp["id"], serde_json::json!(3));
+    }
+
+    /// A unique scratch directory under the system temp dir; removed on drop.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "vikram-acp-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn workspace_handler() -> (ScratchDir, WorkspaceAgentRequestHandler) {
+        let dir = ScratchDir::new("ws");
+        let handler = WorkspaceAgentRequestHandler::new(dir.path()).unwrap();
+        (dir, handler)
+    }
+
+    #[test]
+    fn workspace_handler_reads_file_inside_root() {
+        let (dir, handler) = workspace_handler();
+        std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
+        let resp = handle_inbound_with(
+            &handler,
+            r#"{"jsonrpc":"2.0","id":1,"method":"fs/read_text_file","params":{"sessionId":"s","path":"a.txt"}}"#,
+        );
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap()["content"], "hello\nworld\n");
+    }
+
+    #[test]
+    fn workspace_handler_read_honors_line_and_limit() {
+        let (dir, handler) = workspace_handler();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let resp = handle_inbound_with(
+            &handler,
+            r#"{"jsonrpc":"2.0","id":1,"method":"fs/read_text_file","params":{"sessionId":"s","path":"a.txt","line":2,"limit":1}}"#,
+        );
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap()["content"], "two\n");
+    }
+
+    #[test]
+    fn workspace_handler_writes_file_inside_root() {
+        let (dir, handler) = workspace_handler();
+        let resp = handle_inbound_with(
+            &handler,
+            r#"{"jsonrpc":"2.0","id":1,"method":"fs/write_text_file","params":{"sessionId":"s","path":"sub/b.txt","content":"data"}}"#,
+        );
+        assert!(resp.error.is_none());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("sub/b.txt")).unwrap(),
+            "data"
+        );
+    }
+
+    #[test]
+    fn workspace_handler_refuses_read_outside_root() {
+        let (dir, handler) = workspace_handler();
+        let outside = dir.path().parent().unwrap().join("vikram-acp-outside.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        for path in [
+            "../vikram-acp-outside.txt".to_string(),
+            outside.to_string_lossy().into_owned(),
+        ] {
+            let resp = handle_inbound_with(
+                &handler,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"method":"fs/read_text_file","params":{{"sessionId":"s","path":{}}}}}"#,
+                    serde_json::to_string(&path).unwrap()
+                ),
+            );
+            assert_eq!(resp.error.unwrap().code, ERR_REQUEST_DENIED, "{path}");
+        }
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn workspace_handler_refuses_write_outside_root() {
+        let (dir, handler) = workspace_handler();
+        let outside = dir.path().parent().unwrap().join("vikram-acp-escape.txt");
+        let _ = std::fs::remove_file(&outside);
+        let resp = handle_inbound_with(
+            &handler,
+            r#"{"jsonrpc":"2.0","id":1,"method":"fs/write_text_file","params":{"sessionId":"s","path":"../vikram-acp-escape.txt","content":"x"}}"#,
+        );
+        assert_eq!(resp.error.unwrap().code, ERR_REQUEST_DENIED);
+        assert!(!outside.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_handler_refuses_symlink_escape() {
+        let (dir, handler) = workspace_handler();
+        let outside = ScratchDir::new("outside");
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        let resp = handle_inbound_with(
+            &handler,
+            r#"{"jsonrpc":"2.0","id":1,"method":"fs/read_text_file","params":{"sessionId":"s","path":"link/secret.txt"}}"#,
+        );
+        assert_eq!(resp.error.unwrap().code, ERR_REQUEST_DENIED);
+    }
+
+    #[test]
+    fn workspace_handler_write_over_size_cap_is_denied() {
+        let (dir, handler) = workspace_handler();
+        let huge = "x".repeat(MAX_WRITE_BYTES + 1);
+        let resp = handle_inbound_with(
+            &handler,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"fs/write_text_file","params":{{"sessionId":"s","path":"big.txt","content":{}}}}}"#,
+                serde_json::to_string(&huge).unwrap()
+            ),
+        );
+        assert_eq!(resp.error.unwrap().code, ERR_REQUEST_DENIED);
+        assert!(!dir.path().join("big.txt").exists());
+    }
+
+    #[test]
+    fn workspace_handler_permission_defaults_to_cancelled() {
+        let (_dir, handler) = workspace_handler();
+        let resp = handle_inbound_with(
+            &handler,
+            r#"{"jsonrpc":"2.0","id":1,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"title":"rm"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]}}"#,
+        );
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert_eq!(result["outcome"]["outcome"], "cancelled");
+        assert!(result["outcome"].get("optionId").is_none());
+    }
+
+    #[test]
+    fn workspace_handler_permission_uses_installed_decider() {
+        let (_dir, base) = workspace_handler();
+        let handler = base.with_permission_decider(|params| {
+            assert_eq!(params.options.len(), 1);
+            RequestPermissionResult::selected("allow")
+        });
+        let resp = handle_inbound_with(
+            &handler,
+            r#"{"jsonrpc":"2.0","id":1,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]}}"#,
+        );
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert_eq!(result["outcome"]["outcome"], "selected");
+        assert_eq!(result["outcome"]["optionId"], "allow");
+    }
+
+    #[test]
+    fn workspace_handler_still_rejects_terminal_methods() {
+        let (_dir, handler) = workspace_handler();
+        let resp = handle_inbound_with(
+            &handler,
+            r#"{"jsonrpc":"2.0","id":1,"method":"terminal/create","params":{}}"#,
+        );
+        assert_eq!(resp.error.unwrap().code, -32601);
     }
 
     #[test]
