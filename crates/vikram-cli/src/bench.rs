@@ -17,6 +17,19 @@ pub enum BenchAction {
         #[arg(long, value_name = "PATH")]
         save_baseline: Option<PathBuf>,
     },
+    /// Personality-consistency harness: deterministic style fingerprinting of
+    /// assistant outputs against a seeded baseline. Offline, no model calls.
+    Personality {
+        /// Directory of observed assistant turns (*.txt files).
+        #[arg(long, value_name = "DIR")]
+        turns: Option<PathBuf>,
+        /// An inline observed turn; repeatable.
+        #[arg(long, value_name = "TEXT")]
+        text: Vec<String>,
+        /// Drift threshold in [0, 1]; turns below it are flagged WARN.
+        #[arg(long, value_name = "F", default_value_t = vikram_bench::personality::DEFAULT_THRESHOLD)]
+        threshold: f64,
+    },
 }
 
 pub fn run(action: BenchAction) -> Result<(), String> {
@@ -25,5 +38,10 @@ pub fn run(action: BenchAction) -> Result<(), String> {
             baseline,
             save_baseline,
         } => vikram_bench::learning::learning(baseline.as_deref(), save_baseline.as_deref()),
+        BenchAction::Personality {
+            turns,
+            text,
+            threshold,
+        } => vikram_bench::personality::personality(turns.as_deref(), &text, Some(threshold)),
     }
 }

@@ -387,6 +387,16 @@ enum DaemonAction {
     Disable,
     /// Say which config changes take effect on the next tick.
     Reload,
+    /// Show or set the quiet-hours silence policy.
+    Quiet {
+        /// Window start, local time: 22 or 22:30.
+        start: Option<String>,
+        /// Window end, local time.
+        end: Option<String>,
+        /// Turn quiet hours off.
+        #[arg(long)]
+        off: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -434,6 +444,17 @@ enum CronAction {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
+    /// Raise an internal event that jobs can subscribe to with `on <trigger>`.
+    Signal {
+        /// The event: postbox, job.settled or notify.
+        event: String,
+        /// What the event is about (usually a job id).
+        #[arg(long)]
+        subject: Option<String>,
+        /// Extra detail recorded with the event.
+        #[arg(long)]
+        detail: Option<String>,
+    },
 }
 
 /// Everything a job can be created with.
@@ -441,7 +462,7 @@ enum CronAction {
 struct JobArgs {
     /// A short name people will type instead of an id.
     name: String,
-    /// When it runs: "every 10m", "0 9 * * *", "at 2026-11-05 09:00", "in 30m".
+    /// When it runs: "every 10m", "0 9 * * *", "at 2026-11-05 09:00", "in 30m", "on postbox".
     schedule: String,
     /// The instruction to an agent, or the command to a script.
     payload: String,
@@ -3156,6 +3177,14 @@ fn daemon(action: DaemonAction) -> std::process::ExitCode {
         DaemonAction::Enable => report(cli::set_service_enabled(true)),
         DaemonAction::Disable => report(cli::set_service_enabled(false)),
         DaemonAction::Reload => report(cli::reload()),
+        DaemonAction::Quiet { start, end, off } => match (start, end, off) {
+            (None, None, false) => report(cli::quiet_status()),
+            (None, None, true) => report(cli::quiet_off()),
+            (Some(start), Some(end), false) => report(cli::quiet_set(&start, &end)),
+            _ => report(Err(
+                "usage: vikram daemon quiet [<start> <end>] [--off]".to_string()
+            )),
+        },
     }
 }
 
@@ -3183,6 +3212,15 @@ fn cron(action: CronAction) -> std::process::ExitCode {
         CronAction::Run { id } => report(cli::cron_run(&id)),
         CronAction::Remove { id } => report(cli::cron_remove(&id)),
         CronAction::History { id, limit } => report(cli::cron_history(&id, limit)),
+        CronAction::Signal {
+            event,
+            subject,
+            detail,
+        } => report(cli::trigger_signal(
+            &event,
+            subject.as_deref(),
+            detail.as_deref(),
+        )),
     }
 }
 

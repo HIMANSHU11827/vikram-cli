@@ -28,4 +28,5 @@ pub mod service;
 pub mod store;
 pub mod time;
 pub mod tools;
+pub mod triggers;
 pub mod worker;

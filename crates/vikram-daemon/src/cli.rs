@@ -19,6 +19,7 @@ use crate::runner::HiveRosterOrder;
 use crate::service;
 use crate::store::{Delivery, JobMode, Run, RunStatus, ScheduleStore};
 use crate::time::{Zone, format_ms, humanize_ms, now_ms, parse_duration};
+use crate::triggers::{EmitOutcome, EventBus, QuietHours, URGENT_PRIORITY};
 use crate::worker::TaskClass;
 
 /// Where the daemon keeps its lock, its log and its service definition.
@@ -700,6 +701,92 @@ pub fn cron_history(needle: &str, limit: usize) -> Result<String, String> {
         ));
     }
     Ok(text)
+}
+
+/// Raise an internal event. Jobs subscribe with `on <trigger>`; this is how an operator (or
+/// another tool) produces one by hand. The trigger kind is validated deny-first, and the row is
+/// durable — the daemon picks it up on its next tick even though this process cannot wake it.
+pub fn trigger_signal(
+    event: &str,
+    subject: Option<&str>,
+    detail: Option<&str>,
+) -> Result<String, String> {
+    let store = store()?;
+    let bus = EventBus::without_wake(store);
+    match bus.emit(event, subject.unwrap_or(""), detail.unwrap_or(""), now_ms()) {
+        Ok(EmitOutcome::Recorded(row)) => {
+            audit(
+                &home(),
+                &format!("trigger signal {}:{}", row.kind, row.subject),
+            );
+            Ok(format!(
+                "signalled {} (seq {})\nthe daemon picks it up on its next tick",
+                if row.subject.is_empty() {
+                    row.kind.clone()
+                } else {
+                    format!("{}:{}", row.kind, row.subject)
+                },
+                row.seq
+            ))
+        }
+        Ok(EmitOutcome::Deduped) => Ok(format!(
+            "{event} fired within the last minute already; nothing new was queued"
+        )),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// quiet hours
+// ---------------------------------------------------------------------------
+
+/// The silence policy as the operator sees it.
+pub fn quiet_status() -> Result<String, String> {
+    let store = store()?;
+    let quiet = QuietHours::load(&store).map_err(|err| err.to_string())?;
+    if !quiet.enabled {
+        return Ok(format!(
+            "quiet hours: off\nset one with `vikram daemon quiet <start> <end>` (local time, e.g. 22 7)\nurgent jobs (priority >= {URGENT_PRIORITY}) always run"
+        ));
+    }
+    Ok(format!(
+        "quiet hours: {}\nduring the window, jobs below priority {URGENT_PRIORITY} are skipped and notifications are suppressed\nchanges are written to the audit log",
+        quiet.describe()
+    ))
+}
+
+/// Set the window. Both ends are required: a quiet policy with one end is a typo, not a policy.
+pub fn quiet_set(start: &str, end: &str) -> Result<String, String> {
+    let start = crate::triggers::parse_hhmm(start)?;
+    let end = crate::triggers::parse_hhmm(end)?;
+    let store = store()?;
+    let quiet = QuietHours {
+        enabled: true,
+        start,
+        end,
+    };
+    quiet
+        .apply(&store, now_ms())
+        .map_err(|err| err.to_string())?;
+    audit(&home(), &format!("quiet hours {}", quiet.describe()));
+    Ok(format!(
+        "quiet hours: {}\nthe running daemon picks it up on its next tick",
+        quiet.describe()
+    ))
+}
+
+/// Turn the policy off. The stored window stays on record; only the switch moves.
+pub fn quiet_off() -> Result<String, String> {
+    let store = store()?;
+    let quiet = QuietHours {
+        enabled: false,
+        ..QuietHours::load(&store).map_err(|err| err.to_string())?
+    };
+    quiet
+        .apply(&store, now_ms())
+        .map_err(|err| err.to_string())?;
+    audit(&home(), "quiet hours off");
+    Ok("quiet hours: off".to_string())
 }
 
 // ---------------------------------------------------------------------------

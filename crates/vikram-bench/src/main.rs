@@ -69,6 +69,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.next().as_deref() == Some("learning") {
         return vikram_bench::learning::cli(&args.collect::<Vec<_>>()).map_err(Into::into);
     }
+    // `vikram-bench personality ...` runs the style-consistency harness.
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("personality") {
+        return vikram_bench::personality::cli(&args.collect::<Vec<_>>()).map_err(Into::into);
+    }
     print_header();
 
     let mut rows: Vec<Row> = Vec::new();

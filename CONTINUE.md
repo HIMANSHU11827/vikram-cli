@@ -38,9 +38,22 @@ Status: **~2,900 tests passing, clippy clean, pushed to GitHub at `e3c95dd`**
 ### P2 — long tail
 8. Journal: compaction-state GC for deleted sessions' artifacts.
 9. Provider-specific features (prompt caching, structured outputs).
-10. `computer.*` remaining helpers (clipboard, notifications).
+10. ~~`computer.*` remaining helpers (clipboard, notifications)~~ — done:
+    `computer.clipboard_read/write` + `computer.notify` landed.
 11. Relations: temporal decay, inference from conversations.
 12. Distribution: plugin marketplace signing chain beyond manifest sig.
+
+### JARVIS-class track (docs/jarvis-class.md, docs/voice-plan.md, docs/always-on.md)
+- [x] docs/voice-plan.md — phased voice plan, honest limits
+- [x] docs/always-on.md — presence-session design (phases A–D)
+- [x] Event-driven daemon triggers (`on <trigger>` schedules, EventBus,
+      daemon_events dedup, quiet hours, daemon_audit trail)
+- [x] Personality-consistency harness (`vikram bench personality`,
+      deterministic local scoring)
+- [ ] Phase A: durable presence session identity
+- [ ] Phase B: liveness states (awake/dozing/asleep) + `/sleep` `/wake`
+- [ ] Phase C: proactive turns via triggers into presence session
+- [ ] Phase D: vikram-voice crate (Phase 1 push-to-talk per voice-plan.md)
 
 ### Verification
 ```bash

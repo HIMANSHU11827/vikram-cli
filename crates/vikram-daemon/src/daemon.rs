@@ -33,6 +33,7 @@ use crate::postbox::Postbox;
 use crate::runner::{self, AgentRequest, RunOutcome};
 use crate::store::{Delivery, Job, JobMode, Run, RunStatus, ScheduleStore, StoreError};
 use crate::time::{self, Millis};
+use crate::triggers::{EventBus, QuietHours, TriggerKind, URGENT_PRIORITY};
 use crate::worker::{Finished, Limits, TaskClass, WorkerPool};
 
 /// How often the supervisor looks for work when the caller does not say.
@@ -256,6 +257,10 @@ pub struct TickReport {
     pub delivered: Vec<(String, bool)>,
     pub beats: Vec<Beat>,
     pub refused: Vec<String>,
+    /// Jobs an event armed this pass.
+    pub triggered: Vec<String>,
+    /// Jobs and notifications quiet hours held back this pass.
+    pub suppressed: Vec<String>,
 }
 
 impl TickReport {
@@ -264,6 +269,8 @@ impl TickReport {
             && self.finished.is_empty()
             && self.beats.is_empty()
             && self.refused.is_empty()
+            && self.triggered.is_empty()
+            && self.suppressed.is_empty()
     }
 }
 
@@ -280,6 +287,9 @@ pub struct Daemon {
     running: Vec<Running>,
     results: tokio::sync::mpsc::UnboundedReceiver<Finished>,
     postbox: Postbox,
+    /// Woken by [`EventBus::emit`] so a signal does not wait out the tick interval.
+    wake: Arc<Notify>,
+    bus: EventBus,
 }
 
 impl Daemon {
@@ -287,6 +297,8 @@ impl Daemon {
         let jobs = JobManager::new(store.clone());
         let pool = WorkerPool::new(Limits::default());
         let results = pool.take_results().expect("a fresh pool owns its results");
+        let wake = Arc::new(Notify::new());
+        let bus = EventBus::new(store.clone(), wake.clone());
         Self {
             postbox: Postbox::new(store.clone()),
             store,
@@ -298,6 +310,8 @@ impl Daemon {
             catch_up_ms: DEFAULT_CATCH_UP_MS,
             running: Vec::new(),
             results,
+            wake,
+            bus,
         }
     }
 
@@ -338,6 +352,12 @@ impl Daemon {
 
     pub fn home(&self) -> &Path {
         &self.home
+    }
+
+    /// The bus internal emitters and external signals share. Emitting through it validates the
+    /// trigger kind (deny-first) and wakes the run loop when it is waiting between ticks.
+    pub fn bus(&self) -> EventBus {
+        self.bus.clone()
     }
 
     pub fn tick_ms(&self) -> u64 {
@@ -385,12 +405,31 @@ impl Daemon {
             }
         }
 
+        // Events land before the due scan so a job armed by one is claimed in this same pass.
+        self.drain_events(now, &mut report)?;
+
+        let quiet = QuietHours::load(&self.store)?;
+        let silent = quiet.is_quiet(now);
         for job in self.store.due_jobs(now)? {
             // The slot to claim is the one the store says is due. Recomputing it from the schedule
             // would produce the *following* slot and the compare-and-set would never match.
             let Some(slot) = job.next_run_ms else {
                 continue;
             };
+            // Quiet hours suppress non-urgent work: the slot is advanced exactly like a stale one
+            // — skipped, not replayed — and the decision is audited. Urgent jobs still fire.
+            if silent && job.priority < URGENT_PRIORITY {
+                let next = self.jobs.next_slot(&job, now);
+                self.store.skip_slot(&job.id, next, now)?;
+                self.store.audit(
+                    "job.suppress",
+                    &job.id,
+                    &format!("quiet hours {}", quiet.describe()),
+                    now,
+                )?;
+                report.suppressed.push(job.id);
+                continue;
+            }
             match self.jobs.claim(&job, slot, now) {
                 Ok(Some(claimed)) => self.dispatch(claimed, now, &mut report)?,
                 Ok(None) => {}
@@ -401,7 +440,7 @@ impl Daemon {
         self.collect(&mut report, now).await?;
         self.reconcile_lost(now)?;
         self.sweep_state()?;
-        self.beat(now, &mut report).await;
+        self.beat(now, &mut report).await?;
         self.maintenance(now, &mut report).await;
         Ok(report)
     }
@@ -496,8 +535,94 @@ impl Daemon {
         Ok(())
     }
 
+    /// Offer every event the scheduler has not seen to the jobs subscribed to it.
+    ///
+    /// An event arms a job by moving its `next_run_ms` to now; the ordinary claim path then runs
+    /// it, which is what gives event fires the same once-only and retry semantics as cron slots.
+    /// Events older than the catch-up window are passed over — a signal from before the daemon
+    /// was away is history, not work — and the cursor still advances past them.
+    fn drain_events(&self, now: Millis, report: &mut TickReport) -> Result<(), StoreError> {
+        const SEEN_KEY: &str = "events.seen";
+        let seen = self.store.state_ms(SEEN_KEY).ok().flatten().unwrap_or(0);
+        let mut latest = seen;
+        for row in self.store.events_after(seen)? {
+            latest = row.seq;
+            if now.saturating_sub(row.at_ms) > self.catch_up_ms {
+                continue;
+            }
+            let Ok(kind) = TriggerKind::parse(&row.kind) else {
+                self.store
+                    .audit("trigger.refused", &row.kind, &row.detail, now)?;
+                continue;
+            };
+            let mut armed = Vec::new();
+            for job in self.store.list_jobs()? {
+                if !job.enabled {
+                    continue;
+                }
+                let Some(trigger) = self.jobs.trigger_of(&job) else {
+                    continue;
+                };
+                if !trigger.matches(kind, &row.subject) {
+                    continue;
+                }
+                // Deny-first: a job may not wake itself. `on job.settled` matching its own id
+                // would feed every run into the next one forever.
+                if kind == TriggerKind::JobSettled && row.subject == job.id {
+                    continue;
+                }
+                if self.store.set_next_run(&job.id, Some(now), now)? {
+                    armed.push(job.id.clone());
+                }
+            }
+            if !armed.is_empty() {
+                self.store.audit(
+                    "trigger.fire",
+                    &format!("{}:{}", kind.as_str(), row.subject),
+                    &armed.join(", "),
+                    now,
+                )?;
+                report.triggered.extend(armed);
+            }
+        }
+        if latest != seen {
+            self.store.set_state_ms(SEEN_KEY, latest)?;
+        }
+        Ok(())
+    }
+
+    /// Record an internal event and wake the run loop. Emission is best-effort on the wake side —
+    /// the row is the truth, and the next tick finds it even if nobody was listening.
+    fn emit(
+        &self,
+        kind: TriggerKind,
+        subject: &str,
+        detail: &str,
+        now: Millis,
+    ) -> Result<(), StoreError> {
+        if self
+            .store
+            .emit_event(
+                kind.as_str(),
+                subject,
+                detail,
+                crate::triggers::EVENT_DEDUP_MS,
+                now,
+            )?
+            .is_some()
+        {
+            self.wake.notify_waiters();
+        }
+        Ok(())
+    }
+
     /// Advance a slot that is older than the tolerance instead of running it.
     fn stale_slot(&self, job: &Job, now: Millis) -> Result<bool, StoreError> {
+        // An event-armed job is not a missed schedule slot: its wake-up is a signal, and skipping
+        // it would silently drop the event the job was waiting for.
+        if self.jobs.event_driven(job) {
+            return Ok(false);
+        }
         let Some(next) = job.next_run_ms else {
             return Ok(false);
         };
@@ -515,7 +640,7 @@ impl Daemon {
         now: Millis,
         report: &mut TickReport,
     ) -> Result<(), StoreError> {
-        let Claimed { job, run, .. } = claimed;
+        let Claimed { job, run, slot } = claimed;
         let timeout = job.timeout_ms.unwrap_or(DEFAULT_JOB_TIMEOUT_MS).max(1_000);
         let stop = Some(member_probe(self.store.clone(), &run.id));
         let work = work_for(&job, timeout, stop);
@@ -526,6 +651,12 @@ impl Daemon {
                     job_id: job.id.clone(),
                     run_id: run.id.clone(),
                 });
+                self.store.audit(
+                    "job.dispatch",
+                    &job.id,
+                    &format!("run {} slot {}", run.id, slot),
+                    now,
+                )?;
                 report.dispatched.push(job.id);
                 Ok(())
             }
@@ -593,12 +724,15 @@ impl Daemon {
             // cancellation the operator asked for.
             self.jobs
                 .settle_cancelled(&job, &run, &done.outcome.output, &error, now)?;
+            self.emit(TriggerKind::JobSettled, &job.id, "cancelled", now)?;
             return Ok(());
         }
         // `settle` decides what the job's next slot is, including a retry that comes back sooner
         // than the schedule would have said.
         self.jobs
             .settle(&job, &run, ok, &done.outcome.output, &error, now)?;
+        // The state change is itself a signal: jobs subscribed to `on job.settled` wake on it.
+        self.emit(TriggerKind::JobSettled, &job.id, status.as_str(), now)?;
         // Bound history: without this every run row (with its output blob) is kept forever.
         let _ = self.store.prune_runs(&job.id, 200);
         let notice = Notice {
@@ -609,8 +743,22 @@ impl Daemon {
             session: done.outcome.session.clone(),
             at: now,
         };
+        // Quiet hours hold back reports from non-urgent jobs. The run itself already settled —
+        // suppression is a delivery decision, recorded as `suppressed` rather than as a failure.
+        let urgent = job.priority >= URGENT_PRIORITY;
+        let silent = QuietHours::load(&self.store)
+            .map(|quiet| quiet.is_quiet(now))
+            .unwrap_or(false);
         match Destination::parse(&job.target) {
             Ok(destination) => {
+                if silent && !urgent && destination != Destination::None {
+                    self.store
+                        .set_delivery_note(&run.id, Delivery::Suppressed, "quiet hours")?;
+                    self.store
+                        .audit("notify.suppress", &job.id, "quiet hours", now)?;
+                    report.suppressed.push(format!("notify:{}", job.id));
+                    return Ok(());
+                }
                 // Set when a session delivery landed somewhere other than the session the job
                 // named, so the record can say `rerouted` instead of claiming the asked-for
                 // destination was reached.
@@ -623,6 +771,8 @@ impl Daemon {
                         match self.postbox.post(wanted, &notice.line()).await {
                             Ok((session, note)) => {
                                 rerouted = note.is_some();
+                                // A postbox entry is itself an event other jobs can subscribe to.
+                                self.emit(TriggerKind::Postbox, &job.id, &session, now)?;
                                 notify::Report {
                                     delivered: true,
                                     detail: match note {
@@ -651,6 +801,10 @@ impl Daemon {
                 // nothing about what to fix.
                 self.store
                     .set_delivery_note(&run.id, state, &delivered.detail)?;
+                // A delivered notification is a signal too: `on notify` jobs wake on it.
+                if delivered.delivered && destination != Destination::None {
+                    self.emit(TriggerKind::Notify, &job.id, &destination.label(), now)?;
+                }
                 report.delivered.push((job.id, delivered.delivered));
             }
             Err(err) => report.refused.push(format!("{}: {err}", job.id)),
@@ -659,34 +813,49 @@ impl Daemon {
     }
 
     /// Ask the heartbeats whether anything needs attention, and report what they raised.
-    async fn beat(&mut self, now: Millis, report: &mut TickReport) {
+    async fn beat(&mut self, now: Millis, report: &mut TickReport) -> Result<(), StoreError> {
         let heartbeat = Heartbeat::new(&self.store, self.policy.clone());
         if heartbeat.next_due(now).is_none() {
-            return;
+            return Ok(());
         }
+        // Heartbeat notices are non-urgent by definition: quiet hours hold them like any other
+        // report, and the suppression is audited rather than silently dropped.
+        let silent = QuietHours::load(&self.store)
+            .map(|quiet| quiet.is_quiet(now))
+            .unwrap_or(false);
         for kind in [BeatKind::Runtime, BeatKind::Agent, BeatKind::Workers] {
             match heartbeat.beat(kind, now) {
                 Ok(beat) => {
                     if !beat.notify.is_empty() {
-                        let notice = Notice {
-                            job: format!("heartbeat.{}", beat.kind.as_str()),
-                            name: format!("heartbeat {}", beat.kind.as_str()),
-                            status: beat.state.as_str().to_string(),
-                            summary: beat
-                                .notify
-                                .iter()
-                                .map(|issue| issue.message.as_str())
-                                .collect::<Vec<_>>()
-                                .join("; "),
-                            session: None,
-                            at: beat.at,
-                        };
-                        let delivered =
-                            notify::deliver(&Destination::Local, &notice, &self.home, None).await;
-                        report.delivered.push((
-                            format!("heartbeat.{}", beat.kind.as_str()),
-                            delivered.delivered,
-                        ));
+                        let subject = format!("heartbeat.{}", beat.kind.as_str());
+                        if silent {
+                            self.store
+                                .audit("notify.suppress", &subject, "quiet hours", now)?;
+                            report.suppressed.push(format!("notify:{subject}"));
+                        } else {
+                            let notice = Notice {
+                                job: subject.clone(),
+                                name: format!("heartbeat {}", beat.kind.as_str()),
+                                status: beat.state.as_str().to_string(),
+                                summary: beat
+                                    .notify
+                                    .iter()
+                                    .map(|issue| issue.message.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("; "),
+                                session: None,
+                                at: beat.at,
+                            };
+                            let delivered =
+                                notify::deliver(&Destination::Local, &notice, &self.home, None)
+                                    .await;
+                            report
+                                .delivered
+                                .push((subject.clone(), delivered.delivered));
+                            if delivered.delivered {
+                                self.emit(TriggerKind::Notify, &subject, "local", now)?;
+                            }
+                        }
                     }
                     report.beats.push(beat);
                 }
@@ -695,6 +864,7 @@ impl Daemon {
                     .push(format!("heartbeat {}: {err}", kind.as_str())),
             }
         }
+        Ok(())
     }
 
     /// Run until `stop` is notified. Each pass is bounded, because a tick that hangs looks exactly
@@ -706,12 +876,16 @@ impl Daemon {
         if let Err(err) = self.postbox.open().await {
             eprintln!("[vikram] conversation delivery unavailable: {err}");
         }
+        let wake = self.wake.clone();
         loop {
             if let Err(err) = self.tick(time::now_ms()).await {
                 eprintln!("[vikram] tick failed: {err}");
             }
             tokio::select! {
                 _ = stop.notified() => return Ok(()),
+                // An event landed while the tick ran (or between ticks): go straight back
+                // around instead of sleeping out the interval.
+                _ = wake.notified() => {}
                 _ = tokio::time::sleep(Duration::from_millis(self.tick_ms)) => {}
             }
         }
@@ -1236,5 +1410,282 @@ mod tests {
         let fresh = store.get_job(&stuck_job.id).unwrap().unwrap();
         let claimed = manager.claim(&fresh, slot, slot).unwrap();
         assert!(claimed.is_some(), "the job can be claimed again");
+    }
+
+    /// A quiet window that certainly contains `now`, whatever zone the machine is in: five hours
+    /// either side of the current local minute, wrapped the same way the policy wraps.
+    fn quiet_covering(now: Millis) -> QuietHours {
+        let civil = time::civil_in(crate::time::Zone::Local, now);
+        let minute = civil.hour * 60 + civil.minute;
+        QuietHours {
+            enabled: true,
+            start: (minute + 1440 - 300) % 1440,
+            end: (minute + 300) % 1440,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_event_wakes_a_subscribed_job_and_the_fire_is_audited() {
+        let store = store();
+        let manager = JobManager::new(store.clone());
+        let now = time::now_ms();
+        let job = manager
+            .create(
+                NewJob::new("on mail", "on postbox")
+                    .mode(JobMode::Script)
+                    .payload("echo woke up")
+                    .target("none"),
+                now,
+            )
+            .unwrap();
+        assert!(job.next_run_ms.is_none(), "an event job has no clock slot");
+        assert!(job.enabled, "it is armed, just not scheduled");
+
+        let dir = home();
+        let mut daemon = Daemon::new(store.clone(), dir.path()).with_tick_ms(50);
+        // Nothing has happened yet: the job must not fire on a clock that does not exist.
+        let idle = daemon.tick(now).await.unwrap();
+        assert!(idle.dispatched.is_empty());
+        assert!(store.runs_for(&job.id, 5).unwrap().is_empty());
+
+        daemon
+            .bus()
+            .emit("postbox", "job-1", "a report landed", now)
+            .unwrap();
+        let woke = daemon.tick(time::now_ms()).await.unwrap();
+        assert_eq!(woke.triggered, vec![job.id.clone()]);
+        assert_eq!(woke.dispatched, vec![job.id.clone()]);
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        daemon.tick(time::now_ms()).await.unwrap();
+        let runs = store.runs_for(&job.id, 5).unwrap();
+        assert_eq!(runs.len(), 1, "the event fired the job exactly once");
+        assert_eq!(runs[0].status, RunStatus::Ok);
+        // And the job is armed again: settling did not switch it off.
+        let after = store.get_job(&job.id).unwrap().unwrap();
+        assert!(after.enabled);
+        assert!(after.next_run_ms.is_none());
+
+        let trail = store.audit_trail(50).unwrap();
+        let kinds: Vec<&str> = trail.iter().map(|row| row.kind.as_str()).collect();
+        for expected in ["trigger.emit", "trigger.fire", "job.dispatch"] {
+            assert!(
+                kinds.contains(&expected),
+                "audit holds {expected}: {kinds:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_same_event_inside_the_dedup_window_fires_once() {
+        let store = store();
+        let manager = JobManager::new(store.clone());
+        let now = time::now_ms();
+        let job = manager
+            .create(
+                NewJob::new("on mail", "on postbox")
+                    .mode(JobMode::Script)
+                    .payload("echo once")
+                    .target("none"),
+                now,
+            )
+            .unwrap();
+        let dir = home();
+        let mut daemon = Daemon::new(store.clone(), dir.path());
+        let bus = daemon.bus();
+        assert!(matches!(
+            bus.emit("postbox", "job-1", "first", now).unwrap(),
+            crate::triggers::EmitOutcome::Recorded(_)
+        ));
+        assert!(matches!(
+            bus.emit("postbox", "job-1", "second", now + 1_000).unwrap(),
+            crate::triggers::EmitOutcome::Deduped
+        ));
+        daemon.tick(time::now_ms()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        daemon.tick(time::now_ms()).await.unwrap();
+        assert_eq!(
+            store.runs_for(&job.id, 5).unwrap().len(),
+            1,
+            "a deduplicated event is one fire, not two"
+        );
+    }
+
+    #[tokio::test]
+    async fn quiet_hours_skip_ordinary_jobs_but_urgent_ones_still_fire() {
+        let store = store();
+        let manager = JobManager::new(store.clone());
+        let now = time::now_ms();
+        let ordinary = manager
+            .create(
+                NewJob::new("ordinary", "every 1m")
+                    .mode(JobMode::Script)
+                    .payload("echo ordinary")
+                    .target("none"),
+                now,
+            )
+            .unwrap();
+        let urgent = manager
+            .create(
+                NewJob::new("urgent", "every 1m")
+                    .mode(JobMode::Script)
+                    .payload("echo urgent")
+                    .target("none")
+                    .priority(URGENT_PRIORITY),
+                now,
+            )
+            .unwrap();
+        manager.run_now(&ordinary.id, now).unwrap();
+        manager.run_now(&urgent.id, now).unwrap();
+        quiet_covering(now).apply(&store, now).unwrap();
+
+        let dir = home();
+        let mut daemon = Daemon::new(store.clone(), dir.path());
+        let report = daemon.tick(time::now_ms()).await.unwrap();
+        assert!(
+            report.suppressed.contains(&ordinary.id),
+            "{:?}",
+            report.suppressed
+        );
+        assert!(
+            report.dispatched.contains(&urgent.id),
+            "{:?}",
+            report.dispatched
+        );
+        assert!(store.runs_for(&ordinary.id, 5).unwrap().is_empty());
+        let ordinary_job = store.get_job(&ordinary.id).unwrap().unwrap();
+        assert_eq!(ordinary_job.last_status, "skipped");
+
+        let trail = store.audit_trail(50).unwrap();
+        assert!(
+            trail
+                .iter()
+                .any(|row| row.kind == "job.suppress" && row.subject == ordinary.id),
+            "the suppression decision is audited: {trail:?}"
+        );
+
+        // Off again, the same job runs.
+        QuietHours {
+            enabled: false,
+            ..quiet_covering(now)
+        }
+        .apply(&store, now)
+        .unwrap();
+        manager.run_now(&ordinary.id, now).unwrap();
+        let report = daemon.tick(time::now_ms()).await.unwrap();
+        assert!(report.dispatched.contains(&ordinary.id));
+    }
+
+    #[tokio::test]
+    async fn quiet_hours_hold_back_the_report_not_the_run() {
+        let store = store();
+        let manager = JobManager::new(store.clone());
+        let now = time::now_ms();
+        let job = manager
+            .create(
+                NewJob::new("report", "every 1m")
+                    .mode(JobMode::Script)
+                    .payload("echo quiet report")
+                    .target("local"),
+                now,
+            )
+            .unwrap();
+        manager.run_now(&job.id, now).unwrap();
+
+        let dir = home();
+        let mut daemon = Daemon::new(store.clone(), dir.path()).with_tick_ms(50);
+        // The run starts before quiet hours; it settles inside them, which is the case where a
+        // report is held back while the work itself is allowed to finish.
+        daemon.tick(time::now_ms()).await.unwrap();
+        quiet_covering(time::now_ms())
+            .apply(&store, time::now_ms())
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let report = daemon.tick(time::now_ms()).await.unwrap();
+        assert!(
+            report
+                .suppressed
+                .iter()
+                .any(|s| s == &format!("notify:{}", job.id)),
+            "{:?}",
+            report.suppressed
+        );
+
+        let run = store.runs_for(&job.id, 1).unwrap().remove(0);
+        assert_eq!(run.status, RunStatus::Ok, "the work still ran");
+        assert_eq!(run.delivery, Delivery::Suppressed);
+        assert!(run.delivery_note.contains("quiet"));
+        assert!(
+            !notify::log_path(dir.path()).exists(),
+            "nothing was written to the notification log"
+        );
+        let trail = store.audit_trail(50).unwrap();
+        assert!(trail.iter().any(|row| row.kind == "notify.suppress"));
+    }
+
+    #[tokio::test]
+    async fn a_settled_job_is_itself_an_event_for_other_jobs() {
+        let store = store();
+        let manager = JobManager::new(store.clone());
+        let now = time::now_ms();
+        let source = manager
+            .create(
+                NewJob::new("source", "every 1m")
+                    .mode(JobMode::Script)
+                    .payload("true")
+                    .target("none"),
+                now,
+            )
+            .unwrap();
+        let listener = manager
+            .create(
+                NewJob::new("listener", format!("on job.settled:{}", source.id))
+                    .mode(JobMode::Script)
+                    .payload("echo heard")
+                    .target("none"),
+                now,
+            )
+            .unwrap();
+        manager.run_now(&source.id, now).unwrap();
+
+        let dir = home();
+        let mut daemon = Daemon::new(store.clone(), dir.path()).with_tick_ms(50);
+        daemon.tick(now).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // This pass settles the source and emits job.settled.
+        daemon.tick(time::now_ms()).await.unwrap();
+        // The next pass drains the event and dispatches the listener.
+        let report = daemon.tick(time::now_ms()).await.unwrap();
+        assert!(
+            report.triggered.contains(&listener.id),
+            "{:?}",
+            report.triggered
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        daemon.tick(time::now_ms()).await.unwrap();
+        let runs = store.runs_for(&listener.id, 5).unwrap();
+        assert_eq!(runs.len(), 1, "the listener ran once for the settlement");
+        assert_eq!(runs[0].status, RunStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_trigger_is_refused_at_the_door() {
+        let store = store();
+        let manager = JobManager::new(store.clone());
+        let now = time::now_ms();
+        // A job cannot subscribe to a signal the daemon does not produce.
+        let err = manager
+            .create(NewJob::new("bad", "on smoke-signal"), now)
+            .unwrap_err();
+        assert!(err.to_string().contains("smoke-signal"), "{err}");
+        assert!(manager.list().unwrap().is_empty());
+
+        // And a hand-raised signal with an unknown kind is refused and audited.
+        let dir = home();
+        let daemon = Daemon::new(store.clone(), dir.path());
+        let refused = daemon.bus().emit("smoke-signal", "", "", now).unwrap_err();
+        assert!(refused.to_string().contains("smoke-signal"));
+        let trail = store.audit_trail(20).unwrap();
+        assert!(trail.iter().any(|row| row.kind == "trigger.refused"));
     }
 }

@@ -2,3 +2,4 @@
 //! shared between the `vikram-bench learning` subcommand and `vikram bench
 //! learning` in the CLI.
 pub mod learning;
+pub mod personality;

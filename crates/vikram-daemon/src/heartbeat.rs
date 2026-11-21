@@ -388,6 +388,8 @@ impl<'a> Heartbeat<'a> {
                 && run.delivery != crate::store::Delivery::Delivered
                 && run.delivery != crate::store::Delivery::Rerouted
                 && run.delivery != crate::store::Delivery::None
+                // A report held back by quiet hours was a decision, not a failure.
+                && run.delivery != crate::store::Delivery::Suppressed
             {
                 issues.push(Issue::new(
                     format!("delivery.{}", job.id),

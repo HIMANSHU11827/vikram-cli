@@ -111,6 +111,9 @@ pub enum Delivery {
     /// report landed in the daemon's own reports conversation instead.
     Rerouted,
     Failed,
+    /// Held back by the quiet-hours policy: the run settled, but its report was deliberately not
+    /// delivered. Distinct from `none` (never meant to report) and `failed` (tried and lost).
+    Suppressed,
 }
 
 impl Delivery {
@@ -121,6 +124,7 @@ impl Delivery {
             Self::Delivered => "delivered",
             Self::Rerouted => "rerouted",
             Self::Failed => "failed",
+            Self::Suppressed => "suppressed",
         }
     }
 
@@ -130,6 +134,7 @@ impl Delivery {
             "delivered" => Self::Delivered,
             "rerouted" => Self::Rerouted,
             "failed" => Self::Failed,
+            "suppressed" => Self::Suppressed,
             _ => Self::None,
         }
     }
@@ -310,6 +315,28 @@ impl ScheduleStore {
             CREATE TABLE IF NOT EXISTS daemon_state (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+
+            -- Internal events that wake event-driven jobs. Bounded and deduplicated on write;
+            -- the scheduler's cursor lives in daemon_state, so a row here is history as well as
+            -- a signal.
+            CREATE TABLE IF NOT EXISTS daemon_events (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                subject TEXT NOT NULL DEFAULT '',
+                detail TEXT NOT NULL DEFAULT '',
+                at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS daemon_events_at ON daemon_events(at_ms);
+
+            -- The append-only ledger: trigger fires, dispatches, settlements, suppressions and
+            -- policy changes. Run rows say what a job did; this says what the daemon decided.
+            CREATE TABLE IF NOT EXISTS daemon_audit (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                at_ms INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                subject TEXT NOT NULL DEFAULT '',
+                detail TEXT NOT NULL DEFAULT ''
             );
             "#,
         )?;
@@ -854,6 +881,147 @@ impl ScheduleStore {
         Ok(removed)
     }
 
+    // -- events ------------------------------------------------------------------------------
+
+    /// Raise an internal event. Dedup is on `(kind, subject)` inside `dedup_ms`: a repeat inside
+    /// the window returns `None` instead of a second row, which is the same "a slot runs at most
+    /// once" rule the run table enforces for schedules. A written event also lands in the audit
+    /// ledger in the same commit, so a signal can never exist unrecorded.
+    ///
+    /// The table is bounded two ways: rows older than a week are dropped, and only the newest
+    /// [`EVENT_KEEP`] survive regardless of age.
+    pub fn emit_event(
+        &self,
+        kind: &str,
+        subject: &str,
+        detail: &str,
+        dedup_ms: Millis,
+        now: Millis,
+    ) -> Result<Option<EventRow>, StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        if dedup_ms > 0 {
+            let recent: Option<i64> = tx
+                .query_row(
+                    "SELECT seq FROM daemon_events
+                     WHERE kind = ?1 AND subject = ?2 AND at_ms > ?3
+                     ORDER BY seq DESC LIMIT 1",
+                    params![kind, subject, now - dedup_ms],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if recent.is_some() {
+                return Ok(None);
+            }
+        }
+        tx.execute(
+            "INSERT INTO daemon_events (kind, subject, detail, at_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![kind, subject, detail, now],
+        )?;
+        let seq = tx.last_insert_rowid();
+        let name = if subject.is_empty() {
+            kind.to_string()
+        } else {
+            format!("{kind}:{subject}")
+        };
+        tx.execute(
+            "INSERT INTO daemon_audit (at_ms, kind, subject, detail) VALUES (?1, 'trigger.emit', ?2, ?3)",
+            params![now, name, detail],
+        )?;
+        // Bound the queue: a week of history is plenty for a signal, and the cap keeps a noisy
+        // emitter from growing the table without limit.
+        tx.execute(
+            "DELETE FROM daemon_events WHERE at_ms < ?1",
+            params![now - 7 * 86_400_000],
+        )?;
+        tx.execute(
+            "DELETE FROM daemon_events WHERE seq NOT IN (
+                 SELECT seq FROM daemon_events ORDER BY seq DESC LIMIT ?1
+             )",
+            params![EVENT_KEEP as i64],
+        )?;
+        tx.commit()?;
+        Ok(Some(EventRow {
+            seq,
+            kind: kind.to_string(),
+            subject: subject.to_string(),
+            detail: detail.to_string(),
+            at_ms: now,
+        }))
+    }
+
+    /// Events after `seq`, oldest first — what the scheduler has not seen yet.
+    pub fn events_after(&self, seq: i64) -> Result<Vec<EventRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT seq, kind, subject, detail, at_ms FROM daemon_events
+             WHERE seq > ?1 ORDER BY seq",
+        )?;
+        let rows = stmt
+            .query_map(params![seq], |row| {
+                Ok(EventRow {
+                    seq: row.get(0)?,
+                    kind: row.get(1)?,
+                    subject: row.get(2)?,
+                    detail: row.get(3)?,
+                    at_ms: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The newest event seq, so a caller can ask "is there anything I have not seen".
+    pub fn latest_event_seq(&self) -> Result<i64, StoreError> {
+        let conn = self.lock();
+        let seq: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM daemon_events",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(seq)
+    }
+
+    // -- audit -------------------------------------------------------------------------------
+
+    /// Append one line to the decision ledger. `kind` names the decision (`trigger.fire`,
+    /// `job.suppress`, `quiet.set`, …), `subject` what it was about, `detail` the why.
+    pub fn audit(
+        &self,
+        kind: &str,
+        subject: &str,
+        detail: &str,
+        now: Millis,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO daemon_audit (at_ms, kind, subject, detail) VALUES (?1, ?2, ?3, ?4)",
+            params![now, kind, subject, detail],
+        )?;
+        Ok(())
+    }
+
+    /// The newest `limit` audit rows, newest first.
+    pub fn audit_trail(&self, limit: usize) -> Result<Vec<AuditRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT seq, at_ms, kind, subject, detail FROM daemon_audit
+             ORDER BY seq DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(AuditRow {
+                    seq: row.get(0)?,
+                    at_ms: row.get(1)?,
+                    kind: row.get(2)?,
+                    subject: row.get(3)?,
+                    detail: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     // -- scalars ----------------------------------------------------------------------------
 
     pub fn state(&self, key: &str) -> Result<Option<String>, StoreError> {
@@ -935,6 +1103,30 @@ const JOB_COLUMNS: &str = "id, name, description, schedule, timezone, mode, payl
 /// millisecond — which is normal in a test and possible in a burst — must still come back in a
 /// stable order, or `history` would show a different list every time it was asked.
 const RUN_ORDER: &str = "started_ms DESC, slot_ms DESC, attempt DESC";
+
+/// One internal event, as stored. `seq` is the scheduler's cursor: everything at or below the
+/// last seen seq has already been offered to the jobs that subscribe to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventRow {
+    pub seq: i64,
+    pub kind: String,
+    pub subject: String,
+    pub detail: String,
+    pub at_ms: Millis,
+}
+
+/// One line of the decision ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditRow {
+    pub seq: i64,
+    pub at_ms: Millis,
+    pub kind: String,
+    pub subject: String,
+    pub detail: String,
+}
+
+/// How many event rows survive pruning, newest first.
+pub const EVENT_KEEP: usize = 512;
 
 /// The state key that asks one member of one running hive to stop. It lives in the database
 /// because the CLI that asks and the daemon that honours it are different processes.

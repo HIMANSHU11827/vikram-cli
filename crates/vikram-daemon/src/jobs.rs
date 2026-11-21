@@ -15,6 +15,7 @@
 use crate::cron::{Schedule, ScheduleError};
 use crate::store::{Delivery, Job, JobMode, Run, RunStatus, ScheduleStore, StoreError};
 use crate::time::{Millis, Zone};
+use crate::triggers::Trigger;
 
 /// A job as the operator describes it, before it has an id or a next wake-up.
 #[derive(Debug, Clone, Default)]
@@ -167,6 +168,19 @@ impl JobManager {
         self.schedule_of(job, after).ok()?.next_after(after)
     }
 
+    /// The event subscription a job carries, when its schedule is `on <trigger>`.
+    pub fn trigger_of(&self, job: &Job) -> Option<Trigger> {
+        match self.schedule_of(job, 0).ok()? {
+            Schedule::Event { trigger } => Some(trigger),
+            _ => None,
+        }
+    }
+
+    /// Whether the job waits on events rather than a clock.
+    pub fn event_driven(&self, job: &Job) -> bool {
+        self.trigger_of(job).is_some()
+    }
+
     pub fn create(&self, draft: NewJob, now: Millis) -> Result<Job, ManagerError> {
         if draft.name.trim().is_empty() {
             return Err(ManagerError::Missing("a job needs a name".into()));
@@ -212,6 +226,9 @@ impl JobManager {
         }
         job.next_run_ms = match schedule.next_after(now) {
             Some(at) => Some(at),
+            // An event-driven job has no next slot: it is armed (`enabled`, no wake-up) until a
+            // matching event arrives, which is not the same as a schedule that ran out.
+            None if matches!(schedule, Schedule::Event { .. }) => None,
             None => return Err(ManagerError::PastDeadline),
         };
         job.last_status = "never".into();
@@ -332,8 +349,10 @@ impl JobManager {
             None
         };
         // A one-time job has no next slot, so it is switched off rather than left enabled with
-        // nothing to do.
-        let disabled = retry_at.is_none() && job.next_run_ms.is_none();
+        // nothing to do. An event-driven job is the exception: `None` is its resting state — it
+        // stays armed for the next matching event.
+        let event_driven = self.event_driven(job);
+        let disabled = retry_at.is_none() && job.next_run_ms.is_none() && !event_driven;
         self.store.settle_run(
             &run.id,
             status,
@@ -358,7 +377,8 @@ impl JobManager {
         error: &str,
         now: Millis,
     ) -> Result<Settled, StoreError> {
-        let disabled = job.next_run_ms.is_none();
+        let event_driven = self.event_driven(job);
+        let disabled = job.next_run_ms.is_none() && !event_driven;
         self.store.settle_run(
             &run.id,
             RunStatus::Cancelled,
@@ -629,5 +649,43 @@ mod tests {
         let moved = jobs.run_now("poll", at(8, 5)).unwrap();
         assert_eq!(moved.next_run_ms, Some(at(8, 5)));
         assert_eq!(jobs.find(&job.id).unwrap().next_run_ms, Some(at(8, 5)));
+    }
+
+    #[test]
+    fn an_event_job_is_armed_without_a_slot_and_stays_armed_after_it_runs() {
+        let jobs = manager();
+        let job = jobs
+            .create(
+                NewJob::new("on mail", "on postbox:ses_1")
+                    .mode(JobMode::Script)
+                    .payload("echo hi"),
+                at(8, 0),
+            )
+            .unwrap();
+        assert!(job.enabled);
+        assert!(job.next_run_ms.is_none(), "no clock slot for an event job");
+        let trigger = jobs.trigger_of(&job).unwrap();
+        assert_eq!(trigger.describe(), "postbox:ses_1");
+
+        // A fire claims a slot like any other, and settling must not retire the subscription.
+        store_run_and_settle(&jobs, &job);
+        let after = jobs.find(&job.id).unwrap();
+        assert!(after.enabled, "an event job is never done waiting");
+        assert!(after.next_run_ms.is_none());
+    }
+
+    fn store_run_and_settle(jobs: &JobManager, job: &crate::store::Job) {
+        let slot = at(8, 30);
+        // What the daemon does when the event lands: arm the job, then claim the slot it woke for.
+        jobs.store()
+            .set_next_run(&job.id, Some(slot), slot)
+            .unwrap();
+        let armed = jobs.find(&job.id).unwrap();
+        let claimed = jobs
+            .claim(&armed, slot, slot)
+            .unwrap()
+            .expect("the armed slot is claimable");
+        jobs.settle(&claimed.job, &claimed.run, true, "ok", "", slot)
+            .unwrap();
     }
 }

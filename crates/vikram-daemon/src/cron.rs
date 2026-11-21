@@ -18,6 +18,7 @@
 use std::fmt;
 
 use crate::time::{self, Civil, Millis, Zone};
+use crate::triggers::Trigger;
 
 /// Why a schedule string could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +42,8 @@ pub enum ScheduleError {
     BadTimestamp(String),
     /// A word in front of the expression that names no schedule.
     UnknownShape(String),
+    /// A trigger name the daemon does not produce.
+    BadTrigger(String),
 }
 
 impl fmt::Display for ScheduleError {
@@ -72,9 +75,10 @@ impl fmt::Display for ScheduleError {
             ScheduleError::UnknownShape(text) => {
                 write!(
                     f,
-                    "`{text}` is not a schedule (try `every 10m`, `in 30m`, or a cron expression)"
+                    "`{text}` is not a schedule (try `every 10m`, `in 30m`, `on postbox`, or a cron expression)"
                 )
             }
+            ScheduleError::BadTrigger(text) => write!(f, "{text}"),
         }
     }
 }
@@ -90,6 +94,8 @@ pub enum Schedule {
     Every { period: Millis, from: Millis },
     /// A five field cron expression, read in `zone`.
     Cron { fields: CronExpr, zone: Zone },
+    /// Fires when a matching internal event arrives — never on a clock, so it has no next slot.
+    Event { trigger: Trigger },
 }
 
 impl Schedule {
@@ -120,6 +126,13 @@ impl Schedule {
             });
         }
 
+        // `on <trigger>` subscribes to an internal event instead of a clock. The trigger is
+        // validated here so a job can never be created for a signal the daemon cannot produce.
+        if let Some(rest) = lower.strip_prefix("on ") {
+            let trigger =
+                Trigger::parse(rest).map_err(|err| ScheduleError::BadTrigger(err.to_string()))?;
+            return Ok(Schedule::Event { trigger });
+        }
         if let Some(rest) = lower.strip_prefix("every ") {
             let period = time::parse_duration(rest)
                 .ok_or_else(|| ScheduleError::BadDuration(rest.trim().to_string()))?;
@@ -179,6 +192,8 @@ impl Schedule {
                 Some(from + slots * period)
             }
             Schedule::Cron { fields, zone } => fields.next_after(zone.clone(), after),
+            // An event has no next slot: it fires when the event does, or not at all.
+            Schedule::Event { .. } => None,
         }
     }
 
@@ -196,6 +211,7 @@ impl Schedule {
                     format!("cron {} ({zone})", fields.source)
                 }
             }
+            Schedule::Event { trigger } => format!("on {}", trigger.describe()),
         }
     }
 
@@ -205,6 +221,7 @@ impl Schedule {
             Schedule::Once { .. } => "once",
             Schedule::Every { .. } => "every",
             Schedule::Cron { .. } => "cron",
+            Schedule::Event { .. } => "event",
         }
     }
 
@@ -788,5 +805,21 @@ mod tests {
                 .describe(),
             "cron 0 9 * * *"
         );
+    }
+
+    #[test]
+    fn an_event_schedule_has_no_next_slot_and_names_its_trigger() {
+        let schedule =
+            Schedule::parse("on job.settled:nightly", Zone::Utc, at(2026, 11, 3, 0, 0)).unwrap();
+        assert_eq!(schedule.kind(), "event");
+        assert_eq!(schedule.describe(), "on job.settled:nightly");
+        assert_eq!(schedule.next_after(at(2026, 11, 3, 0, 0)), None);
+        assert!(matches!(schedule, Schedule::Event { .. }));
+    }
+
+    #[test]
+    fn a_trigger_the_daemon_does_not_produce_is_refused() {
+        let err = Schedule::parse("on smoke-signal", Zone::Utc, at(2026, 11, 3, 0, 0)).unwrap_err();
+        assert!(err.to_string().contains("smoke-signal"), "{err}");
     }
 }
