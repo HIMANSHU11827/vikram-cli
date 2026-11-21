@@ -1433,12 +1433,13 @@ struct PollMarker {
     options: Vec<String>,
 }
 
-/// Whether a tool's output may raise a poll. Builtin tools never qualify: their results carry
-/// fetched or computed content (a page, a file, a shell log) where the marker could appear by
-/// accident or by injection. Only operator-installed surfaces — MCP tools (`mcp.<server>.<tool>`)
-/// and `plugin.execute` — may, because their output is code the operator chose to run.
+/// Whether a tool's output may raise a poll. Most builtin tools never qualify: their results
+/// carry fetched or computed content (a page, a file, a shell log) where the marker could appear
+/// by accident or by injection. Only surfaces whose marker is deliberate qualify — operator-
+/// installed code (`mcp.*`, `plugin.execute`) and `message.poll`, a builtin whose entire purpose
+/// is emitting the marker.
 fn poll_marker_tool(name: &str) -> bool {
-    name.starts_with("mcp.") || name == "plugin.execute"
+    name.starts_with("mcp.") || name == "plugin.execute" || name == "message.poll"
 }
 
 /// Every well-formed `POLL:` line in a tool result, as `(question, options)`. A line whose JSON
@@ -2084,12 +2085,18 @@ mod tests {
         polls.observe(&tool_result_message(plugin_id, marker, true));
         assert_eq!(polls.polls.len(), 2);
 
+        // `message.poll` is the one builtin whose whole purpose is emitting the marker.
+        let (call_msg, poll_id) = tool_call_message("message.poll");
+        polls.observe(&call_msg);
+        polls.observe(&tool_result_message(poll_id, marker, true));
+        assert_eq!(polls.polls.len(), 3);
+
         // A failed result and an unknown call id raise nothing.
         let (call_msg, failed_id) = tool_call_message("mcp.survey.create");
         polls.observe(&call_msg);
         polls.observe(&tool_result_message(failed_id, marker, false));
         polls.observe(&tool_result_message(ToolCallId::generate(), marker, true));
-        assert_eq!(polls.polls.len(), 2);
+        assert_eq!(polls.polls.len(), 3);
     }
 
     #[test]
