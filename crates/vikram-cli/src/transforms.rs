@@ -10,7 +10,9 @@
 //! Ownership is deny-first: a transform may create or replace a file only when the path does not
 //! exist, or when `transforms.json` records that this same plugin already owns it. A path owned
 //! by a *different* plugin, or an existing file nobody owns, is a conflict and refuses the whole
-//! apply before anything is written.
+//! apply before anything is written. `vikram transforms apply --force` is the explicit operator
+//! override: the applying plugin takes ownership, the displaced owner's record for the path is
+//! removed, and the handoff is logged in `transforms.json` under `superseded` — never silently.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -38,7 +40,12 @@ pub enum TransformsAction {
     /// Show one plugin's transforms and per-file status.
     Status { id: String },
     /// Apply a plugin's declared transforms.
-    Apply { id: String },
+    Apply {
+        id: String,
+        /// Take ownership of paths another plugin owns; the handoff is recorded as superseded.
+        #[arg(long)]
+        force: bool,
+    },
     /// Revert everything a plugin's transforms wrote.
     Rollback { id: String },
 }
@@ -65,14 +72,30 @@ struct TransformRecord {
 struct TransformState {
     #[serde(default)]
     plugins: BTreeMap<String, TransformRecord>,
+    /// Ownership handoffs made by `apply --force`: the displaced owner's op for a path, kept so
+    /// the transfer is auditable rather than silently dropped.
+    #[serde(default)]
+    superseded: Vec<SupersededOp>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SupersededOp {
+    /// Managed-root-relative path that changed hands.
+    path: String,
+    /// Plugin that previously owned the path.
+    from: String,
+    /// Plugin that took ownership.
+    to: String,
+    /// The displaced owner's last recorded op for the path.
+    op: AppliedOp,
 }
 
 pub fn run(action: TransformsAction) -> Result<(), String> {
     match action {
         TransformsAction::List => list(),
         TransformsAction::Status { id } => status(&id),
-        TransformsAction::Apply { id } => {
-            apply(&id)?;
+        TransformsAction::Apply { id, force } => {
+            apply(&id, force)?;
             Ok(())
         }
         TransformsAction::Rollback { id } => {
@@ -219,8 +242,10 @@ fn op_bytes(op: &TransformOp) -> Result<Vec<u8>, String> {
 // ---- apply ------------------------------------------------------------------
 
 /// Apply every transform `id` declares. Validates all ops before writing anything, so a
-/// conflict or bad path refuses the whole apply with the filesystem untouched.
-pub fn apply(id: &str) -> Result<usize, String> {
+/// conflict or bad path refuses the whole apply with the filesystem untouched. With `force`,
+/// paths owned by other plugins are taken over: the displaced owner's record for each path is
+/// removed and the handoff appended to `state.superseded`.
+pub fn apply(id: &str, force: bool) -> Result<usize, String> {
     let (canonical, ops) = declared_ops(id)?;
     if ops.is_empty() {
         println!("{id}: declares no transforms");
@@ -240,6 +265,8 @@ pub fn apply(id: &str) -> Result<usize, String> {
         /// Carried over from a previous apply of the same path so rollback still returns to the
         /// original pre-transform state, not to this plugin's own earlier output.
         carried: Option<AppliedOp>,
+        /// `(previous owner, displaced op)` when `--force` takes a path another plugin owns.
+        taken_from: Option<(String, AppliedOp)>,
     }
     let mut prepared = Vec::with_capacity(ops.len());
     for op in &ops {
@@ -252,27 +279,46 @@ pub fn apply(id: &str) -> Result<usize, String> {
         }
         let target = resolve_target(&op.path)?;
         let bytes = op_bytes(op)?;
-        let carried = prior.ops.iter().find(|p| p.path == op.path.trim()).cloned();
-        let existed_before = target.is_file();
-        let owned = carried.is_some()
-            || state.plugins.iter().any(|(other, record)| {
-                *other != canonical && record.ops.iter().any(|p| p.path == op.path.trim())
+        let rel = op.path.trim();
+        let carried = prior.ops.iter().find(|p| p.path == rel).cloned();
+        let foreign = state
+            .plugins
+            .iter()
+            .find(|(other, record)| {
+                *other != &canonical && record.ops.iter().any(|p| p.path == rel)
+            })
+            .and_then(|(other, record)| {
+                record
+                    .ops
+                    .iter()
+                    .find(|p| p.path == rel)
+                    .map(|displaced| ((*other).clone(), displaced.clone()))
             });
-        if existed_before && !owned {
+        let existed_before = target.is_file();
+        if carried.is_none() {
+            if let Some((owner, _)) = &foreign {
+                if !force {
+                    return Err(format!(
+                        "refusing to transform `{rel}`: {} is owned by plugin `{owner}`; \
+                         re-run with --force to take ownership",
+                        target.display()
+                    ));
+                }
+            } else if existed_before && !force {
+                return Err(format!(
+                    "refusing to transform `{rel}`: {} already exists and is not owned by a \
+                     plugin; remove it or choose another path (or re-run with --force)",
+                    target.display()
+                ));
+            }
+        }
+        if kind == "add_file" && existed_before && carried.is_none() && !force {
             return Err(format!(
-                "refusing to transform `{}`: {} already exists and is not owned by a plugin; \
-                 remove it or choose another path",
-                op.path,
+                "refusing to transform `{rel}`: {} already exists (add_file requires a new path)",
                 target.display()
             ));
         }
-        if kind == "add_file" && existed_before && carried.is_none() {
-            return Err(format!(
-                "refusing to transform `{}`: {} already exists (add_file requires a new path)",
-                op.path,
-                target.display()
-            ));
-        }
+        let taken_from = if carried.is_none() { foreign } else { None };
         // A pre-existing file we are allowed to replace must be small enough to restore.
         let (before_content_b64, sha256_before) = if existed_before && carried.is_none() {
             let data = std::fs::read(&target)
@@ -298,11 +344,16 @@ pub fn apply(id: &str) -> Result<usize, String> {
             before_content_b64,
             sha256_before,
             carried,
+            taken_from,
         });
     }
 
     // Pass 2: write. A failure here leaves the state file untouched, so a partial write is at
     // worst an untracked file the next apply reports as a conflict.
+    let handoffs: Vec<(String, AppliedOp)> = prepared
+        .iter()
+        .filter_map(|item| item.taken_from.clone())
+        .collect();
     let mut records = Vec::with_capacity(prepared.len());
     for item in prepared {
         if let Some(parent) = item.target.parent() {
@@ -329,6 +380,29 @@ pub fn apply(id: &str) -> Result<usize, String> {
             },
         };
         records.push(record);
+    }
+
+    // Ownership handoffs: each path this apply took from another plugin leaves that plugin's
+    // record, and the displaced op is preserved under `superseded` so the transfer is auditable.
+    for (from, displaced) in handoffs {
+        let mut drop_owner = false;
+        if let Some(record) = state.plugins.get_mut(&from) {
+            record.ops.retain(|p| p.path != displaced.path);
+            drop_owner = record.ops.is_empty();
+        }
+        if drop_owner {
+            state.plugins.remove(&from);
+        }
+        state.superseded.push(SupersededOp {
+            path: displaced.path.clone(),
+            from: from.clone(),
+            to: canonical.clone(),
+            op: displaced.clone(),
+        });
+        println!(
+            "took ownership of {} from {from} (recorded as superseded)",
+            displaced.path
+        );
     }
 
     state
@@ -674,7 +748,7 @@ mod tests {
         let manifest = r##"[{"op":"add_file","path":"skills/demo-pack/SKILL.md","content":"# demo"},{"op":"write_file","path":"skills/demo-pack/extra.txt","content_b64":"aGk="}]"##;
         install_plugin(home.dir.path(), "demo", manifest);
 
-        assert_eq!(apply("demo").unwrap(), 2);
+        assert_eq!(apply("demo", false).unwrap(), 2);
         let skill = home.dir.path().join("skills/demo-pack/SKILL.md");
         assert_eq!(fs::read_to_string(&skill).unwrap(), "# demo");
         assert_eq!(
@@ -698,7 +772,7 @@ mod tests {
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, "user data").unwrap();
 
-        let err = apply("clash").unwrap_err();
+        let err = apply("clash", false).unwrap_err();
         assert!(err.contains("not owned"), "{err}");
         assert_eq!(fs::read_to_string(&target).unwrap(), "user data");
         assert!(load_state().unwrap().plugins.is_empty());
@@ -712,14 +786,14 @@ mod tests {
             "owner",
             r#"[{"op":"add_file","path":"skills/shared.txt","content":"v1"}]"#,
         );
-        assert_eq!(apply("owner").unwrap(), 1);
+        assert_eq!(apply("owner", false).unwrap(), 1);
         install_plugin(
             home.dir.path(),
             "owner",
             r#"[{"op":"write_file","path":"skills/shared.txt","content":"v2"}]"#,
         );
         let target = home.dir.path().join("skills/shared.txt");
-        assert_eq!(apply("owner").unwrap(), 1);
+        assert_eq!(apply("owner", false).unwrap(), 1);
         assert_eq!(fs::read_to_string(&target).unwrap(), "v2");
         assert_eq!(rollback("owner").unwrap(), 1);
         assert!(!target.exists());
@@ -748,6 +822,7 @@ mod tests {
                     }],
                 },
             )]),
+            superseded: Vec::new(),
         };
         save_state(&state).unwrap();
 
@@ -764,13 +839,95 @@ mod tests {
             "demo",
             r#"[{"op":"add_file","path":"skills/x/f.txt","content":"plugin"}]"#,
         );
-        apply("demo").unwrap();
+        apply("demo", false).unwrap();
         let target = home.dir.path().join("skills/x/f.txt");
         fs::write(&target, "user edit").unwrap();
 
         assert_eq!(rollback("demo").unwrap(), 0);
         assert_eq!(fs::read_to_string(&target).unwrap(), "user edit");
         assert!(load_state().unwrap().plugins.contains_key("demo"));
+    }
+
+    #[test]
+    fn foreign_owned_path_refuses_without_force() {
+        let home = HomeGuard::new();
+        install_plugin(
+            home.dir.path(),
+            "first",
+            r#"[{"op":"write_file","path":"skills/shared.txt","content":"first"}]"#,
+        );
+        install_plugin(
+            home.dir.path(),
+            "second",
+            r#"[{"op":"write_file","path":"skills/shared.txt","content":"second"}]"#,
+        );
+        assert_eq!(apply("first", false).unwrap(), 1);
+
+        let err = apply("second", false).unwrap_err();
+        assert!(err.contains("owned by plugin `first`"), "{err}");
+        let target = home.dir.path().join("skills/shared.txt");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "first");
+        let state = load_state().unwrap();
+        assert!(state.plugins.contains_key("first"));
+        assert!(!state.plugins.contains_key("second"));
+        assert!(state.superseded.is_empty());
+    }
+
+    #[test]
+    fn force_takes_ownership_and_records_handoff() {
+        let home = HomeGuard::new();
+        install_plugin(
+            home.dir.path(),
+            "first",
+            r#"[{"op":"write_file","path":"skills/shared.txt","content":"first"}]"#,
+        );
+        install_plugin(
+            home.dir.path(),
+            "second",
+            r#"[{"op":"write_file","path":"skills/shared.txt","content":"second"}]"#,
+        );
+        assert_eq!(apply("first", false).unwrap(), 1);
+
+        assert_eq!(apply("second", true).unwrap(), 1);
+        let target = home.dir.path().join("skills/shared.txt");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "second");
+
+        let state = load_state().unwrap();
+        // The displaced owner's record for the path is gone; its plugin entry is dropped once
+        // empty, and the handoff is preserved under `superseded`.
+        assert!(!state.plugins.contains_key("first"));
+        let second_ops = &state.plugins.get("second").unwrap().ops;
+        assert_eq!(second_ops.len(), 1);
+        assert_eq!(second_ops[0].path, "skills/shared.txt");
+        assert_eq!(state.superseded.len(), 1);
+        let handoff = &state.superseded[0];
+        assert_eq!(handoff.path, "skills/shared.txt");
+        assert_eq!(handoff.from, "first");
+        assert_eq!(handoff.to, "second");
+        assert_eq!(handoff.op.sha256_after, sha256_hex(b"first"));
+
+        // The new owner can roll back; the file returns to the displaced owner's last bytes.
+        assert_eq!(rollback("second").unwrap(), 1);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "first");
+    }
+
+    #[test]
+    fn force_adopts_unowned_existing_file() {
+        let home = HomeGuard::new();
+        install_plugin(
+            home.dir.path(),
+            "adopter",
+            r#"[{"op":"write_file","path":"skills/mine.txt","content":"new"}]"#,
+        );
+        let target = home.dir.path().join("skills/mine.txt");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "user data").unwrap();
+
+        assert!(apply("adopter", false).is_err());
+        assert_eq!(apply("adopter", true).unwrap(), 1);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+        assert_eq!(rollback("adopter").unwrap(), 1);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "user data");
     }
 
     #[test]
@@ -781,12 +938,16 @@ mod tests {
             "bad",
             r#"[{"op":"delete_file","path":"skills/x","content":"x"}]"#,
         );
-        assert!(apply("bad").unwrap_err().contains("unknown transform op"));
+        assert!(
+            apply("bad", false)
+                .unwrap_err()
+                .contains("unknown transform op")
+        );
         install_plugin(
             home.dir.path(),
             "bad2",
             r#"[{"op":"add_file","path":"skills/x"}]"#,
         );
-        assert!(apply("bad2").unwrap_err().contains("neither"));
+        assert!(apply("bad2", false).unwrap_err().contains("neither"));
     }
 }

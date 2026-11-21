@@ -1,20 +1,25 @@
 //! Agent Client Protocol (ACP) — client and server over JSON-RPC 2.0 on stdio.
 //!
 //! EXPERIMENTAL — no crate in the workspace depends on this yet. Known gaps before use:
-//! `new_session` cannot pass `mcpServers`, and agent→client `terminal/*` requests are
-//! answered with `-32601` rather than actually handled. `WorkspaceAgentRequestHandler`
-//! implements `session/request_permission`, `fs/read_text_file`, and `fs/write_text_file`
-//! for real, confined to a workspace root.
+//! `new_session` cannot pass `mcpServers`. `WorkspaceAgentRequestHandler` implements
+//! `session/request_permission`, `fs/read_text_file`, and `fs/write_text_file` for real,
+//! confined to a workspace root. The `terminal/*` methods stay `-32601` unless the handler is
+//! built with [`WorkspaceAgentRequestHandler::with_terminal_support`]; those terminals are
+//! pipe-backed (no PTY) and `cwd`-confined, so programs that require a controlling terminal
+//! will not behave correctly.
 //!
 //! ACP connects a *client* (IDE/host) to an *agent* (Vikram or another compatible agent).
 //! It is distinct from MCP (agent↔tools) and A2A (agent↔agent).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Write};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -225,8 +230,64 @@ pub struct WriteTextFileParams {
     pub content: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TerminalEnvVariable {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TerminalCreateParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub command: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: Option<Vec<TerminalEnvVariable>>,
+    #[serde(default, rename = "outputByteLimit")]
+    pub output_byte_limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TerminalCreateResult {
+    #[serde(rename = "terminalId")]
+    pub terminal_id: String,
+}
+
+/// `terminal/output`, `terminal/release`, `terminal/wait_for_exit`, and `terminal/kill`
+/// all take the same `{sessionId, terminalId}` shape.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TerminalIdParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "terminalId")]
+    pub terminal_id: String,
+}
+
+/// Exit information shared by `terminal/output` (`exitStatus`) and `terminal/wait_for_exit`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TerminalExitStatus {
+    #[serde(rename = "exitCode")]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub signal: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TerminalOutputResult {
+    pub output: String,
+    pub truncated: bool,
+    #[serde(
+        rename = "exitStatus",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub exit_status: Option<TerminalExitStatus>,
+}
+
 /// Handles requests an ACP agent sends back to the client
-/// (`session/request_permission`, `fs/read_text_file`, `fs/write_text_file`).
+/// (`session/request_permission`, `fs/read_text_file`, `fs/write_text_file`, `terminal/*`).
 ///
 /// Every method defaults to a `-32601 Method not found` error, so implementers
 /// only override what they support. There is no built-in filesystem or
@@ -253,6 +314,35 @@ pub trait AgentRequestHandler {
     ) -> std::result::Result<(), JsonRpcError> {
         Err(method_not_found())
     }
+
+    fn terminal_create(
+        &self,
+        _params: TerminalCreateParams,
+    ) -> std::result::Result<TerminalCreateResult, JsonRpcError> {
+        Err(method_not_found())
+    }
+
+    fn terminal_output(
+        &self,
+        _params: TerminalIdParams,
+    ) -> std::result::Result<TerminalOutputResult, JsonRpcError> {
+        Err(method_not_found())
+    }
+
+    fn terminal_release(&self, _params: TerminalIdParams) -> std::result::Result<(), JsonRpcError> {
+        Err(method_not_found())
+    }
+
+    fn terminal_wait_for_exit(
+        &self,
+        _params: TerminalIdParams,
+    ) -> std::result::Result<TerminalExitStatus, JsonRpcError> {
+        Err(method_not_found())
+    }
+
+    fn terminal_kill(&self, _params: TerminalIdParams) -> std::result::Result<(), JsonRpcError> {
+        Err(method_not_found())
+    }
 }
 
 /// Default handler: every agent→client request gets `-32601`.
@@ -272,6 +362,18 @@ const MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
 /// on policy grounds (path outside the workspace, oversize payload).
 const ERR_REQUEST_DENIED: i64 = -32001;
 
+/// Live ACP terminals are capped: each one is a real child process with reader threads, and
+/// the handler may live as long as the ACP session.
+const MAX_TERMINALS: usize = 8;
+
+/// Output retained per terminal. Older bytes are dropped so a chatty process cannot exhaust memory.
+const MAX_TERMINAL_OUTPUT: usize = 1024 * 1024;
+
+/// Per-call `terminal/output` byte limit when the agent does not send `outputByteLimit`.
+const DEFAULT_OUTPUT_LIMIT: usize = 256 * 1024;
+
+const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 fn request_denied(message: &str) -> JsonRpcError {
     JsonRpcError {
         code: ERR_REQUEST_DENIED,
@@ -285,18 +387,124 @@ fn request_denied(message: &str) -> JsonRpcError {
 pub type PermissionDecider =
     Box<dyn Fn(&RequestPermissionParams) -> RequestPermissionResult + Send + Sync>;
 
-/// A real [`AgentRequestHandler`] for hosts that want filesystem and permission requests
-/// answered instead of `-32601`.
+/// A live `terminal/*` session: a shell command with piped stdout/stderr. There is no PTY —
+/// `cols`/`rows` do not exist in the ACP terminal API and stdin is `/dev/null` because ACP
+/// has no terminal-stdin method — so interactive programs are not supported.
+struct TerminalState {
+    child: Child,
+    output: Arc<Mutex<OutputBuffer>>,
+    exit: Option<TerminalExitStatus>,
+    /// Absolute offset of the next byte `terminal/output` has not yet returned.
+    read_offset: u64,
+    byte_limit: usize,
+}
+
+/// Ring of retained terminal output. `base` is the absolute offset of `data[0]`; bytes
+/// drained off the front advance `base` so a reader can tell it missed output.
+#[derive(Default)]
+struct OutputBuffer {
+    data: Vec<u8>,
+    base: u64,
+}
+
+fn terminal_shell_command(command: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let comspec = std::env::var("COMSPEC")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "cmd".to_owned());
+        let mut cmd = Command::new(comspec);
+        cmd.args(["/C", command]);
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        let shell = std::env::var("SHELL")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "sh".to_owned());
+        let mut cmd = Command::new(shell);
+        cmd.args(["-c", command]);
+        cmd
+    }
+}
+
+/// Drain a pipe into the shared output buffer, dropping the oldest bytes past the cap.
+fn pump_terminal_output<R: Read + Send + 'static>(mut reader: R, output: Arc<Mutex<OutputBuffer>>) {
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut out) = output.lock() {
+                        out.data.extend_from_slice(&chunk[..n]);
+                        if out.data.len() > MAX_TERMINAL_OUTPUT {
+                            let excess = out.data.len() - MAX_TERMINAL_OUTPUT;
+                            out.data.drain(..excess);
+                            out.base += excess as u64;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Signal numbers that mean the same thing on Linux and the BSDs/macOS; anything else is
+/// reported as `None` rather than guessed.
+#[cfg(unix)]
+fn unix_signal_name(status: ExitStatus) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt;
+    let name = match status.signal()? {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        4 => "SIGILL",
+        5 => "SIGTRAP",
+        6 => "SIGABRT",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        _ => return None,
+    };
+    Some(name.to_string())
+}
+
+#[cfg(not(unix))]
+fn unix_signal_name(_status: ExitStatus) -> Option<String> {
+    None
+}
+
+fn exit_status(status: ExitStatus) -> TerminalExitStatus {
+    TerminalExitStatus {
+        exit_code: status.code(),
+        signal: unix_signal_name(status),
+    }
+}
+
+/// A real [`AgentRequestHandler`] for hosts that want filesystem, permission, and terminal
+/// requests answered instead of `-32601`.
 ///
 /// `fs/read_text_file` and `fs/write_text_file` are confined to `workspace_root` with the
 /// same symlink-aware resolution the runtime uses (`resolve_within` in
 /// `vikram-runtime/src/config.rs`, duplicated here because this crate cannot depend on it).
 /// `session/request_permission` is deny-first: without an installed
 /// [`Self::with_permission_decider`] every request resolves to `cancelled`, which the agent
-/// must treat as a refusal — never a fake approval.
+/// must treat as a refusal — never a fake approval. `terminal/*` is likewise deny-first:
+/// without [`Self::with_terminal_support`] every terminal request gets `-32601`.
 pub struct WorkspaceAgentRequestHandler {
     workspace_root: PathBuf,
     permission_decider: PermissionDecider,
+    terminal_support: bool,
+    terminals: Mutex<HashMap<String, Arc<Mutex<TerminalState>>>>,
+    terminal_seq: AtomicU64,
 }
 
 impl WorkspaceAgentRequestHandler {
@@ -308,6 +516,9 @@ impl WorkspaceAgentRequestHandler {
         Ok(Self {
             workspace_root: root,
             permission_decider: Box::new(|_| RequestPermissionResult::cancelled()),
+            terminal_support: false,
+            terminals: Mutex::new(HashMap::new()),
+            terminal_seq: AtomicU64::new(0),
         })
     }
 
@@ -322,9 +533,43 @@ impl WorkspaceAgentRequestHandler {
         self
     }
 
+    /// Enable the `terminal/*` agent→client methods. Off by default — enabling is the host's
+    /// policy decision, since `terminal/create` runs an arbitrary command line. Terminals are
+    /// pipe-backed, not PTYs, and `cwd` is confined to the workspace root.
+    pub fn with_terminal_support(mut self) -> Self {
+        self.terminal_support = true;
+        self
+    }
+
     fn confined_path(&self, raw: &str) -> std::result::Result<PathBuf, JsonRpcError> {
         resolve_within(&self.workspace_root, Path::new(raw))
             .ok_or_else(|| request_denied(&format!("`{raw}` is outside the workspace root")))
+    }
+
+    fn terminal_state(
+        &self,
+        terminal_id: &str,
+    ) -> std::result::Result<Arc<Mutex<TerminalState>>, JsonRpcError> {
+        self.terminals
+            .lock()
+            .map_err(|_| internal_error("terminal registry poisoned"))?
+            .get(terminal_id)
+            .cloned()
+            .ok_or_else(|| invalid_params(&format!("unknown terminal `{terminal_id}`")))
+    }
+
+    fn reap_if_exited(state: &mut TerminalState) -> std::result::Result<(), JsonRpcError> {
+        if state.exit.is_some() {
+            return Ok(());
+        }
+        match state.child.try_wait() {
+            Ok(Some(status)) => {
+                state.exit = Some(exit_status(status));
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(e) => Err(internal_error(&format!("cannot poll terminal: {e}"))),
+        }
     }
 }
 
@@ -384,6 +629,201 @@ impl AgentRequestHandler for WorkspaceAgentRequestHandler {
         }
         std::fs::write(&path, &params.content)
             .map_err(|e| internal_error(&format!("cannot write `{}`: {e}", path.display())))
+    }
+
+    fn terminal_create(
+        &self,
+        params: TerminalCreateParams,
+    ) -> std::result::Result<TerminalCreateResult, JsonRpcError> {
+        if !self.terminal_support {
+            return Err(method_not_found());
+        }
+        if params.command.trim().is_empty() {
+            return Err(invalid_params("`command` must not be empty"));
+        }
+        let cwd = match params.cwd.as_deref() {
+            Some(raw) => self.confined_path(raw)?,
+            None => self.workspace_root.clone(),
+        };
+        let byte_limit = params
+            .output_byte_limit
+            .unwrap_or(DEFAULT_OUTPUT_LIMIT)
+            .clamp(1, MAX_TERMINAL_OUTPUT);
+
+        {
+            let terminals = self
+                .terminals
+                .lock()
+                .map_err(|_| internal_error("terminal registry poisoned"))?;
+            if terminals.len() >= MAX_TERMINALS {
+                return Err(request_denied(&format!(
+                    "terminal limit reached ({MAX_TERMINALS}); release one first"
+                )));
+            }
+        }
+
+        let mut cmd = terminal_shell_command(params.command.trim());
+        cmd.current_dir(&cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for var in params.env.unwrap_or_default() {
+            cmd.env(var.name, var.value);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| internal_error(&format!("cannot spawn terminal: {e}")))?;
+        let pipes = child.stdout.take().zip(child.stderr.take());
+        let Some((stdout, stderr)) = pipes else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(internal_error("terminal pipes unavailable"));
+        };
+
+        let output = Arc::new(Mutex::new(OutputBuffer::default()));
+        pump_terminal_output(stdout, Arc::clone(&output));
+        pump_terminal_output(stderr, Arc::clone(&output));
+
+        let id = format!(
+            "term-{}-{}",
+            std::process::id(),
+            self.terminal_seq.fetch_add(1, Ordering::Relaxed)
+        );
+        let state = Arc::new(Mutex::new(TerminalState {
+            child,
+            output,
+            exit: None,
+            read_offset: 0,
+            byte_limit,
+        }));
+        self.terminals
+            .lock()
+            .map_err(|_| internal_error("terminal registry poisoned"))?
+            .insert(id.clone(), state);
+        Ok(TerminalCreateResult { terminal_id: id })
+    }
+
+    fn terminal_output(
+        &self,
+        params: TerminalIdParams,
+    ) -> std::result::Result<TerminalOutputResult, JsonRpcError> {
+        if !self.terminal_support {
+            return Err(method_not_found());
+        }
+        let state = self.terminal_state(&params.terminal_id)?;
+        let mut st = state
+            .lock()
+            .map_err(|_| internal_error("terminal state poisoned"))?;
+        Self::reap_if_exited(&mut st)?;
+        let (output, chunk_end, truncated) = {
+            let buf = st
+                .output
+                .lock()
+                .map_err(|_| internal_error("terminal output poisoned"))?;
+            let end = buf.base + buf.data.len() as u64;
+            let start = st.read_offset.max(buf.base);
+            let mut truncated = st.read_offset < buf.base;
+            let mut chunk_end = end;
+            if chunk_end.saturating_sub(start) > st.byte_limit as u64 {
+                chunk_end = start + st.byte_limit as u64;
+                truncated = true;
+            }
+            let output = String::from_utf8_lossy(
+                &buf.data[(start - buf.base) as usize..(chunk_end - buf.base) as usize],
+            )
+            .into_owned();
+            (output, chunk_end, truncated)
+        };
+        st.read_offset = chunk_end;
+        Ok(TerminalOutputResult {
+            output,
+            truncated,
+            exit_status: st.exit.clone(),
+        })
+    }
+
+    fn terminal_release(&self, params: TerminalIdParams) -> std::result::Result<(), JsonRpcError> {
+        if !self.terminal_support {
+            return Err(method_not_found());
+        }
+        let removed = self
+            .terminals
+            .lock()
+            .map_err(|_| internal_error("terminal registry poisoned"))?
+            .remove(&params.terminal_id);
+        let Some(state) = removed else {
+            return Err(invalid_params(&format!(
+                "unknown terminal `{}`",
+                params.terminal_id
+            )));
+        };
+        if let Ok(mut st) = state.lock()
+            && st.exit.is_none()
+        {
+            let _ = st.child.kill();
+            let _ = st.child.wait();
+        }
+        Ok(())
+    }
+
+    fn terminal_wait_for_exit(
+        &self,
+        params: TerminalIdParams,
+    ) -> std::result::Result<TerminalExitStatus, JsonRpcError> {
+        if !self.terminal_support {
+            return Err(method_not_found());
+        }
+        let state = self.terminal_state(&params.terminal_id)?;
+        loop {
+            let result = {
+                let mut st = state
+                    .lock()
+                    .map_err(|_| internal_error("terminal state poisoned"))?;
+                Self::reap_if_exited(&mut st)?;
+                st.exit.clone()
+            };
+            if let Some(exit) = result {
+                return Ok(exit);
+            }
+            std::thread::sleep(TERMINAL_POLL_INTERVAL);
+        }
+    }
+
+    fn terminal_kill(&self, params: TerminalIdParams) -> std::result::Result<(), JsonRpcError> {
+        if !self.terminal_support {
+            return Err(method_not_found());
+        }
+        let state = self.terminal_state(&params.terminal_id)?;
+        let mut st = state
+            .lock()
+            .map_err(|_| internal_error("terminal state poisoned"))?;
+        if st.exit.is_none() {
+            // kill() on an already-dead child errors harmlessly; wait() then reaps and
+            // records the real exit status either way.
+            let _ = st.child.kill();
+            match st.child.wait() {
+                Ok(status) => st.exit = Some(exit_status(status)),
+                Err(e) => return Err(internal_error(&format!("cannot reap terminal: {e}"))),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for WorkspaceAgentRequestHandler {
+    fn drop(&mut self) {
+        // Dropping a std Child does not kill the process; reap every live terminal so a
+        // dropped handler cannot leak shells.
+        if let Ok(mut terminals) = self.terminals.lock() {
+            for (_, state) in terminals.drain() {
+                if let Ok(mut st) = state.lock()
+                    && st.exit.is_none()
+                {
+                    let _ = st.child.kill();
+                    let _ = st.child.wait();
+                }
+            }
+        }
     }
 }
 
@@ -514,6 +954,21 @@ fn agent_request_response(
         "fs/write_text_file" => respond(
             decode_params::<WriteTextFileParams>(req).and_then(|p| handler.write_text_file(p)),
         ),
+        "terminal/create" => respond(
+            decode_params::<TerminalCreateParams>(req).and_then(|p| handler.terminal_create(p)),
+        ),
+        "terminal/output" => {
+            respond(decode_params::<TerminalIdParams>(req).and_then(|p| handler.terminal_output(p)))
+        }
+        "terminal/release" => respond(
+            decode_params::<TerminalIdParams>(req).and_then(|p| handler.terminal_release(p)),
+        ),
+        "terminal/wait_for_exit" => respond(
+            decode_params::<TerminalIdParams>(req).and_then(|p| handler.terminal_wait_for_exit(p)),
+        ),
+        "terminal/kill" => {
+            respond(decode_params::<TerminalIdParams>(req).and_then(|p| handler.terminal_kill(p)))
+        }
         _ => (None, Some(method_not_found())),
     };
     JsonRpcResponse {
@@ -949,7 +1404,7 @@ mod tests {
         let mut out = Vec::new();
         let resp = handle_inbound(
             &mut out,
-            r#"{"jsonrpc":"2.0","id":"agent-1","method":"terminal/create","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"agent-1","method":"unknown/method","params":{}}"#,
             1,
         )
         .unwrap();
@@ -1300,11 +1755,194 @@ mod tests {
     #[test]
     fn workspace_handler_still_rejects_terminal_methods() {
         let (_dir, handler) = workspace_handler();
-        let resp = handle_inbound_with(
+        for (id, method, params) in [
+            (
+                1,
+                "terminal/create",
+                r#"{"sessionId":"s","command":"echo hi"}"#,
+            ),
+            (
+                2,
+                "terminal/output",
+                r#"{"sessionId":"s","terminalId":"t"}"#,
+            ),
+            (
+                3,
+                "terminal/release",
+                r#"{"sessionId":"s","terminalId":"t"}"#,
+            ),
+            (
+                4,
+                "terminal/wait_for_exit",
+                r#"{"sessionId":"s","terminalId":"t"}"#,
+            ),
+            (5, "terminal/kill", r#"{"sessionId":"s","terminalId":"t"}"#),
+        ] {
+            let resp = handle_inbound_with(
+                &handler,
+                &format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{params}}}"#),
+            );
+            assert_eq!(resp.error.unwrap().code, -32601, "{method}");
+        }
+    }
+
+    fn terminal_handler() -> (ScratchDir, WorkspaceAgentRequestHandler) {
+        let (dir, handler) = workspace_handler();
+        (dir, handler.with_terminal_support())
+    }
+
+    fn terminal_request(
+        handler: &WorkspaceAgentRequestHandler,
+        id: i64,
+        method: &str,
+        params: &str,
+    ) -> JsonRpcResponse {
+        handle_inbound_with(
+            handler,
+            &format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{params}}}"#),
+        )
+    }
+
+    #[test]
+    fn terminal_create_output_wait_release_round_trip() {
+        let (_dir, handler) = terminal_handler();
+        let resp = terminal_request(
             &handler,
-            r#"{"jsonrpc":"2.0","id":1,"method":"terminal/create","params":{}}"#,
+            1,
+            "terminal/create",
+            r#"{"sessionId":"s","command":"echo vikram-acp-term","cwd":"."}"#,
         );
-        assert_eq!(resp.error.unwrap().code, -32601);
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let terminal_id = resp.result.unwrap()["terminalId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let mut output = String::new();
+        let mut exit_status = None;
+        for _ in 0..100 {
+            let resp = terminal_request(
+                &handler,
+                2,
+                "terminal/output",
+                &format!(r#"{{"sessionId":"s","terminalId":"{terminal_id}"}}"#),
+            );
+            assert!(resp.error.is_none());
+            let result = resp.result.unwrap();
+            output.push_str(result["output"].as_str().unwrap());
+            if let Some(exit) = result.get("exitStatus") {
+                exit_status = Some(exit.clone());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(output.contains("vikram-acp-term"), "output was {output:?}");
+        assert_eq!(exit_status.unwrap()["exitCode"], serde_json::json!(0));
+
+        let resp = terminal_request(
+            &handler,
+            3,
+            "terminal/wait_for_exit",
+            &format!(r#"{{"sessionId":"s","terminalId":"{terminal_id}"}}"#),
+        );
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap()["exitCode"], serde_json::json!(0));
+
+        let resp = terminal_request(
+            &handler,
+            4,
+            "terminal/release",
+            &format!(r#"{{"sessionId":"s","terminalId":"{terminal_id}"}}"#),
+        );
+        assert!(resp.error.is_none());
+        let resp = terminal_request(
+            &handler,
+            5,
+            "terminal/output",
+            &format!(r#"{{"sessionId":"s","terminalId":"{terminal_id}"}}"#),
+        );
+        assert_eq!(resp.error.unwrap().code, -32602);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_kill_terminates_running_command() {
+        let (_dir, handler) = terminal_handler();
+        let resp = terminal_request(
+            &handler,
+            1,
+            "terminal/create",
+            r#"{"sessionId":"s","command":"sleep 30"}"#,
+        );
+        assert!(resp.error.is_none());
+        let terminal_id = resp.result.unwrap()["terminalId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let resp = terminal_request(
+            &handler,
+            2,
+            "terminal/kill",
+            &format!(r#"{{"sessionId":"s","terminalId":"{terminal_id}"}}"#),
+        );
+        assert!(resp.error.is_none());
+
+        let resp = terminal_request(
+            &handler,
+            3,
+            "terminal/wait_for_exit",
+            &format!(r#"{{"sessionId":"s","terminalId":"{terminal_id}"}}"#),
+        );
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert_eq!(result["exitCode"], serde_json::Value::Null);
+        assert_eq!(result["signal"], serde_json::json!("SIGKILL"));
+    }
+
+    #[test]
+    fn terminal_create_rejects_empty_command_and_bad_params() {
+        let (_dir, handler) = terminal_handler();
+        let resp = terminal_request(
+            &handler,
+            1,
+            "terminal/create",
+            r#"{"sessionId":"s","command":"   "}"#,
+        );
+        assert_eq!(resp.error.unwrap().code, -32602);
+        let resp = terminal_request(&handler, 2, "terminal/create", r#"{"sessionId":"s"}"#);
+        assert_eq!(resp.error.unwrap().code, -32602);
+    }
+
+    #[test]
+    fn terminal_create_refuses_cwd_outside_workspace() {
+        let (_dir, handler) = terminal_handler();
+        let resp = terminal_request(
+            &handler,
+            1,
+            "terminal/create",
+            r#"{"sessionId":"s","command":"pwd","cwd":".."}"#,
+        );
+        assert_eq!(resp.error.unwrap().code, ERR_REQUEST_DENIED);
+    }
+
+    #[test]
+    fn terminal_methods_reject_unknown_terminal_id() {
+        let (_dir, handler) = terminal_handler();
+        for (id, method) in [
+            (1, "terminal/output"),
+            (2, "terminal/release"),
+            (3, "terminal/wait_for_exit"),
+            (4, "terminal/kill"),
+        ] {
+            let resp = terminal_request(
+                &handler,
+                id,
+                method,
+                r#"{"sessionId":"s","terminalId":"nope"}"#,
+            );
+            assert_eq!(resp.error.unwrap().code, -32602, "{method}");
+        }
     }
 
     #[test]
