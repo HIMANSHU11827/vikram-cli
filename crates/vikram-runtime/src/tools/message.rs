@@ -227,6 +227,86 @@ impl Tool for MessageDraft {
     }
 }
 
+/// Largest emoji payload the marker line will carry; ZWJ sequences run ~25 bytes, so 128 is
+/// generous headroom while keeping the `REACT:` line trivially small.
+const MAX_REACT_EMOJI_BYTES: usize = 128;
+
+/// `message.react` attaches an emoji reaction to the chat message that triggered the turn. The
+/// tool only emits the `REACT:{...}` marker line the gateway parses out of the committed tool
+/// result; the target is resolved there from the inbound event's platform message id, so the
+/// model never has to (and cannot) name a message. Like `message.poll`, the permission shape is
+/// a read of the conversation, not a mutation of the workspace.
+pub(crate) struct MessageReact;
+
+impl Tool for MessageReact {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "message.react".into(),
+            description: "React to the user's message with an emoji; `emoji` is a single emoji or emoji sequence, `remove` clears a previous reaction.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "emoji": {"type": "string", "description": "the emoji to react with, e.g. 👍 or 🎉"},
+                    "remove": {"type": "boolean", "description": "true removes the reaction instead of adding it"}
+                },
+                "required": ["emoji"]
+            }),
+        }
+    }
+
+    fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
+        let target = args
+            .get("emoji")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|emoji| !emoji.is_empty())
+            .map(|emoji| emoji.chars().take(64).collect::<String>())
+            .unwrap_or_else(|| "reaction".to_owned());
+        Ok(PermissionRequest::new(
+            ActionKind::Read,
+            "message.react",
+            target,
+            SideEffect::None,
+            Trust::Model,
+        ))
+    }
+
+    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+        let emoji = arg_str(args, "emoji")?.trim().to_owned();
+        if emoji.is_empty() {
+            return Err(VikramError::ProviderRejected(
+                "`emoji` must not be empty".to_owned(),
+            ));
+        }
+        if emoji.len() > MAX_REACT_EMOJI_BYTES {
+            return Err(VikramError::ProviderRejected(format!(
+                "`emoji` is capped at {MAX_REACT_EMOJI_BYTES} bytes"
+            )));
+        }
+        if emoji.chars().any(char::is_control) {
+            return Err(VikramError::ProviderRejected(
+                "`emoji` must not contain control characters".to_owned(),
+            ));
+        }
+        let remove = match args.get("remove") {
+            None => false,
+            Some(value) => value.as_bool().ok_or_else(|| {
+                VikramError::ProviderRejected("`remove` must be a boolean".to_owned())
+            })?,
+        };
+        // The marker line must stay a single line of compact JSON; serde_json escapes any
+        // quote inside the emoji so `REACT:` never splits mid-payload.
+        let marker = json!({"emoji": emoji, "remove": remove});
+        let body = serde_json::to_string(&marker).expect("reaction marker serializes");
+        let content = if remove {
+            format!("REACT:{body}\nReaction removed.")
+        } else {
+            format!("REACT:{body}\nReaction sent.")
+        };
+        Ok(ToolOutput { content, ok: true })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,6 +577,91 @@ mod tests {
         assert_eq!(
             registry.get("message.draft").unwrap().spec().name,
             "message.draft"
+        );
+    }
+
+    #[test]
+    fn react_emits_a_marker_line_carrying_emoji_and_remove() {
+        let out = MessageReact.run(&json!({"emoji": "👍"}), &ctx()).unwrap();
+        assert!(out.ok);
+        let marker = out
+            .content
+            .lines()
+            .next()
+            .expect("marker is the first line");
+        assert!(marker.starts_with("REACT:{"), "{marker}");
+        let body: Value = serde_json::from_str(marker.trim_start_matches("REACT:")).unwrap();
+        assert_eq!(body["emoji"], "👍");
+        assert_eq!(body["remove"], false);
+
+        let out = MessageReact
+            .run(&json!({"emoji": "👀", "remove": true}), &ctx())
+            .unwrap();
+        let marker = out.content.lines().next().unwrap();
+        let body: Value = serde_json::from_str(marker.trim_start_matches("REACT:")).unwrap();
+        assert_eq!(body["emoji"], "👀");
+        assert_eq!(body["remove"], true);
+    }
+
+    #[test]
+    fn react_rejects_missing_blank_and_oversized_emoji() {
+        for args in [
+            json!({}),
+            json!({"emoji": ""}),
+            json!({"emoji": "   "}),
+            json!({"emoji": 42}),
+            json!({"emoji": null}),
+            json!({"emoji": "x".repeat(MAX_REACT_EMOJI_BYTES + 1)}),
+            json!({"emoji": "bad\nemoji"}),
+        ] {
+            assert!(
+                MessageReact.run(&args, &ctx()).is_err(),
+                "{args} should be rejected"
+            );
+        }
+        for args in [
+            json!({"emoji": "👍", "remove": "yes"}),
+            json!({"emoji": "👍", "remove": 1}),
+        ] {
+            assert!(
+                MessageReact.run(&args, &ctx()).is_err(),
+                "{args} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn react_marker_stays_one_line_under_truncation() {
+        let out = MessageReact
+            .run(&json!({"emoji": "family\u{200d}emoji \"quoted\""}), &ctx())
+            .unwrap();
+        let kept = truncated(out.content);
+        let marker = kept.lines().next().unwrap();
+        assert!(marker.starts_with("REACT:{"), "{marker}");
+        assert!(
+            serde_json::from_str::<Value>(marker.trim_start_matches("REACT:")).is_ok(),
+            "truncation must not be able to split the marker"
+        );
+    }
+
+    #[test]
+    fn react_permission_matches_poll_shape() {
+        let req = MessageReact.permission(&json!({"emoji": "👍"})).unwrap();
+        assert_eq!(req.action, ActionKind::Read);
+        assert_eq!(req.verb, "message.react");
+        assert_eq!(req.resource, "👍");
+        assert_eq!(req.side_effect, SideEffect::None);
+        assert_eq!(req.originating_trust, Trust::Model);
+        let req = MessageReact.permission(&json!({})).unwrap();
+        assert_eq!(req.resource, "reaction");
+    }
+
+    #[test]
+    fn react_registered_in_builtins() {
+        let registry = ToolRegistry::with_builtins();
+        assert_eq!(
+            registry.get("message.react").unwrap().spec().name,
+            "message.react"
         );
     }
 }

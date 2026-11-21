@@ -808,22 +808,157 @@ fn record_and_reflect(
         sensitivity: vikram_evolution::Sensitivity::Private,
         metadata: experience_metadata(&session.id, growth, request, corrections),
     };
-    let proposals = {
+    let (proposals, repeated_failure) = {
         let engine = inner.learning.evolution.lock().recover();
         let Ok(recorded) = engine.experience.record(experience) else {
             return;
         };
         let auto_memory = inner.learning.surface.policy_memory() != LearningPolicy::Disabled;
-        match engine.reflection.run_reflection(&recorded.id, auto_memory) {
+        let proposals = match engine.reflection.run_reflection(&recorded.id, auto_memory) {
             Ok(proposals) => proposals,
             Err(_) => return,
-        }
+        };
+        // The signature is read back from the *stored* metadata, so it is compared against
+        // past rows in exactly the form they were sanitized into.
+        let repeated = metadata_verify_signature(&recorded.metadata)
+            .map(|signature| {
+                (
+                    signature.clone(),
+                    count_verify_failures(&engine, &recorded, &signature),
+                )
+            })
+            .filter(|(_, count)| *count >= REPEATED_VERIFY_FAILURES);
+        (proposals, repeated)
     };
     for proposal in proposals {
         if let Some(mapped) = proposal_from_evolution(&proposal, &session.id) {
             apply_or_stage(inner, mapped);
         }
     }
+    if let Some((signature, count)) = repeated_failure {
+        stage_repeated_verify_failure(inner, session, growth, &signature, count);
+    }
+}
+
+/// How many recent experiences sharing one failed-verification signature make it a recurring
+/// pattern worth surfacing, rather than a transient the turn's `RecordIssue` already noted.
+const REPEATED_VERIFY_FAILURES: usize = 3;
+/// How far back the repetition scan looks, in the agent's most recent experiences.
+const VERIFY_FAILURE_SCAN: usize = 25;
+/// Longest step/kind fragment kept in a signature; longer names are truncated, not dropped.
+const VERIFY_SIGNATURE_PART_MAX: usize = 40;
+
+/// The stable name of a failed-verification signature: which check failed and how. Step and
+/// kind are bounded and whitespace-free so a verbose or hostile verifier cannot grow the
+/// memory key or the proposal content unboundedly.
+fn verify_signature_parts(step: Option<&str>, kind: Option<&str>) -> String {
+    let part = |value: Option<&str>| {
+        value
+            .map(|v| {
+                v.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join("_")
+                    .chars()
+                    .take(VERIFY_SIGNATURE_PART_MAX)
+                    .collect::<String>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "-".to_owned())
+    };
+    format!("verify:{}:{}", part(step), part(kind))
+}
+
+/// The failed-verification signature an experience carries in its metadata, or `None` when
+/// verification never ran or passed. This is the same shape `experience_metadata` writes.
+fn metadata_verify_signature(metadata: &serde_json::Value) -> Option<String> {
+    let report = metadata.get("verification")?;
+    if report.get("passed").and_then(serde_json::Value::as_bool) != Some(false) {
+        return None;
+    }
+    Some(verify_signature_parts(
+        report.get("step").and_then(serde_json::Value::as_str),
+        report.get("kind").and_then(serde_json::Value::as_str),
+    ))
+}
+
+/// How many of the agent's recent experiences failed verification with the same signature.
+/// Scoped to the recorded experience's project: the same check failing in two different
+/// projects is two problems, not one pattern. The just-recorded experience is included in
+/// the count, so `REPEATED_VERIFY_FAILURES` means "this is at least the Nth occurrence".
+fn count_verify_failures(
+    engine: &vikram_evolution::EvolutionEngine,
+    recorded: &vikram_evolution::Experience,
+    signature: &str,
+) -> usize {
+    engine
+        .experience
+        .list(Some(recorded.agent_id.as_str()), VERIFY_FAILURE_SCAN)
+        .map(|experiences| {
+            experiences
+                .iter()
+                .filter(|exp| {
+                    exp.project_id == recorded.project_id
+                        && metadata_verify_signature(&exp.metadata).as_deref() == Some(signature)
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// A verification signature that keeps failing is project knowledge worth recalling — but
+/// staged once: the content is deliberately count-free so memory dedup collapses repeats,
+/// and the pending-proposal guard keeps an unapproved first proposal from being re-staged
+/// every turn. The count and the latest output tail live in `reason`, which is shown to the
+/// operator but never deduplicated against.
+fn stage_repeated_verify_failure(
+    inner: &Arc<crate::runtime::RuntimeInner>,
+    session: &crate::session::SessionRuntime,
+    growth: &TurnGrowth,
+    signature: &str,
+    count: usize,
+) {
+    if inner.learning.surface.policy_memory() == LearningPolicy::Disabled {
+        return;
+    }
+    let key = format!("verify-failure-{signature}");
+    let already_pending = inner
+        .learning
+        .surface
+        .all_proposals()
+        .iter()
+        .any(|p| p.key == key && p.status == "pending");
+    if already_pending {
+        return;
+    }
+    let content = format!(
+        "Verification keeps failing the same way: `{signature}`. \
+         Check the project's verify report before changing the code that step covers."
+    );
+    let detail = match &growth.verification {
+        Some(Verification::Failed {
+            detail: Some(detail),
+            ..
+        }) => {
+            let flat = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!(" Latest output: {}", bounded_tail(&flat, 200))
+        }
+        _ => String::new(),
+    };
+    let proposal = LearningProposal {
+        id: new_proposal_id(),
+        session: session.id.clone(),
+        kind: "memory".to_owned(),
+        target: "project".to_owned(),
+        action: "add".to_owned(),
+        key,
+        content: content.clone(),
+        reason: format!("same verification failure seen {count} times recently.{detail}"),
+        status: "pending".to_owned(),
+        created_ms: now_ms(),
+        before: None,
+        after: Some(content),
+    };
+    apply_or_stage(inner, proposal);
 }
 
 // `Experience` has no dedicated verification field and the evolution crate is not ours to
@@ -2447,6 +2582,100 @@ mod tests {
                 .iter()
                 .any(|p| p.kind == vikram_evolution::ProposalKind::CreateSkill),
             "a verified reusable turn should earn a skill candidate, got {proposals:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_verification_signature_is_stable_and_passes_have_none() {
+        let growth = verify_growth("verify: FAIL step=test kind=test_failure", false);
+        let metadata = experience_metadata(&session(), &growth, "fix tests", &[]);
+        assert_eq!(
+            metadata_verify_signature(&metadata).as_deref(),
+            Some("verify:test:test_failure")
+        );
+
+        let passed = verify_growth("verify: PASS", true);
+        let metadata = experience_metadata(&session(), &passed, "ok", &[]);
+        assert!(metadata_verify_signature(&metadata).is_none());
+
+        // A different failing step is a different signature: no false grouping.
+        let other = verify_growth("verify: FAIL step=build kind=compile_error", false);
+        let metadata = experience_metadata(&session(), &other, "fix build", &[]);
+        assert_eq!(
+            metadata_verify_signature(&metadata).as_deref(),
+            Some("verify:build:compile_error")
+        );
+    }
+
+    #[test]
+    fn verify_signature_parts_normalize_whitespace_and_bound_length() {
+        let long_kind = "k".repeat(200);
+        let signature =
+            verify_signature_parts(Some("cargo test --workspace"), Some(long_kind.as_str()));
+        assert_eq!(
+            signature,
+            format!("verify:cargo_test_--workspace:{}", "k".repeat(40))
+        );
+        assert!(!signature.contains(' '));
+        assert_eq!(verify_signature_parts(None, None), "verify:-:-");
+    }
+
+    #[tokio::test]
+    async fn a_recurring_verify_failure_stages_one_project_memory_proposal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, _guard) = test_runtime(dir.path()).await;
+        let inner = runtime.handle().inner.clone();
+        inner
+            .learning
+            .surface
+            .set_policy_memory(LearningPolicy::ApprovalRequired);
+        inner
+            .learning
+            .surface
+            .set_policy_skill(LearningPolicy::Disabled);
+
+        let session = inner.session_list().into_iter().next().unwrap();
+        let growth = verify_growth("verify: FAIL step=test kind=test_failure", false);
+        let turn = || {
+            record_and_reflect(
+                &inner,
+                &session,
+                "fix the tests",
+                crate::types::TurnState::Idle,
+                &growth,
+                &[],
+            )
+        };
+        let verify_failures = || {
+            inner
+                .learning
+                .surface
+                .pending_proposals()
+                .into_iter()
+                .filter(|p| p.key.starts_with("verify-failure-"))
+                .collect::<Vec<_>>()
+        };
+
+        turn();
+        turn();
+        assert!(
+            verify_failures().is_empty(),
+            "two occurrences are still a transient, not a pattern"
+        );
+
+        turn();
+        let staged = verify_failures();
+        assert_eq!(staged.len(), 1, "the third identical failure surfaces once");
+        assert_eq!(staged[0].kind, "memory");
+        assert_eq!(staged[0].target, "project");
+        assert!(staged[0].content.contains("verify:test:test_failure"));
+        assert!(staged[0].reason.contains("3 times"));
+
+        turn();
+        assert_eq!(
+            verify_failures().len(),
+            1,
+            "a pending proposal must not be re-staged every turn"
         );
     }
 

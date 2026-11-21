@@ -261,6 +261,7 @@ impl ToolRegistry {
         registry.register(Box::new(MessagePoll));
         registry.register(Box::new(MessageCard));
         registry.register(Box::new(MessageDraft));
+        registry.register(Box::new(MessageReact));
         registry.register(Box::new(PermissionCheck));
         registry.register(Box::new(BrowserFetch));
         registry.register(Box::new(BrowserDom));

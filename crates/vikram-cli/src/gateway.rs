@@ -1453,6 +1453,27 @@ const MAX_TURN_DRAFTS: usize = 4;
 /// [`MAX_CARD_MARKER_BYTES`].
 const MAX_DRAFT_MARKER_BYTES: usize = 16_000;
 
+/// The line a chat-facing tool ends its output with to ask the reply to react to the inbound
+/// message: `REACT:{"emoji":"…","remove":false}` on its own line. Unlike the other markers the
+/// payload names no target — the gateway attaches the reaction to the platform message id of
+/// the event that triggered the turn, which is the only message a turn can honestly react to.
+const REACT_MARKER_PREFIX: &str = "REACT:";
+
+/// One turn carries at most this many reactions; same flood guard as [`MAX_TURN_POLLS`].
+const MAX_TURN_REACTIONS: usize = 4;
+
+/// Longest emoji a `REACT:` marker will carry; the tool caps at the same size, and anything
+/// larger is not an emoji sequence a platform would accept anyway.
+const MAX_REACTION_EMOJI_BYTES: usize = 128;
+
+/// The JSON body of a [`REACT_MARKER_PREFIX`] line.
+#[derive(serde::Deserialize)]
+struct ReactionMarker {
+    emoji: String,
+    #[serde(default)]
+    remove: bool,
+}
+
 /// The JSON body of a [`DRAFT_MARKER_PREFIX`] line.
 #[derive(serde::Deserialize)]
 struct DraftMarker {
@@ -1487,6 +1508,13 @@ fn card_marker_tool(name: &str) -> bool {
 /// purpose is emitting the marker.
 fn draft_marker_tool(name: &str) -> bool {
     name.starts_with("mcp.") || name == "plugin.execute" || name == "message.draft"
+}
+
+/// Whether a tool's output may raise a reaction. Same deliberate-marker rule as
+/// [`poll_marker_tool`]: operator-installed code and `message.react`, the builtin whose entire
+/// purpose is emitting the marker.
+fn react_marker_tool(name: &str) -> bool {
+    name.starts_with("mcp.") || name == "plugin.execute" || name == "message.react"
 }
 
 /// Every well-formed `POLL:` line in a tool result, as `(question, options)`. A line whose JSON
@@ -1569,7 +1597,29 @@ fn draft_markers(content: &str) -> Vec<String> {
     drafts
 }
 
-/// The polls, cards and drafts a turn's committed messages asked the gateway to send. Assistant
+/// Every well-formed `REACT:` line in a tool result, as `(emoji, remove)` pairs. A line whose
+/// JSON does not describe a sendable reaction — a missing or blank emoji, or one too large to
+/// be an emoji sequence — is skipped rather than pushed onto a platform that would refuse it
+/// anyway.
+fn reaction_markers(content: &str) -> Vec<(String, bool)> {
+    let mut reactions = Vec::new();
+    for line in content.lines() {
+        let Some(raw) = line.strip_prefix(REACT_MARKER_PREFIX) else {
+            continue;
+        };
+        let Ok(marker) = serde_json::from_str::<ReactionMarker>(raw.trim()) else {
+            continue;
+        };
+        let emoji = marker.emoji.trim();
+        if emoji.is_empty() || emoji.len() > MAX_REACTION_EMOJI_BYTES {
+            continue;
+        }
+        reactions.push((emoji.to_owned(), marker.remove));
+    }
+    reactions
+}
+
+/// The polls, cards, drafts and reactions a turn's committed messages asked the gateway to send. Assistant
 /// messages carry the `ToolCall` blocks naming each call; tool messages carry the `ToolResult`
 /// content the markers ride in. Both arrive through `MessageCommitted` call-then-result, so the
 /// name map is always populated before the result that needs it.
@@ -1579,6 +1629,7 @@ struct TurnMarkers {
     polls: Vec<(String, Vec<String>)>,
     cards: Vec<serde_json::Value>,
     drafts: Vec<String>,
+    reactions: Vec<(String, bool)>,
 }
 
 impl TurnMarkers {
@@ -1627,6 +1678,14 @@ impl TurnMarkers {
                                 break;
                             }
                             self.drafts.push(draft);
+                        }
+                    }
+                    if self.reactions.len() < MAX_TURN_REACTIONS && react_marker_tool(name) {
+                        for reaction in reaction_markers(content) {
+                            if self.reactions.len() >= MAX_TURN_REACTIONS {
+                                break;
+                            }
+                            self.reactions.push(reaction);
                         }
                     }
                 }
@@ -1772,6 +1831,68 @@ async fn deliver_assistant_drafts(
     }
 }
 
+/// Deliver the reactions a turn produced, one ledgered [`OutboundVerb::Reaction`] each. The
+/// target is the platform message id of the event that triggered the turn (`message_id`, with
+/// `source.message_id` as the fallback some adapters only fill there); an event that carried
+/// no message id cannot be reacted to, so the markers are dropped with a log line rather than
+/// aimed at a guessed message. Ids hang off the event's delivery identity
+/// (`{base}:react:{n}`) so a redelivered event dedups exactly like the text reply and the
+/// other verbs do. A platform without reaction support refuses the verb honestly through
+/// [`PlatformAdapter::add_reaction`]'s default.
+async fn deliver_assistant_reactions(
+    platform: &Arc<dyn GatewayPlatform>,
+    ledger: Option<&DeliveryLedger>,
+    event: &MessageEvent,
+    chat_id: &str,
+    reactions: &[(String, bool)],
+) {
+    if reactions.is_empty() {
+        return;
+    }
+    let Some(target) = event
+        .message_id
+        .clone()
+        .or_else(|| event.source.message_id.clone())
+    else {
+        eprintln!(
+            "[gateway:{}] reaction markers dropped: event carried no message id",
+            platform.name()
+        );
+        return;
+    };
+    let base = event
+        .ledger_message_id
+        .clone()
+        .or_else(|| event.message_id.clone())
+        .unwrap_or_else(|| format!("{}:{chat_id}:{}", platform.name(), now_unix()));
+    for (index, (emoji, remove)) in reactions.iter().enumerate() {
+        let verb = if *remove {
+            OutboundVerb::remove_reaction(target.clone(), emoji.clone())
+        } else {
+            OutboundVerb::reaction(target.clone(), emoji.clone())
+        };
+        let result = deliver_verb(
+            platform,
+            ledger,
+            &format!("{base}:react:{index}"),
+            chat_id,
+            &verb,
+            None,
+        )
+        .await;
+        if !result.success {
+            eprintln!(
+                "[gateway:{}] reaction on {chat_id} failed: {}",
+                platform.name(),
+                result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".into())
+            );
+        }
+    }
+}
+
 /// What a turn needs to deliver non-text outbound verbs itself: the platform to send through
 /// and the ledger that dedups and retries the send. The text reply still returns through the
 /// host's own path.
@@ -1884,7 +2005,7 @@ fn turn(
         // Assistant messages committed mid-turn can carry media blocks; they are collected here
         // and sent as verbs once the turn's text is known not to be a lagged prefix.
         let mut reply_media: Vec<ImageSource> = Vec::new();
-        // Tool results committed mid-turn can carry `POLL:`/`CARD:`/`DRAFT:` markers; they are
+        // Tool results committed mid-turn can carry `POLL:`/`CARD:`/`DRAFT:`/`REACT:` markers; they are
         // collected here and sent as verbs once the turn's text is known not to be a lagged
         // prefix.
         let mut turn_markers = TurnMarkers::default();
@@ -1978,6 +2099,14 @@ fn turn(
             &event,
             &chat,
             &turn_markers.drafts,
+        )
+        .await;
+        deliver_assistant_reactions(
+            &outbound.platform,
+            outbound.ledger.as_deref(),
+            &event,
+            &chat,
+            &turn_markers.reactions,
         )
         .await;
         if reply.trim().is_empty() {
@@ -2764,5 +2893,176 @@ mod tests {
 
         assert_eq!(platform.verbs.lock().unwrap().len(), 1);
         assert_eq!(ledger.len().expect("ledger len"), 1);
+    }
+
+    #[test]
+    fn a_reaction_marker_line_parses_to_emoji_and_remove() {
+        let content =
+            "reacted\nREACT:{\"emoji\":\"👍\",\"remove\":false}\nREACT:{\"emoji\":\"🎉\"}\ndone";
+        assert_eq!(
+            reaction_markers(content),
+            vec![
+                ("👍".to_owned(), false),
+                // `remove` defaults to false when the marker omits it.
+                ("🎉".to_owned(), false),
+            ]
+        );
+        let content = "REACT:{\"emoji\":\"👀\",\"remove\":true}";
+        assert_eq!(reaction_markers(content), vec![("👀".to_owned(), true)]);
+    }
+
+    #[test]
+    fn malformed_or_untargetable_reaction_markers_are_skipped() {
+        for content in [
+            "no marker here",
+            "REACT:{not json}",
+            "REACT:[1,2,3]",
+            "REACT:{\"emoji\":\"\"}",
+            "REACT:{\"emoji\":\"   \"}",
+            "REACT:{\"emoji\":42}",
+            "REACT:{\"emoji\":\"hi\"} trailing",
+            "prefix REACT:{\"emoji\":\"👍\"}",
+        ] {
+            assert!(reaction_markers(content).is_empty(), "{content}");
+        }
+        // An emoji over the byte cap is skipped even though it is valid JSON.
+        let huge = format!(
+            "REACT:{{\"emoji\":\"{}\"}}",
+            "x".repeat(MAX_REACTION_EMOJI_BYTES + 1)
+        );
+        assert!(reaction_markers(&huge).is_empty());
+    }
+
+    #[test]
+    fn only_allowlisted_tools_raise_reactions_from_their_results() {
+        let mut markers = TurnMarkers::default();
+        let marker = "REACT:{\"emoji\":\"👍\"}";
+
+        // An MCP tool's marker is honored once its call is known.
+        let (call_msg, mcp_id) = tool_call_message("mcp.reactions.add");
+        markers.observe(&call_msg);
+        markers.observe(&tool_result_message(mcp_id, marker, true));
+        assert_eq!(markers.reactions.len(), 1);
+
+        // Builtin tools whose output is fetched or computed content never qualify — and
+        // neither do the sibling chat markers: each marker family is gated independently.
+        for name in [
+            "web.fetch",
+            "shell.run",
+            "fs.read",
+            "plugin.list",
+            "message.poll",
+            "message.card",
+            "message.draft",
+        ] {
+            let (call_msg, id) = tool_call_message(name);
+            markers.observe(&call_msg);
+            markers.observe(&tool_result_message(id, marker, true));
+        }
+        // `plugin.execute` output is operator-installed plugin code, so it does qualify.
+        let (call_msg, plugin_id) = tool_call_message("plugin.execute");
+        markers.observe(&call_msg);
+        markers.observe(&tool_result_message(plugin_id, marker, true));
+        assert_eq!(markers.reactions.len(), 2);
+
+        // `message.react` is the one builtin whose whole purpose is emitting the marker.
+        let (call_msg, react_id) = tool_call_message("message.react");
+        markers.observe(&call_msg);
+        markers.observe(&tool_result_message(react_id, marker, true));
+        assert_eq!(markers.reactions.len(), 3);
+
+        // A failed result and an unknown call id raise nothing.
+        let (call_msg, failed_id) = tool_call_message("mcp.reactions.add");
+        markers.observe(&call_msg);
+        markers.observe(&tool_result_message(failed_id, marker, false));
+        markers.observe(&tool_result_message(ToolCallId::generate(), marker, true));
+        assert_eq!(markers.reactions.len(), 3);
+    }
+
+    #[test]
+    fn a_turn_carries_at_most_the_reaction_cap() {
+        let mut markers = TurnMarkers::default();
+        let (call_msg, id) = tool_call_message("mcp.reactions.add");
+        markers.observe(&call_msg);
+        let marker = "REACT:{\"emoji\":\"👍\"}";
+        for _ in 0..MAX_TURN_REACTIONS + 2 {
+            markers.observe(&tool_result_message(id.clone(), marker, true));
+        }
+        assert_eq!(markers.reactions.len(), MAX_TURN_REACTIONS);
+    }
+
+    #[tokio::test]
+    async fn assistant_reactions_target_the_triggering_message() {
+        let platform = Arc::new(RecordingPlatform::default());
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        let ledger = DeliveryLedger::in_memory().expect("in-memory ledger");
+        let event = test_event();
+        let reactions = vec![("👍".to_owned(), false), ("👀".to_owned(), true)];
+
+        deliver_assistant_reactions(&dyn_platform, Some(&ledger), &event, "chat-1", &reactions)
+            .await;
+        // A redelivery of the same event must not enqueue or send a second copy.
+        deliver_assistant_reactions(&dyn_platform, Some(&ledger), &event, "chat-1", &reactions)
+            .await;
+
+        let verbs = platform.verbs.lock().unwrap();
+        assert_eq!(verbs.len(), 2, "each reaction becomes exactly one verb");
+        let OutboundVerb::Reaction {
+            message_id,
+            emoji,
+            remove,
+        } = &verbs[0]
+        else {
+            panic!("expected a reaction verb, got {:?}", verbs[0]);
+        };
+        assert_eq!(message_id, "m-1", "the target is the inbound message id");
+        assert_eq!(emoji, "👍");
+        assert!(!remove);
+        let OutboundVerb::Reaction { remove, .. } = &verbs[1] else {
+            panic!("expected a reaction verb, got {:?}", verbs[1]);
+        };
+        assert!(remove);
+        assert_eq!(ledger.len().expect("ledger len"), 2);
+    }
+
+    #[tokio::test]
+    async fn reactions_fall_back_to_the_source_message_id() {
+        let platform = Arc::new(RecordingPlatform::default());
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        let mut event = test_event();
+        event.message_id = None;
+        event.source.message_id = Some("src-m-9".to_owned());
+        let reactions = vec![("🎉".to_owned(), false)];
+
+        deliver_assistant_reactions(&dyn_platform, None, &event, "chat-1", &reactions).await;
+
+        let verbs = platform.verbs.lock().unwrap();
+        assert_eq!(verbs.len(), 1);
+        let OutboundVerb::Reaction { message_id, .. } = &verbs[0] else {
+            panic!("expected a reaction verb, got {:?}", verbs[0]);
+        };
+        assert_eq!(message_id, "src-m-9");
+    }
+
+    #[tokio::test]
+    async fn an_event_without_a_message_id_cannot_be_reacted_to() {
+        let platform = Arc::new(RecordingPlatform::default());
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        let mut event = test_event();
+        event.message_id = None;
+        let reactions = vec![("👍".to_owned(), false)];
+
+        deliver_assistant_reactions(&dyn_platform, None, &event, "chat-1", &reactions).await;
+
+        assert!(platform.verbs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn turns_without_reactions_send_no_reaction_verbs() {
+        let platform = Arc::new(RecordingPlatform::default());
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        let event = test_event();
+        deliver_assistant_reactions(&dyn_platform, None, &event, "chat-1", &[]).await;
+        assert!(platform.verbs.lock().unwrap().is_empty());
     }
 }
