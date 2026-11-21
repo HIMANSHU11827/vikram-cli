@@ -54,8 +54,8 @@ paths yet.
 | `autonomy` | every `ApprovalRequest` incl. spent state (`autonomy.approval`) | decisions reachable via `vikram evolution approve/reject`; nothing calls `request_approval` automatically yet |
 | `self_evaluation` | benchmarks, results, metric history (`self_evaluation.*`) | benchmarks runnable via `vikram evolution benchmark`; no scheduler creates/runs them automatically |
 | `mapek` (mutating half) | `KnowledgeBase` + `cycle_count` (`mapek.state`) | one bounded cycle via `vikram evolution cycle`; still not scheduled |
-| `self_improvement` (execute half) | `executions` history (`self_improvement.execution`) | `execute_improvement`/`track_improvement` have no caller; opportunities rebuild per scan |
-| `hive` (`HiveLearning`) | lessons persist in `hive_lessons` | no production caller of `record`; dashboard `hive_lessons` count stays 0 |
+| `self_improvement` (execute half) | `executions` history (`self_improvement.execution`) | self-check records a `Completed` execution for the top opportunity (analysis-only, deduped); `execute_improvement` still has no caller |
+| `hive` (`HiveLearning`) | lessons persist in `hive_lessons` | live: `hive_run` records a per-hive lesson on completion and injects the hive's 3 most recent lessons into participant context |
 
 ## Process-local scaffolds (documented, not wired to fakes)
 

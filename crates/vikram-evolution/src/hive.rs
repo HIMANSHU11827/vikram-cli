@@ -1,10 +1,10 @@
 //! Collaboration lesson recording.
 //!
-//! Store-backed but dormant: lessons written by [`HiveLearning::record`]
-//! persist in the `hive_lessons` table and survive restarts, but no
-//! production path (runtime, CLI, hive chat) calls `record` — the table
-//! stays empty outside tests, so [`Dashboard`](crate::dashboard)'s
-//! `hive_lessons` count is always 0 in production. Awaiting a caller.
+//! [`HiveLearning::record`] persists lessons to the `hive_lessons` table.
+//! The runtime's `hive_run` calls it when a run finishes — `task_id` carries
+//! the hive id, so lessons are scoped per hive — and feeds the most recent
+//! lessons back into each participant's system context on the next run.
+//! [`Dashboard`](crate::dashboard)'s `hive_lessons` count reflects them.
 
 use crate::error::Result;
 use crate::store::EvolutionStore;

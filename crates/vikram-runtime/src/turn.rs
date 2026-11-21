@@ -2301,6 +2301,14 @@ async fn run_stage(
 ) -> bool {
     let failed = match inner.stages().run(point, ctx).await {
         Ok(StageOutcome::Done) => return false,
+        // The registry resolves `Pass` inside the chain, so this is unreachable; treat it as a
+        // stage failure rather than letting a turn continue on an undecided payload.
+        Ok(StageOutcome::Pass) => {
+            format!(
+                "the `{}` stage passed without a handler resolving it",
+                point.as_str()
+            )
+        }
         Ok(StageOutcome::Refused(reason)) => stage_refusal(point, &reason),
         Err(err) => err.to_string(),
     };

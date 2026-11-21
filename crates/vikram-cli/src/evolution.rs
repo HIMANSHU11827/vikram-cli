@@ -1135,9 +1135,7 @@ mod tests {
             "{lines:?}"
         );
         assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("\"runtime_health\"")),
+            lines.iter().any(|l| l.contains("\"runtime_health\"")),
             "{lines:?}"
         );
 

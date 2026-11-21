@@ -12,14 +12,19 @@
 //!
 //! PARTIALLY LIVE: the opportunity scan is wired — the runtime's hourly
 //! self-check and `vikram evolution evaluate` both call
-//! [`SelfImprovementEngine::identify_improvement_opportunities`]. The
-//! execution half (`execute_improvement`, `track_improvement`,
-//! `get_improvement_history`) is still dormant — no caller schedules
-//! execution — but its records are durable: `executions` is persisted to
-//! the store's `engine_records` table under [`EXECUTION_NAMESPACE`] and
-//! reloaded by [`SelfImprovementEngine::new`]. `opportunities` stays
-//! process-local: every scan rebuilds it wholesale from store evidence, so
-//! persisting it would only duplicate what the next scan recomputes.
+//! [`SelfImprovementEngine::identify_improvement_opportunities`]. The same
+//! self-check also *acts* on the top opportunity by surfacing it as a
+//! notice, and records that honestly through
+//! [`SelfImprovementEngine::track_improvement`] — an `ImprovementExecution`
+//! whose single step says the opportunity was reported, not that an
+//! automated change ran. [`SelfImprovementEngine::execute_improvement`]
+//! remains the entry point for a future executor that drives the
+//! Pending → Completed lifecycle; its records are durable either way:
+//! `executions` is persisted to the store's `engine_records` table under
+//! [`EXECUTION_NAMESPACE`] and reloaded by [`SelfImprovementEngine::new`].
+//! `opportunities` stays process-local: every scan rebuilds it wholesale
+//! from store evidence, so persisting it would only duplicate what the
+//! next scan recomputes.
 
 use crate::error::Result;
 use crate::metrics;

@@ -22,8 +22,11 @@
 //!
 //! - **Live via runtime**: `experience`, `memory`, `reflection` (turn-end
 //!   recording + boot drain), `mapek.monitor`/`analyze` (hourly read-only
-//!   self-check), and `self_improvement.identify_improvement_opportunities`
-//!   (same self-check).
+//!   self-check), `self_improvement.identify_improvement_opportunities`
+//!   (same self-check), `self_improvement.track_improvement` (the self-check
+//!   records an honest analysis-only execution for the top opportunity),
+//!   and `hive` — `hive_run` records a lesson per finished run and feeds the
+//!   hive's recent lessons back into participant context.
 //! - **Live via `vikram evolution` CLI (read-only)**: `dashboard.snapshot`,
 //!   plus store listings of experiences, proposals, memory, skills, events.
 //! - **Operator-gated via `vikram evolution` CLI**: `cycle` (one bounded
@@ -34,16 +37,13 @@
 //!   handlers answer from the real store (unsupported commands return
 //!   `success:false` honestly); `self_recovery` persists state
 //!   fingerprints and reports drift on restart.
-//! - **Store-backed but dormant**: `hive` — lessons persist to the store,
-//!   but no production path calls `HiveLearning::record`, so the table
-//!   stays empty outside tests.
 //! - **Durable but dormant**: `autonomy` (approval requests persist to
 //!   `engine_records` and reload on open — CLI can now decide them),
 //!   `self_evaluation` (benchmarks/results/metric history — CLI can now
 //!   run benchmarks), `mapek`'s mutating half (`KnowledgeBase` and
 //!   `cycle_count` — CLI `cycle` runs one bounded cycle), and
-//!   `self_improvement`'s execution history (`execute_improvement`/
-//!   `track_improvement` still have no caller).
+//!   `self_improvement`'s `execute_improvement` lifecycle
+//!   (`track_improvement` is wired — see above).
 //! - **Still process-local**: `self_awareness`, `self_config`,
 //!   `self_adaptation`, `self_development`, and bookkeeping that is
 //!   derived-and-rebuilt (`self_improvement`'s `opportunities`,

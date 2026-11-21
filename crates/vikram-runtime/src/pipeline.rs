@@ -2,10 +2,12 @@
 //!
 //! A stage is a named, ordered step in the turn loop that a native module can replace wholesale.
 //! Where a [`crate::hooks::HookRegistry`] hook observes or amends what the runtime is about to do,
-//! a stage *is* the step: [`StageRegistry::run`] dispatches each [`StagePoint`] to exactly one
-//! [`StageHandler`] — the highest-priority registration, or the builtin default when nothing is
-//! registered — and the handler's writes to the [`StageContext`] payload are what the turn
-//! continues with.
+//! a stage *is* the step: [`StageRegistry::run`] dispatches each [`StagePoint`] through its
+//! registration chain in priority order — each handler may mutate the [`StageContext`] payload
+//! and then [`StageOutcome::Pass`] to hand the dispatch to the next registration, or finish it
+//! with [`StageOutcome::Done`]. When every registration passes, the builtin default runs, so the
+//! pipeline is fully populated from boot and a registration *replaces* a step rather than
+//! wrapping it unless it declines.
 //!
 //! Failure policy is fail-stage, never silent fallback: a handler that returns [`StageError`]
 //! fails the stage and the turn reports it. Falling back to the default would hide a broken
@@ -362,11 +364,18 @@ impl StageContext {
 /// What a stage handler decided.
 #[derive(Debug)]
 pub enum StageOutcome {
-    /// The stage completed; its outputs are in the context payload.
+    /// The stage completed; its outputs are in the context payload. Terminal: no later
+    /// registration or the builtin default runs for this dispatch.
     Done,
     /// The stage declines to let the turn continue; `reason` is operator-facing. The caller maps
-    /// it onto the same refusal path the point's hooks already had.
+    /// it onto the same refusal path the point's hooks already had. Terminal like [`Self::Done`].
     Refused(String),
+    /// This handler does not resolve the dispatch — it may still have amended `ctx.payload`,
+    /// which the next handler in the chain sees. The registry tries the next registration in
+    /// priority order, and the builtin default when every registration passes. `Pass` never
+    /// escapes [`StageRegistry::run`]: a chain in which nothing resolves the stage is a
+    /// [`StageError`], matching the fail-stage policy.
+    Pass,
 }
 
 /// A stage handler failed. The registry re-attributes the error to the point and handler that
@@ -414,8 +423,9 @@ pub trait StageHandler: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 
     /// Run the stage. Mutate `ctx.payload` with the stage's outputs; return [`StageOutcome::Done`]
-    /// when they are authoritative, [`StageOutcome::Refused`] to veto the turn, or [`StageError`]
-    /// when the stage itself failed.
+    /// when they are authoritative, [`StageOutcome::Refused`] to veto the turn,
+    /// [`StageOutcome::Pass`] to hand the dispatch to the next handler in the chain, or
+    /// [`StageError`] when the stage itself failed.
     fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a>;
 }
 
@@ -485,7 +495,7 @@ impl StageHandler for ProcessStageHandler {
         Box::pin(async move {
             if let Some(builtin) = crate::turn::default_stage_handler(ctx.point) {
                 match builtin.handle(ctx).await? {
-                    StageOutcome::Done => {}
+                    StageOutcome::Done | StageOutcome::Pass => {}
                     StageOutcome::Refused(reason) => return Ok(StageOutcome::Refused(reason)),
                 }
             }
@@ -738,12 +748,16 @@ pub struct StageRejection {
     pub reason: String,
 }
 
-/// The stage registry: named points mapped to their winning handler.
+/// The stage registry: named points mapped to their registration chain.
 ///
-/// At most one handler runs per point per dispatch — the highest `priority` registration, with
-/// registration order breaking ties. When nothing is registered the builtin default runs, so the
-/// pipeline is fully populated from boot and a registration *replaces* a step rather than
-/// wrapping it.
+/// Dispatch walks a point's registrations in priority order — highest first, registration
+/// order breaking ties — and each handler decides the dispatch's fate: [`StageOutcome::Done`]
+/// and [`StageOutcome::Refused`] are terminal, [`StageOutcome::Pass`] hands the same context —
+/// including any payload mutations earlier handlers left — to the next registration, and
+/// [`StageError`] fails the stage outright. The builtin default is appended to every chain as
+/// the last resort, so it runs whenever nothing is registered *and* whenever every
+/// registration declines; a registration that resolves the stage still replaces the step
+/// wholesale, exactly as before.
 pub struct StageRegistry {
     registrations: RwLock<HashMap<StagePoint, Vec<StageRegistration>>>,
     sequence: AtomicU64,
@@ -757,8 +771,9 @@ impl StageRegistry {
         }
     }
 
-    /// Register a native handler for `point`. Higher `priority` wins dispatch; ties go to the
-    /// earlier registration. The builtin default runs only while nothing is registered.
+    /// Register a native handler for `point`. Higher `priority` runs earlier in the dispatch
+    /// chain; ties go to the earlier registration. The builtin default runs only while no
+    /// earlier handler resolves the stage — it is the chain's last resort, not a wrapper.
     pub fn register(&self, point: StagePoint, handler: Arc<dyn StageHandler>, priority: i32) {
         self.push_registration(point, handler.name().to_owned(), handler, priority, false);
     }
@@ -900,41 +915,34 @@ impl StageRegistry {
             .is_some_and(|entries| !entries.is_empty())
     }
 
-    /// The handler `point` dispatches to — the highest-priority registration, or the builtin
-    /// default — plus the name errors are attributed to.
-    fn winning_handler(
-        &self,
-        point: StagePoint,
-    ) -> Result<(Arc<dyn StageHandler>, String), StageError> {
-        let selected = {
+    /// The handlers `point` dispatches through, in order: every registration in priority order,
+    /// then the builtin default as the last resort. A handler's [`StageOutcome::Pass`] advances
+    /// the chain; anything else ends it.
+    fn handler_chain(&self, point: StagePoint) -> Vec<(Arc<dyn StageHandler>, String)> {
+        let mut chain: Vec<(Arc<dyn StageHandler>, String)> = {
             let registrations = self.registrations.read().unwrap_or_else(|e| e.into_inner());
             registrations
                 .get(&point)
-                .and_then(|entries| entries.first())
-                .map(|entry| (Arc::clone(&entry.handler), entry.name.clone()))
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|entry| (Arc::clone(&entry.handler), entry.name.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
         };
-        match selected {
-            Some(selected) => Ok(selected),
-            None => match crate::turn::default_stage_handler(point) {
-                Some(handler) => {
-                    let name = handler.name().to_owned();
-                    Ok((handler, name))
-                }
-                None => Err(StageError::new(
-                    point,
-                    "registry",
-                    format!(
-                        "no handler registered for stage `{}` and no builtin default exists",
-                        point.as_str()
-                    ),
-                )),
-            },
+        if let Some(builtin) = crate::turn::default_stage_handler(point) {
+            let name = builtin.name().to_owned();
+            chain.push((builtin, name));
         }
+        chain
     }
 
-    /// Dispatch `point` to its winning handler — a registration if any, else the builtin
-    /// default — and return its outcome. A handler error is attributed and propagated: the stage
-    /// fails, it does not silently fall back.
+    /// Dispatch `point` through its handler chain — registrations in priority order, then the
+    /// builtin default — and return the outcome of the first handler that resolves the stage.
+    /// [`StageOutcome::Pass`] advances the chain with the payload mutations intact; a handler
+    /// error is attributed to that handler and propagated: the stage fails, it does not
+    /// silently fall back. A chain in which every handler passes is a stage failure too.
     pub async fn run(
         &self,
         point: StagePoint,
@@ -951,11 +959,24 @@ impl StageRegistry {
                 ),
             ));
         }
-        let (handler, name) = self.winning_handler(point)?;
-        handler
-            .handle(ctx)
-            .await
-            .map_err(|err| StageError::new(point, name, err.message))
+        for (handler, name) in self.handler_chain(point) {
+            match handler
+                .handle(ctx)
+                .await
+                .map_err(|err| StageError::new(point, name.as_str(), err.message))?
+            {
+                StageOutcome::Pass => continue,
+                outcome => return Ok(outcome),
+            }
+        }
+        Err(StageError::new(
+            point,
+            "registry",
+            format!(
+                "every handler for stage `{}` passed and none resolved it",
+                point.as_str()
+            ),
+        ))
     }
 
     /// Dispatch `point` from synchronous code — the session and agent lifecycle call sites run
@@ -989,21 +1010,34 @@ impl StageRegistry {
                 ),
             ));
         }
-        let (handler, name) = self.winning_handler(point)?;
-        let future = handler.handle(ctx);
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| executor.block_on(future))
-                .join()
-                .unwrap_or_else(|_| {
-                    Err(StageError::new(
-                        point,
-                        name.clone(),
-                        "stage handler thread panicked".to_owned(),
-                    ))
-                })
-        })
-        .map_err(|err| StageError::new(point, name, err.message))
+        for (handler, name) in self.handler_chain(point) {
+            let future = handler.handle(ctx);
+            let outcome = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| executor.block_on(future))
+                    .join()
+                    .unwrap_or_else(|_| {
+                        Err(StageError::new(
+                            point,
+                            name.as_str(),
+                            "stage handler thread panicked".to_owned(),
+                        ))
+                    })
+            })
+            .map_err(|err| StageError::new(point, name.as_str(), err.message))?;
+            match outcome {
+                StageOutcome::Pass => continue,
+                outcome => return Ok(outcome),
+            }
+        }
+        Err(StageError::new(
+            point,
+            "registry",
+            format!(
+                "every handler for stage `{}` passed and none resolved it",
+                point.as_str()
+            ),
+        ))
     }
 }
 
@@ -1277,6 +1311,202 @@ mod tests {
         assert!(
             payload.text.is_none(),
             "no silent fallback rewrote the payload"
+        );
+    }
+
+    /// Stamps the `memory_recall` payload, then declines so the next handler in the chain
+    /// resolves the stage with the stamp still in place.
+    struct Passing {
+        stamp: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl StageHandler for Passing {
+        fn name(&self) -> &'static str {
+            "test.passing"
+        }
+
+        fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if let StagePayload::MemoryRecall(payload) = &mut ctx.payload {
+                    payload.text = Some(match payload.text.take() {
+                        Some(existing) => format!("{existing}|{}", self.stamp),
+                        None => self.stamp.to_owned(),
+                    });
+                }
+                Ok(StageOutcome::Pass)
+            })
+        }
+    }
+
+    /// Resolves `memory_recall` by appending to whatever text earlier handlers left behind.
+    struct Appending {
+        suffix: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl StageHandler for Appending {
+        fn name(&self) -> &'static str {
+            "test.appending"
+        }
+
+        fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if let StagePayload::MemoryRecall(payload) = &mut ctx.payload {
+                    payload.text = Some(format!(
+                        "{}+{}",
+                        payload.text.take().unwrap_or_default(),
+                        self.suffix
+                    ));
+                }
+                Ok(StageOutcome::Done)
+            })
+        }
+    }
+
+    /// Declines every dispatch without touching the payload.
+    struct AlwaysPass {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl StageHandler for AlwaysPass {
+        fn name(&self) -> &'static str {
+            "test.always_pass"
+        }
+
+        fn handle<'a>(&'a self, _ctx: &'a mut StageContext) -> StageFuture<'a> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(StageOutcome::Pass)
+            })
+        }
+    }
+
+    /// Refuses every `memory_recall` dispatch.
+    struct Refusing {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl StageHandler for Refusing {
+        fn name(&self) -> &'static str {
+            "test.refusing"
+        }
+
+        fn handle<'a>(&'a self, _ctx: &'a mut StageContext) -> StageFuture<'a> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(StageOutcome::Refused("the stage says no".to_owned()))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_passing_handler_hands_the_dispatch_to_the_next_registration() {
+        let (_dir, _home, runtime, _session, live) = runtime_and_session().await;
+        let handle = runtime.handle();
+        let registry = StageRegistry::new();
+        let pass_calls = Arc::new(AtomicUsize::new(0));
+        let append_calls = Arc::new(AtomicUsize::new(0));
+        registry.register(
+            StagePoint::MemoryRecall,
+            Arc::new(Passing {
+                stamp: "outer",
+                calls: Arc::clone(&pass_calls),
+            }),
+            9,
+        );
+        registry.register(
+            StagePoint::MemoryRecall,
+            Arc::new(Appending {
+                suffix: "inner",
+                calls: Arc::clone(&append_calls),
+            }),
+            1,
+        );
+        let mut ctx = context_for(&handle.inner, &live, recall_payload());
+        let outcome = registry
+            .run(StagePoint::MemoryRecall, &mut ctx)
+            .await
+            .expect("dispatch succeeds");
+        assert!(matches!(outcome, StageOutcome::Done));
+        let StagePayload::MemoryRecall(payload) = ctx.payload else {
+            panic!("wrong payload");
+        };
+        assert_eq!(
+            payload.text.as_deref(),
+            Some("outer+inner"),
+            "the passer's mutation is what the next handler resolved"
+        );
+        assert_eq!(pass_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(append_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn every_registration_passing_falls_through_to_the_builtin_default() {
+        let (_dir, _home, runtime, _session, live) = runtime_and_session().await;
+        let handle = runtime.handle();
+        let registry = StageRegistry::new();
+        let high_calls = Arc::new(AtomicUsize::new(0));
+        let low_calls = Arc::new(AtomicUsize::new(0));
+        registry.register(
+            StagePoint::MemoryRecall,
+            Arc::new(AlwaysPass {
+                calls: Arc::clone(&high_calls),
+            }),
+            9,
+        );
+        registry.register(
+            StagePoint::MemoryRecall,
+            Arc::new(AlwaysPass {
+                calls: Arc::clone(&low_calls),
+            }),
+            1,
+        );
+        let mut ctx = context_for(&handle.inner, &live, recall_payload());
+        let outcome = registry
+            .run(StagePoint::MemoryRecall, &mut ctx)
+            .await
+            .expect("the builtin default resolves the stage");
+        assert!(matches!(outcome, StageOutcome::Done));
+        assert_eq!(high_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(low_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_terminal_and_lower_registrations_never_run() {
+        let (_dir, _home, runtime, _session, live) = runtime_and_session().await;
+        let handle = runtime.handle();
+        let registry = StageRegistry::new();
+        let refuse_calls = Arc::new(AtomicUsize::new(0));
+        let marker_calls = Arc::new(AtomicUsize::new(0));
+        registry.register(
+            StagePoint::MemoryRecall,
+            Arc::new(Refusing {
+                calls: Arc::clone(&refuse_calls),
+            }),
+            9,
+        );
+        registry.register(
+            StagePoint::MemoryRecall,
+            Arc::new(Marker {
+                text: "low",
+                calls: Arc::clone(&marker_calls),
+            }),
+            1,
+        );
+        let mut ctx = context_for(&handle.inner, &live, recall_payload());
+        let outcome = registry
+            .run(StagePoint::MemoryRecall, &mut ctx)
+            .await
+            .expect("dispatch succeeds");
+        assert!(matches!(outcome, StageOutcome::Refused(reason) if reason == "the stage says no"));
+        assert_eq!(refuse_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            marker_calls.load(Ordering::SeqCst),
+            0,
+            "the loser never ran"
         );
     }
 

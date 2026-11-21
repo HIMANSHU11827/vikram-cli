@@ -92,6 +92,9 @@ const SELF_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 /// Self-check ticks between improvement-opportunity scans — roughly daily at the
 /// hourly cadence.
 const SELF_CHECK_OPPORTUNITY_EVERY: u64 = 24;
+/// How many of a hive's most recent lessons ride along in each participant's
+/// system context on `hive_run`.
+const HIVE_LESSON_CONTEXT: usize = 3;
 
 /// Hive group-chat concerns (canonical: `hive_chat::HiveManager` over
 /// `vikram-store`). Extracted from the god struct so hive construction
@@ -790,6 +793,17 @@ fn dispatch_lifecycle_stage(
 ) -> std::result::Result<(), String> {
     match crate::pipeline::run_lifecycle_stage(inner, point, session, request_text, payload) {
         Ok(crate::pipeline::StageOutcome::Done) => Ok(()),
+        // `Pass` is resolved inside the registry's handler chain and never reaches a caller;
+        // surface it as an event rather than failing the store operation.
+        Ok(crate::pipeline::StageOutcome::Pass) => {
+            inner.emit(RuntimeEvent::Error {
+                text: format!(
+                    "the `{}` stage passed without a handler resolving it",
+                    point.as_str()
+                ),
+            });
+            Ok(())
+        }
         Ok(crate::pipeline::StageOutcome::Refused(reason)) if vetoable => Err(reason),
         Ok(crate::pipeline::StageOutcome::Refused(reason)) => {
             inner.emit(RuntimeEvent::Notice {
@@ -2002,6 +2016,9 @@ pub(crate) struct SelfCheckReport {
     /// Why the opportunity scan returned what it did (empty evidence, or a
     /// summary of the evidence used). `None` when no scan ran.
     pub opportunity_note: Option<String>,
+    /// Improvement executions the scan recorded for the top opportunity
+    /// (analysis-only surfacing). 0 when no scan ran or nothing new qualified.
+    pub improvement_executions: usize,
 }
 
 impl RuntimeInner {
@@ -2066,6 +2083,55 @@ impl RuntimeInner {
             } else {
                 Vec::new()
             };
+            // The scan's top opportunity is acted on by surfacing it — the
+            // self-check notice is the action — so the tracked execution says
+            // exactly that rather than pretending an automated change ran.
+            // `track_improvement` persists it; the step description doubles as
+            // the dedup key so a still-failing category is not re-recorded on
+            // every scan.
+            let mut improvement_executions = 0usize;
+            if scan_opportunities {
+                let prioritized = engine.self_improvement.prioritize_improvements(&opportunities);
+                if let Some(top) = prioritized.first() {
+                    let seen = engine
+                        .self_improvement
+                        .get_improvement_history()
+                        .iter()
+                        .any(|e| e.steps.iter().any(|s| s.description == top.description));
+                    if !seen {
+                        let now = vikram_evolution::now_ms();
+                        let execution = vikram_evolution::ImprovementExecution {
+                            id: vikram_evolution::gen_id("exec"),
+                            opportunity_id: top.id.clone(),
+                            steps: vec![
+                                vikram_evolution::self_improvement::ImprovementStep {
+                                    description: top.description.clone(),
+                                    status:
+                                        vikram_evolution::self_improvement::StepStatus::Completed,
+                                    output: Some(format!(
+                                        "self-check surfaced the opportunity; evidence: {}",
+                                        top.evidence.join("; ")
+                                    )),
+                                },
+                            ],
+                            status: vikram_evolution::ExecutionStatus::Completed,
+                            started_ms: now,
+                            completed_ms: Some(now),
+                            outcome: Some(
+                                "analysis-only: reported via self-check notice; no automated change applied"
+                                    .to_owned(),
+                            ),
+                        };
+                        if engine
+                            .self_improvement
+                            .track_improvement(execution)
+                            .is_ok()
+                        {
+                            improvement_executions = 1;
+                        }
+                    }
+                }
+            }
             let opportunity_note = if scan_opportunities {
                 engine
                     .self_improvement
@@ -2094,6 +2160,7 @@ impl RuntimeInner {
                         .map(|i| format!("{}: {}", i.component, i.description))
                         .collect::<Vec<_>>(),
                     "opportunities": opportunities.len(),
+                    "improvement_executions": improvement_executions,
                 }),
             });
             Ok(SelfCheckReport {
@@ -2101,6 +2168,7 @@ impl RuntimeInner {
                 issues: analysis.issues,
                 opportunities,
                 opportunity_note,
+                improvement_executions,
             })
         })
         .await
@@ -2136,18 +2204,25 @@ impl RuntimeInner {
         }
         if !report.opportunities.is_empty() {
             let top = &report.opportunities[0];
+            let mut text = format!(
+                "evolution self-check: {} improvement opportunit{} — top: {}",
+                report.opportunities.len(),
+                if report.opportunities.len() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                top.description
+            );
+            if report.improvement_executions > 0 {
+                text.push_str(&format!(
+                    "; tracked {} improvement execution(s)",
+                    report.improvement_executions
+                ));
+            }
             self.emit(RuntimeEvent::Notice {
                 level: NoticeLevel::Info,
-                text: format!(
-                    "evolution self-check: {} improvement opportunit{} — top: {}",
-                    report.opportunities.len(),
-                    if report.opportunities.len() == 1 {
-                        "y"
-                    } else {
-                        "ies"
-                    },
-                    top.description
-                ),
+                text,
             });
         } else if let Some(note) = &report.opportunity_note {
             self.emit(RuntimeEvent::Notice {
@@ -5269,6 +5344,31 @@ impl RuntimeHandle {
             .messages(hive)
             .map_err(RuntimeError::InvalidState)?;
 
+        // Lessons earlier runs of *this* hive recorded ride along in each
+        // participant's system context. `task_id` carries the hive id, so the
+        // filter is the scope: nothing recorded for another hive can leak in.
+        // A store/lock failure just means no lessons this run.
+        let past_lessons: Vec<(String, String)> = {
+            let engine = self
+                .inner
+                .learning
+                .evolution
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            engine
+                .hive
+                .list()
+                .map(|lessons| {
+                    lessons
+                        .into_iter()
+                        .filter(|l| l.task_id == hive.as_str())
+                        .take(HIVE_LESSON_CONTEXT)
+                        .map(|l| (l.outcome, l.lesson))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
         // Helper: collect one participant's response given a transcript snapshot.
         async fn collect_one(
             inner: &Arc<RuntimeInner>,
@@ -5276,9 +5376,16 @@ impl RuntimeHandle {
             model: &str,
             ent: &vikram_store::EntityRow,
             msgs: &[vikram_store::HiveMessageRow],
+            lessons: &[(String, String)],
         ) -> String {
             let ctx = inner.context.load_agent_or_bot(ent);
-            let system_text = ctx.render();
+            let mut system_text = ctx.render();
+            if !lessons.is_empty() {
+                system_text.push_str("\n\nLessons from earlier runs of this hive:\n");
+                for (outcome, lesson) in lessons {
+                    system_text.push_str(&format!("- {lesson} (outcome: {outcome})\n"));
+                }
+            }
             // A hive turn is shared context, and authorising a share is not the same as emptying
             // the log into the prompt: the participant answers from the most recent exchange that
             // fits its budget, and nothing it was not party to.
@@ -5349,6 +5456,7 @@ impl RuntimeHandle {
             collected
         }
 
+        let mut responded = 0usize;
         if parallel {
             // Issue all participant requests concurrently, then append responses in order.
             let mut handles = Vec::new();
@@ -5358,8 +5466,9 @@ impl RuntimeHandle {
                 let model = model.clone();
                 let ent = ent.clone();
                 let msgs = base_msgs.clone();
+                let lessons = past_lessons.clone();
                 handles.push(tokio::spawn(async move {
-                    collect_one(&inner, &provider, &model, &ent, &msgs).await
+                    collect_one(&inner, &provider, &model, &ent, &msgs, &lessons).await
                 }));
             }
             let mut responses: Vec<String> = Vec::new();
@@ -5368,6 +5477,7 @@ impl RuntimeHandle {
             }
             for (ent, resp) in entities.iter().zip(responses.iter()) {
                 if !resp.trim().is_empty() {
+                    responded += 1;
                     let ts = now_ms();
                     self.inner
                         .hive
@@ -5383,8 +5493,10 @@ impl RuntimeHandle {
                     .hive
                     .messages(hive)
                     .map_err(RuntimeError::InvalidState)?;
-                let resp = collect_one(&self.inner, &provider, &model, ent, &msgs).await;
+                let resp =
+                    collect_one(&self.inner, &provider, &model, ent, &msgs, &past_lessons).await;
                 if !resp.trim().is_empty() {
+                    responded += 1;
                     let ts = now_ms();
                     self.inner
                         .hive
@@ -5392,6 +5504,38 @@ impl RuntimeHandle {
                         .map_err(RuntimeError::InvalidState)?;
                 }
             }
+        }
+
+        // A finished run is the honest trigger for hive learning: the lesson
+        // records what actually happened — who was asked, how many answered —
+        // and `task_id` scopes it to this hive so later runs of the same hive
+        // see it and no other hive does. A lesson-write failure must not fail
+        // a run that already produced its transcript.
+        let agents: Vec<String> = entities.iter().map(|e| e.name.clone()).collect();
+        let lesson = format!(
+            "{} of {} participant(s) produced a response",
+            responded,
+            entities.len()
+        );
+        let pattern = format!(
+            "hive_run:{}",
+            if parallel { "parallel" } else { "sequential" }
+        );
+        let outcome = if responded > 0 {
+            "success"
+        } else {
+            "no_responses"
+        };
+        {
+            let engine = self
+                .inner
+                .learning
+                .evolution
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _ = engine
+                .hive
+                .record(hive.as_str(), agents, outcome, &lesson, &pattern);
         }
 
         self.inner
@@ -6408,6 +6552,114 @@ mod tests {
             Some(Trust::User),
             "the operator's own prompt stays user-trusted"
         );
+    }
+
+    #[tokio::test]
+    async fn hive_run_records_a_lesson_scoped_to_its_hive() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let (runtime, provider) = named_runtime(dir.path(), "ack").await;
+        let handle = runtime.handle();
+        let user = handle.inner.store.create_user("U", now_ms()).unwrap();
+
+        let mut hives = Vec::new();
+        for (hive_name, bot, prompt) in [
+            ("Alpha", "AlphaBot", "prompt-alpha"),
+            ("Beta", "BetaBot", "prompt-beta"),
+        ] {
+            let hive_id = handle
+                .hive_create(
+                    user.id.clone(),
+                    None,
+                    hive_name.to_string(),
+                    "objective".to_string(),
+                    "cooperative".to_string(),
+                )
+                .unwrap();
+            let ent = vikram_store::EntityRow {
+                id: vikram_contracts::EntityId::generate(),
+                owner_user: None,
+                kind: vikram_store::EntityKind::Agent,
+                name: bot.to_string(),
+                slug: bot.to_lowercase(),
+                title: String::new(),
+                role: String::new(),
+                specialization: String::new(),
+                description: String::new(),
+                icon: None,
+                model: None,
+                profile_id: None,
+                status: "active".to_string(),
+                created_ms: now_ms(),
+                updated_ms: now_ms(),
+            };
+            handle.inner.store.save_entity(&ent).unwrap();
+            handle
+                .hive_add_participant(&hive_id, &ent.id, vikram_store::EntityKind::Agent, "member")
+                .unwrap();
+            hives.push((hive_id, prompt.to_string()));
+        }
+        let (alpha, _) = &hives[0];
+        let (beta, beta_prompt) = &hives[1];
+
+        // A lesson recorded for Alpha must reach Alpha's next run and no other hive's.
+        handle
+            .evolution()
+            .hive
+            .record(
+                alpha.as_str(),
+                vec!["AlphaBot".to_string()],
+                "success",
+                "UNIQUE-LESSON-MARKER",
+                "test",
+            )
+            .unwrap();
+
+        handle.hive_run(beta, beta_prompt, false).await.unwrap();
+        let beta_requests: Vec<_> = provider
+            .asked()
+            .into_iter()
+            .filter(|msgs| msgs.iter().any(|m| m.text_body().contains(beta_prompt)))
+            .collect();
+        assert!(!beta_requests.is_empty(), "Beta's run reached the provider");
+        assert!(
+            beta_requests.iter().all(|msgs| {
+                msgs.iter()
+                    .all(|m| !m.text_body().contains("UNIQUE-LESSON-MARKER"))
+            }),
+            "a lesson scoped to Alpha must not leak into Beta's context"
+        );
+
+        handle.hive_run(alpha, "prompt-alpha", false).await.unwrap();
+        let alpha_requests: Vec<_> = provider
+            .asked()
+            .into_iter()
+            .filter(|msgs| msgs.iter().any(|m| m.text_body().contains("prompt-alpha")))
+            .collect();
+        assert!(
+            alpha_requests.iter().any(|msgs| {
+                msgs.iter()
+                    .any(|m| m.text_body().contains("UNIQUE-LESSON-MARKER"))
+            }),
+            "Alpha's own past lesson must reach its next run"
+        );
+
+        let lessons = handle.evolution().hive.list().unwrap();
+        let alpha_lessons: Vec<_> = lessons
+            .iter()
+            .filter(|l| l.task_id == alpha.as_str())
+            .collect();
+        assert_eq!(alpha_lessons.len(), 2, "manual lesson + the run's own");
+        let beta_lessons: Vec<_> = lessons
+            .iter()
+            .filter(|l| l.task_id == beta.as_str())
+            .collect();
+        assert_eq!(beta_lessons.len(), 1);
+        let run_lesson = beta_lessons[0];
+        assert_eq!(run_lesson.outcome, "success");
+        assert_eq!(run_lesson.agents, vec!["BetaBot".to_string()]);
+        assert!(run_lesson.lesson.contains("1 of 1 participant(s)"));
+        assert_eq!(run_lesson.pattern, "hive_run:sequential");
     }
 
     #[tokio::test]
@@ -7582,6 +7834,72 @@ mod tests {
         assert!(
             warn.is_some(),
             "unhealthy findings must surface as a Warn notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_check_tracks_an_execution_for_the_top_opportunity() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        {
+            let engine = handle.evolution();
+            for i in 0..vikram_evolution::MIN_SAMPLE {
+                engine
+                    .experience
+                    .record(failing_experience(i))
+                    .expect("experience records");
+            }
+        }
+
+        let report = handle
+            .inner
+            .run_self_check(true)
+            .await
+            .expect("recorded failures are still readable");
+        assert_eq!(report.improvement_executions, 1);
+        assert!(!report.opportunities.is_empty());
+        {
+            let engine = handle.evolution();
+            let history = engine.self_improvement.get_improvement_history();
+            assert_eq!(history.len(), 1, "the scan tracked one execution");
+            let execution = &history[0];
+            assert!(
+                report
+                    .opportunities
+                    .iter()
+                    .any(|o| o.id == execution.opportunity_id),
+                "the execution links back to a scanned opportunity"
+            );
+            assert_eq!(
+                execution.status,
+                vikram_evolution::ExecutionStatus::Completed
+            );
+            assert!(
+                execution
+                    .outcome
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("analysis-only"),
+                "the record must not claim an automated change ran"
+            );
+        }
+
+        // A second scan over the same evidence must not duplicate the record.
+        let report = handle
+            .inner
+            .run_self_check(true)
+            .await
+            .expect("the check is repeatable");
+        assert_eq!(report.improvement_executions, 0);
+        assert_eq!(
+            handle
+                .evolution()
+                .self_improvement
+                .get_improvement_history()
+                .len(),
+            1
         );
     }
 
