@@ -15,6 +15,10 @@ const MAX_POLL_QUESTION: usize = 500;
 /// as the poll marker, with headroom for the prefix and the trailing summary line.
 const MAX_CARD_BYTES: usize = 16_000;
 
+/// Largest serialized draft payload the marker line will carry; same [`MAX_TOOL_OUTPUT`] budget
+/// as the card marker.
+const MAX_DRAFT_BYTES: usize = 16_000;
+
 /// `message.poll` asks the chat a question with tappable answers. The tool itself only emits the
 /// `POLL:{...}` marker line the gateway parses out of the committed tool result and delivers as
 /// an outbound poll verb; like `ask_user`, the permission shape is a read of the conversation,
@@ -160,6 +164,65 @@ impl Tool for MessageCard {
             )));
         }
         let content = format!("CARD:{body}\nCard sent.");
+        Ok(ToolOutput { content, ok: true })
+    }
+}
+
+/// `message.draft` previews an unsent message in the chat. The tool only emits the
+/// `DRAFT:{...}` marker line the gateway parses out of the committed tool result and delivers as
+/// an outbound draft verb; like `message.poll`, the permission shape is a read of the
+/// conversation, not a mutation of the workspace.
+pub(crate) struct MessageDraft;
+
+impl Tool for MessageDraft {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "message.draft".into(),
+            description: "Preview an unsent message in the chat as a draft; `text` is the draft body, shown as a preview rather than delivered as a final reply.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "the draft text to preview"}
+                },
+                "required": ["text"]
+            }),
+        }
+    }
+
+    fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
+        let target = args
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| text.chars().take(120).collect::<String>())
+            .unwrap_or_else(|| "draft".to_owned());
+        Ok(PermissionRequest::new(
+            ActionKind::Read,
+            "message.draft",
+            target,
+            SideEffect::None,
+            Trust::Model,
+        ))
+    }
+
+    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+        let text = arg_str(args, "text")?;
+        if text.trim().is_empty() {
+            return Err(VikramError::ProviderRejected(
+                "`text` must not be empty".to_owned(),
+            ));
+        }
+        // The marker line must stay a single line of compact JSON under MAX_TOOL_OUTPUT;
+        // serde_json escapes any newline or quote inside the text so `DRAFT:` never splits.
+        let marker = json!({"text": text});
+        let body = serde_json::to_string(&marker).expect("draft marker serializes");
+        if body.len() > MAX_DRAFT_BYTES {
+            return Err(VikramError::ProviderRejected(format!(
+                "`text` is capped at {MAX_DRAFT_BYTES} bytes of JSON"
+            )));
+        }
+        let content = format!("DRAFT:{body}\nDraft preview shown.");
         Ok(ToolOutput { content, ok: true })
     }
 }
@@ -363,5 +426,77 @@ mod tests {
         assert_eq!(req.originating_trust, Trust::Model);
         let req = MessageCard.permission(&json!({})).unwrap();
         assert_eq!(req.resource, "card");
+    }
+
+    #[test]
+    fn draft_emits_a_marker_line_carrying_the_text_verbatim() {
+        let text = "Draft reply:\nline two with \"quotes\"";
+        let out = MessageDraft.run(&json!({"text": text}), &ctx()).unwrap();
+        assert!(out.ok);
+        let marker = out
+            .content
+            .lines()
+            .next()
+            .expect("marker is the first line");
+        assert!(marker.starts_with("DRAFT:{"), "{marker}");
+        let body: Value = serde_json::from_str(marker.trim_start_matches("DRAFT:")).unwrap();
+        assert_eq!(body["text"], text);
+    }
+
+    #[test]
+    fn draft_rejects_missing_and_blank_text() {
+        for args in [
+            json!({}),
+            json!({"text": ""}),
+            json!({"text": "   "}),
+            json!({"text": "\n\t"}),
+            json!({"text": 42}),
+            json!({"text": null}),
+        ] {
+            assert!(
+                MessageDraft.run(&args, &ctx()).is_err(),
+                "{args} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn draft_payload_is_capped_under_the_tool_output_budget() {
+        let huge = json!({"text": "x".repeat(MAX_DRAFT_BYTES)});
+        assert!(MessageDraft.run(&huge, &ctx()).is_err());
+        let fits = json!({"text": "x".repeat(MAX_DRAFT_BYTES - 32)});
+        let out = MessageDraft.run(&fits, &ctx()).unwrap();
+        assert!(out.ok);
+        let marker = out.content.lines().next().unwrap();
+        assert!(marker.len() < MAX_TOOL_OUTPUT, "{}", marker.len());
+        let kept = truncated(out.content);
+        let kept_marker = kept.lines().next().unwrap();
+        assert!(
+            serde_json::from_str::<Value>(kept_marker.trim_start_matches("DRAFT:")).is_ok(),
+            "truncation must not be able to split the marker"
+        );
+    }
+
+    #[test]
+    fn draft_permission_matches_poll_shape() {
+        let req = MessageDraft
+            .permission(&json!({"text": "here is a preview"}))
+            .unwrap();
+        assert_eq!(req.action, ActionKind::Read);
+        assert_eq!(req.verb, "message.draft");
+        assert_eq!(req.resource, "here is a preview");
+        assert_eq!(req.side_effect, SideEffect::None);
+        assert_eq!(req.originating_trust, Trust::Model);
+        let req = MessageDraft.permission(&json!({})).unwrap();
+        assert_eq!(req.resource, "draft");
+    }
+
+    #[test]
+    fn draft_registered_in_builtins() {
+        let registry = ToolRegistry::with_builtins();
+        assert_eq!(
+            registry.get("message.draft").unwrap().spec().name,
+            "message.draft"
+        );
     }
 }

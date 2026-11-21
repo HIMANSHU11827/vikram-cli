@@ -30,6 +30,7 @@ ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+ed25519-dalek = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

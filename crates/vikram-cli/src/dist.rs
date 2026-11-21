@@ -16,16 +16,20 @@
 //! still needed per plugin.
 //!
 //! Signing: `dist export --sign-key` (or `VIKRAM_DIST_KEY`) stamps the manifest with
-//! an HMAC-SHA256 over its canonical JSON. The scheme is symmetric — the same secret
-//! verifies — so it proves the bundle came from someone holding the key, not from a
-//! specific identity. `dist import` verifies a carried signature whenever a key is
-//! available and refuses a signed bundle when none is, unless `--insecure` is given.
+//! an HMAC-SHA256 over its canonical JSON, while `--sign-key-ed25519` (or
+//! `VIKRAM_DIST_ED25519_KEY`) stamps an `ed25519:` signature that verifies against a
+//! public key alone — importers need not hold the signing secret. The HMAC scheme is
+//! symmetric, so it proves the bundle came from someone holding the key, not from a
+//! specific identity. `dist import` verifies a carried signature whenever the matching
+//! key is available and refuses a signed bundle when none is, unless `--insecure` is
+//! given.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
 use std::path::{Component, Path, PathBuf};
 
 use clap::Subcommand;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use vikram_runtime::config::{config_path, plugins_dir, vikram_home};
 use vikram_runtime::plugins::{PluginManifest, PluginRegistry, sha256, sha256_hex};
@@ -41,9 +45,11 @@ use crate::transforms::TRANSFORMS_FILE;
 /// refused rather than guessed at.
 const FORMAT_VERSION: &str = "1";
 
-/// Manifest signature scheme and the env var both commands fall back to for the key.
+/// Manifest signature schemes and the env vars both commands fall back to for keys.
 const SIGN_ALGORITHM: &str = "hmac-sha256";
+const SIGN_ALGORITHM_ED25519: &str = "ed25519";
 const SIGN_ENV: &str = "VIKRAM_DIST_KEY";
+const SIGN_ED25519_ENV: &str = "VIKRAM_DIST_ED25519_KEY";
 
 /// JSON object keys that must never travel in a bundle, even inside `config.json`.
 /// `api_key_env`-style fields are names, not values, and do not match.
@@ -75,6 +81,10 @@ pub enum DistAction {
         /// Sign the manifest with this HMAC key (falls back to VIKRAM_DIST_KEY).
         #[arg(long)]
         sign_key: Option<String>,
+        /// Sign the manifest with this Ed25519 secret key seed, 64 hex chars
+        /// (falls back to VIKRAM_DIST_ED25519_KEY; mutually exclusive with --sign-key).
+        #[arg(long)]
+        sign_key_ed25519: Option<String>,
     },
     /// Install a bundle produced by `vikram dist export`.
     Import {
@@ -89,6 +99,10 @@ pub enum DistAction {
         /// Key used to verify a signed bundle (falls back to VIKRAM_DIST_KEY).
         #[arg(long)]
         verify_key: Option<String>,
+        /// Ed25519 public key, 64 hex chars, used to verify an `ed25519:` signed
+        /// bundle (falls back to VIKRAM_DIST_ED25519_KEY).
+        #[arg(long)]
+        verify_key_ed25519: Option<String>,
         /// Accept a signed bundle without verifying its signature.
         #[arg(long)]
         insecure: bool,
@@ -106,14 +120,28 @@ pub fn run(action: DistAction) -> Result<(), String> {
             out,
             include_backups,
             sign_key,
-        } => export(out.as_deref(), include_backups, sign_key.as_deref()),
+            sign_key_ed25519,
+        } => export(
+            out.as_deref(),
+            include_backups,
+            sign_key.as_deref(),
+            sign_key_ed25519.as_deref(),
+        ),
         DistAction::Import {
             file,
             yes,
             force,
             verify_key,
+            verify_key_ed25519,
             insecure,
-        } => import(&file, yes, force, verify_key.as_deref(), insecure),
+        } => import(
+            &file,
+            yes,
+            force,
+            verify_key.as_deref(),
+            verify_key_ed25519.as_deref(),
+            insecure,
+        ),
         DistAction::List { file } => list(&file),
     }
 }
@@ -135,7 +163,8 @@ struct Manifest {
     exported_ms: u64,
     entries: Vec<ManifestEntry>,
     requirements: Requirements,
-    /// `hmac-sha256:<hex>` over the manifest's canonical JSON; absent on unsigned bundles.
+    /// `hmac-sha256:<hex>` or `ed25519:<hex>` over the manifest's canonical JSON;
+    /// absent on unsigned bundles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     signature: Option<String>,
 }
@@ -148,17 +177,25 @@ struct Requirements {
 
 // ---- signing ----------------------------------------------------------------
 
-/// The key argument wins; an empty one falls through to `VIKRAM_DIST_KEY`.
-fn dist_key(arg: Option<&str>) -> Option<String> {
+/// The key argument wins; an empty one falls through to its env var.
+fn key_arg(arg: Option<&str>, env: &str) -> Option<String> {
     arg.map(str::trim)
         .filter(|key| !key.is_empty())
         .map(str::to_owned)
         .or_else(|| {
-            std::env::var(SIGN_ENV)
+            std::env::var(env)
                 .ok()
                 .map(|key| key.trim().to_owned())
                 .filter(|key| !key.is_empty())
         })
+}
+
+fn dist_key(arg: Option<&str>) -> Option<String> {
+    key_arg(arg, SIGN_ENV)
+}
+
+fn dist_ed25519_key(arg: Option<&str>) -> Option<String> {
+    key_arg(arg, SIGN_ED25519_ENV)
 }
 
 /// RFC 2104 HMAC over the runtime's self-contained SHA-256 (64-byte block).
@@ -195,6 +232,19 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+fn hex_decode(input: &str, expected: usize) -> Result<Vec<u8>, String> {
+    let input = input.trim();
+    if input.len() != expected * 2 || !input.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "expected {expected} bytes as {} hex chars",
+            expected * 2
+        ));
+    }
+    (0..expected)
+        .map(|i| u8::from_str_radix(&input[i * 2..i * 2 + 2], 16).map_err(|e| e.to_string()))
+        .collect()
+}
+
 /// Canonical bytes the signature covers: the manifest serialized with `signature`
 /// absent, so signing and verifying agree on exactly the same input.
 fn canonical_manifest(manifest: &Manifest) -> Result<Vec<u8>, String> {
@@ -211,32 +261,88 @@ fn sign_manifest(manifest: &Manifest, key: &str) -> Result<String, String> {
     ))
 }
 
-fn verify_signature(manifest: &Manifest, key: &str) -> Result<(), String> {
+/// Ed25519 over the same canonical bytes; the secret key is a 32-byte seed in hex.
+fn sign_manifest_ed25519(manifest: &Manifest, seed_hex: &str) -> Result<String, String> {
+    let seed = hex_decode(seed_hex, 32).map_err(|e| format!("invalid Ed25519 signing key: {e}"))?;
+    let mut seed_bytes = [0u8; 32];
+    seed_bytes.copy_from_slice(&seed);
+    let key = SigningKey::from_bytes(&seed_bytes);
+    let canonical = canonical_manifest(manifest)?;
+    let signature: Signature = key.sign(&canonical);
+    Ok(format!(
+        "{SIGN_ALGORITHM_ED25519}:{}",
+        hex_lower(&signature.to_bytes())
+    ))
+}
+
+const SIGNATURE_MISMATCH: &str = "manifest signature does not match the verification key; the bundle was tampered with or signed with a different key";
+
+fn verify_ed25519(
+    canonical: &[u8],
+    public_key_hex: &str,
+    expected_hex: &str,
+) -> Result<(), String> {
+    let public = hex_decode(public_key_hex, 32)
+        .map_err(|e| format!("invalid Ed25519 verification key: {e}"))?;
+    let mut public_bytes = [0u8; 32];
+    public_bytes.copy_from_slice(&public);
+    let verifying_key = VerifyingKey::from_bytes(&public_bytes)
+        .map_err(|_| "Ed25519 verification key is not a valid public key".to_owned())?;
+    let signature_bytes =
+        hex_decode(expected_hex, 64).map_err(|e| format!("malformed Ed25519 signature: {e}"))?;
+    let mut signature_array = [0u8; 64];
+    signature_array.copy_from_slice(&signature_bytes);
+    let signature = Signature::from_bytes(&signature_array);
+    verifying_key
+        .verify(canonical, &signature)
+        .map_err(|_| SIGNATURE_MISMATCH.to_owned())
+}
+
+fn verify_signature(
+    manifest: &Manifest,
+    key: Option<&str>,
+    ed25519_key: Option<&str>,
+) -> Result<(), String> {
     let Some(signature) = &manifest.signature else {
         return Ok(());
     };
     let Some((algorithm, expected)) = signature.split_once(':') else {
         return Err("manifest signature is malformed".to_owned());
     };
-    if algorithm != SIGN_ALGORITHM {
-        return Err(format!(
-            "unsupported manifest signature algorithm `{algorithm}`"
-        ));
-    }
     let canonical = canonical_manifest(manifest)?;
-    let actual = hex_lower(&hmac_sha256(key.as_bytes(), &canonical));
-    if !actual.eq_ignore_ascii_case(expected) {
-        return Err(
-            "manifest signature does not match the verification key; the bundle was tampered with or signed with a different key"
-                .to_owned(),
-        );
+    match algorithm {
+        SIGN_ALGORITHM => {
+            let key = key.ok_or_else(|| {
+                "bundle is signed with hmac-sha256 but no verification key was given".to_owned()
+            })?;
+            let actual = hex_lower(&hmac_sha256(key.as_bytes(), &canonical));
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err(SIGNATURE_MISMATCH.to_owned());
+            }
+        }
+        SIGN_ALGORITHM_ED25519 => {
+            let key = ed25519_key.ok_or_else(|| {
+                "bundle is signed with ed25519 but no Ed25519 verification key was given".to_owned()
+            })?;
+            verify_ed25519(&canonical, key, expected)?;
+        }
+        _ => {
+            return Err(format!(
+                "unsupported manifest signature algorithm `{algorithm}`"
+            ));
+        }
     }
     Ok(())
 }
 
 // ---- export -----------------------------------------------------------------
 
-fn export(out: Option<&Path>, include_backups: bool, sign_key: Option<&str>) -> Result<(), String> {
+fn export(
+    out: Option<&Path>,
+    include_backups: bool,
+    sign_key: Option<&str>,
+    sign_key_ed25519: Option<&str>,
+) -> Result<(), String> {
     let home = vikram_home();
     if !home.is_dir() {
         return Err(format!("no VIKRAM home at {}", home.display()));
@@ -298,7 +404,17 @@ fn export(out: Option<&Path>, include_backups: bool, sign_key: Option<&str>) -> 
         },
         signature: None,
     };
-    if let Some(key) = dist_key(sign_key) {
+    let hmac_key = dist_key(sign_key);
+    let ed25519_key = dist_ed25519_key(sign_key_ed25519);
+    if hmac_key.is_some() && ed25519_key.is_some() {
+        return Err(
+            "choose one signing scheme: --sign-key (hmac-sha256) or --sign-key-ed25519 (ed25519)"
+                .to_owned(),
+        );
+    }
+    if let Some(key) = ed25519_key {
+        manifest.signature = Some(sign_manifest_ed25519(&manifest, &key)?);
+    } else if let Some(key) = hmac_key {
         manifest.signature = Some(sign_manifest(&manifest, &key)?);
     }
     let body = format!(
@@ -657,6 +773,7 @@ fn import(
     yes: bool,
     force: bool,
     verify_key: Option<&str>,
+    verify_key_ed25519: Option<&str>,
     insecure: bool,
 ) -> Result<(), String> {
     if !archive::looks_like_archive(file) {
@@ -683,19 +800,32 @@ fn import(
     }
 
     // A carried signature is verified before anything else; it is never bypassed by
-    // --force, only by the explicit --insecure opt-out.
+    // --force, only by the explicit --insecure opt-out. The key needed depends on the
+    // signature's algorithm tag.
     if manifest.signature.is_some() {
-        match dist_key(verify_key).as_deref() {
-            Some(key) => verify_signature(&manifest, key)?,
-            None if insecure => eprintln!(
+        let algorithm = manifest
+            .signature
+            .as_deref()
+            .and_then(|signature| signature.split_once(':'))
+            .map(|(algorithm, _)| algorithm);
+        let hmac_key = dist_key(verify_key);
+        let ed25519_key = dist_ed25519_key(verify_key_ed25519);
+        let have_key = if algorithm == Some(SIGN_ALGORITHM_ED25519) {
+            ed25519_key.is_some()
+        } else {
+            hmac_key.is_some()
+        };
+        if have_key {
+            verify_signature(&manifest, hmac_key.as_deref(), ed25519_key.as_deref())?;
+        } else if insecure {
+            eprintln!(
                 "warning: --insecure: importing a signed bundle without verifying its signature"
-            ),
-            None => {
-                return Err(
-                    "bundle is signed but no verification key was given; pass --verify-key or set VIKRAM_DIST_KEY (use --insecure to accept the risk)"
-                        .to_owned(),
-                )
-            }
+            );
+        } else {
+            return Err(
+                "bundle is signed but no verification key was given; pass --verify-key/--verify-key-ed25519 or set VIKRAM_DIST_KEY/VIKRAM_DIST_ED25519_KEY (use --insecure to accept the risk)"
+                    .to_owned(),
+            );
         }
     }
 
@@ -1310,7 +1440,7 @@ mod tests {
         populate(&home);
 
         let out = tmp.path().join("dist.tar.gz");
-        export(Some(&out), false, None).unwrap();
+        export(Some(&out), false, None, None).unwrap();
         assert!(out.is_file());
 
         let names = list_tar(&out);
@@ -1341,7 +1471,7 @@ mod tests {
 
         // --include-backups keeps the rollback copies.
         let out2 = tmp.path().join("dist2.tar.gz");
-        export(Some(&out2), true, None).unwrap();
+        export(Some(&out2), true, None, None).unwrap();
         assert!(list_tar(&out2).join("\n").contains(".backups"));
     }
 
@@ -1356,7 +1486,7 @@ mod tests {
         unsafe { std::env::set_var("VIKRAM_HOME", &home) };
         populate(&home);
         let bundle = tmp.path().join("dist.tar.gz");
-        export(Some(&bundle), false, None).unwrap();
+        export(Some(&bundle), false, None, None).unwrap();
 
         // Repack with one file tampered: extract, edit, re-archive under the same shape.
         let stage = tmp.path().join("stage");
@@ -1388,12 +1518,12 @@ mod tests {
 
         let target = tmp.path().join("target");
         unsafe { std::env::set_var("VIKRAM_HOME", &target) };
-        let err = import(&corrupt, true, false, None, false).unwrap_err();
+        let err = import(&corrupt, true, false, None, None, false).unwrap_err();
         assert!(err.contains("failed verification"), "{err}");
         assert!(err.contains("checksum mismatch"), "{err}");
         assert!(!target.join("plugins/acme/plugin.json").exists());
         // --force gets past verification and reports the unit outcome honestly.
-        let result = import(&corrupt, true, true, None, false);
+        let result = import(&corrupt, true, true, None, None, false);
         assert!(result.is_ok() || result.unwrap_err().contains("unit(s) failed"));
     }
 
@@ -1434,7 +1564,7 @@ mod tests {
                 .unwrap();
         }
         let bundle = tmp.path().join("dist.tar.gz");
-        export(Some(&bundle), false, None).unwrap();
+        export(Some(&bundle), false, None, None).unwrap();
 
         // Fresh target home with its own config and a conflicting gateway toggle.
         let target = tmp.path().join("target");
@@ -1447,7 +1577,7 @@ mod tests {
         .unwrap();
         unsafe { std::env::set_var("VIKRAM_HOME", &target) };
 
-        import(&bundle, true, false, None, false).unwrap();
+        import(&bundle, true, false, None, None, false).unwrap();
 
         assert!(target.join("plugins/acme/plugin.json").is_file());
         assert!(target.join("skills/greet/SKILL.md").is_file());
@@ -1526,7 +1656,7 @@ mod tests {
         std::fs::remove_file(home.join("vikram.db")).unwrap();
 
         let signed = tmp.path().join("signed.tar.gz");
-        export(Some(&signed), false, Some("correct horse")).unwrap();
+        export(Some(&signed), false, Some("correct horse"), None).unwrap();
         let extracted = archive::extract_module_dir(&signed).unwrap();
         let manifest = read_manifest_from(extracted.path()).unwrap();
         let signature = manifest.signature.as_deref().expect("manifest signed");
@@ -1534,16 +1664,16 @@ mod tests {
 
         // An unsigned bundle ignores a supplied verify key and imports as before.
         let plain = tmp.path().join("plain.tar.gz");
-        export(Some(&plain), false, None).unwrap();
+        export(Some(&plain), false, None, None).unwrap();
         let target_plain = tmp.path().join("target-plain");
         unsafe { std::env::set_var("VIKRAM_HOME", &target_plain) };
-        import(&plain, true, false, Some("correct horse"), false).unwrap();
+        import(&plain, true, false, Some("correct horse"), None, false).unwrap();
         assert!(target_plain.join("plugins/acme/plugin.json").is_file());
 
         // The signed bundle verifies with the right key.
         let target = tmp.path().join("target");
         unsafe { std::env::set_var("VIKRAM_HOME", &target) };
-        import(&signed, true, false, Some("correct horse"), false).unwrap();
+        import(&signed, true, false, Some("correct horse"), None, false).unwrap();
         assert!(target.join("plugins/acme/plugin.json").is_file());
         assert!(target.join("skills/greet/SKILL.md").is_file());
     }
@@ -1561,25 +1691,25 @@ mod tests {
         std::fs::remove_file(home.join("vikram.db")).unwrap();
 
         let bundle = tmp.path().join("signed.tar.gz");
-        export(Some(&bundle), false, Some("correct horse")).unwrap();
+        export(Some(&bundle), false, Some("correct horse"), None).unwrap();
 
         let target = tmp.path().join("target");
         unsafe { std::env::set_var("VIKRAM_HOME", &target) };
 
-        let err = import(&bundle, true, false, None, false).unwrap_err();
+        let err = import(&bundle, true, false, None, None, false).unwrap_err();
         assert!(err.contains("signed"), "{err}");
         assert!(!target.join("plugins/acme/plugin.json").exists());
 
-        let err = import(&bundle, true, false, Some("wrong key"), false).unwrap_err();
+        let err = import(&bundle, true, false, Some("wrong key"), None, false).unwrap_err();
         assert!(err.contains("signature"), "{err}");
         assert!(!target.join("plugins/acme/plugin.json").exists());
 
         // --force does not bypass a signature failure either.
-        let err = import(&bundle, true, true, Some("wrong key"), false).unwrap_err();
+        let err = import(&bundle, true, true, Some("wrong key"), None, false).unwrap_err();
         assert!(err.contains("signature"), "{err}");
 
         // The explicit opt-out imports it anyway.
-        import(&bundle, true, false, None, true).unwrap();
+        import(&bundle, true, false, None, None, true).unwrap();
         assert!(target.join("plugins/acme/plugin.json").is_file());
     }
 
@@ -1596,7 +1726,7 @@ mod tests {
         std::fs::remove_file(home.join("vikram.db")).unwrap();
 
         let bundle = tmp.path().join("signed.tar.gz");
-        export(Some(&bundle), false, Some("correct horse")).unwrap();
+        export(Some(&bundle), false, Some("correct horse"), None).unwrap();
 
         let stage = tmp.path().join("stage");
         std::fs::create_dir_all(&stage).unwrap();
@@ -1616,8 +1746,140 @@ mod tests {
 
         let target = tmp.path().join("target");
         unsafe { std::env::set_var("VIKRAM_HOME", &target) };
-        let err = import(&tampered, true, false, Some("correct horse"), false).unwrap_err();
+        let err = import(&tampered, true, false, Some("correct horse"), None, false).unwrap_err();
         assert!(err.contains("signature"), "{err}");
         assert!(!target.join("plugins/acme/plugin.json").exists());
+    }
+
+    const ED25519_SEED: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+    const ED25519_OTHER_SEED: &str =
+        "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb";
+
+    fn ed25519_public_hex(seed_hex: &str) -> String {
+        let seed = hex_decode(seed_hex, 32).unwrap();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&seed);
+        hex_lower(&SigningKey::from_bytes(&bytes).verifying_key().to_bytes())
+    }
+
+    fn unsigned_manifest() -> Manifest {
+        Manifest {
+            version: FORMAT_VERSION.to_owned(),
+            exported_ms: 1,
+            entries: Vec::new(),
+            requirements: Requirements {
+                vikram_version: String::new(),
+            },
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn ed25519_signature_round_trips_and_rejects_tampering() {
+        let public_hex = ed25519_public_hex(ED25519_SEED);
+        let mut manifest = unsigned_manifest();
+        manifest.signature = Some(sign_manifest_ed25519(&manifest, ED25519_SEED).unwrap());
+        assert!(
+            manifest
+                .signature
+                .as_deref()
+                .unwrap()
+                .starts_with("ed25519:")
+        );
+
+        verify_signature(&manifest, None, Some(&public_hex)).unwrap();
+
+        // A tampered manifest fails even with the right public key.
+        let mut tampered = manifest.clone();
+        tampered.exported_ms += 1;
+        let err = verify_signature(&tampered, None, Some(&public_hex)).unwrap_err();
+        assert!(err.contains("signature"), "{err}");
+
+        // A different keypair's public key does not verify.
+        let other_hex = ed25519_public_hex(ED25519_OTHER_SEED);
+        let err = verify_signature(&manifest, None, Some(&other_hex)).unwrap_err();
+        assert!(err.contains("signature"), "{err}");
+
+        // The HMAC key cannot stand in for the Ed25519 key.
+        let err = verify_signature(&manifest, Some("correct horse"), None).unwrap_err();
+        assert!(err.contains("no Ed25519 verification key"), "{err}");
+
+        // Malformed key material is refused before verification.
+        let err = verify_signature(&manifest, None, Some("not-hex")).unwrap_err();
+        assert!(err.contains("invalid Ed25519 verification key"), "{err}");
+        let err = sign_manifest_ed25519(&manifest, "deadbeef").unwrap_err();
+        assert!(err.contains("invalid Ed25519 signing key"), "{err}");
+    }
+
+    #[test]
+    fn hmac_signature_still_verifies_and_unknown_algorithms_are_refused() {
+        let mut manifest = unsigned_manifest();
+        manifest.signature = Some(sign_manifest(&manifest, "correct horse").unwrap());
+        assert!(
+            manifest
+                .signature
+                .as_deref()
+                .unwrap()
+                .starts_with("hmac-sha256:")
+        );
+        verify_signature(&manifest, Some("correct horse"), None).unwrap();
+        let err = verify_signature(&manifest, Some("wrong key"), None).unwrap_err();
+        assert!(err.contains("signature"), "{err}");
+
+        // An Ed25519 signature does not verify when only the HMAC key is supplied.
+        let public_hex = ed25519_public_hex(ED25519_SEED);
+        let mut ed_manifest = unsigned_manifest();
+        ed_manifest.signature = Some(sign_manifest_ed25519(&ed_manifest, ED25519_SEED).unwrap());
+        verify_signature(&ed_manifest, None, Some(&public_hex)).unwrap();
+        let err = verify_signature(&ed_manifest, Some("correct horse"), None).unwrap_err();
+        assert!(err.contains("no Ed25519 verification key"), "{err}");
+
+        manifest.signature = Some("rsa-sha256:deadbeef".to_owned());
+        let err = verify_signature(&manifest, Some("correct horse"), None).unwrap_err();
+        assert!(
+            err.contains("unsupported manifest signature algorithm"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ed25519_signed_bundle_exports_and_imports_with_the_public_key() {
+        if Command::new("tar").arg("--version").output().is_err() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = vikram_runtime::config::lock_security_env();
+        let home = tmp.path().join("home");
+        unsafe { std::env::set_var("VIKRAM_HOME", &home) };
+        populate(&home);
+        std::fs::remove_file(home.join("vikram.db")).unwrap();
+
+        let public_hex = ed25519_public_hex(ED25519_SEED);
+        let bundle = tmp.path().join("ed25519.tar.gz");
+        export(Some(&bundle), false, None, Some(ED25519_SEED)).unwrap();
+        let extracted = archive::extract_module_dir(&bundle).unwrap();
+        let manifest = read_manifest_from(extracted.path()).unwrap();
+        assert!(
+            manifest
+                .signature
+                .as_deref()
+                .expect("manifest signed")
+                .starts_with("ed25519:")
+        );
+
+        // No key: refused unless --insecure.
+        let target = tmp.path().join("target");
+        unsafe { std::env::set_var("VIKRAM_HOME", &target) };
+        let err = import(&bundle, true, false, None, None, false).unwrap_err();
+        assert!(err.contains("signed"), "{err}");
+
+        // The public key alone verifies — the seed never leaves the signer.
+        import(&bundle, true, false, None, Some(&public_hex), false).unwrap();
+        assert!(target.join("plugins/acme/plugin.json").is_file());
+
+        // A wrong public key fails signature verification.
+        let other_hex = ed25519_public_hex(ED25519_OTHER_SEED);
+        let err = import(&bundle, true, false, None, Some(&other_hex), false).unwrap_err();
+        assert!(err.contains("signature"), "{err}");
     }
 }

@@ -1439,6 +1439,26 @@ const MAX_TURN_CARDS: usize = 4;
 /// cap is on the raw JSON text, not the parsed value.
 const MAX_CARD_MARKER_BYTES: usize = 16_000;
 
+/// The line a chat-facing tool ends its output with to ask the reply to carry an unsent message
+/// preview: `DRAFT:{"text":"…"}` on its own line. The payload is already the shape
+/// [`OutboundVerb::Draft`] sends minus the caller-chosen `draft_id`, which the gateway derives
+/// from the delivery identity so a retried or redelivered event animates the same preview
+/// instead of opening a second one.
+const DRAFT_MARKER_PREFIX: &str = "DRAFT:";
+
+/// One turn carries at most this many drafts; same flood guard as [`MAX_TURN_POLLS`].
+const MAX_TURN_DRAFTS: usize = 4;
+
+/// Longest `DRAFT:` payload the gateway will deliver; same single-line cap as
+/// [`MAX_CARD_MARKER_BYTES`].
+const MAX_DRAFT_MARKER_BYTES: usize = 16_000;
+
+/// The JSON body of a [`DRAFT_MARKER_PREFIX`] line.
+#[derive(serde::Deserialize)]
+struct DraftMarker {
+    text: String,
+}
+
 /// The JSON body of a [`POLL_MARKER_PREFIX`] line.
 #[derive(serde::Deserialize)]
 struct PollMarker {
@@ -1460,6 +1480,13 @@ fn poll_marker_tool(name: &str) -> bool {
 /// purpose is emitting the marker.
 fn card_marker_tool(name: &str) -> bool {
     name.starts_with("mcp.") || name == "plugin.execute" || name == "message.card"
+}
+
+/// Whether a tool's output may raise a draft. Same deliberate-marker rule as
+/// [`poll_marker_tool`]: operator-installed code and `message.draft`, the builtin whose entire
+/// purpose is emitting the marker.
+fn draft_marker_tool(name: &str) -> bool {
+    name.starts_with("mcp.") || name == "plugin.execute" || name == "message.draft"
 }
 
 /// Every well-formed `POLL:` line in a tool result, as `(question, options)`. A line whose JSON
@@ -1517,7 +1544,32 @@ fn card_markers(content: &str) -> Vec<serde_json::Value> {
     cards
 }
 
-/// The polls and cards a turn's committed messages asked the gateway to send. Assistant
+/// Every well-formed `DRAFT:` line in a tool result, as draft texts. A line whose JSON does not
+/// describe a sendable draft — not an object with a `text` string, blank text, or a payload too
+/// large to have come from a marker — is skipped rather than pushed onto a platform that would
+/// refuse it anyway.
+fn draft_markers(content: &str) -> Vec<String> {
+    let mut drafts = Vec::new();
+    for line in content.lines() {
+        let Some(raw) = line.strip_prefix(DRAFT_MARKER_PREFIX) else {
+            continue;
+        };
+        let raw = raw.trim();
+        if raw.len() > MAX_DRAFT_MARKER_BYTES {
+            continue;
+        }
+        let Ok(marker) = serde_json::from_str::<DraftMarker>(raw) else {
+            continue;
+        };
+        if marker.text.trim().is_empty() {
+            continue;
+        }
+        drafts.push(marker.text);
+    }
+    drafts
+}
+
+/// The polls, cards and drafts a turn's committed messages asked the gateway to send. Assistant
 /// messages carry the `ToolCall` blocks naming each call; tool messages carry the `ToolResult`
 /// content the markers ride in. Both arrive through `MessageCommitted` call-then-result, so the
 /// name map is always populated before the result that needs it.
@@ -1526,6 +1578,7 @@ struct TurnMarkers {
     names: HashMap<ToolCallId, String>,
     polls: Vec<(String, Vec<String>)>,
     cards: Vec<serde_json::Value>,
+    drafts: Vec<String>,
 }
 
 impl TurnMarkers {
@@ -1566,6 +1619,14 @@ impl TurnMarkers {
                                 break;
                             }
                             self.cards.push(card);
+                        }
+                    }
+                    if self.drafts.len() < MAX_TURN_DRAFTS && draft_marker_tool(name) {
+                        for draft in draft_markers(content) {
+                            if self.drafts.len() >= MAX_TURN_DRAFTS {
+                                break;
+                            }
+                            self.drafts.push(draft);
                         }
                     }
                 }
@@ -1650,6 +1711,57 @@ async fn deliver_assistant_cards(
         if !result.success {
             eprintln!(
                 "[gateway:{}] card reply to {chat_id} failed: {}",
+                platform.name(),
+                result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".into())
+            );
+        }
+    }
+}
+
+/// A stable `u64` draft id for one ledgered draft delivery. [`OutboundVerb::Draft`]'s id is
+/// chosen by the caller — platforms that stream drafts animate the same preview for the same id
+/// — so hashing the delivery identity keeps ledger retries and event redeliveries on one
+/// preview while distinct markers still open distinct ones.
+fn draft_id_for(delivery_id: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in delivery_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Deliver the drafts a turn produced, one ledgered [`OutboundVerb::Draft`] each. Ids hang off
+/// the event's delivery identity (`{base}:draft:{n}`) so a redelivered event dedups exactly
+/// like the text reply, the media verbs, the polls and the cards do; the verb's `draft_id` is
+/// derived from that same identity so a retry animates the same preview. A platform without
+/// draft-streaming support refuses the verb honestly through
+/// [`PlatformAdapter::send_draft`]'s default.
+async fn deliver_assistant_drafts(
+    platform: &Arc<dyn GatewayPlatform>,
+    ledger: Option<&DeliveryLedger>,
+    event: &MessageEvent,
+    chat_id: &str,
+    drafts: &[String],
+) {
+    if drafts.is_empty() {
+        return;
+    }
+    let base = event
+        .ledger_message_id
+        .clone()
+        .or_else(|| event.message_id.clone())
+        .unwrap_or_else(|| format!("{}:{chat_id}:{}", platform.name(), now_unix()));
+    for (index, text) in drafts.iter().enumerate() {
+        let delivery_id = format!("{base}:draft:{index}");
+        let verb = OutboundVerb::draft(draft_id_for(&delivery_id), text.clone());
+        let result = deliver_verb(platform, ledger, &delivery_id, chat_id, &verb, None).await;
+        if !result.success {
+            eprintln!(
+                "[gateway:{}] draft reply to {chat_id} failed: {}",
                 platform.name(),
                 result
                     .error
@@ -1772,8 +1884,9 @@ fn turn(
         // Assistant messages committed mid-turn can carry media blocks; they are collected here
         // and sent as verbs once the turn's text is known not to be a lagged prefix.
         let mut reply_media: Vec<ImageSource> = Vec::new();
-        // Tool results committed mid-turn can carry `POLL:`/`CARD:` markers; they are collected
-        // here and sent as verbs once the turn's text is known not to be a lagged prefix.
+        // Tool results committed mid-turn can carry `POLL:`/`CARD:`/`DRAFT:` markers; they are
+        // collected here and sent as verbs once the turn's text is known not to be a lagged
+        // prefix.
         let mut turn_markers = TurnMarkers::default();
         // A lagged receiver skipped events, so what was collected may be a prefix of the real
         // reply. Keep draining for the turn's end (bounded — a flooded channel must not spin
@@ -1857,6 +1970,14 @@ fn turn(
             &event,
             &chat,
             &turn_markers.cards,
+        )
+        .await;
+        deliver_assistant_drafts(
+            &outbound.platform,
+            outbound.ledger.as_deref(),
+            &event,
+            &chat,
+            &turn_markers.drafts,
         )
         .await;
         if reply.trim().is_empty() {
@@ -2451,6 +2572,195 @@ mod tests {
         // The refusal surfaces as a failed SendResult — logged, ledgered, never retried into
         // a fake success and never downgraded to text.
         deliver_assistant_cards(&dyn_platform, Some(&ledger), &event, "chat-1", &cards).await;
+
+        assert_eq!(platform.verbs.lock().unwrap().len(), 1);
+        assert_eq!(ledger.len().expect("ledger len"), 1);
+    }
+
+    #[test]
+    fn a_draft_marker_line_parses_to_its_text() {
+        let content = "composed a reply\nDRAFT:{\"text\":\"here is a preview\"}\ndone";
+        assert_eq!(draft_markers(content), vec!["here is a preview".to_owned()]);
+    }
+
+    #[test]
+    fn malformed_or_oversized_draft_markers_are_skipped() {
+        for content in [
+            "no marker here",
+            "DRAFT:{not json}",
+            "DRAFT:[1,2,3]",
+            "DRAFT:\"just a string\"",
+            "DRAFT:42",
+            "DRAFT:null",
+            "DRAFT:{}",
+            "DRAFT:{\"text\":\"\"}",
+            "DRAFT:{\"text\":\"   \"}",
+            "DRAFT:{\"text\":42}",
+            "DRAFT:{\"text\":\"hi\"} trailing",
+        ] {
+            assert!(draft_markers(content).is_empty(), "{content}");
+        }
+        // A payload over the byte cap is skipped even though it is valid JSON.
+        let huge = format!(
+            "DRAFT:{{\"text\":\"{}\"}}",
+            "x".repeat(MAX_DRAFT_MARKER_BYTES)
+        );
+        assert!(draft_markers(&huge).is_empty());
+        // A marker embedded mid-line is not a marker.
+        assert!(draft_markers("prefix DRAFT:{\"text\":\"hi\"}").is_empty());
+    }
+
+    #[test]
+    fn only_allowlisted_tools_raise_drafts_from_their_results() {
+        let mut markers = TurnMarkers::default();
+        let marker = "DRAFT:{\"text\":\"preview me\"}";
+
+        // An MCP tool's marker is honored once its call is known.
+        let (call_msg, mcp_id) = tool_call_message("mcp.drafts.create");
+        markers.observe(&call_msg);
+        markers.observe(&tool_result_message(mcp_id, marker, true));
+        assert_eq!(markers.drafts.len(), 1);
+        assert_eq!(markers.drafts[0], "preview me");
+
+        // Builtin tools whose output is fetched or computed content never qualify — and
+        // neither do the sibling chat markers: each marker family is gated independently.
+        for name in [
+            "web.fetch",
+            "shell.run",
+            "fs.read",
+            "plugin.list",
+            "message.poll",
+            "message.card",
+        ] {
+            let (call_msg, id) = tool_call_message(name);
+            markers.observe(&call_msg);
+            markers.observe(&tool_result_message(id, marker, true));
+        }
+        // `plugin.execute` output is operator-installed plugin code, so it does qualify.
+        let (call_msg, plugin_id) = tool_call_message("plugin.execute");
+        markers.observe(&call_msg);
+        markers.observe(&tool_result_message(plugin_id, marker, true));
+        assert_eq!(markers.drafts.len(), 2);
+
+        // `message.draft` is the one builtin whose whole purpose is emitting the marker.
+        let (call_msg, draft_id) = tool_call_message("message.draft");
+        markers.observe(&call_msg);
+        markers.observe(&tool_result_message(draft_id, marker, true));
+        assert_eq!(markers.drafts.len(), 3);
+
+        // A failed result and an unknown call id raise nothing.
+        let (call_msg, failed_id) = tool_call_message("mcp.drafts.create");
+        markers.observe(&call_msg);
+        markers.observe(&tool_result_message(failed_id, marker, false));
+        markers.observe(&tool_result_message(ToolCallId::generate(), marker, true));
+        assert_eq!(markers.drafts.len(), 3);
+    }
+
+    #[test]
+    fn a_turn_carries_at_most_the_draft_cap() {
+        let mut markers = TurnMarkers::default();
+        let (call_msg, id) = tool_call_message("mcp.drafts.create");
+        markers.observe(&call_msg);
+        let marker = "DRAFT:{\"text\":\"preview\"}";
+        for _ in 0..MAX_TURN_DRAFTS + 2 {
+            markers.observe(&tool_result_message(id.clone(), marker, true));
+        }
+        assert_eq!(markers.drafts.len(), MAX_TURN_DRAFTS);
+    }
+
+    #[test]
+    fn draft_ids_are_stable_per_delivery_and_distinct_per_marker() {
+        let first = draft_id_for("evt-1:draft:0");
+        assert_eq!(first, draft_id_for("evt-1:draft:0"));
+        assert_ne!(first, draft_id_for("evt-1:draft:1"));
+        assert_ne!(first, draft_id_for("evt-2:draft:0"));
+    }
+
+    #[tokio::test]
+    async fn assistant_drafts_are_delivered_as_ledgered_draft_verbs() {
+        let platform = Arc::new(RecordingPlatform::default());
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        let ledger = DeliveryLedger::in_memory().expect("in-memory ledger");
+        let event = test_event();
+        let drafts = vec!["first preview".to_owned(), "second preview".to_owned()];
+
+        deliver_assistant_drafts(&dyn_platform, Some(&ledger), &event, "chat-1", &drafts).await;
+        // A redelivery of the same event must not enqueue or send a second copy.
+        deliver_assistant_drafts(&dyn_platform, Some(&ledger), &event, "chat-1", &drafts).await;
+
+        let verbs = platform.verbs.lock().unwrap();
+        assert_eq!(verbs.len(), 2, "each draft becomes exactly one draft verb");
+        let mut draft_ids = Vec::new();
+        for (index, verb) in verbs.iter().enumerate() {
+            let OutboundVerb::Draft { draft_id, content } = verb else {
+                panic!("expected a draft verb, got {verb:?}");
+            };
+            assert_eq!(content, &drafts[index]);
+            draft_ids.push(*draft_id);
+        }
+        assert_ne!(draft_ids[0], draft_ids[1]);
+        assert_eq!(ledger.len().expect("ledger len"), 2);
+    }
+
+    #[tokio::test]
+    async fn turns_without_drafts_send_no_draft_verbs() {
+        let platform = Arc::new(RecordingPlatform::default());
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        let event = test_event();
+        deliver_assistant_drafts(&dyn_platform, None, &event, "chat-1", &[]).await;
+        assert!(platform.verbs.lock().unwrap().is_empty());
+    }
+
+    /// A platform whose adapter refuses drafts the way the trait default does.
+    struct NoDraftPlatform {
+        verbs: Mutex<Vec<OutboundVerb>>,
+    }
+
+    #[async_trait::async_trait]
+    impl GatewayPlatform for NoDraftPlatform {
+        fn name(&self) -> &str {
+            "nodraft"
+        }
+
+        async fn next_events(&self) -> Result<Vec<MessageEvent>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn send(
+            &self,
+            _chat_id: &str,
+            _content: &str,
+        ) -> vikram_gateway::platform::SendResult {
+            vikram_gateway::platform::SendResult::ok("text-id")
+        }
+
+        async fn send_verb(
+            &self,
+            _chat_id: &str,
+            verb: &OutboundVerb,
+            _reply_to: Option<&str>,
+        ) -> vikram_gateway::platform::SendResult {
+            self.verbs.lock().unwrap().push(verb.clone());
+            vikram_gateway::platform::SendResult::failed(
+                "this platform does not stream drafts",
+                Some("bad_format"),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_platform_refuses_the_draft_honestly() {
+        let platform = Arc::new(NoDraftPlatform {
+            verbs: Mutex::new(Vec::new()),
+        });
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        let ledger = DeliveryLedger::in_memory().expect("in-memory ledger");
+        let event = test_event();
+        let drafts = vec!["preview".to_owned()];
+
+        // The refusal surfaces as a failed SendResult — logged, ledgered, never retried into
+        // a fake success and never downgraded to text.
+        deliver_assistant_drafts(&dyn_platform, Some(&ledger), &event, "chat-1", &drafts).await;
 
         assert_eq!(platform.verbs.lock().unwrap().len(), 1);
         assert_eq!(ledger.len().expect("ledger len"), 1);
