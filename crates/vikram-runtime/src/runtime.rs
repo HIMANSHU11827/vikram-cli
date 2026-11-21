@@ -1379,9 +1379,48 @@ impl RuntimeInner {
             let cost = estimator.estimate_text(&section);
             if spent + cost <= budget_tokens {
                 block.push_str(&section);
+                spent += cost;
+            }
+        }
+        // Standing relationships are small and always relevant: the head of the relation table,
+        // one line each, against whatever budget the memory and experience lines left.
+        let relation_lines = self.known_relations();
+        if !relation_lines.is_empty() {
+            let section = format!(
+                "People and projects the user knows:\n{}\n",
+                relation_lines.join("\n")
+            );
+            let cost = estimator.estimate_text(&section);
+            if spent + cost <= budget_tokens {
+                block.push_str(&section);
             }
         }
         if block.is_empty() { None } else { Some(block) }
+    }
+
+    /// The head of the active identity's relationship table as compact prompt lines — closest
+    /// first, capped at ten — or nothing when there is no active identity or no relations.
+    fn known_relations(&self) -> Vec<String> {
+        let identity = self.store.get_active_identity().unwrap_or_default();
+        let (Some(user), Some(profile)) = (identity.user, identity.profile) else {
+            return Vec::new();
+        };
+        let Ok(rows) = self.store.list_relations(&user, &profile) else {
+            return Vec::new();
+        };
+        rows.iter()
+            .take(10)
+            .map(|row| {
+                let mut line = format!(
+                    "- {} — {} (closeness {})",
+                    row.name, row.kind, row.closeness
+                );
+                if !row.aliases.is_empty() {
+                    line.push_str(&format!(" (aka {})", row.aliases.join(", ")));
+                }
+                line
+            })
+            .collect()
     }
 
     /// The last few experiences recorded for this session's agent, as compact outcome lines,
@@ -7922,6 +7961,42 @@ mod tests {
             .retrieved_memory(&session)
             .expect("the in-memory engine still answers recall");
         assert!(block.contains("always run migrations before deploy"));
+    }
+
+    #[tokio::test]
+    async fn retrieved_memory_surfaces_known_relations_for_the_active_identity_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let (_id, session) = seeded_session(&handle, "what should I get mom for her birthday");
+
+        let store = vikram_store::Store::open(&database_path()).unwrap();
+        let identity = store.get_active_identity().unwrap();
+        let user = identity.user.expect("bootstrapped user");
+        let profile = identity.profile.expect("bootstrapped profile");
+        store
+            .upsert_relation(&user, &profile, "person", "Mom", now_ms())
+            .unwrap();
+        store
+            .upsert_relation(&user, &profile, "project", "Vikram CLI", now_ms())
+            .unwrap();
+        // A different user's relation must never reach this identity's recall.
+        let other = store.create_user("mallory", now_ms()).unwrap();
+        let other_profile = store
+            .create_profile(&other.id, "default", now_ms())
+            .unwrap();
+        store
+            .upsert_relation(&other.id, &other_profile.id, "person", "Eve", now_ms())
+            .unwrap();
+
+        let block = handle
+            .inner
+            .retrieved_memory(&session)
+            .expect("known relations produce a memory block");
+        assert!(block.contains("Mom"), "{block}");
+        assert!(block.contains("Vikram CLI"), "{block}");
+        assert!(!block.contains("Eve"), "{block}");
     }
 
     fn failing_experience(i: usize) -> vikram_evolution::Experience {

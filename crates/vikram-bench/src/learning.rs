@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use vikram_contracts::SessionId;
+use vikram_contracts::{JournalSink, NewRecord, RecordKind, SessionId};
 use vikram_evolution::{
     EvolutionStore, Experience, ExperienceCollector, ExperienceOutcome, HeuristicReflector,
     ProposalKind, ProposalStatus, ReflectionEngine, Sensitivity,
@@ -25,7 +25,10 @@ use vikram_evolution::{
 use vikram_runtime::MemoryStore;
 use vikram_runtime::consolidation::{ConsolidationPolicy, ConsolidationStore, ObservationStatus};
 use vikram_runtime::learning::{proposal_from_evolution, scope_of};
+use vikram_runtime::memory::{project_scope, user_scope};
+use vikram_runtime::types::now_ms;
 use vikram_skills::{History, Manager, Manifest, SkillId, hash_dir};
+use vikram_store::Store;
 
 /// One benchmark's outcome: a pass/fail verdict plus every metric it measured.
 pub struct Report {
@@ -59,6 +62,9 @@ pub fn run_all() -> Result<Vec<Report>, String> {
         skill_lifecycle(&dir.path().join("skill"))?,
         correction_pipeline(&dir.path().join("correction"))?,
         consolidation(&dir.path().join("consolidation"))?,
+        memory_consolidate(&dir.path().join("memory_consolidate"))?,
+        scope_isolation(&dir.path().join("scope_isolation"))?,
+        journal_prune(&dir.path().join("journal_prune"))?,
     ];
     Ok(reports)
 }
@@ -472,6 +478,436 @@ fn consolidation(dir: &Path) -> Result<Report, String> {
     ))
 }
 
+// ---------------------------------------------------------------- memory_consolidate
+
+/// Inserts one `memory` row through a second SQLite connection on the same file —
+/// the "legacy/foreign writer" path `MemoryStore::consolidate` exists for, since
+/// `save` itself upserts by the deterministic `{scope}\u{1f}{key}` id and can never
+/// produce the duplicate `(scope, key)` groups consolidation collapses.
+fn insert_memory_row(
+    conn: &rusqlite::Connection,
+    id: &str,
+    scope: &str,
+    key: &str,
+    value: &str,
+    importance: f64,
+    updated_ms: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO memory (id, key, value, scope, created_ms, updated_ms, importance, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, 'active')",
+        rusqlite::params![id, key, value, scope, updated_ms, importance],
+    )
+    .map_err(|e| e.to_string())?;
+    let _ = conn.execute(
+        "INSERT INTO memory_fts(id, key, value) VALUES (?1, ?2, ?3)",
+        rusqlite::params![id, key, value],
+    );
+    Ok(())
+}
+
+/// Seeds duplicate, contradictory and stale-low-importance rows into a file-backed
+/// `MemoryStore`, runs `MemoryStore::consolidate`, and checks the report's
+/// dedup/contradiction/supersession/expiry counts, the superseded row's lineage
+/// pointer, recall reflecting only the post-consolidation state, and idempotence
+/// of a second run.
+fn memory_consolidate(dir: &Path) -> Result<Report, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let db = dir.join("memory.db");
+    let store = MemoryStore::open(&db).map_err(|e| e.to_string())?;
+    store
+        .save("session-note", "plain save-path memory", "ses-bench")
+        .map_err(|e| e.to_string())?;
+
+    let now = now_ms() as i64;
+    let ancient = now - 100 * 24 * 3_600_000;
+    let raw = rusqlite::Connection::open(&db).map_err(|e| e.to_string())?;
+
+    // Duplicate group: three rows, one (scope, key), values equal after
+    // normalization. The highest-importance/newest row must win.
+    for (id, value, importance, updated_ms) in [
+        (
+            "project\u{1f}deploy-target#old",
+            "Staging",
+            0.4,
+            now - 3_000,
+        ),
+        (
+            "project\u{1f}deploy-target#mid",
+            "staging",
+            0.6,
+            now - 2_000,
+        ),
+        (
+            "project\u{1f}deploy-target#win",
+            "  staging  ",
+            0.9,
+            now - 1_000,
+        ),
+    ] {
+        insert_memory_row(
+            &raw,
+            id,
+            "project",
+            "deploy-target",
+            value,
+            importance,
+            updated_ms,
+        )?;
+    }
+    // Contradiction: two genuinely different values for one (scope, key).
+    insert_memory_row(
+        &raw,
+        "project\u{1f}db-backend#loser",
+        "project",
+        "db-backend",
+        "mysql-8",
+        0.4,
+        now - 5_000,
+    )?;
+    insert_memory_row(
+        &raw,
+        "project\u{1f}db-backend#winner",
+        "project",
+        "db-backend",
+        "postgres-14",
+        0.8,
+        now,
+    )?;
+    // Aging: one ancient low-importance row expires, one ancient important row stays.
+    insert_memory_row(
+        &raw,
+        "old\u{1f}trivial",
+        "old",
+        "trivial",
+        "meh-quixotic",
+        0.1,
+        ancient,
+    )?;
+    insert_memory_row(
+        &raw,
+        "old\u{1f}key",
+        "old",
+        "key",
+        "keep-me-quixotic",
+        0.9,
+        ancient,
+    )?;
+
+    let report = store.consolidate().map_err(|e| e.to_string())?;
+
+    let loser_status: Option<String> = raw
+        .query_row(
+            "SELECT status FROM memory WHERE id = ?1",
+            rusqlite::params!["project\u{1f}db-backend#loser"],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let superseded_by: Option<String> = raw
+        .query_row(
+            "SELECT superseded_by FROM memory WHERE id = ?1",
+            rusqlite::params!["project\u{1f}db-backend#loser"],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+
+    let winner_value = store
+        .get("db-backend", "project")
+        .map_err(|e| e.to_string())?;
+    let loser_recall = store
+        .recall_terms(&["mysql-8".to_string()], &["project".to_string()], 8)
+        .map_err(|e| e.to_string())?;
+    let winner_recall = store
+        .recall_terms(&["postgres-14".to_string()], &["project".to_string()], 8)
+        .map_err(|e| e.to_string())?;
+    let expired_get = store.get("trivial", "old").map_err(|e| e.to_string())?;
+    let expired_recall = store
+        .recall_terms(&["meh-quixotic".to_string()], &["old".to_string()], 8)
+        .map_err(|e| e.to_string())?;
+    let kept_get = store.get("key", "old").map_err(|e| e.to_string())?;
+    let project_active = store.count("project").map_err(|e| e.to_string())?;
+
+    let second = store.consolidate().map_err(|e| e.to_string())?;
+
+    let lineage_ok = loser_status.as_deref() == Some("superseded")
+        && superseded_by.as_deref() == Some("project\u{1f}db-backend#winner");
+    let recall_ok = winner_value.as_deref() == Some("postgres-14")
+        && loser_recall.is_empty()
+        && winner_recall.iter().any(|(_, key, _)| key == "db-backend")
+        && expired_get.is_none()
+        && expired_recall.is_empty()
+        && kept_get.as_deref() == Some("keep-me-quixotic");
+    let idempotent = second.duplicates_removed == 0
+        && second.contradictions == 0
+        && second.superseded == 0
+        && second.expired == 0;
+
+    let passed = report.examined == 8
+        && report.duplicates_removed == 2
+        && report.contradictions == 1
+        && report.superseded == 1
+        && report.expired == 1
+        && lineage_ok
+        && recall_ok
+        && project_active == 2
+        && idempotent;
+    Ok(Report::new(
+        "memory_consolidate",
+        passed,
+        vec![
+            ("examined", report.examined as f64),
+            ("duplicates_removed", report.duplicates_removed as f64),
+            ("contradictions", report.contradictions as f64),
+            ("superseded", report.superseded as f64),
+            ("expired", report.expired as f64),
+            ("project_active_after", project_active as f64),
+            ("lineage_ok", f64::from(lineage_ok)),
+            ("recall_post_state", f64::from(recall_ok)),
+            ("second_run_zeros", f64::from(idempotent)),
+        ],
+    ))
+}
+
+// ---------------------------------------------------------------- scope_isolation
+
+/// Writes one memory per shelf (`user:`, two `project:` scopes, one session scope),
+/// binds two sessions the way `bind_session_memory_scopes` does each turn, and
+/// checks recall expansion: a bound session sees its own scope plus exactly the
+/// shelves it was bound to, a sibling project stays invisible, an unbound session
+/// sees nothing shared, and clearing the binding removes the expansion.
+fn scope_isolation(dir: &Path) -> Result<Report, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let store = MemoryStore::open(dir.join("memory.db")).map_err(|e| e.to_string())?;
+
+    let user = user_scope("bench-operator").ok_or("empty user scope")?;
+    let alpha = project_scope("alpha").ok_or("empty project scope")?;
+    let beta = project_scope("beta").ok_or("empty project scope")?;
+
+    store
+        .save("editor-pref", "uses-neovim-editor", &user)
+        .map_err(|e| e.to_string())?;
+    store
+        .save("deploy-target", "deploys-to-staging", &alpha)
+        .map_err(|e| e.to_string())?;
+    store
+        .save("deploy-target", "deploys-to-production", &beta)
+        .map_err(|e| e.to_string())?;
+    store
+        .save("session-note", "sessionlocal-quixotic", "ses-bench-a")
+        .map_err(|e| e.to_string())?;
+
+    store
+        .bind_session_scopes("ses-bench-a", Some(&user), Some(&alpha))
+        .map_err(|e| e.to_string())?;
+    store
+        .bind_session_scopes("ses-bench-b", Some(&user), Some(&beta))
+        .map_err(|e| e.to_string())?;
+
+    // The same scope list the context builder passes: "global" plus the session id.
+    let terms = [
+        "neovim".to_string(),
+        "staging".to_string(),
+        "production".to_string(),
+        "quixotic".to_string(),
+    ];
+    let recall_a = store
+        .recall_terms(
+            &terms,
+            &["global".to_string(), "ses-bench-a".to_string()],
+            10,
+        )
+        .map_err(|e| e.to_string())?;
+    let recall_b = store
+        .recall_terms(
+            &terms,
+            &["global".to_string(), "ses-bench-b".to_string()],
+            10,
+        )
+        .map_err(|e| e.to_string())?;
+    let recall_unbound = store
+        .recall_terms(
+            &terms,
+            &["global".to_string(), "ses-bench-c".to_string()],
+            10,
+        )
+        .map_err(|e| e.to_string())?;
+
+    let has = |rows: &[(String, String, String)], scope: &str, key: &str| {
+        rows.iter()
+            .any(|(s, k, _)| s.as_str() == scope && k.as_str() == key)
+    };
+    let a_ok = has(&recall_a, user.as_str(), "editor-pref")
+        && has(&recall_a, alpha.as_str(), "deploy-target")
+        && has(&recall_a, "ses-bench-a", "session-note")
+        && !recall_a.iter().any(|(s, _, _)| s == &beta);
+    let b_ok = has(&recall_b, user.as_str(), "editor-pref")
+        && has(&recall_b, beta.as_str(), "deploy-target")
+        && !recall_b
+            .iter()
+            .any(|(s, _, _)| s == &alpha || s.as_str() == "ses-bench-a");
+    let unbound_ok = recall_unbound.is_empty();
+
+    // Clearing the binding (what a session leaving its project triggers) must
+    // drop the shared shelves on the next recall.
+    store
+        .bind_session_scopes("ses-bench-a", None, None)
+        .map_err(|e| e.to_string())?;
+    let recall_cleared = store
+        .recall_terms(
+            &terms,
+            &["global".to_string(), "ses-bench-a".to_string()],
+            10,
+        )
+        .map_err(|e| e.to_string())?;
+    let cleared_ok = recall_cleared
+        .iter()
+        .all(|(s, _, _)| s.as_str() == "ses-bench-a" || s.as_str() == "global");
+
+    let passed = a_ok && b_ok && unbound_ok && cleared_ok;
+    Ok(Report::new(
+        "scope_isolation",
+        passed,
+        vec![
+            ("bound_sessions", 2.0),
+            ("recall_a_rows", recall_a.len() as f64),
+            ("recall_b_rows", recall_b.len() as f64),
+            ("recall_unbound_rows", recall_unbound.len() as f64),
+            ("recall_a_ok", f64::from(a_ok)),
+            ("recall_b_ok", f64::from(b_ok)),
+            ("unbound_isolated", f64::from(unbound_ok)),
+            ("cleared_binding_ok", f64::from(cleared_ok)),
+        ],
+    ))
+}
+
+// ---------------------------------------------------------------- journal_prune
+
+const DAY_MS: u64 = 24 * 3_600_000;
+
+/// The compact -> prune -> replay path: a live session journals 30 old messages,
+/// a compaction marker, then 10 recent ones; an orphan session (journal rows with
+/// no `sessions` row) holds 10 old and 1 recent record. `prune_journal` must delete
+/// exactly the compaction-covered prefix and the old orphans, keep the marker, the
+/// recent tail and the fresh orphan, and replay must still return the surviving
+/// suffix intact.
+fn journal_prune(dir: &Path) -> Result<Report, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let store = Store::open(&dir.join("store.db")).map_err(|e| e.to_string())?;
+    let journal = store.journal();
+
+    let now = now_ms();
+    let old_ts = now - 100 * DAY_MS;
+    let recent_ts = now - DAY_MS;
+    let live = store
+        .create_session("bench live", Path::new("/work/bench"), None, now)
+        .map_err(|e| e.to_string())?;
+
+    let message = |i: usize| {
+        NewRecord::new(
+            live.id.clone(),
+            RecordKind::Message,
+            json!({
+                "role": "user",
+                "blocks": [{ "type": "text", "text": format!("prune bench message {i}"), "trust": "user" }]
+            }),
+        )
+    };
+    for i in 0..30 {
+        journal
+            .append(&message(i).at(old_ts))
+            .map_err(|e| e.to_string())?;
+    }
+    // The compaction marker the runtime journals before authorizing the prune.
+    journal
+        .append(
+            &NewRecord::new(
+                live.id.clone(),
+                RecordKind::Compaction,
+                json!({ "through_seq": 30, "summary": "bench fold" }),
+            )
+            .at(old_ts),
+        )
+        .map_err(|e| e.to_string())?;
+    store
+        .note_session_compaction(&live.id, 30)
+        .map_err(|e| e.to_string())?;
+    for i in 0..10 {
+        journal
+            .append(&message(30 + i).at(recent_ts))
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Orphan rows: a session id no `sessions` row can produce.
+    let orphan = SessionId::new("ses-bench-orphan");
+    for i in 0..10 {
+        journal
+            .append(
+                &NewRecord::new(
+                    orphan.clone(),
+                    RecordKind::Message,
+                    json!({ "role": "user", "blocks": [{ "type": "text", "text": format!("orphan {i}"), "trust": "user" }] }),
+                )
+                .at(old_ts),
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    journal
+        .append(
+            &NewRecord::new(
+                orphan.clone(),
+                RecordKind::Message,
+                json!({ "role": "user", "blocks": [{ "type": "text", "text": "orphan recent", "trust": "user" }] }),
+            )
+            .at(recent_ts),
+        )
+        .map_err(|e| e.to_string())?;
+
+    let before = store
+        .replay_messages(&live.id)
+        .map_err(|e| e.to_string())?
+        .len()
+        + 11;
+    let report = store
+        .prune_journal(now, 30 * DAY_MS)
+        .map_err(|e| e.to_string())?;
+
+    let replayed = store.replay_messages(&live.id).map_err(|e| e.to_string())?;
+    let replay_ok = replayed.len() == 11
+        && replayed
+            .first()
+            .is_some_and(|r| r.seq == 31 && r.kind == RecordKind::Compaction)
+        && replayed.last().is_some_and(|r| r.seq == 41)
+        && replayed.windows(2).all(|w| w[1].seq == w[0].seq + 1);
+    let prunable = store
+        .prunable_through_seq(&live.id)
+        .map_err(|e| e.to_string())?;
+    let second = store
+        .prune_journal(now, 30 * DAY_MS)
+        .map_err(|e| e.to_string())?;
+
+    let passed = before == 52
+        && report.deleted == 40
+        && report.kept_sessions == 11
+        && report.kept_recent_orphans == 1
+        && replay_ok
+        && prunable == Some(30)
+        && second.deleted == 0;
+    Ok(Report::new(
+        "journal_prune",
+        passed,
+        vec![
+            ("journal_rows_before", before as f64),
+            ("deleted", report.deleted as f64),
+            ("kept_sessions", report.kept_sessions as f64),
+            ("kept_recent_orphans", report.kept_recent_orphans as f64),
+            ("replay_len_after", replayed.len() as f64),
+            ("replay_ok", f64::from(replay_ok)),
+            ("prunable_through_seq", prunable.unwrap_or(0) as f64),
+            ("second_run_deleted", second.deleted as f64),
+        ],
+    ))
+}
+
 // ---------------------------------------------------------------- baseline
 
 /// Metrics baseline: `{version, created_ms, benchmarks: {name: {metric: value}}}`.
@@ -709,6 +1145,9 @@ mod tests {
             skill_lifecycle(&dir.path().join("skill")).unwrap(),
             correction_pipeline(&dir.path().join("correction")).unwrap(),
             consolidation(&dir.path().join("consolidation")).unwrap(),
+            memory_consolidate(&dir.path().join("memory_consolidate")).unwrap(),
+            scope_isolation(&dir.path().join("scope_isolation")).unwrap(),
+            journal_prune(&dir.path().join("journal_prune")).unwrap(),
         ];
         for report in &reports {
             assert!(
@@ -717,7 +1156,7 @@ mod tests {
                 report.name, report.metrics
             );
         }
-        assert_eq!(run_all().unwrap().len(), 5);
+        assert_eq!(run_all().unwrap().len(), 8);
     }
 
     #[test]

@@ -1637,6 +1637,123 @@ fn memory_and_tasks_round_trip_through_their_own_store() {
     assert!(tasks.content.contains("probe"), "{}", tasks.content);
 }
 
+fn relation_ctx() -> (
+    tempfile::TempDir,
+    ToolContext,
+    vikram_store::Store,
+    std::sync::MutexGuard<'static, ()>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let env = crate::config::lock_security_env();
+    unsafe { std::env::set_var("VIKRAM_HOME", dir.path().join("home")) };
+    let store = vikram_store::Store::open(&crate::config::database_path()).unwrap();
+    let ctx = ToolContext {
+        workspace_root: dir.path().to_path_buf(),
+        sandbox: crate::sandbox::Sandbox::disabled("test context"),
+        spill: crate::spill::Spill::disabled(),
+        runtime: None,
+        session: None,
+        agent: None,
+        bot: None,
+        cancel: None,
+    };
+    (dir, ctx, store, env)
+}
+
+#[test]
+fn relation_tool_round_trips_scoped_to_the_active_identity() {
+    let (_dir, ctx, store, _env) = relation_ctx();
+    let user = store.create_user("alice", 1).unwrap();
+    let profile = store.create_profile(&user.id, "default", 1).unwrap();
+    store
+        .set_active_identity(&vikram_store::ActiveIdentity {
+            user: Some(user.id.clone()),
+            profile: Some(profile.id.clone()),
+            main_agent: None,
+        })
+        .unwrap();
+    // Another user's relation must never surface through this identity's calls.
+    let other = store.create_user("bob", 1).unwrap();
+    let other_profile = store.create_profile(&other.id, "default", 1).unwrap();
+    store
+        .upsert_relation(&other.id, &other_profile.id, "person", "Mallory", 1)
+        .unwrap();
+
+    let saved = Relation
+        .run(
+            &json!({"action": "save", "kind": "person", "name": "Mom", "aliases": ["mother"], "closeness": 250}),
+            &ctx,
+        )
+        .unwrap();
+    assert!(saved.ok, "{}", saved.content);
+    assert!(saved.content.contains("Mom"), "{}", saved.content);
+
+    let got = Relation
+        .run(
+            &json!({"action": "get", "kind": "PERSON", "name": "mom"}),
+            &ctx,
+        )
+        .unwrap();
+    assert!(got.ok, "{}", got.content);
+    assert!(got.content.contains("mother"), "{}", got.content);
+
+    let row = store
+        .get_relation(&user.id, &profile.id, "person", "Mom")
+        .unwrap()
+        .expect("saved row exists");
+    assert_eq!(row.closeness, 100, "closeness is clamped to -100..=100");
+
+    let listed = Relation.run(&json!({"action": "list"}), &ctx).unwrap();
+    assert!(listed.content.contains("Mom"), "{}", listed.content);
+    assert!(
+        !listed.content.contains("Mallory"),
+        "another user's relation must not list: {}",
+        listed.content
+    );
+
+    let foreign_delete = Relation
+        .run(
+            &json!({"action": "delete", "kind": "person", "name": "Mallory"}),
+            &ctx,
+        )
+        .unwrap();
+    assert!(!foreign_delete.ok, "{}", foreign_delete.content);
+    assert!(
+        store
+            .get_relation(&other.id, &other_profile.id, "person", "Mallory")
+            .unwrap()
+            .is_some(),
+        "a scoped delete cannot reach another user's row"
+    );
+
+    let deleted = Relation
+        .run(
+            &json!({"action": "delete", "kind": "person", "name": "Mom"}),
+            &ctx,
+        )
+        .unwrap();
+    assert!(deleted.ok, "{}", deleted.content);
+    let after = Relation.run(&json!({"action": "list"}), &ctx).unwrap();
+    assert!(!after.content.contains("Mom"), "{}", after.content);
+}
+
+#[test]
+fn relation_tool_denies_without_an_active_identity() {
+    let (_dir, ctx, _store, _env) = relation_ctx();
+    for action in ["list", "get", "save", "delete"] {
+        let mut args = json!({"action": action});
+        if action != "list" {
+            args["kind"] = json!("person");
+            args["name"] = json!("Mom");
+        }
+        let err = Relation.run(&args, &ctx).unwrap_err();
+        assert!(
+            matches!(err, VikramError::PolicyDenied { .. }),
+            "{action} must deny-first without identity, got {err:?}"
+        );
+    }
+}
+
 #[test]
 fn code_search_is_registered() {
     let registry = ToolRegistry::with_builtins();

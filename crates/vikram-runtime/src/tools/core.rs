@@ -237,6 +237,7 @@ impl ToolRegistry {
         registry.register(Box::new(MemoryDelete));
         registry.register(Box::new(MemoryNote));
         registry.register(Box::new(MemoryConsolidate));
+        registry.register(Box::new(Relation));
         registry.register(Box::new(SessionSearch));
         registry.register(Box::new(WebSearch));
         registry.register(Box::new(HiveCreate));

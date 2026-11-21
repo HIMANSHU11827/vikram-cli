@@ -19,3 +19,4 @@ vikram-skills.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 tempfile.workspace = true
+rusqlite.workspace = true
