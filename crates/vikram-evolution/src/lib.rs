@@ -122,7 +122,8 @@ pub use hive::HiveLearning;
 pub use mapek::{CycleResult, HealthStatus, MapekLoop};
 pub use memory::LayeredMemory;
 pub use metrics::{
-    CategoryStats, ExperienceStats, MIN_SAMPLE, OutcomeCounts, ProposalStats, ReflectionStats,
+    AgentTrend, CategoryStats, ExperienceStats, MIN_SAMPLE, OutcomeCounts, ProposalStats,
+    ReflectionStats, TREND_WINDOW_MS, TrendDirection,
 };
 pub use optimization::OptimizationEngine;
 pub use reflection::{HeuristicReflector, ReflectionEngine, Reflector};

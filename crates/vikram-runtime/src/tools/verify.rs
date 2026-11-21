@@ -14,7 +14,8 @@ impl Tool for VerifyRun {
                 "type": "object",
                 "properties": {
                     "max_attempts": {"type": "integer", "description": "accepted for compatibility; only one attempt runs because no repair step is wired"},
-                    "expected_changes": {"type": "array", "items": {"type": "string"}, "description": "workspace-relative paths you expect to have modified; compared against git status as warnings only, never affects pass/fail"}
+                    "expected_changes": {"type": "array", "items": {"type": "string"}, "description": "workspace-relative paths you expect to have modified; compared against git status as warnings only, never affects pass/fail"},
+                    "expect": {"type": "array", "items": {"type": "string"}, "description": "literal case-sensitive substrings you expect to find in the changed files' new content (e.g. \"fn handle_poll\", \"POLL_MARKER\"); reported per-pattern as found/missing, warnings only, never affects pass/fail"}
                 }
             }),
         }
@@ -51,12 +52,24 @@ impl Tool for VerifyRun {
                     .collect()
             })
             .unwrap_or_default();
+        let expect: Vec<String> = args
+            .get("expect")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         let outcome = crate::verification::verify(
             &ctx.workspace_root,
             &crate::verification::VerificationPlan::cargo(),
             &budget,
             &ctx.sandbox,
             &expected_changes,
+            &expect,
             |_, _| None,
         )?;
         let steps = outcome
@@ -88,6 +101,19 @@ impl Tool for VerifyRun {
                 "files": outcome.changes.files,
                 "note": outcome.changes.note,
                 "warnings": outcome.changes.warnings,
+                "expectations": outcome
+                    .changes
+                    .expectations
+                    .iter()
+                    .map(|e| {
+                        json!({
+                            "pattern": e.pattern,
+                            "found_in": e.found_in,
+                            "found": e.found,
+                            "checked": e.checked,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
             },
         });
         // The verdict leads the output on its own line: the growth pipeline reads it even when

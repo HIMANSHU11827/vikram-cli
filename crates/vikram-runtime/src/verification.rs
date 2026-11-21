@@ -124,14 +124,124 @@ pub struct ChangeReport {
     pub files: Vec<String>,
     pub note: Option<String>,
     pub warnings: Vec<String>,
+    /// Declared `expect` patterns checked against the changed files' current
+    /// content. Case-sensitive literal substring matches; `checked` is false
+    /// when no file evidence was available (non-git workspace, git failure).
+    pub expectations: Vec<Expectation>,
+}
+
+/// One declared expectation vs the changed files. Evidence, not a verdict:
+/// a missing pattern is a warning, never a failure — the intent may have been
+/// satisfied differently than the agent predicted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Expectation {
+    pub pattern: String,
+    /// Repo-relative paths of changed files containing the pattern.
+    pub found_in: Vec<String>,
+    pub found: bool,
+    pub checked: bool,
 }
 
 const MAX_CHANGE_FILES: usize = 200;
+const MAX_EXPECTATIONS: usize = 32;
+const MAX_EXPECTATION_LEN: usize = 200;
+const MAX_EXPECT_FILE_BYTES: u64 = 1 << 20;
+const MAX_EXPECT_SCAN_BYTES: u64 = 8 << 20;
 
-/// `git status --porcelain` evidence for `workspace_root`, plus a declared-vs-actual
-/// comparison. Paths in `files` are repository-root relative; `declared` entries are
-/// matched against both that form and the workspace-relative form.
-fn collect_changes(workspace_root: &Path, declared: &[String]) -> ChangeReport {
+/// Bound the declared patterns: at most `MAX_EXPECTATIONS`, each truncated to
+/// `MAX_EXPECTATION_LEN` chars. Empty patterns are dropped; skipped or
+/// truncated input is reported as a warning so the bound is never silent.
+fn bound_expectations(patterns: &[String]) -> (Vec<String>, Option<String>) {
+    let mut bounded = Vec::new();
+    let mut adjusted = false;
+    for pattern in patterns {
+        let trimmed = pattern.trim();
+        if trimmed.is_empty() {
+            adjusted = true;
+            continue;
+        }
+        if bounded.len() >= MAX_EXPECTATIONS {
+            adjusted = true;
+            continue;
+        }
+        let truncated: String = trimmed.chars().take(MAX_EXPECTATION_LEN).collect();
+        if truncated.chars().count() != trimmed.chars().count() {
+            adjusted = true;
+        }
+        bounded.push(truncated);
+    }
+    let note = adjusted.then(|| {
+        format!(
+            "expectations bounded to {MAX_EXPECTATIONS} patterns of at most \
+             {MAX_EXPECTATION_LEN} chars each"
+        )
+    });
+    (bounded, note)
+}
+
+/// Search the post-change content of `files` (repo-root relative, resolved
+/// against `repo_root`) for each declared pattern. Reads are byte-capped per
+/// file and total; a scan that hits the budget sets `truncated` so the caller
+/// can say the evidence is partial.
+fn check_expectations(
+    repo_root: &Path,
+    files: &[String],
+    patterns: &[String],
+) -> (Vec<Expectation>, bool) {
+    use std::io::Read;
+    let mut expectations: Vec<Expectation> = patterns
+        .iter()
+        .map(|pattern| Expectation {
+            pattern: pattern.clone(),
+            found_in: Vec::new(),
+            found: false,
+            checked: false,
+        })
+        .collect();
+    let mut scanned = 0u64;
+    let mut truncated = false;
+    for file in files {
+        if scanned >= MAX_EXPECT_SCAN_BYTES {
+            truncated = true;
+            break;
+        }
+        let path = repo_root.join(file);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(mut handle) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let mut buf = Vec::new();
+        let _ = handle
+            .by_ref()
+            .take(MAX_EXPECT_FILE_BYTES)
+            .read_to_end(&mut buf);
+        scanned += buf.len() as u64;
+        let content = String::from_utf8_lossy(&buf);
+        for expectation in &mut expectations {
+            if content.contains(expectation.pattern.as_str()) {
+                expectation.found = true;
+                expectation.found_in.push(file.clone());
+            }
+        }
+    }
+    for expectation in &mut expectations {
+        expectation.checked = true;
+    }
+    (expectations, truncated)
+}
+
+/// `git status --porcelain` evidence for `workspace_root`, plus declared-vs-actual
+/// comparisons: `declared` paths against the status list, and `expect` patterns
+/// against the changed files' current content. Paths in `files` are
+/// repository-root relative; `declared` entries are matched against both that
+/// form and the workspace-relative form.
+fn collect_changes(workspace_root: &Path, declared: &[String], expect: &[String]) -> ChangeReport {
+    let (patterns, bound_note) = bound_expectations(expect);
     let inside = Command::new("git")
         .arg("-C")
         .arg(workspace_root)
@@ -152,6 +262,23 @@ fn collect_changes(workspace_root: &Path, declared: &[String]) -> ChangeReport {
             report
                 .warnings
                 .push("declared changes could not be checked without git evidence".to_owned());
+        }
+        if !patterns.is_empty() {
+            report
+                .warnings
+                .push("expected content could not be checked without git evidence".to_owned());
+            report.expectations = patterns
+                .iter()
+                .map(|pattern| Expectation {
+                    pattern: pattern.clone(),
+                    found_in: Vec::new(),
+                    found: false,
+                    checked: false,
+                })
+                .collect();
+        }
+        if let Some(bound_note) = bound_note {
+            report.warnings.push(bound_note);
         }
         return report;
     }
@@ -221,10 +348,58 @@ fn collect_changes(workspace_root: &Path, declared: &[String]) -> ChangeReport {
             ));
         }
     }
+
+    let mut expectations = Vec::new();
+    if !patterns.is_empty() {
+        let repo_root = Command::new("git")
+            .arg("-C")
+            .arg(workspace_root)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_owned()));
+        match repo_root {
+            Some(root) => {
+                let (checked, truncated) = check_expectations(&root, &files, &patterns);
+                for expectation in &checked {
+                    if expectation.checked && !expectation.found {
+                        warnings.push(format!(
+                            "expected content '{}' not found in changed files",
+                            expectation.pattern
+                        ));
+                    }
+                }
+                if truncated {
+                    warnings.push(format!(
+                        "expectation scan truncated after {MAX_EXPECT_SCAN_BYTES} bytes"
+                    ));
+                }
+                expectations = checked;
+            }
+            None => {
+                warnings
+                    .push("expected content could not be checked: git rev-parse failed".to_owned());
+                expectations = patterns
+                    .iter()
+                    .map(|pattern| Expectation {
+                        pattern: pattern.clone(),
+                        found_in: Vec::new(),
+                        found: false,
+                        checked: false,
+                    })
+                    .collect();
+            }
+        }
+    }
+    if let Some(bound_note) = bound_note {
+        warnings.push(bound_note);
+    }
     ChangeReport {
         files,
         note,
         warnings,
+        expectations,
     }
 }
 
@@ -474,18 +649,20 @@ fn retryable(kind: &FailureKind) -> bool {
 /// The loop. `repair` is called with the failing step and its output, and is expected to edit
 /// the workspace in place. Each attempt runs its own steps so double-counting successes is
 /// impossible: the loop stops at the first fully green attempt. `expected_changes` declares
-/// the paths the caller believes were modified; the outcome's `changes` report compares that
-/// declaration against `git status` as warnings only — it never affects `ok`.
+/// the paths the caller believes were modified; `expect` declares content patterns the
+/// caller expects to find in the changed files. The outcome's `changes` report compares
+/// both declarations against git evidence as warnings only — neither affects `ok`.
 pub fn verify(
     workspace_root: &Path,
     plan: &VerificationPlan,
     budget: &Budget,
     sandbox: &Sandbox,
     expected_changes: &[String],
+    expect: &[String],
     mut repair: impl FnMut(&str, &str) -> Option<Vec<PathBuf>>,
 ) -> Result<VerificationOutcome, VikramError> {
     let mut outcome = verify_attempts(workspace_root, plan, budget, sandbox, &mut repair)?;
-    outcome.changes = collect_changes(workspace_root, expected_changes);
+    outcome.changes = collect_changes(workspace_root, expected_changes, expect);
     Ok(outcome)
 }
 
@@ -643,6 +820,7 @@ mod tests {
             &Budget::attempts(3),
             &Sandbox::disabled("test"),
             &[],
+            &[],
             |_, _| None,
         )
         .unwrap();
@@ -666,6 +844,7 @@ mod tests {
             &plan,
             &Budget::attempts(3),
             &Sandbox::disabled("test"),
+            &[],
             &[],
             |_, _| {
                 let seen = counter_for_repair.metadata().map(|m| m.len()).unwrap_or(0);
@@ -703,6 +882,7 @@ mod tests {
             &Budget::attempts(2),
             &Sandbox::disabled("test"),
             &[],
+            &[],
             |_, _| Some(vec![dir.join("untouched.txt")]),
         )
         .unwrap();
@@ -727,6 +907,7 @@ mod tests {
             &plan,
             &Budget::attempts(5),
             &Sandbox::disabled("test"),
+            &[],
             &[],
             |_, _| Some(Vec::new()),
         )
@@ -795,7 +976,7 @@ mod tests {
         };
         std::fs::write(dir.join("a.txt"), "two").unwrap();
         std::fs::write(dir.join("b.txt"), "new").unwrap();
-        let report = collect_changes(&dir, &[]);
+        let report = collect_changes(&dir, &[], &[]);
         assert!(report.files.contains(&"a.txt".to_owned()), "{report:?}");
         assert!(report.files.contains(&"b.txt".to_owned()), "{report:?}");
         assert!(report.note.is_none(), "{report:?}");
@@ -805,7 +986,7 @@ mod tests {
     #[test]
     fn a_non_git_workspace_reports_the_limitation_not_a_crash() {
         let dir = workspace_with("changes-no-git", "");
-        let report = collect_changes(&dir, &["anything.rs".to_owned()]);
+        let report = collect_changes(&dir, &["anything.rs".to_owned()], &["x".to_owned()]);
         assert!(report.files.is_empty(), "{report:?}");
         assert!(
             report
@@ -814,7 +995,22 @@ mod tests {
                 .is_some_and(|n| n.contains("not a git repository")),
             "{report:?}"
         );
-        assert_eq!(report.warnings.len(), 1, "{report:?}");
+        assert_eq!(report.warnings.len(), 2, "{report:?}");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("declared changes could not be checked")),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("expected content could not be checked")),
+            "{report:?}"
+        );
+        assert!(!report.expectations[0].checked, "{report:?}");
     }
 
     #[test]
@@ -833,6 +1029,7 @@ mod tests {
             &Budget::attempts(1),
             &Sandbox::disabled("test"),
             &declared,
+            &[],
             |_, _| None,
         )
         .unwrap();
@@ -847,6 +1044,143 @@ mod tests {
         assert_eq!(outcome.changes.warnings.len(), 1, "{outcome:?}");
         assert!(
             outcome.changes.warnings[0].contains("ghost.txt"),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn expect_patterns_are_checked_against_changed_files() {
+        let Some(dir) = git_repo("expect-found") else {
+            return;
+        };
+        std::fs::write(dir.join("a.txt"), "fn handle_poll() {}\nPOLL_MARKER\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "unrelated\n").unwrap();
+        let report = collect_changes(
+            &dir,
+            &[],
+            &[
+                "handle_poll".to_owned(),
+                "POLL_MARKER".to_owned(),
+                "ABSENT_SYMBOL".to_owned(),
+            ],
+        );
+        assert_eq!(report.expectations.len(), 3, "{report:?}");
+        let found = &report.expectations[0];
+        assert!(found.found && found.checked, "{found:?}");
+        assert_eq!(found.found_in, vec!["a.txt".to_owned()]);
+        assert!(report.expectations[1].found, "{report:?}");
+        let missing = &report.expectations[2];
+        assert!(!missing.found && missing.checked, "{missing:?}");
+        assert!(missing.found_in.is_empty(), "{missing:?}");
+        assert!(
+            report.warnings.iter().any(|w| w.contains("ABSENT_SYMBOL")),
+            "missing expectation must warn: {report:?}"
+        );
+        // Matching is case-sensitive: a differently-cased pattern is absent.
+        let report = collect_changes(&dir, &[], &["poll_marker".to_owned()]);
+        assert!(!report.expectations[0].found, "{report:?}");
+    }
+
+    #[test]
+    fn expect_patterns_only_search_changed_files() {
+        let Some(dir) = git_repo("expect-scope") else {
+            return;
+        };
+        // Committed content holds the needle; the change does not touch it.
+        std::fs::write(dir.join("needle.txt"), "NEEDLE").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "needle"]);
+        std::fs::write(dir.join("other.txt"), "no needle here").unwrap();
+        let report = collect_changes(&dir, &[], &["NEEDLE".to_owned()]);
+        assert!(!report.expectations[0].found, "{report:?}");
+        assert!(
+            report.expectations[0].found_in.is_empty(),
+            "unchanged files must not satisfy expectations: {report:?}"
+        );
+    }
+
+    #[test]
+    fn expect_on_a_non_git_workspace_is_unchecked_not_missing() {
+        let dir = workspace_with("expect-no-git", "");
+        std::fs::write(dir.join("a.txt"), "handle_poll\n").unwrap();
+        let report = collect_changes(&dir, &[], &["handle_poll".to_owned()]);
+        assert_eq!(report.expectations.len(), 1, "{report:?}");
+        assert!(!report.expectations[0].checked, "{report:?}");
+        assert!(!report.expectations[0].found, "{report:?}");
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| w.contains("not found in changed files")),
+            "an unchecked expectation must not claim absence: {report:?}"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("could not be checked")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn expect_patterns_are_bounded() {
+        let (patterns, note) = bound_expectations(&[
+            "ok".to_owned(),
+            "   ".to_owned(),
+            "x".repeat(MAX_EXPECTATION_LEN + 50),
+        ]);
+        assert_eq!(patterns.len(), 2, "empty dropped, long kept truncated");
+        assert_eq!(
+            patterns[1].chars().count(),
+            MAX_EXPECTATION_LEN,
+            "over-length pattern truncated"
+        );
+        assert!(note.is_some(), "adjustment must be reported: {note:?}");
+
+        let many: Vec<String> = (0..MAX_EXPECTATIONS + 10)
+            .map(|i| format!("p{i}"))
+            .collect();
+        let (patterns, note) = bound_expectations(&many);
+        assert_eq!(patterns.len(), MAX_EXPECTATIONS);
+        assert!(note.is_some());
+
+        let (patterns, note) = bound_expectations(&["clean".to_owned()]);
+        assert_eq!(patterns, vec!["clean".to_owned()]);
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn expect_warnings_never_affect_the_verdict() {
+        let Some(dir) = git_repo("expect-verdict") else {
+            return;
+        };
+        std::fs::write(dir.join("a.txt"), "changed").unwrap();
+        let plan = VerificationPlan {
+            steps: vec![PlanStep::new("true", "true", Duration::from_secs(5))],
+        };
+        let outcome = verify(
+            &dir,
+            &plan,
+            &Budget::attempts(1),
+            &Sandbox::disabled("test"),
+            &[],
+            &["DEFINITELY_ABSENT".to_owned()],
+            |_, _| None,
+        )
+        .unwrap();
+        assert!(
+            outcome.ok,
+            "a missing expectation warns, it does not fail: {outcome:?}"
+        );
+        assert_eq!(outcome.changes.expectations.len(), 1, "{outcome:?}");
+        assert!(!outcome.changes.expectations[0].found);
+        assert!(
+            outcome
+                .changes
+                .warnings
+                .iter()
+                .any(|w| w.contains("DEFINITELY_ABSENT")),
             "{outcome:?}"
         );
     }

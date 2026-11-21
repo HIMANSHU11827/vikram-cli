@@ -249,6 +249,66 @@ impl PerformanceStats {
 /// unbounded payload.
 pub const TOP_PERFORMANCE_ITEMS: usize = 5;
 
+/// Recency window each side of an [`AgentTrend`] comparison covers.
+pub const TREND_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Minimum absolute success-rate change (as a fraction, e.g. 0.05 = 5
+/// points) before a trend is reported as improving or declining rather
+/// than stable.
+pub const TREND_EPSILON: f32 = 0.05;
+
+// ---------- agent performance trends ----------
+
+/// Direction of an agent's success-rate movement between the prior and
+/// recent windows of an [`AgentTrend`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrendDirection {
+    Improving,
+    Declining,
+    Stable,
+    /// One or both windows held fewer than [`MIN_SAMPLE`] experiences, so
+    /// the rate delta is not evidence of a real change.
+    InsufficientData,
+}
+
+/// Per-agent success-rate comparison between the recent window and the
+/// equally long window before it. Counts are SQL aggregates over
+/// `experiences`; rates are `None` when a window has no rows in range.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentTrend {
+    pub agent_id: String,
+    pub recent_total: usize,
+    pub recent_success: usize,
+    pub prior_total: usize,
+    pub prior_success: usize,
+    pub recent_success_rate: Option<f32>,
+    pub prior_success_rate: Option<f32>,
+    pub trend: TrendDirection,
+}
+
+impl AgentTrend {
+    fn rate(total: usize, success: usize) -> Option<f32> {
+        if total == 0 {
+            None
+        } else {
+            Some(success as f32 / total as f32)
+        }
+    }
+
+    fn classify(recent_total: usize, prior_total: usize, delta: f32) -> TrendDirection {
+        if recent_total < MIN_SAMPLE || prior_total < MIN_SAMPLE {
+            TrendDirection::InsufficientData
+        } else if delta > TREND_EPSILON {
+            TrendDirection::Improving
+        } else if delta < -TREND_EPSILON {
+            TrendDirection::Declining
+        } else {
+            TrendDirection::Stable
+        }
+    }
+}
+
 // ---------- proposals ----------
 
 /// Proposal tallies by status.
@@ -649,6 +709,72 @@ impl EvolutionStore {
                 }
             }
             Ok(stats)
+        })
+    }
+
+    /// Per-agent success-rate trend over two adjacent windows of `window_ms`:
+    /// the most recent `window_ms` versus the `window_ms` before it.
+    /// Experiences older than two windows are ignored. One row per `agent_id`
+    /// seen in either window, ordered by `agent_id`.
+    ///
+    /// All counts are SQL aggregates over `experiences`; the trend
+    /// classification is [`AgentTrend::classify`] — `InsufficientData`
+    /// unless both windows hold at least [`MIN_SAMPLE`] experiences.
+    pub fn agent_trends(&self, window_ms: u64) -> Result<Vec<AgentTrend>> {
+        let now = now_ms();
+        let recent_since = now.saturating_sub(window_ms);
+        let prior_since = now.saturating_sub(window_ms.saturating_mul(2));
+        self.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT agent_id,
+                            COALESCE(SUM(timestamp_ms >= ?1), 0),
+                            COALESCE(SUM(outcome = 'success' AND timestamp_ms >= ?1), 0),
+                            COALESCE(SUM(timestamp_ms >= ?2 AND timestamp_ms < ?1), 0),
+                            COALESCE(SUM(outcome = 'success'
+                                         AND timestamp_ms >= ?2 AND timestamp_ms < ?1), 0)
+                     FROM experiences
+                     WHERE timestamp_ms >= ?2
+                     GROUP BY agent_id
+                     ORDER BY agent_id ASC",
+                )
+                .map_err(store_err)?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params![recent_since as i64, prior_since as i64],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)? as usize,
+                            r.get::<_, i64>(2)? as usize,
+                            r.get::<_, i64>(3)? as usize,
+                            r.get::<_, i64>(4)? as usize,
+                        ))
+                    },
+                )
+                .map_err(store_err)?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (agent_id, recent_total, recent_success, prior_total, prior_success) =
+                    row.map_err(store_err)?;
+                let recent_rate = AgentTrend::rate(recent_total, recent_success);
+                let prior_rate = AgentTrend::rate(prior_total, prior_success);
+                let delta = match (recent_rate, prior_rate) {
+                    (Some(r), Some(p)) => r - p,
+                    _ => 0.0,
+                };
+                out.push(AgentTrend {
+                    agent_id,
+                    recent_total,
+                    recent_success,
+                    prior_total,
+                    prior_success,
+                    recent_success_rate: recent_rate,
+                    prior_success_rate: prior_rate,
+                    trend: AgentTrend::classify(recent_total, prior_total, delta),
+                });
+            }
+            Ok(out)
         })
     }
 
@@ -1059,5 +1185,118 @@ mod tests {
         assert_eq!(stats.done, 1);
         assert_eq!(stats.avg_latency_ms, Some(500));
         assert_eq!(stats.failure_rate(), Some(0.0));
+    }
+
+    fn seed_trend(
+        store: &EvolutionStore,
+        id: &str,
+        agent: &str,
+        outcome: ExperienceOutcome,
+        timestamp_ms: u64,
+    ) {
+        let mut e = perf_exp(id, agent, "coding", outcome, vec![], vec![], None);
+        e.timestamp_ms = timestamp_ms;
+        store.save_experience(&e).unwrap();
+    }
+
+    /// Seed `n` experiences for `agent` all with `outcome` at `timestamp_ms`.
+    fn seed_trend_batch(
+        store: &EvolutionStore,
+        agent: &str,
+        outcome: ExperienceOutcome,
+        timestamp_ms: u64,
+        n: usize,
+    ) {
+        for i in 0..n {
+            seed_trend(
+                store,
+                &format!("{agent}-{i}-{}", timestamp_ms),
+                agent,
+                outcome,
+                timestamp_ms,
+            );
+        }
+    }
+
+    #[test]
+    fn agent_trends_empty_store_is_empty() {
+        let store = EvolutionStore::open_in_memory().unwrap();
+        assert!(store.agent_trends(TREND_WINDOW_MS).unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_trends_classify_improving_declining_stable_and_thin_windows() {
+        let store = EvolutionStore::open_in_memory().unwrap();
+        let now = now_ms();
+        let w = TREND_WINDOW_MS;
+        let recent = now;
+        let prior = now - w - 1_000; // inside the prior window
+        let ancient = now - w * 2 - 1_000; // older than both windows
+
+        // a1: 5/5 recent successes vs 0/5 prior -> improving.
+        seed_trend_batch(&store, "a1", ExperienceOutcome::Success, recent, 5);
+        seed_trend_batch(&store, "a1", ExperienceOutcome::Failure, prior, 5);
+        // a2: 5/5 vs 5/5 -> stable.
+        seed_trend_batch(&store, "a2", ExperienceOutcome::Success, recent, 5);
+        seed_trend_batch(&store, "a2", ExperienceOutcome::Success, prior, 5);
+        // a3: 0/5 vs 5/5 -> declining.
+        seed_trend_batch(&store, "a3", ExperienceOutcome::Failure, recent, 5);
+        seed_trend_batch(&store, "a3", ExperienceOutcome::Success, prior, 5);
+        // a4: recent only -> prior window empty -> insufficient data.
+        seed_trend_batch(&store, "a4", ExperienceOutcome::Success, recent, 5);
+        // a5: only an ancient row -> outside both windows, must not appear.
+        seed_trend_batch(&store, "a5", ExperienceOutcome::Success, ancient, 5);
+        // a6: 3 recent successes -> below MIN_SAMPLE -> insufficient data.
+        seed_trend_batch(&store, "a6", ExperienceOutcome::Success, recent, 3);
+        seed_trend_batch(&store, "a6", ExperienceOutcome::Failure, prior, 5);
+
+        let trends = store.agent_trends(w).unwrap();
+        let by_agent: std::collections::HashMap<_, _> =
+            trends.iter().map(|t| (t.agent_id.as_str(), t)).collect();
+        assert_eq!(trends.len(), 5, "a5 must be excluded: {trends:?}");
+
+        let a1 = by_agent["a1"];
+        assert_eq!(a1.recent_total, 5);
+        assert_eq!(a1.recent_success, 5);
+        assert_eq!(a1.prior_total, 5);
+        assert_eq!(a1.prior_success, 0);
+        assert_eq!(a1.recent_success_rate, Some(1.0));
+        assert_eq!(a1.prior_success_rate, Some(0.0));
+        assert_eq!(a1.trend, TrendDirection::Improving);
+
+        assert_eq!(by_agent["a2"].trend, TrendDirection::Stable);
+        assert_eq!(by_agent["a3"].trend, TrendDirection::Declining);
+
+        let a4 = by_agent["a4"];
+        assert_eq!(a4.prior_total, 0);
+        assert_eq!(a4.prior_success_rate, None);
+        assert_eq!(a4.trend, TrendDirection::InsufficientData);
+
+        assert_eq!(by_agent["a6"].trend, TrendDirection::InsufficientData);
+
+        // Rows come back ordered by agent_id.
+        let ids: Vec<_> = trends.iter().map(|t| t.agent_id.as_str()).collect();
+        assert_eq!(ids, vec!["a1", "a2", "a3", "a4", "a6"]);
+    }
+
+    #[test]
+    fn agent_trends_small_delta_is_stable() {
+        let store = EvolutionStore::open_in_memory().unwrap();
+        let now = now_ms();
+        let w = TREND_WINDOW_MS;
+        // recent: 39/40 success (0.975); prior: 40/40 (1.0) -> delta -0.025,
+        // inside TREND_EPSILON, so stable rather than declining.
+        seed_trend_batch(&store, "b1", ExperienceOutcome::Success, now, 39);
+        seed_trend(&store, "b1-f", "b1", ExperienceOutcome::Failure, now);
+        seed_trend_batch(
+            &store,
+            "b1",
+            ExperienceOutcome::Success,
+            now - w - 1_000,
+            40,
+        );
+        let trends = store.agent_trends(w).unwrap();
+        assert_eq!(trends.len(), 1);
+        assert_eq!(trends[0].trend, TrendDirection::Stable);
     }
 }

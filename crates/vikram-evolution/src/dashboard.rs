@@ -4,7 +4,7 @@
 //! through `vikram evolution status`. It mutates nothing.
 
 use crate::error::Result;
-use crate::metrics::{PerformanceDimension, PerformanceStats};
+use crate::metrics::{AgentTrend, PerformanceDimension, PerformanceStats, TREND_WINDOW_MS};
 use crate::store::EvolutionStore;
 use serde::Serialize;
 
@@ -24,6 +24,10 @@ pub struct LearningDashboard {
     pub agent_performance: Vec<PerformanceStats>,
     /// Same aggregates grouped by `task_category`.
     pub category_performance: Vec<PerformanceStats>,
+    /// Per-agent success-rate trend: the last [`TREND_WINDOW_MS`] versus the
+    /// equally long window before it. `InsufficientData` unless both windows
+    /// hold at least `MIN_SAMPLE` experiences.
+    pub agent_trends: Vec<AgentTrend>,
 }
 
 pub struct Dashboard {
@@ -65,6 +69,7 @@ impl Dashboard {
                 None,
                 10,
             )?,
+            agent_trends: self.store.agent_trends(TREND_WINDOW_MS)?,
         })
     }
 }
@@ -118,5 +123,50 @@ mod tests {
         assert_eq!(dash.category_performance.len(), 2);
         assert_eq!(dash.category_performance[0].key, "coding");
         assert_eq!(dash.category_performance[0].total, 2);
+        // All seeds are "now": both trend windows are too thin for a verdict.
+        assert_eq!(dash.agent_trends.len(), 2);
+        assert!(
+            dash.agent_trends
+                .iter()
+                .all(|t| t.trend == crate::metrics::TrendDirection::InsufficientData)
+        );
+    }
+
+    #[test]
+    fn snapshot_reports_improving_trend_from_seeded_windows() {
+        let store = EvolutionStore::open_in_memory().unwrap();
+        let now = now_ms();
+        let w = crate::metrics::TREND_WINDOW_MS;
+        let prior = now - w - 1_000;
+        for i in 0..5 {
+            let mut e = Experience {
+                id: format!("r{i}"),
+                timestamp_ms: now,
+                agent_id: "agent-1".to_string(),
+                project_id: None,
+                task_category: "coding".to_string(),
+                user_request: "req".to_string(),
+                outcome: ExperienceOutcome::Success,
+                tools_used: vec![],
+                errors: vec![],
+                corrections: vec![],
+                feedback: None,
+                reusable: false,
+                sensitivity: Sensitivity::Public,
+                metadata: serde_json::json!({}),
+            };
+            store.save_experience(&e).unwrap();
+            e.id = format!("p{i}");
+            e.timestamp_ms = prior;
+            e.outcome = ExperienceOutcome::Failure;
+            store.save_experience(&e).unwrap();
+        }
+        let dash = Dashboard::new(store).snapshot().unwrap();
+        assert_eq!(dash.agent_trends.len(), 1);
+        let trend = &dash.agent_trends[0];
+        assert_eq!(trend.agent_id, "agent-1");
+        assert_eq!(trend.recent_success_rate, Some(1.0));
+        assert_eq!(trend.prior_success_rate, Some(0.0));
+        assert_eq!(trend.trend, crate::metrics::TrendDirection::Improving);
     }
 }
