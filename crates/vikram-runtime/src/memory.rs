@@ -43,6 +43,17 @@ pub fn project_scope(slug: &str) -> Option<String> {
     scope_segment(slug).map(|seg| format!("project:{seg}"))
 }
 
+/// Scope name for memory shared by every participant of one hive: `hive:<id>`.
+///
+/// Hive participants run ad-hoc — they hold no session id, so the session-keyed
+/// [`MemoryStore::bind_session_scopes`] binding cannot reach them. Instead the hive run
+/// names this shelf explicitly in its recall scopes. Same free-form convention and same
+/// `None`-on-empty contract as [`user_scope`]. Recall-only by convention: host code may
+/// write here, but nothing in a run writes a participant's private notes onto the shelf.
+pub fn hive_scope(hive: &str) -> Option<String> {
+    scope_segment(hive).map(|seg| format!("hive:{seg}"))
+}
+
 /// Scope ids are path/DB-safe by construction: anything outside `[A-Za-z0-9._~-]` folds to
 /// `_`, and an all-empty result is no scope at all.
 fn scope_segment(raw: &str) -> Option<String> {
@@ -1685,6 +1696,42 @@ mod tests {
         );
         assert_eq!(user_scope("   "), None, "no segment, no scope");
         assert_eq!(project_scope(""), None);
+        assert_eq!(hive_scope("hive-1").as_deref(), Some("hive:hive-1"));
+        assert_eq!(hive_scope("forge team").as_deref(), Some("hive:forge_team"));
+        assert_eq!(hive_scope(""), None);
+    }
+
+    #[test]
+    fn a_hive_shelf_recalls_only_when_the_run_names_it() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store
+            .save("runbook", "rotate staging credentials", "hive:h1")
+            .unwrap();
+        store
+            .save("runbook", "rotate staging credentials too", "hive:h2")
+            .unwrap();
+        store.save("note", "session only note", "ses-a").unwrap();
+        let terms = vec!["rotate".to_string(), "credentials".to_string()];
+
+        // A session-bound recall never names the hive shelf: deny-first.
+        let session = store
+            .recall_terms(&terms, &["global".into(), "ses-a".into()], 8)
+            .unwrap();
+        assert!(
+            session.iter().all(|(s, _, _)| !s.starts_with("hive:")),
+            "an ordinary session must not see hive shelves: {session:?}"
+        );
+
+        // The hive run names its own shelf explicitly, and only its own.
+        let hive = store
+            .recall_terms(&terms, &["global".into(), "hive:h1".into()], 8)
+            .unwrap();
+        let scopes: Vec<&str> = hive.iter().map(|(s, _, _)| s.as_str()).collect();
+        assert!(scopes.contains(&"hive:h1"), "hive h1 recalls: {hive:?}");
+        assert!(
+            !scopes.contains(&"hive:h2"),
+            "another hive's shelf must not leak: {hive:?}"
+        );
     }
 
     #[test]

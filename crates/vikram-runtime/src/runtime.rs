@@ -5591,6 +5591,12 @@ impl RuntimeHandle {
                 .unwrap_or_default()
         };
 
+        // The shelf every participant of this hive may recall. Participants hold no
+        // session id, so the session-keyed scope binding cannot reach them; the run
+        // names `hive:<id>` explicitly instead. `None` only for a hive id that
+        // sanitizes to nothing, which cannot happen for a generated id.
+        let hive_memory_scope = crate::memory::hive_scope(hive.as_str());
+
         // Helper: collect one participant's response given a transcript snapshot.
         async fn collect_one(
             inner: &Arc<RuntimeInner>,
@@ -5599,6 +5605,7 @@ impl RuntimeHandle {
             ent: &vikram_store::EntityRow,
             msgs: &[vikram_store::HiveMessageRow],
             lessons: &[(String, String)],
+            hive_memory_scope: Option<&str>,
         ) -> String {
             let ctx = inner.context.load_agent_or_bot(ent);
             let mut system_text = ctx.render();
@@ -5618,6 +5625,55 @@ impl RuntimeHandle {
                 .context
                 .hive_budget_tokens;
             let estimator = crate::context_engine::TokenEstimator::default();
+            // Recall the team's shared shelf: `global` plus this hive's `hive:<id>`
+            // scope, matched against the operator's prompt. Recall-only — a run
+            // writes nothing here, so a participant's private notes can surface to
+            // the team without the team writing into anyone's shelf. The block is
+            // capped by the same memory budget a session's retrieval uses, and it
+            // lands inside `system_text` before `spent` is measured, so it prices
+            // against the hive budget like everything else the participant reads.
+            if let Some(hscope) = hive_memory_scope {
+                let query = msgs
+                    .iter()
+                    .rev()
+                    .find(|m| m.sender == "vikram")
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default();
+                let terms = RuntimeInner::retrieval_terms(&query);
+                if !terms.is_empty() {
+                    let scopes = vec!["global".to_owned(), hscope.to_owned()];
+                    if let Ok(scored) = inner.memory.hybrid_recall(
+                        &terms,
+                        &scopes,
+                        6,
+                        &crate::HybridOptions::default(),
+                    ) {
+                        let mem_budget = inner
+                            .config
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .context
+                            .memory_budget_tokens;
+                        let mut body = String::new();
+                        let mut mem_spent = 0u64;
+                        for s in scored {
+                            let line = format!("- [{}] {}: {}\n", s.scope, s.key, s.value);
+                            let cost = estimator.estimate_text(&line);
+                            if mem_spent + cost > mem_budget {
+                                break;
+                            }
+                            mem_spent += cost;
+                            body.push_str(&line);
+                        }
+                        if !body.is_empty() {
+                            system_text.push_str(
+                                "Shared hive memory (durable notes the team may recall; may be stale, verify before relying on it):\n",
+                            );
+                            system_text.push_str(&body);
+                        }
+                    }
+                }
+            }
             let mut spent = estimator.estimate_text(&system_text);
             let mut kept: Vec<&vikram_store::HiveMessageRow> = Vec::new();
             for m in msgs.iter().rev() {
@@ -5689,8 +5745,18 @@ impl RuntimeHandle {
                 let ent = ent.clone();
                 let msgs = base_msgs.clone();
                 let lessons = past_lessons.clone();
+                let hscope = hive_memory_scope.clone();
                 handles.push(tokio::spawn(async move {
-                    collect_one(&inner, &provider, &model, &ent, &msgs, &lessons).await
+                    collect_one(
+                        &inner,
+                        &provider,
+                        &model,
+                        &ent,
+                        &msgs,
+                        &lessons,
+                        hscope.as_deref(),
+                    )
+                    .await
                 }));
             }
             let mut responses: Vec<String> = Vec::new();
@@ -5715,8 +5781,16 @@ impl RuntimeHandle {
                     .hive
                     .messages(hive)
                     .map_err(RuntimeError::InvalidState)?;
-                let resp =
-                    collect_one(&self.inner, &provider, &model, ent, &msgs, &past_lessons).await;
+                let resp = collect_one(
+                    &self.inner,
+                    &provider,
+                    &model,
+                    ent,
+                    &msgs,
+                    &past_lessons,
+                    hive_memory_scope.as_deref(),
+                )
+                .await;
                 if !resp.trim().is_empty() {
                     responded += 1;
                     let ts = now_ms();
@@ -6882,6 +6956,112 @@ mod tests {
         assert_eq!(run_lesson.agents, vec!["BetaBot".to_string()]);
         assert!(run_lesson.lesson.contains("1 of 1 participant(s)"));
         assert_eq!(run_lesson.pattern, "hive_run:sequential");
+    }
+
+    #[tokio::test]
+    async fn hive_run_recalls_only_its_own_hive_shelf() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let (runtime, provider) = named_runtime(dir.path(), "ack").await;
+        let handle = runtime.handle();
+        let user = handle.inner.store.create_user("U", now_ms()).unwrap();
+
+        let mut hives = Vec::new();
+        for (hive_name, bot) in [("Alpha", "AlphaBot"), ("Beta", "BetaBot")] {
+            let hive_id = handle
+                .hive_create(
+                    user.id.clone(),
+                    None,
+                    hive_name.to_string(),
+                    "objective".to_string(),
+                    "cooperative".to_string(),
+                )
+                .unwrap();
+            let ent = vikram_store::EntityRow {
+                id: vikram_contracts::EntityId::generate(),
+                owner_user: None,
+                kind: vikram_store::EntityKind::Agent,
+                name: bot.to_string(),
+                slug: bot.to_lowercase(),
+                title: String::new(),
+                role: String::new(),
+                specialization: String::new(),
+                description: String::new(),
+                icon: None,
+                model: None,
+                profile_id: None,
+                status: "active".to_string(),
+                created_ms: now_ms(),
+                updated_ms: now_ms(),
+            };
+            handle.inner.store.save_entity(&ent).unwrap();
+            handle
+                .hive_add_participant(&hive_id, &ent.id, vikram_store::EntityKind::Agent, "member")
+                .unwrap();
+            hives.push(hive_id);
+        }
+        let (alpha, beta) = (&hives[0], &hives[1]);
+
+        // Host-written shared knowledge on each hive's shelf; the value carries a
+        // query term so hybrid recall can match it.
+        handle
+            .memory_save(
+                "deploy-runbook",
+                "ALPHA-HIVE-MARKER deployment checklist: rotate staging credentials",
+                format!("hive:{}", alpha.as_str()),
+            )
+            .unwrap();
+        handle
+            .memory_save(
+                "deploy-runbook",
+                "BETA-HIVE-MARKER deployment checklist: different note",
+                format!("hive:{}", beta.as_str()),
+            )
+            .unwrap();
+        // A session-scoped note with the same terms must never surface in a hive.
+        handle
+            .memory_save(
+                "deploy-runbook",
+                "SESSION-ONLY-MARKER deployment checklist private note",
+                "ses-private",
+            )
+            .unwrap();
+
+        handle
+            .hive_run(alpha, "review the deployment checklist", false)
+            .await
+            .unwrap();
+        handle
+            .hive_run(beta, "review the deployment checklist", false)
+            .await
+            .unwrap();
+
+        let requests = provider.asked();
+        assert_eq!(requests.len(), 2, "one request per single-participant run");
+        let system_text = |msgs: &[Message]| {
+            msgs.iter()
+                .find(|m| m.role == vikram_contracts::Role::System)
+                .map(|m| m.text_body())
+                .unwrap_or_default()
+        };
+        let alpha_ctx = requests
+            .iter()
+            .map(|r| system_text(r))
+            .find(|t| t.contains("ALPHA-HIVE-MARKER"))
+            .expect("Alpha's participant must recall Alpha's hive shelf");
+        assert!(
+            !alpha_ctx.contains("BETA-HIVE-MARKER") && !alpha_ctx.contains("SESSION-ONLY-MARKER"),
+            "Alpha must not see Beta's shelf or a session's private note"
+        );
+        let beta_ctx = requests
+            .iter()
+            .map(|r| system_text(r))
+            .find(|t| t.contains("BETA-HIVE-MARKER"))
+            .expect("Beta's participant recalls Beta's shelf");
+        assert!(
+            !beta_ctx.contains("ALPHA-HIVE-MARKER") && !beta_ctx.contains("SESSION-ONLY-MARKER"),
+            "Beta must not see Alpha's shelf or a session's private note"
+        );
     }
 
     #[tokio::test]
