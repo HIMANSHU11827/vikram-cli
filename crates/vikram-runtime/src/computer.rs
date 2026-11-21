@@ -456,11 +456,14 @@ fn ocr_text(path: &str) -> Result<String, String> {
     )
 }
 
-/// Screenshot the whole screen, OCR it, and remove the temporary image.
+/// Screenshot the whole screen, OCR it, and keep the capture inside the workspace.
 ///
 /// `tesseract` is checked before the capture so a machine without it writes no file and gets the
-/// install hint rather than a dangling screenshot path.
-pub fn ocr_screen() -> Result<String, String> {
+/// install hint rather than a dangling screenshot path. The helper still writes to a temp file
+/// that is deleted afterwards, but the PNG is first copied under `workspace_root` so the turn
+/// loop can attach it as an image artifact. Returns the recognised text and, when the copy
+/// succeeded, the display path for the `IMAGE:` marker.
+pub fn ocr_screen(workspace_root: &Path) -> Result<(String, Option<String>), String> {
     require_tool("tesseract")?;
     let path = temp_screenshot_path();
     let target = path.to_string_lossy().into_owned();
@@ -468,13 +471,30 @@ pub fn ocr_screen() -> Result<String, String> {
         let _ = std::fs::remove_file(&path);
         return Err(err);
     }
+    let artifact = keep_screen_shot(&path, workspace_root);
     let text = ocr_text(&target);
     let _ = std::fs::remove_file(&path);
     let body = text?.trim().to_string();
-    if body.is_empty() {
-        return Ok("no text recognised on screen".to_string());
-    }
-    Ok(truncated(body))
+    let text = if body.is_empty() {
+        "no text recognised on screen".to_string()
+    } else {
+        truncated(body)
+    };
+    Ok((text, artifact))
+}
+
+/// Copy a temp capture to `.vikram/shots/read_screen-latest.png` under the workspace and return
+/// its display path for the `IMAGE:` marker, or `None` when the workspace cannot hold it. One
+/// fixed name keeps repeated calls from filling the disk; the next capture overwrites it, and a
+/// failed copy simply means no artifact is advertised.
+fn keep_screen_shot(temp: &Path, workspace_root: &Path) -> Option<String> {
+    let shot = crate::config::resolve_within(
+        workspace_root,
+        Path::new(".vikram/shots/read_screen-latest.png"),
+    )?;
+    std::fs::create_dir_all(shot.parent()?).ok()?;
+    std::fs::copy(temp, &shot).ok()?;
+    Some(shot.to_string_lossy().into_owned())
 }
 
 /// Move the pointer to `(x, y)` and click `button` (1 left, 2 middle, 3 right, 4/5 wheel).
@@ -1108,7 +1128,9 @@ impl Tool for ReadScreen {
         ToolSpec {
             name: "computer.read_screen".into(),
             description: "Screenshot the whole screen, run it through tesseract and return the \
-                          recognised text. The temporary image is deleted afterwards."
+                          recognised text. The capture is kept at \
+                          `.vikram/shots/read_screen-latest.png` and attached to the reply as an \
+                          image."
                 .into(),
             schema: json!({"type": "object", "properties": {}}),
         }
@@ -1124,8 +1146,19 @@ impl Tool for ReadScreen {
         ))
     }
 
-    fn run(&self, _args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
-        Ok(reported(ocr_screen()))
+    fn run(&self, _args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+        match ocr_screen(&ctx.workspace_root) {
+            Ok((text, artifact)) => {
+                let mut out = reported(Ok(text));
+                if let Some(display) = artifact {
+                    // The same artifact marker `computer.screenshot` emits; `keep_screen_shot`
+                    // only ever names a file inside the workspace.
+                    out.content = format!("{}\nIMAGE:{display}", out.content);
+                }
+                Ok(out)
+            }
+            Err(err) => Ok(reported(Err(err))),
+        }
     }
 }
 
@@ -1412,6 +1445,66 @@ mod tests {
             crate::config::resolve_within(dir.path(), Path::new(raw)).is_some(),
             "marker path must stay inside the workspace: {raw}"
         );
+    }
+
+    #[test]
+    fn read_screen_keeps_a_workspace_confined_png_artifact() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let capture = dir.path().join("capture.png");
+        let png = b"\x89PNG\r\n\x1a\nfake-but-signed";
+        std::fs::write(&capture, png).expect("capture");
+
+        let display = keep_screen_shot(&capture, dir.path()).expect("kept");
+        assert!(
+            Path::new(&display).ends_with(Path::new(".vikram/shots/read_screen-latest.png")),
+            "artifact path: {display}"
+        );
+        let resolved = crate::config::resolve_within(dir.path(), Path::new(&display))
+            .expect("marker path must resolve inside the workspace");
+        assert!(resolved.is_file(), "{}", resolved.display());
+        assert_eq!(std::fs::read(&resolved).expect("read"), png);
+
+        // The fixed name is overwritten, not accumulated: a second capture leaves one file.
+        std::fs::write(&capture, png).expect("capture again");
+        let again = keep_screen_shot(&capture, dir.path()).expect("kept again");
+        assert_eq!(again, display);
+        let shots = resolved.parent().expect("shots dir");
+        assert_eq!(std::fs::read_dir(shots).expect("read dir").count(), 1);
+    }
+
+    #[test]
+    fn read_screen_artifact_is_skipped_when_the_shots_dir_cannot_hold_it() {
+        let dir = tempfile::tempdir().expect("workspace");
+        // `.vikram` as a plain file makes `.vikram/shots` uncreatable; OCR must still work, just
+        // without an artifact to advertise.
+        std::fs::write(dir.path().join(".vikram"), b"not a dir").expect("blocker");
+        let capture = dir.path().join("capture.png");
+        std::fs::write(&capture, b"\x89PNG\r\n\x1a\nx").expect("capture");
+        assert!(keep_screen_shot(&capture, dir.path()).is_none());
+    }
+
+    #[test]
+    fn a_successful_read_screen_reports_the_image_artifact_marker() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let mut context = ctx();
+        context.workspace_root = dir.path().to_path_buf();
+        let out = ReadScreen.run(&json!({}), &context).unwrap();
+        if !out.ok {
+            // No tesseract or screenshot helper on this machine: a refusal must not carry an
+            // artifact marker.
+            assert!(!out.content.contains("IMAGE:"), "{}", out.content);
+            return;
+        }
+        let raw = out
+            .content
+            .lines()
+            .last()
+            .and_then(|line| line.strip_prefix("IMAGE:"))
+            .expect("a successful read_screen ends with the artifact marker");
+        let resolved = crate::config::resolve_within(dir.path(), Path::new(raw))
+            .expect("marker path must stay inside the workspace");
+        let bytes = std::fs::read(&resolved).expect("artifact file");
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "artifact must be a PNG");
     }
 
     #[test]

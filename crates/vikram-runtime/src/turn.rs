@@ -1504,7 +1504,11 @@ const IMAGE_ARTIFACT_PREFIX: &str = "IMAGE:";
 
 /// Tools whose `IMAGE:` lines name real files a reply may carry. Anything else — a fetched page,
 /// a file's contents — can print the marker but is never honored.
-const IMAGE_ARTIFACT_TOOLS: &[&str] = &["browser.screenshot", "computer.screenshot"];
+const IMAGE_ARTIFACT_TOOLS: &[&str] = &[
+    "browser.screenshot",
+    "computer.screenshot",
+    "computer.read_screen",
+];
 
 /// One reply carries at most this many artifacts, each at most this many bytes. A skipped image
 /// loses delivery, not the artifact: the file stays in the workspace either way.
@@ -3965,6 +3969,29 @@ mod tests {
         );
         assert!(pending_image_artifacts(&handle.inner, &session).is_empty());
 
+        // `computer.read_screen` keeps its capture under `.vikram/shots/` and marks it the same
+        // way, so the OCR result's screenshot attaches too.
+        let screen = dir.path().join(".vikram/shots/read_screen-latest.png");
+        std::fs::create_dir_all(screen.parent().expect("shots dir")).expect("shots dir");
+        std::fs::write(&screen, PNG_1X1).expect("screen png");
+        push_tool_round(
+            &session,
+            "computer.read_screen",
+            &format!("some text\nIMAGE:{}", screen.display()),
+            true,
+        );
+        let artifacts = pending_image_artifacts(&handle.inner, &session);
+        assert_eq!(artifacts.len(), 1, "computer.read_screen attaches its PNG");
+        assert_eq!(
+            artifacts[0],
+            ImageSource::data("image/png", base64_encode(PNG_1X1))
+        );
+        session.push_message(
+            Message::text(Role::Assistant, "the screen text", Trust::Model),
+            now_ms(),
+        );
+        assert!(pending_image_artifacts(&handle.inner, &session).is_empty());
+
         // Everything the marker could lie about is refused: other tools, failed results, paths
         // outside the workspace, files that are not PNGs, and files over the size cap.
         let mut big = PNG_1X1.to_vec();
@@ -3978,10 +4005,13 @@ mod tests {
             ("browser.screenshot", marker.as_str(), false),
             ("browser.screenshot", outside_marker.as_str(), true),
             ("computer.screenshot", outside_marker.as_str(), true),
+            ("computer.read_screen", outside_marker.as_str(), true),
             ("browser.screenshot", text_marker.as_str(), true),
             ("computer.screenshot", text_marker.as_str(), true),
+            ("computer.read_screen", text_marker.as_str(), true),
             ("browser.screenshot", big_marker.as_str(), true),
             ("computer.screenshot", big_marker.as_str(), true),
+            ("computer.read_screen", big_marker.as_str(), true),
         ] {
             push_tool_round(&session, name, result, ok);
             assert!(

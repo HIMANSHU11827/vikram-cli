@@ -4,8 +4,8 @@
 //! the `.wasm` extension) runs inside the same permission envelope as a process plugin: the
 //! manifest must declare an execution permission (`process` or `network`) and the entry must
 //! resolve strictly inside the plugin directory. Execution is in-process through wasmi — no
-//! subprocess, no WASI. The only host import a module may use is `vikram.log`; any other
-//! import fails to instantiate.
+//! subprocess, no WASI. The only host imports a module may use are `vikram.log` and
+//! `vikram.read_resource`; any other import fails to instantiate.
 //!
 //! ABI (v2, JSON-over-memory):
 //! - the module exports `memory`, `alloc(size: i32) -> i32`, `dealloc(ptr: i32, size: i32)` and
@@ -21,9 +21,18 @@
 //!   or `len` is negative or `ptr` lies outside memory, and `0` once the per-request log
 //!   budget ([`MAX_WASM_LOG`]) is spent. Captured lines are merged into the reply object
 //!   under the reserved `_logs` key (overwriting any guest-supplied value); effect parsing
-//!   ignores unknown keys, so v1 guests and replies interoperate unchanged. Serving
-//!   workspace resources to guests ACP-style (`resources/read`) is deliberately out of
-//!   scope: it needs a host-to-guest data channel, not just diagnostics.
+//!   ignores unknown keys, so v1 guests and replies interoperate unchanged;
+//! - the module may also import
+//!   `(import "vikram" "read_resource" (func (param i32 i32 i32 i32) (result i32)))`:
+//!   `read_resource(uri_ptr, uri_len, out_ptr, out_cap)` reads a `uri_len`-byte URI at
+//!   `uri_ptr` from guest linear memory, resolves it strictly inside the plugin's own
+//!   directory (`plugin://<relpath>` or a bare relative path; absolute paths, `..` and
+//!   symlink escapes are refused), and copies up to `out_cap` bytes of the file — capped
+//!   at [`MAX_WASM_RESOURCE`] — into guest memory at `out_ptr`. It returns the number of
+//!   bytes written, `0` for an empty file, or a negative code: `-1` not found or not a
+//!   regular file, `-2` path refused (outside the plugin directory), `-3` file or
+//!   `out_cap` exceeds the cap, `-4` host I/O failure, `-5` invalid guest pointer,
+//!   length or URI.
 //!
 //! Execution is bounded: the module is compiled once per plugin and every call runs under a
 //! fresh store with a fuel budget ([`WASM_FUEL_LIMIT`]) plus the recursion and stack limits
@@ -47,6 +56,9 @@ const WASM_FUEL_LIMIT: u64 = 50_000_000;
 /// Total bytes `vikram.log` may capture per `handle` call. Host-side log reads are not
 /// fuel-metered, so the budget bounds what a guest can make the host copy.
 const MAX_WASM_LOG: usize = 64 * 1024;
+
+/// Largest file `vikram.read_resource` will copy into guest memory per call.
+const MAX_WASM_RESOURCE: usize = 64 * 1024;
 
 /// Errors a wasm plugin call can produce. Every variant names the plugin so registry and stage
 /// diagnostics attribute the failure correctly.
@@ -79,10 +91,12 @@ struct CompiledModule {
     module: Module,
 }
 
-/// Per-call host state: the raw bytes `vikram.log` has captured so far.
+/// Per-call host state: the raw bytes `vikram.log` has captured so far, plus the plugin
+/// directory `vikram.read_resource` confines reads to.
 #[derive(Default)]
 struct CallState {
     log: Vec<u8>,
+    root: PathBuf,
 }
 
 /// A wasm plugin: its manifest-gated entry, compiled lazily on first call.
@@ -91,6 +105,7 @@ struct CallState {
 /// fresh store, so concurrent dispatches cannot share mutable wasm state.
 pub struct WasmPlugin {
     plugin: String,
+    dir: PathBuf,
     path: PathBuf,
     compiled: OnceLock<Result<CompiledModule, String>>,
 }
@@ -122,6 +137,7 @@ impl WasmPlugin {
         }
         Ok(Self {
             plugin,
+            dir,
             path,
             compiled: OnceLock::new(),
         })
@@ -238,7 +254,13 @@ impl WasmPlugin {
                 plugin: self.plugin.clone(),
                 reason: reason.clone(),
             })?;
-        let mut store = Store::new(&compiled.engine, CallState::default());
+        let mut store = Store::new(
+            &compiled.engine,
+            CallState {
+                log: Vec::new(),
+                root: self.dir.clone(),
+            },
+        );
         store
             .set_fuel(WASM_FUEL_LIMIT)
             .map_err(|reason| WasmError::Execution {
@@ -251,6 +273,12 @@ impl WasmPlugin {
             .map_err(|reason| WasmError::Execution {
                 plugin: self.plugin.clone(),
                 reason: format!("cannot register `vikram.log` host import: {reason}"),
+            })?;
+        linker
+            .func_wrap("vikram", "read_resource", wasm_read_resource)
+            .map_err(|reason| WasmError::Execution {
+                plugin: self.plugin.clone(),
+                reason: format!("cannot register `vikram.read_resource` host import: {reason}"),
             })?;
         let instance = linker
             .instantiate_and_start(&mut store, &compiled.module)
@@ -374,6 +402,92 @@ fn wasm_log(mut caller: Caller<'_, CallState>, ptr: i32, len: i32) -> i32 {
     }
     caller.data_mut().log.extend_from_slice(&bytes);
     take as i32
+}
+
+/// The `vikram.read_resource` host import: serve a file from inside the plugin's own
+/// directory into a guest-provided out buffer.
+///
+/// The URI is read from guest memory, trimmed, stripped of an optional `plugin://`
+/// prefix and resolved through [`entry_path`] against the plugin directory, so absolute
+/// paths, `..` components and symlinks pointing outside are all refused before any host
+/// filesystem access. Only regular files up to [`MAX_WASM_RESOURCE`] bytes are served,
+/// and only when they fit in the guest's `out_cap` buffer; the copy itself is validated
+/// against guest memory bounds like every other pointer. Returns bytes written, `0` for
+/// an empty file, or a negative code documented in the module docs.
+fn wasm_read_resource(
+    mut caller: Caller<'_, CallState>,
+    uri_ptr: i32,
+    uri_len: i32,
+    out_ptr: i32,
+    out_cap: i32,
+) -> i32 {
+    const BAD_ARGS: i32 = -5;
+    if uri_ptr < 0 || uri_len < 0 || out_ptr < 0 || out_cap < 0 {
+        return BAD_ARGS;
+    }
+    let Some(memory) = caller.get_export("memory").and_then(Extern::into_memory) else {
+        return BAD_ARGS;
+    };
+    let data_size = memory.data_size(&caller);
+    let uri_start = uri_ptr as usize;
+    let uri_len = uri_len as usize;
+    let uri_end = uri_start.saturating_add(uri_len);
+    if uri_len == 0 || uri_end > data_size {
+        return BAD_ARGS;
+    }
+    let mut uri_bytes = vec![0u8; uri_len];
+    if memory.read(&caller, uri_start, &mut uri_bytes).is_err() {
+        return BAD_ARGS;
+    }
+    let Ok(uri) = std::str::from_utf8(&uri_bytes) else {
+        return BAD_ARGS;
+    };
+    let uri = uri.trim();
+    let rel = uri.strip_prefix("plugin://").unwrap_or(uri);
+    let path = match entry_path(&caller.data().root, rel) {
+        Ok(path) => path,
+        Err(_) => return -2,
+    };
+    let meta = match std::fs::metadata(&path) {
+        Ok(meta) => meta,
+        Err(reason) => {
+            return if reason.kind() == std::io::ErrorKind::NotFound {
+                -1
+            } else {
+                -4
+            };
+        }
+    };
+    if !meta.is_file() {
+        return -1;
+    }
+    let size = meta.len() as usize;
+    if size > MAX_WASM_RESOURCE || size > out_cap as usize {
+        return -3;
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            return if reason.kind() == std::io::ErrorKind::NotFound {
+                -1
+            } else {
+                -4
+            };
+        }
+    };
+    let len = bytes.len();
+    if len > out_cap as usize {
+        return -3;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let out_start = out_ptr as usize;
+    let out_end = out_start.saturating_add(len);
+    if out_end > data_size || memory.write(&mut caller, out_start, &bytes).is_err() {
+        return BAD_ARGS;
+    }
+    len as i32
 }
 
 #[cfg(test)]
@@ -529,6 +643,163 @@ mod tests {
         let reply = plugin.request(&json!({})).unwrap();
         assert_eq!(reply["ok"], json!(false), "{reply}");
         assert!(reply.get("_logs").is_none(), "{reply}");
+    }
+
+    const READ_WAT: &str = r#"(module
+  (import "vikram" "log" (func $log (param i32 i32) (result i32)))
+  (import "vikram" "read_resource" (func $read (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 512) "plugin://data.txt   ")
+  (data (i32.const 536) "data.txt            ")
+  (data (i32.const 560) "../escape.txt       ")
+  (data (i32.const 584) "missing.txt         ")
+  (data (i32.const 608) "big.txt             ")
+  (data (i32.const 632) "unused              ")
+  (data (i32.const 656) "data.txt            ")
+  (data (i32.const 680) "link.txt            ")
+  (data (i32.const 720) "{\"ok\":true}")
+  (data (i32.const 740) "{\"code\":-1}")
+  (data (i32.const 760) "{\"code\":-2}")
+  (data (i32.const 780) "{\"code\":-3}")
+  (data (i32.const 800) "{\"code\":-4}")
+  (data (i32.const 820) "{\"code\":-5}")
+  (data (i32.const 840) "{\"ok\":false}")
+  (global $heap (mut i32) (i32.const 4096))
+  (func $uri_ptr (param $sel i32) (result i32)
+    (if (result i32)
+      (i32.eq (local.get $sel) (i32.const 102))
+      (then (i32.const 999999))
+      (else
+        (i32.add (i32.const 512)
+          (i32.mul (i32.sub (local.get $sel) (i32.const 97)) (i32.const 24))))))
+  (func $out_cap (param $sel i32) (result i32)
+    (if (result i32)
+      (i32.eq (local.get $sel) (i32.const 103))
+      (then (i32.const 4))
+      (else (i32.const 8192))))
+  (func $pack (param $p i32) (param $l i32) (result i64)
+    (i64.add
+      (i64.shl (i64.extend_i32_u (local.get $p)) (i64.const 32))
+      (i64.extend_i32_u (local.get $l))))
+  (func $pack_reply (param $n i32) (result i64)
+    (if (result i64) (i32.eq (local.get $n) (i32.const -1))
+      (then (call $pack (i32.const 740) (i32.const 11)))
+      (else
+        (if (result i64) (i32.eq (local.get $n) (i32.const -2))
+          (then (call $pack (i32.const 760) (i32.const 11)))
+          (else
+            (if (result i64) (i32.eq (local.get $n) (i32.const -3))
+              (then (call $pack (i32.const 780) (i32.const 11)))
+              (else
+                (if (result i64) (i32.eq (local.get $n) (i32.const -4))
+                  (then (call $pack (i32.const 800) (i32.const 11)))
+                  (else
+                    (if (result i64) (i32.eq (local.get $n) (i32.const -5))
+                      (then (call $pack (i32.const 820) (i32.const 11)))
+                      (else (call $pack (i32.const 840) (i32.const 12)))))))))))))
+  (func (export "alloc") (param $size i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (local.get $size)))
+    (local.get $ptr))
+  (func (export "dealloc") (param i32 i32))
+  (func (export "handle") (param $ptr i32) (param $len i32) (result i64)
+    (local $sel i32) (local $n i32)
+    (local.set $sel (i32.load8_u (i32.add (local.get $ptr) (i32.const 1))))
+    (local.set $n (call $read
+      (call $uri_ptr (local.get $sel))
+      (i32.const 20)
+      (i32.const 8192)
+      (call $out_cap (local.get $sel))))
+    (if (result i64)
+      (i32.gt_s (local.get $n) (i32.const 0))
+      (then
+        (drop (call $log (i32.const 8192) (local.get $n)))
+        (call $pack (i32.const 720) (i32.const 11)))
+      (else (call $pack_reply (local.get $n))))))
+"#;
+
+    const READ_OK_WAT: &str = r#"(module
+  (import "vikram" "log" (func $log (param i32 i32) (result i32)))
+  (import "vikram" "read_resource" (func $read (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 512) "plugin://data.txt")
+  (data (i32.const 560) "data.txt")
+  (data (i32.const 600) "{\"ok\":true}")
+  (global $heap (mut i32) (i32.const 4096))
+  (func (export "alloc") (param $size i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (local.get $size)))
+    (local.get $ptr))
+  (func (export "dealloc") (param i32 i32))
+  (func (export "handle") (param $ptr i32) (param $len i32) (result i64)
+    (local $n i32)
+    (local.set $n (call $read (i32.const 512) (i32.const 17) (i32.const 8192) (i32.const 8192)))
+    (if (i32.gt_s (local.get $n) (i32.const 0))
+      (then (drop (call $log (i32.const 8192) (local.get $n)))))
+    (local.set $n (call $read (i32.const 560) (i32.const 8) (i32.const 8192) (i32.const 8192)))
+    (if (i32.gt_s (local.get $n) (i32.const 0))
+      (then (drop (call $log (i32.const 8192) (local.get $n)))))
+    (i64.add
+      (i64.shl (i64.extend_i32_u (i32.const 600)) (i64.const 32))
+      (i64.extend_i32_u (i32.const 11)))))
+"#;
+
+    fn resource_plugin(wat: &str) -> (tempfile::TempDir, WasmPlugin) {
+        let (dir, plugin) = plugin_dir(wat);
+        std::fs::write(dir.path().join("data.txt"), b"res\xffource\n").unwrap();
+        std::fs::write(dir.path().join("big.txt"), vec![b'x'; 128 * 1024]).unwrap();
+        (dir, plugin)
+    }
+
+    #[test]
+    fn read_resource_serves_files_inside_plugin_dir() {
+        let (_dir, plugin) = resource_plugin(READ_OK_WAT);
+        let reply = plugin.request(&json!("a")).unwrap();
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+        assert_eq!(
+            reply["_logs"],
+            json!(["res\u{fffd}ource", "res\u{fffd}ource"]),
+            "{reply}"
+        );
+    }
+
+    #[test]
+    fn read_resource_accepts_bare_relative_paths() {
+        let (_dir, plugin) = resource_plugin(READ_WAT);
+        let reply = plugin.request(&json!("b")).unwrap();
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+        assert_eq!(reply["_logs"], json!(["res\u{fffd}ource"]), "{reply}");
+    }
+
+    #[test]
+    fn read_resource_refuses_paths_outside_plugin_dir() {
+        let (_dir, plugin) = resource_plugin(READ_WAT);
+        assert_eq!(plugin.request(&json!("c")).unwrap(), json!({"code": -2}));
+    }
+
+    #[test]
+    fn read_resource_reports_not_found_too_big_and_bad_args() {
+        let (_dir, plugin) = resource_plugin(READ_WAT);
+        assert_eq!(plugin.request(&json!("d")).unwrap(), json!({"code": -1}));
+        assert_eq!(plugin.request(&json!("e")).unwrap(), json!({"code": -3}));
+        assert_eq!(plugin.request(&json!("f")).unwrap(), json!({"code": -5}));
+        assert_eq!(plugin.request(&json!("g")).unwrap(), json!({"code": -3}));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_resource_refuses_symlink_escape() {
+        let (dir, plugin) = resource_plugin(READ_WAT);
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), b"secret").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            dir.path().join("link.txt"),
+        )
+        .unwrap();
+        assert_eq!(plugin.request(&json!("h")).unwrap(), json!({"code": -2}));
     }
 
     const FOREIGN_IMPORT_WAT: &str = r#"(module
