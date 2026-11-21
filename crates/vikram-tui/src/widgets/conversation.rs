@@ -23,7 +23,7 @@ use crate::app::{
     ThoughtKey,
 };
 use crate::theme::Theme;
-use crate::widgets::{indent, markdown, payload};
+use crate::widgets::{image, indent, markdown, payload};
 
 /// A tool result longer than this is elided: the transcript is a summary, not a log file.
 const TOOL_LINE_CAP: usize = 12;
@@ -473,16 +473,7 @@ fn push_user(
                 };
                 push_message_body(lines, content, width, theme, Some(style));
             }
-            Block::Image { source, .. } => {
-                lines.push(Line::styled(
-                    format!(
-                        "{}[image: {}]",
-                        indent::row_prefix(indent::TURN),
-                        image_label(source)
-                    ),
-                    theme.muted(),
-                ));
-            }
+            Block::Image { source, .. } => lines.push(image::line(source, theme)),
         }
     }
     lines.push(separator_line(width, theme));
@@ -625,16 +616,7 @@ fn push_blocks(
                     );
                 }
             }
-            Block::Image { source, .. } => {
-                lines.push(Line::styled(
-                    format!(
-                        "{}[image: {}]",
-                        indent::row_prefix(indent::TURN),
-                        image_label(source)
-                    ),
-                    theme.muted(),
-                ));
-            }
+            Block::Image { source, .. } => lines.push(image::line(source, theme)),
         }
     }
 }
@@ -993,16 +975,7 @@ fn push_system(
                     );
                 }
             }
-            Block::Image { source, .. } => {
-                lines.push(Line::styled(
-                    format!(
-                        "{}[image: {}]",
-                        indent::row_prefix(indent::TURN),
-                        image_label(source)
-                    ),
-                    theme.muted(),
-                ));
-            }
+            Block::Image { source, .. } => lines.push(image::line(source, theme)),
         }
     }
 }
@@ -1038,16 +1011,7 @@ fn push_tool(
                     push_message_body(lines, text, width, theme, Some(theme.muted()));
                 }
             }
-            Block::Image { source, .. } => {
-                lines.push(Line::styled(
-                    format!(
-                        "{}[image: {}]",
-                        indent::row_prefix(indent::TURN),
-                        image_label(source)
-                    ),
-                    theme.muted(),
-                ));
-            }
+            Block::Image { source, .. } => lines.push(image::line(source, theme)),
             Block::ToolCall { call } => {
                 let label = tool_label(call, theme);
                 lines.push(Line::from(vec![
@@ -1713,19 +1677,6 @@ fn push_message_body(
     };
     for line in body {
         lines.push(indent_line(line, &prefix));
-    }
-}
-
-/// A short, safe label for an image block; the bytes are never rendered in a terminal.
-fn image_label(source: &vikram_contracts::ImageSource) -> String {
-    match source {
-        vikram_contracts::ImageSource::Url { url } => url
-            .rsplit('/')
-            .next()
-            .filter(|part| !part.is_empty())
-            .unwrap_or("linked image")
-            .to_string(),
-        vikram_contracts::ImageSource::Data { media_type, .. } => media_type.clone(),
     }
 }
 
@@ -3475,5 +3426,35 @@ mod tests {
             all.contains("first answer") && all.contains("second answer"),
             "a fold hides the work, never the answer: {all}"
         );
+    }
+
+    #[test]
+    fn image_blocks_render_as_honest_placeholders() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::widgets::image::HOME_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("VIKRAM_HOME", home.path()) };
+        let app = App::new(false);
+        let mut session = sample_session();
+        session.messages.push(Message::user_with_images(
+            "look at these",
+            vec![
+                vikram_contracts::ImageSource::url("https://example.test/shot.png"),
+                vikram_contracts::ImageSource::data("image/png", "UE5HAAAA"),
+                vikram_contracts::ImageSource::data("image/jpeg", "SlBFRwAA"),
+            ],
+        ));
+        session.turn = TurnState::Idle;
+        let theme = Theme::new(false);
+        let all = transcript(&shown(&app, &mut session, 78, &theme)).join("\n");
+
+        assert!(all.contains("look at these"), "text is unchanged: {all}");
+        assert_eq!(
+            all.matches("[image:").count(),
+            3,
+            "one row per image block: {all}"
+        );
+        assert!(all.contains("shot.png"), "got {all}");
+        assert!(all.contains("image/png"), "got {all}");
+        assert!(all.contains("image/jpeg"), "got {all}");
     }
 }

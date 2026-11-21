@@ -2,6 +2,7 @@
 //! be asserted against a `TestBackend` buffer without a terminal.
 
 pub mod conversation;
+pub mod image;
 pub mod indent;
 pub mod markdown;
 pub mod panels;
