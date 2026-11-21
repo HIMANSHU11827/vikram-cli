@@ -9,6 +9,10 @@ sessions, delegates work to bots and agent teams, answers from your own machines
 and runs scheduled jobs while you're away. It is honest by design — it reports what it actually
 did, asks before it acts, and never claims a success it didn't earn.
 
+**Target class: JARVIS.** What that means, and how it differs from an LLM, a chatbot, an agent or
+an Alexa-class assistant, is defined in [`docs/jarvis-class.md`](docs/jarvis-class.md) — including
+what is still missing.
+
 [![Rust](https://img.shields.io/badge/rust-1.89%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![Edition](https://img.shields.io/badge/edition-2024-blue)]()
 [![Status](https://img.shields.io/badge/status-pre--release-yellow)]()

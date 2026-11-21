@@ -203,7 +203,9 @@ impl MemoryStore {
         let conn = self.lock();
         let existing: Option<String> = conn
             .query_row(
-                "SELECT id FROM memory WHERE key = ?1 AND scope = ?2",
+                "SELECT id FROM memory WHERE key = ?1 AND scope = ?2
+                 ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END, updated_ms DESC
+                 LIMIT 1",
                 params![key, scope],
                 |row| row.get(0),
             )
@@ -212,7 +214,7 @@ impl MemoryStore {
 
         let id = if let Some(id) = existing {
             conn.execute(
-                "UPDATE memory SET value = ?1, updated_ms = ?2, importance = ?3, embedding = ?4 WHERE id = ?5",
+                "UPDATE memory SET value = ?1, updated_ms = ?2, importance = ?3, embedding = ?4, status = 'active', superseded_by = NULL WHERE id = ?5",
                 params![value, now, importance, embedding_blob.as_deref(), id],
             )
             .map_err(|e| RuntimeError::Store(e.to_string()))?;
@@ -220,8 +222,8 @@ impl MemoryStore {
         } else {
             let id = format!("{scope}\u{1f}{key}");
             conn.execute(
-                "INSERT INTO memory (id, key, value, scope, created_ms, updated_ms, importance, embedding)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO memory (id, key, value, scope, created_ms, updated_ms, importance, embedding, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active')",
                 params![id, key, value, scope, now, now, importance, embedding_blob.as_deref()],
             )
             .map_err(|e| RuntimeError::Store(e.to_string()))?;
@@ -255,7 +257,7 @@ impl MemoryStore {
         let scope = scope.as_ref();
         let conn = self.lock();
         conn.query_row(
-            "SELECT value FROM memory WHERE key = ?1 AND scope = ?2",
+            "SELECT value FROM memory WHERE key = ?1 AND scope = ?2 AND status = 'active'",
             params![key, scope],
             |row| row.get(0),
         )
@@ -272,7 +274,7 @@ impl MemoryStore {
         let scope = scope.as_ref();
         let conn = self.lock();
         let mut stmt = conn
-            .prepare("SELECT key, value FROM memory WHERE scope = ?1 ORDER BY key ASC")
+            .prepare("SELECT key, value FROM memory WHERE scope = ?1 AND status = 'active' ORDER BY key ASC")
             .map_err(|e| RuntimeError::Store(e.to_string()))?;
         let mut rows = stmt
             .query_map(params![scope], |row| {
@@ -399,7 +401,7 @@ impl MemoryStore {
             .join(" OR ");
         let sql = format!(
             "SELECT id, scope, key, value, updated_ms, COALESCE(importance, 0.5), embedding \
-             FROM memory WHERE scope IN ({scope_placeholders}) AND ({clauses}) \
+             FROM memory WHERE scope IN ({scope_placeholders}) AND status = 'active' AND ({clauses}) \
              ORDER BY updated_ms DESC LIMIT 500"
         );
         let mut stmt = conn
@@ -513,7 +515,7 @@ impl MemoryStore {
     pub fn list_all(&self) -> Result<Vec<(String, String, String)>> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare("SELECT scope, key, value FROM memory ORDER BY scope ASC, key ASC")
+            .prepare("SELECT scope, key, value FROM memory WHERE status = 'active' ORDER BY scope ASC, key ASC")
             .map_err(|e| RuntimeError::Store(e.to_string()))?;
         let rows = stmt
             .query_map([], |row| {
@@ -539,7 +541,7 @@ impl MemoryStore {
         let scope = scope.as_ref();
         let conn = self.lock();
         let mut stmt = conn
-            .prepare("SELECT key, value FROM memory WHERE scope = ?1 ORDER BY key ASC")
+            .prepare("SELECT key, value FROM memory WHERE scope = ?1 AND status = 'active' ORDER BY key ASC")
             .map_err(|e| RuntimeError::Store(e.to_string()))?;
         let mut rows = stmt
             .query_map(params![scope], |row| {
@@ -574,7 +576,7 @@ impl MemoryStore {
         let scope = scope.as_ref();
         let conn = self.lock();
         conn.query_row(
-            "SELECT COUNT(*) FROM memory WHERE scope = ?1",
+            "SELECT COUNT(*) FROM memory WHERE scope = ?1 AND status = 'active'",
             params![scope],
             |row| row.get::<_, i64>(0),
         )
@@ -585,11 +587,180 @@ impl MemoryStore {
     /// Total number of entries across all scopes.
     pub fn total_count(&self) -> Result<usize> {
         let conn = self.lock();
-        conn.query_row("SELECT COUNT(*) FROM memory", [], |row| {
-            row.get::<_, i64>(0)
-        })
+        conn.query_row(
+            "SELECT COUNT(*) FROM memory WHERE status = 'active'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
         .map(|n| n as usize)
         .map_err(|e| RuntimeError::Store(e.to_string()))
+    }
+
+    /// Consolidate the `memory` table: collapse duplicate rows, supersede
+    /// contradictory values for the same `(scope, key)`, and expire stale
+    /// low-importance entries.
+    ///
+    /// The `memory` table is a current-state key/value store — `save` already
+    /// upserts by `(scope, key)`, so duplicate `(scope, key)` rows only appear
+    /// through legacy data or foreign writers. Within such a group:
+    ///
+    /// - Rows whose values match after normalization keep the winner
+    ///   (highest `importance`, then newest `updated_ms`); losers are deleted
+    ///   outright — they carry no information the winner doesn't.
+    /// - Rows with genuinely different values are a contradiction: the winner
+    ///   stays `active`, losers become `status = 'superseded'` with a
+    ///   `superseded_by` pointer, exactly like the observation lifecycle in
+    ///   `consolidation.rs`. Nothing is deleted, so the history stays auditable.
+    /// - Active rows older than [`MEMORY_MAX_AGE_MS`] whose importance-decayed
+    ///   score falls below [`MEMORY_MIN_KEEP_SCORE`] become `expired`.
+    ///
+    /// Non-active rows are removed from `memory_fts` so recall never surfaces
+    /// them, and every read path (`get`, `list`, `search`, `recall_terms`,
+    /// counts) already filters on `status = 'active'`. Re-saving a key revives
+    /// its row to `active`. Idempotent: a second run reports all zeros.
+    pub fn consolidate(&self) -> Result<MemoryConsolidationReport> {
+        let mut report = MemoryConsolidationReport::default();
+        let now = now_ms() as i64;
+        let mut conn = self.lock();
+
+        struct Row {
+            id: String,
+            scope: String,
+            key: String,
+            value: String,
+            importance: f64,
+            updated_ms: i64,
+            status: String,
+        }
+        let rows: Vec<Row> = {
+            let mut stmt = conn
+                .prepare("SELECT id, scope, key, value, importance, updated_ms, status FROM memory")
+                .map_err(|e| RuntimeError::Store(e.to_string()))?;
+            let mapped = stmt
+                .query_map([], |r| {
+                    Ok(Row {
+                        id: r.get(0)?,
+                        scope: r.get(1)?,
+                        key: r.get(2)?,
+                        value: r.get(3)?,
+                        importance: r.get::<_, f64>(4)?,
+                        updated_ms: r.get(5)?,
+                        status: r.get(6)?,
+                    })
+                })
+                .map_err(|e| RuntimeError::Store(e.to_string()))?;
+            mapped
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| RuntimeError::Store(e.to_string()))?
+        };
+        report.examined = rows.len();
+
+        // Winner ordering shared by dedup and contradiction resolution:
+        // more important first, then more recently written.
+        let cmp_rows = |a: usize, b: usize| {
+            rows[a]
+                .importance
+                .partial_cmp(&rows[b].importance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(rows[a].updated_ms.cmp(&rows[b].updated_ms))
+        };
+
+        // Group candidate (active) rows by (scope, key); already-retired rows
+        // are left untouched and never re-enter candidacy.
+        let mut groups: HashMap<(String, String), Vec<usize>> = HashMap::new();
+        for (i, row) in rows.iter().enumerate() {
+            if row.status == "active" {
+                groups
+                    .entry((row.scope.clone(), row.key.clone()))
+                    .or_default()
+                    .push(i);
+            }
+        }
+
+        let mut supersede: Vec<(String, String)> = Vec::new(); // (loser id, winner id)
+        let mut delete_ids: Vec<String> = Vec::new();
+
+        for idxs in groups.values() {
+            if idxs.len() < 2 {
+                continue;
+            }
+            // Dedup first: cluster by normalized value, keep one winner per
+            // cluster, delete the rest (identical information, no lineage).
+            let mut by_value: HashMap<String, Vec<usize>> = HashMap::new();
+            for &i in idxs {
+                by_value
+                    .entry(normalize_memory_value(&rows[i].value))
+                    .or_default()
+                    .push(i);
+            }
+            let mut survivors: Vec<usize> = Vec::new();
+            for cluster in by_value.values() {
+                let winner = *cluster.iter().max_by(|&&a, &&b| cmp_rows(a, b)).unwrap();
+                survivors.push(winner);
+                for &i in cluster {
+                    if i != winner {
+                        delete_ids.push(rows[i].id.clone());
+                        report.duplicates_removed += 1;
+                    }
+                }
+            }
+            // Contradiction: more than one distinct value survived dedup.
+            if survivors.len() < 2 {
+                continue;
+            }
+            report.contradictions += 1;
+            let winner = *survivors.iter().max_by(|&&a, &&b| cmp_rows(a, b)).unwrap();
+            let winner_id = rows[winner].id.clone();
+            for &i in &survivors {
+                if i != winner {
+                    supersede.push((rows[i].id.clone(), winner_id.clone()));
+                    report.superseded += 1;
+                }
+            }
+        }
+
+        // Aging: expire active rows that are old and unimportant.
+        let mut expire_ids: Vec<String> = Vec::new();
+        for row in &rows {
+            if row.status != "active" {
+                continue;
+            }
+            let age_ms = (now - row.updated_ms).max(0) as u64;
+            if age_ms > MEMORY_MAX_AGE_MS
+                && memory_keep_score(row.importance, age_ms) < MEMORY_MIN_KEEP_SCORE
+            {
+                expire_ids.push(row.id.clone());
+                report.expired += 1;
+            }
+        }
+
+        let tx = conn
+            .transaction()
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        for id in &delete_ids {
+            tx.execute("DELETE FROM memory WHERE id = ?1", params![id])
+                .map_err(|e| RuntimeError::Store(e.to_string()))?;
+            let _ = tx.execute("DELETE FROM memory_fts WHERE id = ?1", params![id]);
+        }
+        for (loser, winner) in &supersede {
+            tx.execute(
+                "UPDATE memory SET status = 'superseded', superseded_by = ?1 WHERE id = ?2",
+                params![winner, loser],
+            )
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+            let _ = tx.execute("DELETE FROM memory_fts WHERE id = ?1", params![loser]);
+        }
+        for id in &expire_ids {
+            tx.execute(
+                "UPDATE memory SET status = 'expired' WHERE id = ?1",
+                params![id],
+            )
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+            let _ = tx.execute("DELETE FROM memory_fts WHERE id = ?1", params![id]);
+        }
+        tx.commit()
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        Ok(report)
     }
 }
 
@@ -697,7 +868,7 @@ fn fts_or_like_scores(conn: &Connection, terms: &[String]) -> Result<HashMap<Str
     // corpus where the FTS index was never backfilled).
     let store_err = |e: rusqlite::Error| RuntimeError::Store(e.to_string());
     let mut stmt = conn
-        .prepare("SELECT id, key, value FROM memory")
+        .prepare("SELECT id, key, value FROM memory WHERE status = 'active'")
         .map_err(store_err)?;
     let rows: Vec<(String, String, String)> = stmt
         .query_map([], |r| {
@@ -745,6 +916,45 @@ fn escape_like(term: &str) -> String {
 
 fn clamp01(v: f64) -> f64 {
     if v.is_nan() { 0.5 } else { v.clamp(0.0, 1.0) }
+}
+
+/// Rows older than this are candidates for expiration during consolidation.
+const MEMORY_MAX_AGE_MS: u64 = 90 * 24 * 3_600_000;
+/// Keep-score floor for expiration, mirroring `ConsolidationPolicy::min_keep_score`.
+const MEMORY_MIN_KEEP_SCORE: f64 = 0.05;
+/// Half-life for the recency factor in `memory_keep_score`.
+const MEMORY_HALF_LIFE_MS: u64 = 30 * 24 * 3_600_000;
+
+/// What [`MemoryStore::consolidate`] changed. Counts are per-run; a clean store
+/// reports all zeros, which also makes the method idempotent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryConsolidationReport {
+    /// Total rows inspected (active and already-retired).
+    pub examined: usize,
+    /// Exact-duplicate rows deleted (same scope, key, normalized value).
+    pub duplicates_removed: usize,
+    /// `(scope, key)` groups that held genuinely different values.
+    pub contradictions: usize,
+    /// Rows marked `superseded` by a contradiction winner.
+    pub superseded: usize,
+    /// Rows marked `expired` for age + low importance.
+    pub expired: usize,
+}
+
+/// Normalized-value comparison for dedup: case- and whitespace-insensitive,
+/// matching `consolidation::normalize`.
+fn normalize_memory_value(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Importance decayed by age — the memory-table analogue of the observation
+/// score's importance*recency factors (no confidence/access columns exist here).
+fn memory_keep_score(importance: f64, age_ms: u64) -> f64 {
+    let decay = 0.5_f64.powf(age_ms as f64 / MEMORY_HALF_LIFE_MS as f64);
+    clamp01(importance) * decay
 }
 
 fn embed_to_bytes(v: &[f32]) -> Vec<u8> {
@@ -875,6 +1085,11 @@ fn migrate(conn: &Connection) -> Result<()> {
     // one is checked against the live schema instead of being folded into the batch above.
     ensure_column(conn, "memory", "importance", "REAL NOT NULL DEFAULT 0.5")?;
     ensure_column(conn, "memory", "embedding", "BLOB")?;
+    // Consolidation lineage: `active` rows are the only ones recall/list/get see;
+    // `superseded`/`expired` rows are retained for provenance, mirroring the
+    // observation lifecycle in `consolidation.rs`.
+    ensure_column(conn, "memory", "status", "TEXT NOT NULL DEFAULT 'active'")?;
+    ensure_column(conn, "memory", "superseded_by", "TEXT")?;
     // Backfill the FTS5 index for rows that predate it (idempotent; no-op when already indexed).
     let _ = conn.execute_batch(
         "INSERT INTO memory_fts(id, key, value)
@@ -1581,6 +1796,294 @@ mod tests {
         assert!(
             hits.iter().all(|(s, _, _)| s != "project:p1"),
             "a cleared binding recalls nothing shared: {hits:?}"
+        );
+    }
+
+    // ---- memory-table consolidation --------------------------------------
+
+    /// Insert a row bypassing `save` so tests can build the duplicate
+    /// `(scope, key)` groups that only legacy/foreign writers produce — `save`
+    /// itself upserts by the deterministic `{scope}\u{1f}{key}` id.
+    fn insert_raw_memory(
+        store: &MemoryStore,
+        id: &str,
+        scope: &str,
+        key: &str,
+        value: &str,
+        importance: f64,
+        updated_ms: i64,
+    ) {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO memory (id, key, value, scope, created_ms, updated_ms, importance, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, 'active')",
+            rusqlite::params![id, key, value, scope, updated_ms, importance],
+        )
+        .unwrap();
+        let _ = conn.execute(
+            "INSERT INTO memory_fts(id, key, value) VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, key, value],
+        );
+    }
+
+    fn status_of(store: &MemoryStore, id: &str) -> Option<String> {
+        store
+            .lock()
+            .query_row(
+                "SELECT status FROM memory WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    #[test]
+    fn consolidate_collapses_duplicate_rows_for_one_key() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let now = now_ms() as i64;
+        insert_raw_memory(
+            &store,
+            "global\u{1f}dup",
+            "global",
+            "dup",
+            "Same Value",
+            0.4,
+            now - 1000,
+        );
+        insert_raw_memory(
+            &store,
+            "global\u{1f}dup#legacy",
+            "global",
+            "dup",
+            "  same   value ",
+            0.9,
+            now,
+        );
+
+        let report = store.consolidate().unwrap();
+        assert_eq!(report.duplicates_removed, 1);
+        assert_eq!(report.contradictions, 0);
+        assert_eq!(store.count("global").unwrap(), 1);
+        // The higher-importance row wins and keeps its raw (un-normalized) value.
+        assert_eq!(
+            store.get("dup", "global").unwrap(),
+            Some("  same   value ".to_string())
+        );
+        assert_eq!(status_of(&store, "global\u{1f}dup"), None, "loser deleted");
+        assert_eq!(
+            status_of(&store, "global\u{1f}dup#legacy"),
+            Some("active".to_string())
+        );
+    }
+
+    #[test]
+    fn consolidate_supersedes_the_older_side_of_a_contradiction() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let now = now_ms() as i64;
+        insert_raw_memory(
+            &store,
+            "global\u{1f}conflict#a",
+            "global",
+            "conflict",
+            "editor uses tabs",
+            0.3,
+            now - 5000,
+        );
+        insert_raw_memory(
+            &store,
+            "global\u{1f}conflict#b",
+            "global",
+            "conflict",
+            "editor uses spaces",
+            0.8,
+            now,
+        );
+
+        let report = store.consolidate().unwrap();
+        assert_eq!(report.contradictions, 1);
+        assert_eq!(report.superseded, 1);
+        assert_eq!(report.duplicates_removed, 0);
+
+        // The important/newer value is what recall and get now see.
+        assert_eq!(
+            store.get("conflict", "global").unwrap(),
+            Some("editor uses spaces".to_string())
+        );
+        assert_eq!(
+            status_of(&store, "global\u{1f}conflict#a"),
+            Some("superseded".to_string())
+        );
+        let superseded_by: Option<String> = store
+            .lock()
+            .query_row(
+                "SELECT superseded_by FROM memory WHERE id = ?1",
+                rusqlite::params!["global\u{1f}conflict#a"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            superseded_by.as_deref(),
+            Some("global\u{1f}conflict#b"),
+            "honest lineage pointer to the winner"
+        );
+        // The loser is retained for provenance, not deleted.
+        assert_eq!(store.total_count().unwrap(), 1);
+        let raw_rows: i64 = store
+            .lock()
+            .query_row("SELECT COUNT(*) FROM memory", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw_rows, 2, "superseded row stays in the table");
+    }
+
+    #[test]
+    fn consolidate_never_merges_across_scopes() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store.save("k", "global value", "global").unwrap();
+        store.save("k", "session value", "session-1").unwrap();
+
+        let report = store.consolidate().unwrap();
+        assert_eq!(report.contradictions, 0);
+        assert_eq!(report.superseded, 0);
+        assert_eq!(report.duplicates_removed, 0);
+        assert_eq!(
+            store.get("k", "global").unwrap(),
+            Some("global value".to_string())
+        );
+        assert_eq!(
+            store.get("k", "session-1").unwrap(),
+            Some("session value".to_string())
+        );
+    }
+
+    #[test]
+    fn consolidate_is_idempotent() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let now = now_ms() as i64;
+        insert_raw_memory(&store, "s\u{1f}k#1", "s", "k", "alpha", 0.5, now);
+        insert_raw_memory(&store, "s\u{1f}k#2", "s", "k", "beta", 0.5, now);
+        insert_raw_memory(&store, "s\u{1f}k#3", "s", "k", "beta ", 0.5, now);
+
+        let first = store.consolidate().unwrap();
+        assert!(first.contradictions >= 1 || first.duplicates_removed >= 1);
+        let second = store.consolidate().unwrap();
+        assert_eq!(second.duplicates_removed, 0);
+        assert_eq!(second.contradictions, 0);
+        assert_eq!(second.superseded, 0);
+        assert_eq!(second.expired, 0);
+    }
+
+    #[test]
+    fn recall_reflects_the_post_consolidation_state() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let now = now_ms() as i64;
+        insert_raw_memory(
+            &store,
+            "g\u{1f}pref#a",
+            "g",
+            "pref",
+            "uses tabs for indentation",
+            0.9,
+            now,
+        );
+        insert_raw_memory(
+            &store,
+            "g\u{1f}pref#b",
+            "g",
+            "pref",
+            "uses spaces for indentation",
+            0.2,
+            now - 10_000,
+        );
+        store.consolidate().unwrap();
+
+        let tabs = store
+            .recall_terms(&["tabs".to_string()], &["g".to_string()], 8)
+            .unwrap();
+        assert_eq!(tabs.len(), 1, "only the surviving value recalls");
+        assert_eq!(tabs[0].2, "uses tabs for indentation");
+        let spaces = store
+            .recall_terms(&["spaces".to_string()], &["g".to_string()], 8)
+            .unwrap();
+        assert!(
+            spaces.is_empty(),
+            "the superseded value must not surface through recall: {spaces:?}"
+        );
+    }
+
+    #[test]
+    fn consolidate_expires_old_low_importance_rows() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let now = now_ms() as i64;
+        let ancient = now - (MEMORY_MAX_AGE_MS as i64) - 3_600_000;
+        insert_raw_memory(
+            &store,
+            "old\u{1f}trivial",
+            "old",
+            "trivial",
+            "meh",
+            0.0,
+            ancient,
+        );
+        insert_raw_memory(
+            &store,
+            "old\u{1f}key",
+            "old",
+            "key",
+            "keep me",
+            0.9,
+            ancient,
+        );
+
+        let report = store.consolidate().unwrap();
+        assert_eq!(report.expired, 1);
+        assert_eq!(store.get("trivial", "old").unwrap(), None);
+        assert_eq!(
+            store.get("key", "old").unwrap(),
+            Some("keep me".to_string()),
+            "high importance survives aging"
+        );
+        assert_eq!(
+            status_of(&store, "old\u{1f}trivial"),
+            Some("expired".to_string())
+        );
+    }
+
+    #[test]
+    fn resaving_a_superseded_key_revives_it() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let now = now_ms() as i64;
+        insert_raw_memory(
+            &store,
+            "g\u{1f}k#old",
+            "g",
+            "k",
+            "stale value",
+            0.1,
+            now - 1000,
+        );
+        insert_raw_memory(&store, "g\u{1f}k#new", "g", "k", "fresh value", 0.9, now);
+        store.consolidate().unwrap();
+        assert_eq!(
+            store.get("k", "g").unwrap(),
+            Some("fresh value".to_string())
+        );
+
+        // A later save updates whichever row the (key, scope) lookup finds and
+        // flips it back to active — consolidation never bricks a key.
+        store.save("k", "revised value", "g").unwrap();
+        let active: i64 = store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM memory WHERE scope = 'g' AND key = 'k' AND status = 'active'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 1);
+        assert_eq!(
+            store.get("k", "g").unwrap(),
+            Some("revised value".to_string())
         );
     }
 }

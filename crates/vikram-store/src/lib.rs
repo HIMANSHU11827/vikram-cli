@@ -1139,11 +1139,66 @@ impl Store {
     /// Every session whose journal ends mid-work: tool calls recorded but never answered.
     /// Sessions whose last operation was a tool result, or whose journal is empty, are not
     /// interrupted and are not returned.
+    ///
+    /// The candidate scan is SQL over `journal.kind`/`payload` — a session is a candidate when
+    /// a `tool_call` record's `call` id has no matching `tool_result` (top-level `call`, or a
+    /// `tool_result` block inside a journaled `message`). Only candidates are replayed, so a
+    /// store with no pending work never materializes a journal; the replay below remains the
+    /// authority on the exact pending set.
     pub fn list_interrupted_sessions(&self) -> Result<Vec<InterruptedSession>> {
         let ids: Vec<SessionId> = {
             let conn = self.lock();
             let mut stmt = conn.prepare(
-                "SELECT id FROM sessions WHERE status = 'active' ORDER BY created_ms ASC",
+                "WITH calls AS (
+                    SELECT c.session AS session, json_extract(c.payload, '$.call') AS call
+                    FROM journal c
+                    JOIN sessions s ON s.id = c.session AND s.status = 'active'
+                    WHERE c.kind = 'tool_call'
+                      AND CASE WHEN json_valid(c.payload)
+                               THEN CASE WHEN json_type(c.payload, '$.call') = 'text' THEN 1 ELSE 0 END
+                               ELSE 0 END = 1
+                 ),
+                 answers AS (
+                    SELECT a.session AS session, json_extract(a.payload, '$.call') AS call
+                    FROM journal a
+                    JOIN sessions s ON s.id = a.session AND s.status = 'active'
+                    WHERE a.kind = 'tool_result'
+                      AND CASE WHEN json_valid(a.payload)
+                               THEN CASE WHEN json_type(a.payload, '$.call') = 'text' THEN 1 ELSE 0 END
+                               ELSE 0 END = 1
+                    UNION
+                    SELECT a.session AS session,
+                           CASE WHEN b.type = 'object' THEN json_extract(b.value, '$.call') END AS call
+                    FROM journal a
+                    JOIN sessions s ON s.id = a.session AND s.status = 'active',
+                         json_each(
+                             CASE WHEN json_valid(a.payload)
+                                  THEN CASE WHEN json_type(a.payload, '$.message.blocks') = 'array'
+                                            THEN a.payload ELSE '{}' END
+                                  ELSE '{}' END,
+                             '$.message.blocks'
+                         ) AS b
+                    WHERE a.kind = 'tool_result'
+                      AND CASE WHEN json_valid(a.payload)
+                               THEN json_extract(a.payload, '$.message.role')
+                               END IN ('system', 'user', 'assistant', 'tool')
+                      AND CASE WHEN b.type = 'object'
+                               THEN CASE WHEN json_extract(b.value, '$.type') = 'tool_result'
+                                         THEN CASE WHEN json_type(b.value, '$.call') = 'text' THEN 1 ELSE 0 END
+                                         ELSE 0 END
+                               ELSE 0 END = 1
+                 ),
+                 pending AS (
+                    SELECT DISTINCT c.session AS session
+                    FROM calls c
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM answers a
+                        WHERE a.session = c.session AND a.call = c.call
+                    )
+                 )
+                 SELECT s.id FROM sessions s
+                 JOIN pending p ON p.session = s.id
+                 ORDER BY s.created_ms ASC",
             )?;
             let rows = stmt.query_map([], |r| Ok(SessionId::new(r.get::<_, String>(0)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -4109,6 +4164,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE UNIQUE INDEX IF NOT EXISTS journal_effect
             ON journal(session, effect) WHERE effect IS NOT NULL;
 
+        -- Interrupted-session detection scans only tool_call/tool_result rows across every
+        -- session; without this it would read every journal payload just to skip them.
+        CREATE INDEX IF NOT EXISTS journal_kind_session
+            ON journal(kind, session);
+
         -- Deep-prune authorization: the journal seq up to which a compaction marker's
         -- summary covers the prefix. A row is written only after the marker commits, so
         -- its presence implies the marker exists; `prune_journal` deletes seq <= this.
@@ -5922,5 +5982,78 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let report = store.prune_journal(1_000_000, RETENTION_MS).unwrap();
         assert_eq!(report, JournalPruneReport::default());
+    }
+
+    #[test]
+    fn interrupted_detection_only_flags_sessions_with_unanswered_calls() {
+        let store = Store::open_in_memory().unwrap();
+
+        // Answered through a journaled `message` block only: the tool_result record carries no
+        // top-level `call`, so the candidate scan must look inside `message.blocks` too.
+        let answered = store
+            .create_session("Answered", Path::new("/work"), None, 1)
+            .unwrap();
+        let done = vikram_contracts::ToolCallId::new("call-done-1");
+        store
+            .journal()
+            .append(&NewRecord::new(
+                answered.id.clone(),
+                RecordKind::ToolCall,
+                serde_json::json!({"call": done.as_str(), "name": "shell.run"}),
+            ))
+            .unwrap();
+        store
+            .journal()
+            .append(&NewRecord::new(
+                answered.id.clone(),
+                RecordKind::ToolResult,
+                serde_json::json!({
+                    "message": vikram_contracts::Message::tool_result(done, "finished", true),
+                }),
+            ))
+            .unwrap();
+
+        // Archived sessions keep their journal but are never recovery candidates.
+        let archived = store
+            .create_session("Archived mid-tool", Path::new("/work"), None, 2)
+            .unwrap();
+        store
+            .journal()
+            .append(&NewRecord::new(
+                archived.id.clone(),
+                RecordKind::ToolCall,
+                serde_json::json!({"call": "call-archived", "name": "shell.run"}),
+            ))
+            .unwrap();
+        store
+            .set_session_status(&archived.id, "archived", 3)
+            .unwrap();
+
+        // Two pending calls in one session still surface as a single interrupted session.
+        let crashed = store
+            .create_session("Crashed", Path::new("/work"), None, 4)
+            .unwrap();
+        store
+            .journal()
+            .append(&NewRecord::new(
+                crashed.id.clone(),
+                RecordKind::ToolCall,
+                serde_json::json!({"call": "call-a", "name": "shell.run"}),
+            ))
+            .unwrap();
+        store
+            .journal()
+            .append(&NewRecord::new(
+                crashed.id.clone(),
+                RecordKind::ToolCall,
+                serde_json::json!({"call": "call-b", "name": "fs.read"}),
+            ))
+            .unwrap();
+
+        let interrupted = store.list_interrupted_sessions().unwrap();
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].id, crashed.id);
+        assert_eq!(interrupted[0].pending_calls.len(), 2);
+        assert_eq!(interrupted[0].tool_preview.as_deref(), Some("shell.run"));
     }
 }

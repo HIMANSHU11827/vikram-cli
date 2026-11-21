@@ -23,6 +23,12 @@ Remembers and understands the user, helps with many tasks, and never sugarcoats 
 direct, like a true friend. Chats politely and clearly. Receives user requests and decides:
 respond directly, delegate to a sub-agent, invoke a bot, or run a Hive team.
 
+**Target class: JARVIS.** A voice-first AI that knows the user as a person, remembers their life,
+and acts on their behalf without being briefed — with a personality that stays the same and
+judgement of its own. This is not a chatbot with tools, and not an Alexa-class skill router; the
+distinction, the acceptance criteria and the remaining gap are in
+[`jarvis-class.md`](jarvis-class.md). Vikram is aiming at the class, not claiming it.
+
 ## Agent (sub-agent)
 
 A delegated worker. Owns its own context files and memory. Works under a parent agent on a

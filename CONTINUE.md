@@ -44,6 +44,23 @@ session). Architecture is production-grade; remaining work is coverage depth.
 12. Semantic memory dedup/contradiction in `memory` table (consolidation
     covers observations table only).
 
+## JARVIS-class track — see `docs/jarvis-class.md`
+
+The runtime already has the hard half (memory, deny-first policy, tools, gateway, evolution).
+The missing half is human-facing:
+
+1. **Voice I/O** — ASR in, TTS out, interruptible. New `vikram-voice` crate; no workspace
+   dependency exists today. Without it Vikram is a CLI, not a presence.
+2. **Relationship model** — people, projects, preferences, mood as first-class rows that feed
+   context assembly, not free-text memories.
+3. **Event-driven proactivity** — `vikram-daemon` today is cron-only. Add triggers (file change,
+   calendar proximity, inbox arrival, long-job completion) plus an explicit silence policy.
+4. **Personality consistency harness** — score the same persona prompts across sessions and
+   models so "same person every day" is measured, not hoped for.
+5. **Always-on session** — keep working memory warm instead of paying cold start each turn.
+
+Order matters: voice and relationship make it feel like JARVIS; proactivity before those is noise.
+
 ### Verification
 ```bash
 cargo check --workspace --all-targets

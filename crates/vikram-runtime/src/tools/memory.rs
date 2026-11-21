@@ -416,6 +416,10 @@ impl Tool for MemoryConsolidate {
             }
             // "run" and any unknown action fall through to consolidation.
             _ => {
+                let memory_report =
+                    crate::memory::MemoryStore::open(crate::config::database_path())
+                        .ok()
+                        .and_then(|store| store.consolidate().ok());
                 let (report, observations) = store
                     .run_consolidation(Some(&scope), &policy)
                     .map_err(|e| VikramError::Storage(e.to_string()))?;
@@ -429,6 +433,16 @@ impl Tool for MemoryConsolidate {
                     report.active_after,
                     report.staged_after
                 );
+                if let Some(memory) = memory_report {
+                    body.push_str(&format!(
+                        "\nmemory table: examined={} duplicates_removed={} contradictions={} superseded={} expired={}",
+                        memory.examined,
+                        memory.duplicates_removed,
+                        memory.contradictions,
+                        memory.superseded,
+                        memory.expired
+                    ));
+                }
                 if !observations.is_empty() {
                     body.push_str("\n--- observations (score desc) ---");
                     for o in &observations {
