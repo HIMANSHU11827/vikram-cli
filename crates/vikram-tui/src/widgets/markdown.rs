@@ -171,8 +171,11 @@ fn code_block(language: &str, body: &[String], width: usize, theme: &Theme) -> V
         Piece::new(gutter, theme.muted()),
         Piece::new(" ", theme.muted()),
     ];
-    // Code is deliberately uncoloured: a dim, single-colour block cannot bleed into the body.
+    // Code keeps a dim base so unrecognised tokens and unknown languages cannot bleed into the
+    // body; a known language only recolours comments, strings and keywords on top of it.
     let code_style = theme.secondary();
+    let spec = language_spec(language);
+    let mut state = CodeState::Normal;
 
     let mut out: Vec<Line<'static>> = Vec::new();
     if !language.is_empty() {
@@ -185,13 +188,11 @@ fn code_block(language: &str, body: &[String], width: usize, theme: &Theme) -> V
         ));
     }
     for line in body {
-        out.extend(render(
-            vec![Piece::new(line.clone(), code_style)],
-            prefix.clone(),
-            prefix.clone(),
-            width,
-            false,
-        ));
+        let pieces = match &spec {
+            Some(spec) => code_pieces(line, spec, &mut state, code_style, theme),
+            None => vec![Piece::new(line.clone(), code_style)],
+        };
+        out.extend(render(pieces, prefix.clone(), prefix.clone(), width, false));
     }
     // A closing gutter line marks the end of the block.
     out.extend(render(
@@ -202,6 +203,520 @@ fn code_block(language: &str, body: &[String], width: usize, theme: &Theme) -> V
         false,
     ));
     out
+}
+
+// ---------------------------------------------------------------------------
+// code highlighting
+// ---------------------------------------------------------------------------
+//
+// A deliberately small lexer: comments, strings and keywords for the languages a coding agent
+// actually emits. Anything else stays the dim base colour, so highlighting is always a subset of
+// the truth — a missed token reads as ordinary code, never as a wrong colour on the wrong thing.
+
+/// What a stretch of code is, as far as colour is concerned.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CodeMode {
+    Code,
+    Keyword,
+    Str,
+    Comment,
+}
+
+/// What carries across a line boundary inside a fenced block.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CodeState {
+    Normal,
+    BlockComment,
+    /// A Python-style triple-quoted string; the byte is the quote character.
+    TripleString(u8),
+}
+
+/// The comment and string syntax plus keyword set for one language family.
+#[derive(Clone, Copy)]
+struct CodeSpec {
+    line_comments: &'static [&'static str],
+    block_comment: Option<(&'static str, &'static str)>,
+    quotes: &'static [u8],
+    /// Python `"""`/`'''` strings; only meaningful with `quotes` covering both quote chars.
+    triple_quotes: bool,
+    keywords: &'static [&'static str],
+}
+
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while",
+];
+const PYTHON_KEYWORDS: &[&str] = &[
+    "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class", "continue",
+    "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if", "import",
+    "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while",
+    "with", "yield",
+];
+const JS_KEYWORDS: &[&str] = &[
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "from",
+    "function",
+    "get",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "let",
+    "new",
+    "null",
+    "of",
+    "return",
+    "set",
+    "static",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "undefined",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
+];
+const GO_KEYWORDS: &[&str] = &[
+    "break",
+    "case",
+    "chan",
+    "const",
+    "continue",
+    "default",
+    "defer",
+    "else",
+    "fallthrough",
+    "false",
+    "for",
+    "func",
+    "go",
+    "goto",
+    "if",
+    "import",
+    "interface",
+    "map",
+    "nil",
+    "package",
+    "range",
+    "return",
+    "select",
+    "struct",
+    "switch",
+    "true",
+    "type",
+    "var",
+];
+const C_KEYWORDS: &[&str] = &[
+    "auto",
+    "bool",
+    "break",
+    "case",
+    "catch",
+    "char",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "delete",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "extern",
+    "false",
+    "final",
+    "float",
+    "for",
+    "goto",
+    "if",
+    "inline",
+    "int",
+    "long",
+    "namespace",
+    "new",
+    "nullptr",
+    "private",
+    "protected",
+    "public",
+    "register",
+    "return",
+    "short",
+    "signed",
+    "sizeof",
+    "static",
+    "struct",
+    "switch",
+    "template",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typedef",
+    "typename",
+    "union",
+    "unsigned",
+    "using",
+    "virtual",
+    "void",
+    "volatile",
+    "while",
+];
+const SHELL_KEYWORDS: &[&str] = &[
+    "alias", "break", "case", "cd", "continue", "declare", "do", "done", "echo", "elif", "else",
+    "esac", "export", "false", "fi", "for", "function", "if", "in", "local", "readonly", "return",
+    "set", "shift", "source", "then", "trap", "true", "unset", "while",
+];
+const SQL_KEYWORDS: &[&str] = &[
+    "all",
+    "alter",
+    "and",
+    "as",
+    "avg",
+    "between",
+    "by",
+    "case",
+    "count",
+    "create",
+    "delete",
+    "distinct",
+    "drop",
+    "else",
+    "end",
+    "exists",
+    "false",
+    "foreign",
+    "from",
+    "full",
+    "group",
+    "having",
+    "if",
+    "in",
+    "index",
+    "inner",
+    "insert",
+    "into",
+    "is",
+    "join",
+    "left",
+    "like",
+    "limit",
+    "max",
+    "min",
+    "not",
+    "null",
+    "offset",
+    "on",
+    "or",
+    "order",
+    "outer",
+    "primary",
+    "references",
+    "right",
+    "select",
+    "set",
+    "sum",
+    "table",
+    "then",
+    "true",
+    "union",
+    "unique",
+    "update",
+    "values",
+    "view",
+    "when",
+    "where",
+];
+const JSON_KEYWORDS: &[&str] = &["false", "null", "true"];
+const TOML_KEYWORDS: &[&str] = &["false", "true"];
+const YAML_KEYWORDS: &[&str] = &["false", "no", "null", "off", "on", "true", "yes"];
+
+const RUST_SPEC: CodeSpec = CodeSpec {
+    line_comments: &["//"],
+    block_comment: Some(("/*", "*/")),
+    // `'` is excluded on purpose: Rust lifetimes would open a string that never closes.
+    quotes: b"\"",
+    triple_quotes: false,
+    keywords: RUST_KEYWORDS,
+};
+const PYTHON_SPEC: CodeSpec = CodeSpec {
+    line_comments: &["#"],
+    block_comment: None,
+    quotes: b"\"'",
+    triple_quotes: true,
+    keywords: PYTHON_KEYWORDS,
+};
+const JS_SPEC: CodeSpec = CodeSpec {
+    line_comments: &["//"],
+    block_comment: Some(("/*", "*/")),
+    quotes: b"\"'`",
+    triple_quotes: false,
+    keywords: JS_KEYWORDS,
+};
+const GO_SPEC: CodeSpec = CodeSpec {
+    line_comments: &["//"],
+    block_comment: Some(("/*", "*/")),
+    quotes: b"\"'",
+    triple_quotes: false,
+    keywords: GO_KEYWORDS,
+};
+const C_SPEC: CodeSpec = CodeSpec {
+    line_comments: &["//"],
+    block_comment: Some(("/*", "*/")),
+    quotes: b"\"'",
+    triple_quotes: false,
+    keywords: C_KEYWORDS,
+};
+const SHELL_SPEC: CodeSpec = CodeSpec {
+    line_comments: &["#"],
+    block_comment: None,
+    quotes: b"\"'",
+    triple_quotes: false,
+    keywords: SHELL_KEYWORDS,
+};
+const SQL_SPEC: CodeSpec = CodeSpec {
+    line_comments: &["--"],
+    block_comment: None,
+    quotes: b"\"'",
+    triple_quotes: false,
+    keywords: SQL_KEYWORDS,
+};
+const JSON_SPEC: CodeSpec = CodeSpec {
+    line_comments: &[],
+    block_comment: None,
+    quotes: b"\"",
+    triple_quotes: false,
+    keywords: JSON_KEYWORDS,
+};
+const TOML_SPEC: CodeSpec = CodeSpec {
+    line_comments: &["#"],
+    block_comment: None,
+    quotes: b"\"'",
+    triple_quotes: false,
+    keywords: TOML_KEYWORDS,
+};
+const YAML_SPEC: CodeSpec = CodeSpec {
+    line_comments: &["#"],
+    block_comment: None,
+    quotes: b"\"'",
+    triple_quotes: false,
+    keywords: YAML_KEYWORDS,
+};
+
+/// The spec for a fenced block's language tag, or `None` for anything unrecognised — which keeps
+/// the old single-colour rendering rather than guessing at syntax.
+fn language_spec(language: &str) -> Option<CodeSpec> {
+    let lang = language.trim().to_ascii_lowercase();
+    Some(match lang.as_str() {
+        "rust" | "rs" => RUST_SPEC,
+        "python" | "py" | "python3" => PYTHON_SPEC,
+        "javascript" | "js" | "jsx" | "mjs" | "cjs" | "typescript" | "ts" | "tsx" => JS_SPEC,
+        "go" | "golang" => GO_SPEC,
+        "c" | "h" | "cpp" | "c++" | "cc" | "cxx" | "hpp" | "hh" | "java" | "cs" | "csharp"
+        | "php" | "swift" | "kotlin" | "scala" | "dart" | "objc" | "objective-c" => C_SPEC,
+        "sh" | "bash" | "zsh" | "shell" | "shellscript" | "console" => SHELL_SPEC,
+        "sql" => SQL_SPEC,
+        "json" => JSON_SPEC,
+        "toml" => TOML_SPEC,
+        "yaml" | "yml" => YAML_SPEC,
+        _ => return None,
+    })
+}
+
+/// Classify every byte of one code line, carrying block comments and triple-quoted strings
+/// across lines through `state`. All token boundaries land on ASCII delimiters or the line end,
+/// so the byte-indexed modes always slice at character boundaries.
+fn highlight_modes(line: &str, spec: &CodeSpec, state: &mut CodeState) -> Vec<CodeMode> {
+    let bytes = line.as_bytes();
+    let n = bytes.len();
+    let mut modes = vec![CodeMode::Code; n];
+    let mut i = 0usize;
+
+    while i < n {
+        match *state {
+            CodeState::BlockComment => {
+                let end = spec.block_comment.map(|(_, end)| end).unwrap_or("*/");
+                if bytes[i..].starts_with(end.as_bytes()) {
+                    let stop = i + end.len();
+                    modes[i..stop].fill(CodeMode::Comment);
+                    i = stop;
+                    *state = CodeState::Normal;
+                } else {
+                    modes[i..].fill(CodeMode::Comment);
+                    break;
+                }
+            }
+            CodeState::TripleString(quote) => {
+                let close = [quote, quote, quote];
+                let mut j = i;
+                let mut closed = false;
+                while j < n {
+                    if bytes[j] == b'\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if bytes[j..].starts_with(&close) {
+                        closed = true;
+                        break;
+                    }
+                    j += 1;
+                }
+                if closed {
+                    let stop = j + 3;
+                    modes[i..stop].fill(CodeMode::Str);
+                    i = stop;
+                    *state = CodeState::Normal;
+                } else {
+                    modes[i..].fill(CodeMode::Str);
+                    break;
+                }
+            }
+            CodeState::Normal => {
+                if let Some((open, _)) = spec.block_comment
+                    && bytes[i..].starts_with(open.as_bytes())
+                {
+                    modes[i..i + open.len()].fill(CodeMode::Comment);
+                    i += open.len();
+                    *state = CodeState::BlockComment;
+                    continue;
+                }
+                if spec
+                    .line_comments
+                    .iter()
+                    .any(|comment| bytes[i..].starts_with(comment.as_bytes()))
+                {
+                    modes[i..].fill(CodeMode::Comment);
+                    break;
+                }
+                if spec.triple_quotes {
+                    let mut opened = false;
+                    for quote in spec.quotes {
+                        let triple = [*quote, *quote, *quote];
+                        if bytes[i..].starts_with(&triple) {
+                            modes[i..i + 3].fill(CodeMode::Str);
+                            i += 3;
+                            *state = CodeState::TripleString(*quote);
+                            opened = true;
+                            break;
+                        }
+                    }
+                    if opened {
+                        continue;
+                    }
+                }
+                if spec.quotes.contains(&bytes[i]) {
+                    let quote = bytes[i];
+                    let mut j = i + 1;
+                    while j < n {
+                        if bytes[j] == b'\\' {
+                            j += 2;
+                            continue;
+                        }
+                        if bytes[j] == quote {
+                            j += 1;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    let stop = j.min(n);
+                    modes[i..stop].fill(CodeMode::Str);
+                    i = stop;
+                    continue;
+                }
+                let len = keyword_len(bytes, i, spec.keywords);
+                if len > 0 {
+                    modes[i..i + len].fill(CodeMode::Keyword);
+                    i += len;
+                    continue;
+                }
+                i += 1;
+            }
+        }
+    }
+    modes
+}
+
+/// Length of the keyword starting at `i`, or 0. Both sides of the match must sit on identifier
+/// boundaries, so `fn` inside `myfn` and `in` inside `begin` stay plain code.
+fn keyword_len(bytes: &[u8], i: usize, keywords: &[&str]) -> usize {
+    if i > 0 && is_ident_byte(bytes[i - 1]) {
+        return 0;
+    }
+    for keyword in keywords {
+        let word = keyword.as_bytes();
+        if i + word.len() <= bytes.len()
+            && &bytes[i..i + word.len()] == word
+            && (i + word.len() == bytes.len() || !is_ident_byte(bytes[i + word.len()]))
+        {
+            return word.len();
+        }
+    }
+    0
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn mode_style(mode: CodeMode, base: Style, theme: &Theme) -> Style {
+    match mode {
+        CodeMode::Code => base,
+        CodeMode::Keyword => Style::default().fg(theme.accent),
+        CodeMode::Str => Style::default().fg(theme.tool),
+        CodeMode::Comment => theme.muted(),
+    }
+}
+
+/// Merge a line's byte modes into styled pieces; adjacent equal styles collapse into one span.
+fn code_pieces(
+    line: &str,
+    spec: &CodeSpec,
+    state: &mut CodeState,
+    base: Style,
+    theme: &Theme,
+) -> Vec<Piece> {
+    let modes = highlight_modes(line, spec, state);
+    let mut pieces = Vec::new();
+    let mut start = 0usize;
+    let mut current = modes.first().map(|mode| mode_style(*mode, base, theme));
+    for (index, mode) in modes.iter().enumerate().skip(1) {
+        let style = mode_style(*mode, base, theme);
+        if Some(style) != current {
+            if let Some(style) = current {
+                pieces.push(Piece::new(line[start..index].to_owned(), style));
+            }
+            start = index;
+            current = Some(style);
+        }
+    }
+    if let Some(style) = current {
+        pieces.push(Piece::new(line[start..].to_owned(), style));
+    }
+    pieces
 }
 
 fn table_rows(
@@ -653,19 +1168,119 @@ mod tests {
         assert!(body.contains('|'), "ascii gutter missing: {body}");
         assert!(body.contains("rust"));
 
-        // The code line itself is uncoloured: one dim tone, no bleed from the surroundings.
+        // An unknown language keeps the code uncoloured: one dim tone, no bleed from the
+        // surroundings.
         let theme = Theme::new(false);
-        let code_line = markdown_lines(text, 40, &theme)
+        let plain = markdown_lines("```text\nfn main() {}\n```", 40, &theme)
             .into_iter()
             .find(|line| text_of(line).contains("fn main"))
             .expect("code line missing");
-        for span in &code_line.spans {
+        for span in &plain.spans {
             let fg = span.style.fg;
             assert!(
                 fg == Some(theme.dim) || fg == Some(theme.faint),
                 "code span is not dim: {fg:?}"
             );
         }
+    }
+
+    fn span_with<'a>(lines: &'a [Line<'a>], needle: &str) -> &'a Span<'a> {
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref() == needle)
+            .unwrap_or_else(|| panic!("span {needle:?} missing"))
+    }
+
+    #[test]
+    fn a_known_language_colours_keywords_strings_and_comments() {
+        let theme = Theme::new(false);
+        let lines = markdown_lines(
+            "```rust\nfn main() {\n    // hi\n    let s = \"x\";\n}\n```",
+            60,
+            &theme,
+        );
+        assert_eq!(
+            span_with(&lines, "fn").style.fg,
+            Some(theme.accent),
+            "keyword not accented"
+        );
+        assert_eq!(
+            span_with(&lines, "\"x\"").style.fg,
+            Some(theme.tool),
+            "string not tool-coloured"
+        );
+        assert_eq!(
+            span_with(&lines, "// hi").style.fg,
+            Some(theme.faint),
+            "comment not muted"
+        );
+        // The identifier between the tokens stays the dim code colour.
+        let main = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("main"))
+            .expect("identifier missing");
+        assert_eq!(main.style.fg, Some(theme.dim));
+    }
+
+    #[test]
+    fn keywords_respect_identifier_boundaries() {
+        let theme = Theme::new(false);
+        // `fn` inside `myfn` is not a keyword; `in` inside `begin` is not either.
+        let lines = markdown_lines("```rust\nmyfn begin;\n```", 60, &theme);
+        for line in &lines {
+            for span in &line.spans {
+                assert_ne!(
+                    span.style.fg,
+                    Some(theme.accent),
+                    "identifier wrongly accented: {:?}",
+                    span.content
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_block_comment_and_triple_string_span_lines() {
+        let theme = Theme::new(false);
+        let rust = markdown_lines("```rust\n/* one\ntwo */\nfn f() {}\n```", 60, &theme);
+        let comment = rust
+            .iter()
+            .find(|line| text_of(line).contains("two */"))
+            .expect("comment line missing");
+        let comment_span = comment
+            .spans
+            .iter()
+            .find(|span| span.content.contains("two"))
+            .expect("comment span missing");
+        assert_eq!(comment_span.style.fg, Some(theme.faint));
+
+        let python = markdown_lines(
+            "```python\ns = \"\"\"one\ntwo\"\"\"\nreturn s\n```",
+            60,
+            &theme,
+        );
+        let middle = python
+            .iter()
+            .find(|line| text_of(line).contains("two"))
+            .expect("string line missing");
+        let string_span = middle
+            .spans
+            .iter()
+            .find(|span| span.content.contains("two"))
+            .expect("string span missing");
+        assert_eq!(string_span.style.fg, Some(theme.tool));
+        // The string closed: the next line's keyword is accented again.
+        assert_eq!(span_with(&python, "return").style.fg, Some(theme.accent));
+    }
+
+    #[test]
+    fn an_unclosed_fence_still_renders_its_body() {
+        let theme = Theme::new(false);
+        let lines = markdown_lines("```rust\nfn main() {}", 60, &theme);
+        assert!(joined(&lines).contains("fn main() {}"));
+        assert_eq!(span_with(&lines, "fn").style.fg, Some(theme.accent));
     }
 
     #[test]

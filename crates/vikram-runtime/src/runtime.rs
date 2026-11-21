@@ -4296,6 +4296,46 @@ impl RuntimeHandle {
             .lock()
             .expect("sessions lock")
             .push(Arc::clone(&live));
+        // A fork continues the source's conversation, so it resolves the same shared memory
+        // shelves. `learning::on_turn_end` rebinds every turn, but that leaves the fork's first
+        // turn recalling without `user:`/`project:` scope expansion — bind now, mirroring
+        // `learning::shared_memory_scopes`/`project_memory_scope` exactly.
+        fn fnv1a(bytes: &[u8]) -> u64 {
+            let mut h = 0xcbf29ce484222325u64;
+            for b in bytes {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h
+        }
+        let user_scope = self
+            .inner
+            .store
+            .get_active_identity()
+            .ok()
+            .and_then(|identity| identity.user)
+            .and_then(|id| crate::memory::user_scope(id.as_str()));
+        let project_scope = match live.project_id() {
+            Some(id) => crate::memory::project_scope(id.as_str()),
+            None => {
+                let cwd = live.cwd().to_string_lossy().into_owned();
+                if cwd.trim().is_empty() {
+                    None
+                } else {
+                    crate::memory::project_scope(&format!("ws-{:016x}", fnv1a(cwd.as_bytes())))
+                }
+            }
+        };
+        if let Err(err) = self.inner.memory.bind_session_scopes(
+            live.id.as_str(),
+            user_scope.as_deref(),
+            project_scope.as_deref(),
+        ) {
+            self.inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!("could not bind memory scopes for the fork: {err}"),
+            });
+        }
         self.inner
             .emit(RuntimeEvent::SessionCreated(live.snapshot()));
         // Stage: session_lifecycle — a fork is a create the operator named differently; the
@@ -8595,5 +8635,159 @@ mod tests {
         // `interval_hours = 0` makes every tick due, so more than one cycle may have run;
         // the stamp itself proves at least one completed past its benchmarks.
         assert!(mapek_cycle_count(&handle) >= 1, "the cycle still completed");
+    }
+
+    #[tokio::test]
+    async fn a_fork_replays_the_source_transcript_including_image_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let id = handle.create_session(Some("with images".into())).unwrap();
+
+        let message = Message {
+            role: vikram_contracts::Role::User,
+            blocks: vec![
+                Block::Text {
+                    text: "what is in this screenshot".into(),
+                    trust: Trust::User,
+                },
+                Block::Image {
+                    source: vikram_contracts::ImageSource::data("image/png", "aGVsbG8="),
+                    trust: Trust::External,
+                },
+            ],
+        };
+        handle.inner.journal(
+            &id,
+            RecordKind::Message,
+            serde_json::json!({"message": message}),
+        );
+
+        let fork = handle.fork_session(&id).unwrap();
+        assert_ne!(fork, id);
+        let live = handle.inner.session(&fork).expect("the fork is live");
+        let messages = live.messages();
+        assert_eq!(messages.len(), 1, "the fork replays the copied journal");
+        assert!(
+            matches!(messages[0].blocks[1], Block::Image { .. }),
+            "image blocks survive the journal copy and replay"
+        );
+
+        // The copied journal keeps the source's seqs, so the fork's next append continues
+        // after them instead of colliding.
+        let appended = handle
+            .inner
+            .store
+            .journal()
+            .append(
+                &vikram_contracts::NewRecord::new(
+                    fork.clone(),
+                    RecordKind::Message,
+                    serde_json::json!({"message": message}),
+                )
+                .at(2),
+            )
+            .unwrap();
+        assert!(
+            matches!(appended, vikram_contracts::Appended::Written(2)),
+            "the fork's journal re-sequences after the copied prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fork_is_bound_to_the_same_shared_memory_scopes() {
+        fn fnv1a(bytes: &[u8]) -> u64 {
+            let mut h = 0xcbf29ce484222325u64;
+            for b in bytes {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let id = handle.create_session(Some("scoped".into())).unwrap();
+        let fork = handle.fork_session(&id).unwrap();
+
+        // No project row is attached, so the workspace shelf is named by the cwd hash — the
+        // same derivation `learning::project_memory_scope` uses.
+        let cwd = handle
+            .inner
+            .session(&fork)
+            .unwrap()
+            .cwd()
+            .to_string_lossy()
+            .into_owned();
+        let shelf =
+            crate::memory::project_scope(&format!("ws-{:016x}", fnv1a(cwd.as_bytes()))).unwrap();
+        handle
+            .inner
+            .memory
+            .save("forknote", "a fact on the project shelf", &shelf)
+            .unwrap();
+
+        let terms = vec!["forknote".to_owned()];
+        let hits = handle
+            .inner
+            .memory
+            .recall_terms(&terms, &[fork.as_str().to_owned()], 8)
+            .unwrap();
+        assert!(
+            hits.iter()
+                .any(|(scope, key, _)| scope == &shelf && key == "forknote"),
+            "the fork recalls the project shelf its source would resolve to"
+        );
+
+        let other = handle.create_session(Some("unrelated".into())).unwrap();
+        assert!(
+            handle
+                .inner
+                .memory
+                .recall_terms(&terms, &[other.as_str().to_owned()], 8)
+                .unwrap()
+                .is_empty(),
+            "an unbound session cannot see the shelf"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fork_does_not_inherit_the_source_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let id = handle.create_session(Some("edited".into())).unwrap();
+
+        handle
+            .inner
+            .store
+            .record_file_change(&vikram_store::FileChangeRow {
+                id: "fc-1".into(),
+                session: id.clone(),
+                bot: None,
+                path: dir.path().join("a.txt"),
+                operation: "modify".into(),
+                checksum_before: None,
+                checksum_after: None,
+                size: None,
+                checkpoint_path: None,
+                ts_ms: 1,
+            })
+            .unwrap();
+
+        let fork = handle.fork_session(&id).unwrap();
+        assert_eq!(
+            handle.inner.store.list_file_changes(&fork).unwrap().len(),
+            0,
+            "file changes belong to the session that made them, not the fork"
+        );
+        assert_eq!(
+            handle.inner.store.list_file_changes(&id).unwrap().len(),
+            1,
+            "the source keeps its own change log"
+        );
     }
 }
