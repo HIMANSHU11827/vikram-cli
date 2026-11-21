@@ -832,7 +832,14 @@ impl Tool for Screenshot {
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let raw = arg_str(args, "path")?;
         let (_path, display) = canonical_resource(&ctx.workspace_root, &raw)?;
-        Ok(reported(screenshot(&display)))
+        let mut out = reported(screenshot(&display));
+        if out.ok {
+            // The same artifact marker `browser.screenshot` emits: the turn loop reads the line
+            // back off the committed result and attaches the PNG to the assistant reply. The
+            // path is already workspace-confined by `canonical_resource` above.
+            out.content = format!("{}\nIMAGE:{display}", out.content);
+        }
+        Ok(out)
     }
 }
 
@@ -1358,6 +1365,53 @@ mod tests {
     fn screenshot_requires_a_destination() {
         assert!(screenshot("").is_err());
         assert!(screenshot("   ").is_err());
+    }
+
+    #[test]
+    fn screenshot_refuses_a_destination_outside_the_workspace() {
+        // The artifact marker can only ever name a workspace file: `canonical_resource` denies
+        // the run before a helper is spawned, so no `IMAGE:` line for an outside path exists.
+        let dir = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let mut context = ctx();
+        context.workspace_root = dir.path().to_path_buf();
+        for raw in [
+            outside
+                .path()
+                .join("shot.png")
+                .to_string_lossy()
+                .into_owned(),
+            "../escape.png".to_string(),
+        ] {
+            let err = Screenshot.run(&json!({"path": raw}), &context).unwrap_err();
+            assert!(matches!(err, VikramError::PolicyDenied { .. }), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn a_successful_screenshot_reports_the_image_artifact_marker() {
+        let dir = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(dir.path().join("shots")).expect("shots dir");
+        let mut context = ctx();
+        context.workspace_root = dir.path().to_path_buf();
+        let out = Screenshot
+            .run(&json!({"path": "shots/desk.png"}), &context)
+            .unwrap();
+        if !out.ok {
+            // No screenshot helper on this machine: a refusal must not carry an artifact marker.
+            assert!(!out.content.contains("IMAGE:"), "{}", out.content);
+            return;
+        }
+        let raw = out
+            .content
+            .lines()
+            .last()
+            .and_then(|line| line.strip_prefix("IMAGE:"))
+            .expect("a successful capture ends with the artifact marker");
+        assert!(
+            crate::config::resolve_within(dir.path(), Path::new(raw)).is_some(),
+            "marker path must stay inside the workspace: {raw}"
+        );
     }
 
     #[test]

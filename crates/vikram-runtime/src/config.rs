@@ -92,6 +92,10 @@ pub struct Config {
     /// skill is any good is a behavioral question the gate does not answer.
     #[serde(default = "default_true")]
     pub skill_proposal_gate: bool,
+    /// Scheduled self-evolution. Opt-in: with the defaults the runtime never mutates the
+    /// evolution store on a timer — cycles and benchmarks stay operator-run.
+    #[serde(default)]
+    pub evolution: EvolutionConfig,
 }
 
 /// Restrictions on mode *availability*, as distinct from the mode itself. `mode` says what this
@@ -429,6 +433,35 @@ impl Default for ContextConfig {
     }
 }
 
+/// Scheduled self-evolution knobs. Everything here is off or read-only by default: enabling
+/// `auto_cycle` lets the runtime's self-check schedule run one bounded MAPE-K cycle per
+/// interval — the same `mapek.run_cycle` `vikram evolution cycle` runs — but proposals it
+/// records still pass through the ordinary approval gates; nothing is auto-approved.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EvolutionConfig {
+    /// Run one MAPE-K cycle per `cycle_interval_hours`. `false` — the default — means cycles
+    /// only ever run when an operator asks (`vikram evolution cycle`).
+    pub auto_cycle: bool,
+    /// Minimum hours between scheduled cycles, measured against a durable last-run record so
+    /// a restart cannot fire early. `0` runs on every self-check tick.
+    pub cycle_interval_hours: u64,
+    /// After each scheduled cycle, also run every recorded evaluation benchmark — the same
+    /// `self_evaluation.run_benchmark` `vikram evolution benchmark <id>` runs. Results land
+    /// in the store as evaluations; benchmarks the engine did not load at boot are skipped.
+    pub auto_benchmark: bool,
+}
+
+impl Default for EvolutionConfig {
+    fn default() -> Self {
+        Self {
+            auto_cycle: false,
+            cycle_interval_hours: 24,
+            auto_benchmark: false,
+        }
+    }
+}
+
 /// The two colours an operator is most likely to have an opinion about. The rest of the palette
 /// either derives from these or stays fixed, so the section stays short enough to edit by hand.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -475,6 +508,7 @@ impl Default for Config {
             theme: ThemeConfig::default(),
             tool_permissions: std::collections::HashMap::new(),
             skill_proposal_gate: true,
+            evolution: EvolutionConfig::default(),
         }
     }
 }
@@ -1198,5 +1232,21 @@ mod tests {
         assert_eq!(cfg.provider, "anthropic");
         assert_eq!(cfg.fallback_model, "claude-haiku");
         assert_eq!(cfg.memory_provider, "builtin");
+    }
+
+    #[test]
+    fn scheduled_evolution_is_opt_in() {
+        let cfg = Config::default();
+        assert!(!cfg.evolution.auto_cycle);
+        assert!(!cfg.evolution.auto_benchmark);
+        assert_eq!(cfg.evolution.cycle_interval_hours, 24);
+
+        let cfg: Config = serde_json::from_str(
+            r#"{"model":"m","evolution":{"auto_cycle":true,"cycle_interval_hours":6,"auto_benchmark":true}}"#,
+        )
+        .unwrap();
+        assert!(cfg.evolution.auto_cycle);
+        assert!(cfg.evolution.auto_benchmark);
+        assert_eq!(cfg.evolution.cycle_interval_hours, 6);
     }
 }

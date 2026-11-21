@@ -92,6 +92,14 @@ const SELF_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 /// Self-check ticks between improvement-opportunity scans — roughly daily at the
 /// hourly cadence.
 const SELF_CHECK_OPPORTUNITY_EVERY: u64 = 24;
+/// `engine_records` namespace/id holding the last scheduled-cycle timestamp — the durable
+/// dedup that keeps `evolution.auto_cycle` to one MAPE-K cycle per interval across restarts.
+const EVOLUTION_CYCLE_NAMESPACE: &str = "runtime.evolution_cycle";
+const EVOLUTION_CYCLE_ID: &str = "last";
+/// `engine_records` namespace benchmarks persist under (mirrors the private
+/// `self_evaluation::BENCHMARK_NAMESPACE` the CLI reads the same way).
+const BENCHMARK_NAMESPACE: &str = "self_evaluation.benchmark";
+const HOUR_MS: u64 = 60 * 60 * 1000;
 /// How many of a hive's most recent lessons ride along in each participant's
 /// system context on `hive_run`.
 const HIVE_LESSON_CONTEXT: usize = 3;
@@ -2065,6 +2073,151 @@ impl RuntimeInner {
                 text: format!("evolution self-check failed: {err}"),
             }),
         }
+        self.maybe_run_evolution_cycle().await;
+    }
+
+    /// The opt-in half of scheduled evolution: when `evolution.auto_cycle` is set, run one
+    /// bounded MAPE-K cycle per `cycle_interval_hours` on the self-check schedule — the same
+    /// `mapek.run_cycle` `vikram evolution cycle` runs, minus the prompt. Proposals it records
+    /// still pass the ordinary approval gates; nothing is auto-approved. Failures surface as
+    /// Warn notices and never fail the tick.
+    async fn maybe_run_evolution_cycle(self: &Arc<Self>) {
+        let (auto_cycle, interval_hours, auto_benchmark) = {
+            let cfg = self.config.read().unwrap_or_else(|e| e.into_inner());
+            (
+                cfg.evolution.auto_cycle,
+                cfg.evolution.cycle_interval_hours,
+                cfg.evolution.auto_benchmark,
+            )
+        };
+        if !auto_cycle {
+            return;
+        }
+        let interval_ms = interval_hours.saturating_mul(HOUR_MS);
+        let worker = Arc::clone(self);
+        let outcome = tokio::task::spawn_blocking(move || {
+            worker.run_evolution_cycle_once(interval_ms, auto_benchmark)
+        })
+        .await;
+        match outcome {
+            Ok(Ok(Some(text))) => self.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Info,
+                text,
+            }),
+            Ok(Ok(None)) => {}
+            Ok(Err(err)) => self.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!("scheduled evolution cycle failed: {err}"),
+            }),
+            Err(err) => self.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!("scheduled evolution cycle task failed: {err}"),
+            }),
+        }
+    }
+
+    /// One scheduled-cycle decision on the blocking pool, like the self-check: read the
+    /// durable last-run stamp, skip while the interval has not elapsed, otherwise run the
+    /// cycle (and every recorded benchmark when `auto_benchmark` is set) and stamp the
+    /// record. All of it is synchronous store work.
+    fn run_evolution_cycle_once(
+        &self,
+        interval_ms: u64,
+        auto_benchmark: bool,
+    ) -> std::result::Result<Option<String>, String> {
+        let mut engine = self
+            .learning
+            .evolution
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now = vikram_evolution::now_ms();
+        let last_run = engine
+            .store
+            .list_engine_records(EVOLUTION_CYCLE_NAMESPACE)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|(id, _)| id == EVOLUTION_CYCLE_ID)
+            .and_then(|(_, payload)| payload.get("last_run_ms").and_then(|v| v.as_u64()));
+        if let Some(last) = last_run
+            && now.saturating_sub(last) < interval_ms
+        {
+            return Ok(None);
+        }
+
+        let cycle = engine.mapek.run_cycle().map_err(|e| e.to_string())?;
+
+        let mut benchmarks_run = 0usize;
+        let mut benchmarks_failed = 0usize;
+        if auto_benchmark {
+            for (id, payload) in engine
+                .store
+                .list_engine_records(BENCHMARK_NAMESPACE)
+                .map_err(|e| e.to_string())?
+            {
+                // A record that does not decode, or a benchmark the engine did not load at
+                // boot, is a failed run — counted, never fatal to the cycle.
+                let known =
+                    serde_json::from_value::<vikram_evolution::EvaluationBenchmark>(payload)
+                        .is_ok()
+                        && engine.self_evaluation.run_benchmark(&id).is_ok();
+                if known {
+                    benchmarks_run += 1;
+                } else {
+                    benchmarks_failed += 1;
+                }
+            }
+        }
+
+        // The stamp is the dedup: if it cannot be persisted the next tick would run again,
+        // so a failed write is an error, not a silent double-cycle risk.
+        engine
+            .store
+            .save_engine_record(
+                EVOLUTION_CYCLE_NAMESPACE,
+                EVOLUTION_CYCLE_ID,
+                &serde_json::json!({
+                    "last_run_ms": now,
+                    "cycle_number": cycle.cycle_number,
+                    "execution_success": cycle.execution_success,
+                    "benchmarks_run": benchmarks_run,
+                    "benchmarks_failed": benchmarks_failed,
+                }),
+            )
+            .map_err(|e| e.to_string())?;
+
+        // Durable trail for `vikram evolution`; telemetry must not fail the cycle.
+        let _ = engine.store.save_event(&vikram_evolution::LearningEvent {
+            id: vikram_evolution::gen_id("cycle"),
+            timestamp_ms: vikram_evolution::now_ms(),
+            agent_id: "scheduler".to_owned(),
+            kind: "evolution_cycle".to_owned(),
+            summary: format!(
+                "scheduled cycle {} complete (plan {}), {} action(s) remediated",
+                cycle.cycle_number, cycle.plan_id, cycle.remediated_actions
+            ),
+            payload: serde_json::json!({
+                "cycle_number": cycle.cycle_number,
+                "plan_id": cycle.plan_id,
+                "execution_success": cycle.execution_success,
+                "failure_reason": cycle.failure_reason.as_deref(),
+                "benchmarks_run": benchmarks_run,
+                "benchmarks_failed": benchmarks_failed,
+            }),
+        });
+
+        let mut text = format!(
+            "evolution scheduled cycle {} complete (plan {}): {} action(s) remediated, {} recorded for review",
+            cycle.cycle_number, cycle.plan_id, cycle.remediated_actions, cycle.recorded_for_review
+        );
+        if let Some(reason) = &cycle.failure_reason {
+            text.push_str(&format!("; incomplete: {reason}"));
+        }
+        if auto_benchmark {
+            text.push_str(&format!(
+                "; {benchmarks_run} benchmark(s) run, {benchmarks_failed} failed"
+            ));
+        }
+        Ok(Some(text))
     }
 
     /// One self-check: `mapek.monitor()` + `mapek.analyze()` are read-only probes
@@ -8006,5 +8159,186 @@ mod tests {
             .expect("a poisoned lock is recovered, not a check failure");
         assert_eq!(report.status, vikram_evolution::HealthStatus::Unknown);
         assert!(report.opportunity_note.is_none(), "no scan was asked for");
+    }
+
+    fn mapek_cycle_count(handle: &RuntimeHandle) -> u64 {
+        handle
+            .evolution()
+            .store
+            .list_engine_records("mapek.state")
+            .unwrap_or_default()
+            .into_iter()
+            .find(|(id, _)| id == "state")
+            .and_then(|(_, payload)| payload.get("cycle_count").and_then(|v| v.as_u64()))
+            .unwrap_or(0)
+    }
+
+    fn cycle_stamp(handle: &RuntimeHandle) -> Option<u64> {
+        handle
+            .evolution()
+            .store
+            .list_engine_records(EVOLUTION_CYCLE_NAMESPACE)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|(id, _)| id == EVOLUTION_CYCLE_ID)
+            .and_then(|(_, payload)| payload.get("last_run_ms").and_then(|v| v.as_u64()))
+    }
+
+    async fn wait_for_ticks(handle: &RuntimeHandle, ticks: u64) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while handle.inner.self_check_ticks.load(Ordering::SeqCst) < ticks {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the self-check interval never fired");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_evolution_cycle_never_runs_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start_with_self_check_interval(
+            config_for(dir.path()),
+            std::time::Duration::from_millis(15),
+        )
+        .await
+        .unwrap();
+        let handle = runtime.handle();
+
+        wait_for_ticks(&handle, 5).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(mapek_cycle_count(&handle), 0, "auto_cycle defaults off");
+        assert!(cycle_stamp(&handle).is_none());
+    }
+
+    #[tokio::test]
+    async fn scheduled_evolution_cycle_runs_once_per_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let mut config = config_for(dir.path());
+        config.evolution.auto_cycle = true;
+        config.evolution.cycle_interval_hours = 24;
+        let runtime =
+            Runtime::start_with_self_check_interval(config, std::time::Duration::from_millis(15))
+                .await
+                .unwrap();
+        let handle = runtime.handle();
+
+        // The first tick has no stamp, so it is due; every later tick inside the
+        // 24h interval must dedup against the durable record.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mapek_cycle_count(&handle) == 0 {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the scheduled cycle never ran");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        wait_for_ticks(&handle, 6).await;
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(
+            mapek_cycle_count(&handle),
+            1,
+            "ticks inside the interval must not re-run the cycle"
+        );
+        assert!(cycle_stamp(&handle).is_some());
+
+        // Age the stamp past the interval: the next tick is due again, once.
+        {
+            let engine = handle.evolution();
+            let stale = vikram_evolution::now_ms() - 25 * HOUR_MS;
+            engine
+                .store
+                .save_engine_record(
+                    EVOLUTION_CYCLE_NAMESPACE,
+                    EVOLUTION_CYCLE_ID,
+                    &serde_json::json!({ "last_run_ms": stale }),
+                )
+                .unwrap();
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mapek_cycle_count(&handle) < 2 {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("an elapsed interval never re-ran the cycle");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(mapek_cycle_count(&handle), 2);
+    }
+
+    #[tokio::test]
+    async fn scheduled_cycle_benchmark_failures_do_not_fail_the_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let mut config = config_for(dir.path());
+        config.evolution.auto_cycle = true;
+        config.evolution.auto_benchmark = true;
+        config.evolution.cycle_interval_hours = 0;
+        let runtime =
+            Runtime::start_with_self_check_interval(config, std::time::Duration::from_millis(15))
+                .await
+                .unwrap();
+        let handle = runtime.handle();
+
+        // A decodable benchmark record the engine did not load at boot: the run
+        // fails inside `run_benchmark`, which must be counted, not fatal.
+        {
+            let engine = handle.evolution();
+            let benchmark = vikram_evolution::EvaluationBenchmark {
+                id: "bench-unknown".to_owned(),
+                name: "unknown".to_owned(),
+                description: "recorded after boot".to_owned(),
+                task_type: "build".to_owned(),
+                expected_metrics: vikram_evolution::PerformanceMetrics {
+                    task_completion_rate: 0.0,
+                    task_correctness: 0.0,
+                    tool_success_rate: 0.0,
+                    model_performance: 0.0,
+                    agent_performance: 0.0,
+                    execution_time_ms: 0,
+                    token_consumption: 0,
+                    resource_consumption: 0.0,
+                    failure_rate: 0.0,
+                    recovery_rate: 0.0,
+                    regression_rate: 0.0,
+                    user_corrections: 0,
+                    skill_effectiveness: 0.0,
+                },
+                created_ms: 0,
+            };
+            engine
+                .store
+                .save_engine_record(
+                    BENCHMARK_NAMESPACE,
+                    "bench-unknown",
+                    &serde_json::to_value(&benchmark).unwrap(),
+                )
+                .unwrap();
+        }
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let record = handle
+                .evolution()
+                .store
+                .list_engine_records(EVOLUTION_CYCLE_NAMESPACE)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|(id, _)| id == EVOLUTION_CYCLE_ID)
+                .map(|(_, payload)| payload);
+            if let Some(payload) = record
+                && payload.get("benchmarks_failed").and_then(|v| v.as_u64()) == Some(1)
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the scheduled cycle never recorded its benchmark outcome");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // `interval_hours = 0` makes every tick due, so more than one cycle may have run;
+        // the stamp itself proves at least one completed past its benchmarks.
+        assert!(mapek_cycle_count(&handle) >= 1, "the cycle still completed");
     }
 }
