@@ -17,7 +17,8 @@
 //! Installing resolves the entry's `source` (an archive, or a directory optionally narrowed by
 //! `path`) through the same `PluginRegistry::install` path `plugins install` uses, then caches
 //! the resolved module under `~/.vikram/plugin-registry/<id>` so `plugins update` keeps working
-//! offline.
+//! offline. When the resolved module is newer than the cached copy the cache is refreshed too,
+//! so `plugins update` cannot reinstall a stale version over a registry upgrade.
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -26,7 +27,7 @@ use std::process::Command;
 
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
-use vikram_runtime::plugins::{PluginManifest, PluginRegistry};
+use vikram_runtime::plugins::{PluginManifest, PluginRegistry, compare_versions};
 
 const INDEX_VERSION: u32 = 1;
 const REPO_ARCHIVE: &str = "https://github.com/VIKRAM-CLI/vikram/archive/HEAD.tar.gz";
@@ -39,13 +40,16 @@ pub enum RegistryAction {
     Search { query: String },
     /// Show one entry in full.
     Info { id: String },
-    /// Install an entry by id.
+    /// Install an entry by id; when the index carries a newer version than the installed one
+    /// this is the update path for registry-installed plugins.
     Install {
         id: String,
         /// Skip the confirmation prompt.
         #[arg(long)]
         yes: bool,
     },
+    /// List installed plugins whose index version is newer than the installed one.
+    Outdated,
     /// Fetch the configured remote index into the local cache.
     Refresh {
         /// Remote index URL for this fetch only.
@@ -136,6 +140,7 @@ pub fn run(action: RegistryAction) -> Result<(), String> {
             let entry = find(&catalog, &id)?;
             install_entry(&entry.entry, yes)
         }
+        RegistryAction::Outdated => outdated(),
         RegistryAction::Refresh { registry_url } => refresh(registry_url.as_deref()),
         RegistryAction::Url => url(),
         RegistryAction::SetUrl { url, clear } => set_url(url.as_deref(), clear),
@@ -432,6 +437,64 @@ fn list(entries: &[CatalogEntry]) -> Result<(), String> {
     Ok(())
 }
 
+struct OutdatedRow {
+    id: String,
+    installed: String,
+    index: String,
+    origin: Origin,
+}
+
+/// Installed plugins whose catalog entry declares a newer version. Versions compare by numeric
+/// core via `compare_versions`; a pair that does not parse is not reported rather than guessed.
+fn outdated_rows(
+    catalog: &[CatalogEntry],
+    installed: &BTreeMap<String, String>,
+) -> Vec<OutdatedRow> {
+    installed
+        .iter()
+        .filter_map(|(id, version)| {
+            let candidate = catalog.iter().find(|c| c.entry.id == *id)?;
+            if compare_versions(&candidate.entry.version, version)
+                != Some(std::cmp::Ordering::Greater)
+            {
+                return None;
+            }
+            Some(OutdatedRow {
+                id: id.clone(),
+                installed: version.clone(),
+                index: candidate.entry.version.clone(),
+                origin: candidate.origin,
+            })
+        })
+        .collect()
+}
+
+fn outdated() -> Result<(), String> {
+    let rows = outdated_rows(&catalog()?, &installed_versions());
+    if rows.is_empty() {
+        println!("no installed plugins have an older index version");
+    } else {
+        println!(
+            "{:<28} {:<10} {:<10} {:<8}",
+            "ID", "INSTALLED", "INDEX", "SOURCE"
+        );
+        for row in &rows {
+            println!(
+                "{:<28} {:<10} {:<10} {:<8}",
+                row.id,
+                row.installed,
+                row.index,
+                row.origin.label()
+            );
+        }
+        println!("update with `vikram registry install <id>`");
+    }
+    if !remote_index_path().is_file() {
+        println!("note: remote index not fetched; run `vikram registry refresh`");
+    }
+    Ok(())
+}
+
 /// Where `registry refresh` fetches from: `--registry-url` > `VIKRAM_REGISTRY_URL` > the local
 /// index `url` field > `registry_url` in `~/.vikram/config.json`.
 fn configured_url(flag: Option<&str>) -> Option<String> {
@@ -704,33 +767,68 @@ fn confirm(question: &str) -> Result<(), String> {
 }
 
 /// Install through the same registry path `plugins install` uses, then cache the resolved module
-/// in the local source registry (`plugin-registry/<id>`) when absent so `plugins update` has a
-/// durable source. An existing cache entry is left alone: it is the operator's local registry.
+/// in the local source registry (`plugin-registry/<id>`) so `plugins update` has a durable
+/// source. An existing cache entry is left alone unless the resolved module is newer than it:
+/// the cache is what `plugins update` reinstalls from, so a registry upgrade must refresh it or
+/// the next `plugins update` would downgrade the plugin.
 fn install_entry(entry: &RegistryEntry, yes: bool) -> Result<(), String> {
     let (dir, _held) = resolve_source(entry)?;
     let manifest = PluginManifest::from_dir(&dir)
         .map_err(|err| format!("registry entry `{}` is not a plugin: {err}", entry.id))?;
     let id = manifest.id().trim().to_owned();
+    let registry = PluginRegistry::from_default_dir();
+    let before = registry.installed_version(&id);
     if !yes {
         confirm(&format!(
             "install registry entry `{id}` ({})? [y/N] ",
             entry.source
         ))?;
     }
-    let registry = PluginRegistry::from_default_dir();
-    let installed = registry.install(&dir)?;
+    // `install` refuses an existing id; an already-installed plugin takes the update path,
+    // which parks the replaced copy for `plugins rollback`.
+    let installed = if before.is_some() {
+        registry.update(&dir, &id)?
+    } else {
+        registry.install(&dir)?
+    };
     let cache = registry.registry_root().join(&id);
-    if !cache.join("plugin.json").is_file()
-        && let Err(err) = copy_dir(&dir, &cache)
-    {
+    if let Err(err) = sync_cache(&cache, &dir, &manifest) {
         println!("installed {installed} (could not cache the source: {err})");
         return Ok(());
     }
     if cache.join("plugin.json").is_file() {
         crate::plugins::record_source(&id, &cache)?;
     }
-    println!("installed {installed}");
+    if let Some(before) = &before {
+        let direction = match compare_versions(&manifest.version, before) {
+            Some(std::cmp::Ordering::Less) => " (downgrade)",
+            _ => "",
+        };
+        println!(
+            "updated {installed}: {before} -> {}{direction}",
+            manifest.version
+        );
+    } else {
+        println!("installed {installed}");
+    }
     Ok(())
+}
+
+/// Keep `plugin-registry/<id>` in step with what was just installed: copy when absent, replace
+/// when the installed manifest is newer than the cached one, leave an up-to-date or unparsable
+/// cache untouched (it is the operator's local registry).
+fn sync_cache(cache: &Path, dir: &Path, manifest: &PluginManifest) -> Result<(), String> {
+    if cache.join("plugin.json").is_file() {
+        let cached = PluginManifest::from_dir(cache)
+            .map(|cached| cached.version)
+            .unwrap_or_default();
+        if compare_versions(&manifest.version, &cached) != Some(std::cmp::Ordering::Greater) {
+            return Ok(());
+        }
+        std::fs::remove_dir_all(cache)
+            .map_err(|err| format!("cannot replace {}: {err}", cache.display()))?;
+    }
+    copy_dir(dir, cache)
 }
 
 #[cfg(test)]
@@ -856,11 +954,15 @@ mod tests {
     }
 
     fn write_module(dir: &Path, id: &str) {
+        write_module_version(dir, id, "1.0.0");
+    }
+
+    fn write_module_version(dir: &Path, id: &str, version: &str) {
         let module = dir.join(id);
         std::fs::create_dir_all(&module).unwrap();
         std::fs::write(
             module.join("plugin.json"),
-            format!(r#"{{"id": "{id}", "name": "{id}", "version": "1.0.0"}}"#),
+            format!(r#"{{"id": "{id}", "name": "{id}", "version": "{version}"}}"#),
         )
         .unwrap();
     }
@@ -914,6 +1016,87 @@ mod tests {
         assert_eq!(
             installed.get("packed-mod").map(String::as_str),
             Some("1.0.0")
+        );
+    }
+
+    #[test]
+    fn outdated_rows_reports_only_newer_index_versions() {
+        let catalog = vec![
+            CatalogEntry {
+                entry: {
+                    let mut e = entry("acme", "https://a/1.tgz");
+                    e.version = "2.0.0".to_owned();
+                    e
+                },
+                origin: Origin::Remote,
+            },
+            CatalogEntry {
+                entry: entry("beta", "https://a/2.tgz"),
+                origin: Origin::Local,
+            },
+            CatalogEntry {
+                entry: {
+                    let mut e = entry("epsilon", "https://a/3.tgz");
+                    e.version = "2.0.0".to_owned();
+                    e
+                },
+                origin: Origin::Bundled,
+            },
+        ];
+        let installed: BTreeMap<String, String> = [
+            ("acme".to_owned(), "1.0.0".to_owned()),
+            ("beta".to_owned(), "1.0.0".to_owned()),
+            ("epsilon".to_owned(), "3.0.0".to_owned()),
+            ("ghost".to_owned(), "1.0.0".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        let rows = outdated_rows(&catalog, &installed);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "acme");
+        assert_eq!(rows[0].installed, "1.0.0");
+        assert_eq!(rows[0].index, "2.0.0");
+        assert_eq!(rows[0].origin, Origin::Remote);
+    }
+
+    /// A second `registry install` of an installed plugin takes the update path: the plugin is
+    /// swapped (old copy parked for rollback) and the source-registry cache follows the newer
+    /// version so `plugins update` cannot downgrade it again.
+    #[test]
+    fn install_entry_upgrades_and_refreshes_the_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = vikram_runtime::config::lock_security_env();
+        unsafe { std::env::set_var("VIKRAM_HOME", tmp.path().join("home")) };
+
+        let src_v1 = tmp.path().join("src-v1");
+        write_module_version(&src_v1, "acme", "1.0.0");
+        let mut local = entry("acme", &src_v1.to_string_lossy());
+        install_entry(&local, true).unwrap();
+        assert_eq!(
+            installed_versions().get("acme").map(String::as_str),
+            Some("1.0.0")
+        );
+
+        let src_v2 = tmp.path().join("src-v2");
+        write_module_version(&src_v2, "acme", "2.0.0");
+        local.source = src_v2.to_string_lossy().into_owned();
+        local.version = "2.0.0".to_owned();
+        install_entry(&local, true).unwrap();
+
+        let plugins = vikram_runtime::config::plugins_dir();
+        let manifest = PluginManifest::from_dir(&plugins.join("acme")).unwrap();
+        assert_eq!(manifest.version, "2.0.0");
+        // The replaced copy is parked for `plugins rollback`.
+        assert!(plugins.join(".backups/acme/plugin.json").is_file());
+        // The cache `plugins update` reads was refreshed to the newer version.
+        let cache = vikram_runtime::config::vikram_home()
+            .join("plugin-registry")
+            .join("acme");
+        let cached = PluginManifest::from_dir(&cache).unwrap();
+        assert_eq!(cached.version, "2.0.0");
+        assert_eq!(
+            installed_versions().get("acme").map(String::as_str),
+            Some("2.0.0")
         );
     }
 

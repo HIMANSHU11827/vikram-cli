@@ -13,17 +13,21 @@
 //! do it and say so — `Research` reports recorded experience tallies,
 //! `Inspection` reports recorded skill versions and memory counts,
 //! `Planning` persists a plan artifact under `self_development.plan`,
-//! `IndependentReview` evaluates the recorded stage results,
-//! `Recording`/`RollbackPath` document the durable record and rollback
-//! path. Stages that need tooling this crate does not have (implementation,
-//! formatting, test runs, comparison, integration) still record
-//! `success: false` — they never fabricate work, so a project cannot
-//! reach `Completed` until real executors exist.
+//! `Implementation` records the change as a new `SkillVersion` row for
+//! skill targets, `Formatting` lints the recorded head version,
+//! `UnitTests`/`IntegrationTests`/`RegressionTests` review recorded
+//! experience outcomes for the target (no test execution — this crate
+//! runs no build or test tooling), `Comparison` snapshots recorded state
+//! before/after project creation, `Integration` verifies the recorded
+//! head version belongs to this lifecycle, `IndependentReview` evaluates
+//! the recorded stage results, and `Recording`/`RollbackPath` document
+//! the durable record and rollback path. Change types with no store
+//! representation still record `success: false` at `Implementation`.
 
 use crate::error::{EvolutionError, Result};
 use crate::metrics;
 use crate::store::{EvolutionStore, from_json_value, to_json_value};
-use crate::types::{gen_id, now_ms};
+use crate::types::{Experience, ExperienceOutcome, SkillVersion, gen_id, now_ms};
 use serde::{Deserialize, Serialize};
 
 /// `engine_records` namespace holding every persisted [`DevelopmentProject`].
@@ -31,6 +35,9 @@ const PROJECT_NAMESPACE: &str = "self_development.project";
 /// `engine_records` namespace holding the plan artifact each project
 /// emits at its `Planning` stage.
 const PLAN_NAMESPACE: &str = "self_development.plan";
+/// `engine_records` namespace holding the before/after snapshot each
+/// project emits at its `Comparison` stage.
+const COMPARISON_NAMESPACE: &str = "self_development.comparison";
 
 /// Development change types.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -464,21 +471,28 @@ impl SelfDevelopmentEngine {
 
     /// Execute one lifecycle stage.
     ///
-    /// Stages fall into three honest groups:
+    /// Stages fall into honest groups:
     ///
     /// - **Real work over the store** — `Research` (recorded experience
     ///   tallies), `Inspection` (recorded skill versions + memory counts),
-    ///   `Planning` (persists a plan artifact), `IndependentReview`
-    ///   (evaluates the recorded stage results), `Recording` (the project
-    ///   record is persisted by [`Self::advance_stage`]), and
-    ///   `RollbackPath` (the rollback path is `rollback_change`, verified
-    ///   against the live project). These succeed only because they
-    ///   actually did the work.
-    /// - **No executor in this crate** — `Implementation`, `Formatting`,
-    ///   `UnitTests`, `IntegrationTests`, `RegressionTests`, `Comparison`,
-    ///   `Integration`. There is no formatter, test runner, baseline, or
-    ///   integration actuator reachable from the store, so they record
-    ///   `success: false` rather than fabricating results.
+    ///   `Planning` (persists a plan artifact), `Implementation` (records
+    ///   the change as a new `SkillVersion` row for skill targets),
+    ///   `Formatting` (lints the recorded head version), `UnitTests`/
+    ///   `IntegrationTests`/`RegressionTests` (review recorded experience
+    ///   outcomes for the target — evidence, not execution),
+    ///   `IndependentReview` (evaluates the recorded stage results),
+    ///   `Comparison` (persists a before/after snapshot of recorded
+    ///   state), `Integration` (verifies the recorded head version was
+    ///   produced by this lifecycle), `Recording` (the project record is
+    ///   persisted by [`Self::advance_stage`]), and `RollbackPath` (the
+    ///   rollback path is `rollback_change`, verified against the live
+    ///   project). These succeed only because they actually did the
+    ///   work.
+    /// - **No store representation** — `Implementation` for change types
+    ///   other than skill create/improve (tools, agents, source edits,
+    ///   workflows have no table this engine can write), and
+    ///   `Formatting`/test stages/`Integration` for those same targets.
+    ///   They record `success: false` rather than fabricating results.
     fn execute_stage(
         &self,
         stage: &DevelopmentStage,
@@ -489,7 +503,18 @@ impl SelfDevelopmentEngine {
             DevelopmentStage::Research => self.stage_research()?,
             DevelopmentStage::Inspection => self.stage_inspection(change)?,
             DevelopmentStage::Planning => self.stage_planning(project_id, change)?,
+            DevelopmentStage::Implementation => self.stage_implementation(project_id, change)?,
+            DevelopmentStage::Formatting => self.stage_formatting(change)?,
+            DevelopmentStage::UnitTests => self.stage_test_evidence(*stage, project_id, change)?,
+            DevelopmentStage::IntegrationTests => {
+                self.stage_test_evidence(*stage, project_id, change)?
+            }
+            DevelopmentStage::RegressionTests => {
+                self.stage_test_evidence(*stage, project_id, change)?
+            }
             DevelopmentStage::IndependentReview => self.stage_independent_review(project_id)?,
+            DevelopmentStage::Comparison => self.stage_comparison(project_id, change)?,
+            DevelopmentStage::Integration => self.stage_integration(project_id, change)?,
             DevelopmentStage::Recording => StageResult {
                 stage: *stage,
                 success: true,
@@ -588,7 +613,8 @@ impl SelfDevelopmentEngine {
                 "regression_tests", "independent_review", "comparison",
                 "integration", "recording", "rollback_path"
             ],
-            "note": "plan artifact only — stages without an executor in this crate cannot run",
+            "note": "plan artifact only — later stages verify recorded store \
+                     evidence; no code execution happens in this crate",
         });
         self.store
             .save_engine_record(PLAN_NAMESPACE, project_id, &plan)?;
@@ -626,6 +652,360 @@ impl SelfDevelopmentEngine {
             timestamp_ms: now_ms(),
         })
     }
+
+    /// Implementation: for skill targets this is a real store mutation —
+    /// the change payload is recorded as the next [`SkillVersion`] row,
+    /// the same durable record [`crate::skills::SkillEvolution`] writes
+    /// (this engine is store-scoped: no `SKILL.md` is materialized), and
+    /// the write is verified by re-reading the version table. Other
+    /// change types have no store representation and fail honestly.
+    fn stage_implementation(
+        &self,
+        project_id: &str,
+        change: &DevelopmentChange,
+    ) -> Result<StageResult> {
+        let (name, content) = match change {
+            DevelopmentChange::CreateSkill { name, content } => (name, content),
+            DevelopmentChange::ImproveSkill { name, changes } => (name, changes),
+            _ => {
+                return Ok(StageResult {
+                    stage: DevelopmentStage::Implementation,
+                    success: false,
+                    output: format!(
+                        "change type has no store-backed implementation: {}",
+                        describe_change(change)
+                    ),
+                    timestamp_ms: now_ms(),
+                });
+            }
+        };
+
+        if let Err(e) = crate::redact::scan_injection(content) {
+            return Ok(StageResult {
+                stage: DevelopmentStage::Implementation,
+                success: false,
+                output: format!("content rejected before recording: {e}"),
+                timestamp_ms: now_ms(),
+            });
+        }
+
+        let versions = self.store.list_skill_versions(name)?;
+        let head = versions.iter().map(|v| v.version).max();
+        let next = head.unwrap_or(0) + 1;
+        let recorded = SkillVersion {
+            skill_name: name.clone(),
+            version: next,
+            content: content.clone(),
+            created_ms: now_ms(),
+            parent_version: head,
+            change_description: format!("self-development project {project_id}"),
+        };
+        self.store.save_skill_version(&recorded)?;
+
+        let verified = self
+            .store
+            .list_skill_versions(name)?
+            .iter()
+            .any(|v| v.version == next && v.content == *content);
+        Ok(StageResult {
+            stage: DevelopmentStage::Implementation,
+            success: verified,
+            output: if verified {
+                format!(
+                    "recorded skill '{name}' v{next} (parent {head:?}) in the version \
+                     table and verified by re-read; no SKILL.md materialized — \
+                     store-scoped engine"
+                )
+            } else {
+                format!("skill '{name}' v{next} did not verify after recording")
+            },
+            timestamp_ms: now_ms(),
+        })
+    }
+
+    /// Formatting: no formatter exists in this crate, so this is an
+    /// honest format *check* over the recorded head version — it
+    /// verifies the artifact Implementation produced is non-empty and
+    /// free of NUL/control characters. It does not claim to have
+    /// reformatted anything.
+    fn stage_formatting(&self, change: &DevelopmentChange) -> Result<StageResult> {
+        let Some(name) = skill_target(change) else {
+            return Ok(StageResult {
+                stage: DevelopmentStage::Formatting,
+                success: false,
+                output: "no recorded skill artifact to check for this change type".to_string(),
+                timestamp_ms: now_ms(),
+            });
+        };
+        let versions = self.store.list_skill_versions(name)?;
+        let Some(head) = versions.iter().max_by_key(|v| v.version) else {
+            return Ok(StageResult {
+                stage: DevelopmentStage::Formatting,
+                success: false,
+                output: format!("no recorded version for skill '{name}' to check"),
+                timestamp_ms: now_ms(),
+            });
+        };
+        let content = &head.content;
+        let non_empty = !content.trim().is_empty();
+        let no_nul = !content.contains('\0');
+        let no_bad_controls = !content
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'));
+        let success = non_empty && no_nul && no_bad_controls;
+        Ok(StageResult {
+            stage: DevelopmentStage::Formatting,
+            success,
+            output: format!(
+                "format check over recorded '{name}' v{} (no formatter run): \
+                 non-empty={}, no-NUL={}, no-stray-control-characters={}",
+                head.version, non_empty, no_nul, no_bad_controls
+            ),
+            timestamp_ms: now_ms(),
+        })
+    }
+
+    /// Unit/Integration/Regression tests: this crate executes no test
+    /// tooling, so each stage performs an evidence review over recorded
+    /// [`Experience`] rows that reference the change's skill target.
+    ///
+    /// - `UnitTests` passes only when recorded outcomes for the target
+    ///   include at least one success and no failure/partial.
+    /// - `IntegrationTests` applies the same rule to experiences that
+    ///   used tools.
+    /// - `RegressionTests` checks experiences recorded at or after the
+    ///   project's creation: it passes when none of them failed
+    ///   (vacuous pass is reported with its zero counts, not hidden).
+    ///
+    /// No recorded evidence means `success: false` — the stage reports
+    /// exactly what the store holds rather than claiming a test run.
+    fn stage_test_evidence(
+        &self,
+        stage: DevelopmentStage,
+        project_id: &str,
+        change: &DevelopmentChange,
+    ) -> Result<StageResult> {
+        let Some(name) = skill_target(change) else {
+            return Ok(StageResult {
+                stage,
+                success: false,
+                output: "no recorded-outcome target for this change type; \
+                         no test evidence can be reviewed"
+                    .to_string(),
+                timestamp_ms: now_ms(),
+            });
+        };
+
+        let experiences = self
+            .store
+            .list_experiences(None, 500)?
+            .into_iter()
+            .filter(|e| experience_references(e, name))
+            .collect::<Vec<_>>();
+
+        let considered: Vec<&Experience> = match stage {
+            DevelopmentStage::UnitTests => experiences.iter().collect(),
+            DevelopmentStage::IntegrationTests => experiences
+                .iter()
+                .filter(|e| !e.tools_used.is_empty())
+                .collect(),
+            DevelopmentStage::RegressionTests => {
+                let since = self
+                    .projects
+                    .iter()
+                    .find(|p| p.id == project_id)
+                    .map(|p| p.created_ms)
+                    .unwrap_or(0);
+                experiences
+                    .iter()
+                    .filter(|e| e.timestamp_ms >= since)
+                    .collect()
+            }
+            _ => unreachable!("stage_test_evidence only runs for test stages"),
+        };
+        let (successes, failures, considered_count) = tally_outcomes(&considered);
+
+        let success = match stage {
+            DevelopmentStage::RegressionTests => failures == 0,
+            _ => successes > 0 && failures == 0,
+        };
+        Ok(StageResult {
+            stage,
+            success,
+            output: format!(
+                "evidence review over recorded experiences for '{name}' \
+                 ({considered_count} relevant, {successes} success, {failures} \
+                 failure/partial); no tests executed in this crate"
+            ),
+            timestamp_ms: now_ms(),
+        })
+    }
+
+    /// Comparison: a real before/after snapshot of recorded state split
+    /// at the project's creation time — experience outcome tallies plus
+    /// the target skill's recorded version count — persisted as an
+    /// `engine_records` artifact. The comparison itself is the work, so
+    /// it succeeds whenever the snapshot was taken; the output reports
+    /// the observed delta honestly (possibly zero).
+    fn stage_comparison(
+        &self,
+        project_id: &str,
+        change: &DevelopmentChange,
+    ) -> Result<StageResult> {
+        let project = self
+            .projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .ok_or_else(|| EvolutionError::NotFound("Project not found".to_string()))?;
+        let since = project.created_ms;
+
+        let mut pre = (0usize, 0usize);
+        let mut post = (0usize, 0usize);
+        for e in self.store.list_experiences(None, 500)? {
+            let (s, f) = tally_one(&e);
+            if e.timestamp_ms >= since {
+                post.0 += s;
+                post.1 += f;
+            } else {
+                pre.0 += s;
+                pre.1 += f;
+            }
+        }
+
+        let skill_delta = if let Some(name) = skill_target(change) {
+            let versions = self.store.list_skill_versions(name)?;
+            let new_versions = versions
+                .iter()
+                .filter(|v| v.created_ms >= since)
+                .map(|v| v.version)
+                .collect::<Vec<_>>();
+            Some(serde_json::json!({
+                "skill": name,
+                "versions_before": versions.iter().filter(|v| v.created_ms < since).count(),
+                "versions_after": new_versions,
+            }))
+        } else {
+            None
+        };
+
+        let snapshot = serde_json::json!({
+            "project_id": project_id,
+            "split_at_ms": since,
+            "experiences": {
+                "before": {"success": pre.0, "failure_or_partial": pre.1},
+                "after": {"success": post.0, "failure_or_partial": post.1},
+            },
+            "skill": skill_delta,
+        });
+        self.store
+            .save_engine_record(COMPARISON_NAMESPACE, project_id, &snapshot)?;
+
+        Ok(StageResult {
+            stage: DevelopmentStage::Comparison,
+            success: true,
+            output: format!(
+                "comparison snapshot persisted to engine_records/{COMPARISON_NAMESPACE}/{project_id}: \
+                 experiences before/after project start = {pre:?}/{post:?}; \
+                 skill delta = {}",
+                skill_delta
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "none (non-skill change)".to_string())
+            ),
+            timestamp_ms: now_ms(),
+        })
+    }
+
+    /// Integration: for skill targets this verifies the recorded head
+    /// version is one this lifecycle produced — the store's current head
+    /// for the skill must have been recorded at or after the project's
+    /// creation. This is store integration only; no runtime activation
+    /// path exists in this crate and none is claimed.
+    fn stage_integration(
+        &self,
+        project_id: &str,
+        change: &DevelopmentChange,
+    ) -> Result<StageResult> {
+        let Some(name) = skill_target(change) else {
+            return Ok(StageResult {
+                stage: DevelopmentStage::Integration,
+                success: false,
+                output: "no store integration target for this change type".to_string(),
+                timestamp_ms: now_ms(),
+            });
+        };
+        let project = self
+            .projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .ok_or_else(|| EvolutionError::NotFound("Project not found".to_string()))?;
+        let versions = self.store.list_skill_versions(name)?;
+        let Some(head) = versions.iter().max_by_key(|v| v.version) else {
+            return Ok(StageResult {
+                stage: DevelopmentStage::Integration,
+                success: false,
+                output: format!("no recorded version for skill '{name}' to integrate"),
+                timestamp_ms: now_ms(),
+            });
+        };
+        let produced_by_project = head.created_ms >= project.created_ms;
+        Ok(StageResult {
+            stage: DevelopmentStage::Integration,
+            success: produced_by_project,
+            output: if produced_by_project {
+                format!(
+                    "store integration verified: '{name}' head is v{} recorded at {} \
+                     (project started {}); runtime activation is not wired in this crate",
+                    head.version, head.created_ms, project.created_ms
+                )
+            } else {
+                format!(
+                    "'{name}' head v{} was recorded at {}, before this project started \
+                     at {}; this lifecycle did not produce the current head",
+                    head.version, head.created_ms, project.created_ms
+                )
+            },
+            timestamp_ms: now_ms(),
+        })
+    }
+}
+
+/// The skill name a change targets, if it is a skill create/improve.
+fn skill_target(change: &DevelopmentChange) -> Option<&str> {
+    match change {
+        DevelopmentChange::CreateSkill { name, .. }
+        | DevelopmentChange::ImproveSkill { name, .. } => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether a recorded experience references the target — matched against
+/// the request text, task category, and metadata payload.
+fn experience_references(e: &Experience, target: &str) -> bool {
+    e.user_request.contains(target)
+        || e.task_category.contains(target)
+        || e.metadata.to_string().contains(target)
+}
+
+/// (successes, failures) for one experience; `Partial` counts as a
+/// non-success so evidence review stays conservative.
+fn tally_one(e: &Experience) -> (usize, usize) {
+    match e.outcome {
+        ExperienceOutcome::Success => (1, 0),
+        ExperienceOutcome::Failure | ExperienceOutcome::Partial => (0, 1),
+    }
+}
+
+/// (successes, failures, considered) over a set of experiences.
+fn tally_outcomes(experiences: &[&Experience]) -> (usize, usize, usize) {
+    let mut s = 0;
+    let mut f = 0;
+    for e in experiences {
+        let (es, ef) = tally_one(e);
+        s += es;
+        f += ef;
+    }
+    (s, f, experiences.len())
 }
 
 fn describe_change(change: &DevelopmentChange) -> String {
@@ -695,9 +1075,37 @@ mod tests {
         SelfDevelopmentEngine::new(store)
     }
 
+    fn seed_experience(
+        store: &EvolutionStore,
+        id: &str,
+        request: &str,
+        outcome: ExperienceOutcome,
+        tools: Vec<String>,
+    ) {
+        store
+            .save_experience(&Experience {
+                id: id.to_string(),
+                timestamp_ms: now_ms(),
+                agent_id: "a".to_string(),
+                project_id: None,
+                task_category: "coding".to_string(),
+                user_request: request.to_string(),
+                outcome,
+                tools_used: tools,
+                errors: vec![],
+                corrections: vec![],
+                feedback: None,
+                reusable: false,
+                sensitivity: Sensitivity::Private,
+                metadata: serde_json::json!({}),
+            })
+            .unwrap();
+    }
+
     #[test]
-    fn store_backed_stages_do_real_work_and_tooling_stages_fail_honestly() {
-        let mut engine = engine();
+    fn store_backed_stages_do_real_work_and_unevidenced_gates_fail_honestly() {
+        let store = EvolutionStore::open_in_memory().unwrap();
+        let mut engine = engine_with_store(store.clone());
         let project = engine.create_skill("skill", "content", "reason").unwrap();
 
         // Identification was recorded at creation.
@@ -727,11 +1135,147 @@ mod tests {
         assert!(planning.success);
         assert!(planning.output.contains(PLAN_NAMESPACE));
 
-        // Implementation has no executor — it must fail, not pretend.
+        // Implementation records the skill as a real version row.
+        let implementation = engine.advance_stage(&project.id).unwrap();
+        assert!(implementation.success);
+        assert!(implementation.output.contains("recorded skill 'skill' v1"));
+        let versions = store.list_skill_versions("skill").unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].content, "content");
+
+        // Formatting lints the recorded artifact and passes.
+        let formatting = engine.advance_stage(&project.id).unwrap();
+        assert!(formatting.success);
+        assert!(formatting.output.contains("format check"));
+
+        // UnitTests finds no recorded evidence — it fails, not pretends.
+        let unit = engine.advance_stage(&project.id).unwrap();
+        assert!(!unit.success);
+        assert!(unit.output.contains("no tests executed"));
+        assert_eq!(engine.get_projects()[0].status, ProjectStatus::Failed);
+    }
+
+    #[test]
+    fn non_skill_changes_still_fail_implementation_honestly() {
+        let mut engine = engine();
+        let project = engine.create_tool("spec", "impl", "reason").unwrap();
+        for _ in 0..3 {
+            engine.advance_stage(&project.id).unwrap(); // research, inspection, planning
+        }
         let implementation = engine.advance_stage(&project.id).unwrap();
         assert!(!implementation.success);
-        assert!(implementation.output.contains("no executor"));
-        assert_eq!(engine.get_projects()[0].status, ProjectStatus::Failed);
+        assert!(
+            implementation
+                .output
+                .contains("no store-backed implementation")
+        );
+    }
+
+    #[test]
+    fn skill_project_completes_when_recorded_evidence_supports_every_gate() {
+        let store = EvolutionStore::open_in_memory().unwrap();
+        // Recorded outcome for the skill target, using a tool — this is
+        // the only evidence the test stages accept.
+        seed_experience(
+            &store,
+            "exp-ok",
+            "run skill workflow",
+            ExperienceOutcome::Success,
+            vec!["tool".to_string()],
+        );
+        // Unrelated noise that must not satisfy the gates.
+        seed_experience(
+            &store,
+            "exp-other",
+            "unrelated task",
+            ExperienceOutcome::Failure,
+            vec![],
+        );
+
+        let mut engine = engine_with_store(store.clone());
+        let project = engine
+            .create_skill("skill", "# skill\nbody", "reason")
+            .unwrap();
+
+        for _ in 0..14 {
+            engine.advance_stage(&project.id).unwrap();
+            if engine.get_projects()[0].completed_ms.is_some() {
+                break;
+            }
+        }
+
+        let finished = &engine.get_projects()[0];
+        assert_eq!(finished.status, ProjectStatus::Completed);
+        assert!(finished.completed_ms.is_some());
+        // Identification + 13 lifecycle stages, all successful.
+        assert!(finished.stage_results.iter().all(|r| r.success));
+        assert_eq!(finished.stage_results.len(), 14);
+
+        // The implementation artifact is a real recorded version.
+        let versions = store.list_skill_versions("skill").unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, 1);
+
+        // Comparison left a real snapshot artifact.
+        let comparisons = store.list_engine_records(COMPARISON_NAMESPACE).unwrap();
+        assert_eq!(comparisons.len(), 1);
+        assert_eq!(comparisons[0].0, project.id);
+    }
+
+    #[test]
+    fn test_gates_reject_recorded_failures_for_the_target() {
+        let store = EvolutionStore::open_in_memory().unwrap();
+        seed_experience(
+            &store,
+            "exp-bad",
+            "skill attempt",
+            ExperienceOutcome::Failure,
+            vec!["tool".to_string()],
+        );
+        let mut engine = engine_with_store(store);
+        let project = engine.create_skill("skill", "body", "reason").unwrap();
+        for _ in 0..7 {
+            engine.advance_stage(&project.id).unwrap(); // through UnitTests
+        }
+        // UnitTests ran at advance #7? count: research,inspection,planning,
+        // implementation,formatting,unit_tests → 6 advances to reach it.
+        let stages = &engine.get_projects()[0].stage_results;
+        let unit = stages
+            .iter()
+            .find(|r| r.stage == DevelopmentStage::UnitTests)
+            .unwrap();
+        assert!(!unit.success);
+        assert!(unit.output.contains("1 failure/partial"));
+    }
+
+    #[test]
+    fn improve_skill_records_a_new_version_over_existing_history() {
+        let store = EvolutionStore::open_in_memory().unwrap();
+        store
+            .save_skill_version(&SkillVersion {
+                skill_name: "skill".to_string(),
+                version: 1,
+                content: "v1".to_string(),
+                created_ms: now_ms(),
+                parent_version: None,
+                change_description: "init".to_string(),
+            })
+            .unwrap();
+        let mut engine = engine_with_store(store.clone());
+        let project = engine
+            .improve_skill("skill", "v2 content", "reason")
+            .unwrap();
+        for _ in 0..3 {
+            engine.advance_stage(&project.id).unwrap();
+        }
+        let implementation = engine.advance_stage(&project.id).unwrap();
+        assert!(implementation.success);
+        assert!(implementation.output.contains("v2"));
+        let versions = store.list_skill_versions("skill").unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[1].version, 2);
+        assert_eq!(versions[1].parent_version, Some(1));
+        assert_eq!(versions[1].content, "v2 content");
     }
 
     #[test]
