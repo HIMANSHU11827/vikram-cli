@@ -16,6 +16,7 @@
 //! | metric | source |
 //! |---|---|
 //! | outcomes, errors, corrections, reusable | `experiences.outcome/errors/corrections/reusable` |
+//! | per-agent/category performance | `experiences` grouped by `agent_id`/`task_category`, `json_each` over `errors`/`tools_used`, `metadata.duration_ms` |
 //! | durations | `experiences.metadata.duration_ms` (optional producer key) |
 //! | token usage | `experiences.metadata.tokens_used` (optional producer key) |
 //! | reflection latency | `reflection_jobs.updated_ms - created_ms` for `done` jobs |
@@ -180,6 +181,73 @@ impl CategoryStats {
         }
     }
 }
+
+/// Which `experiences` column performance groups are keyed by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PerformanceDimension {
+    /// Group by `experiences.agent_id`.
+    Agent,
+    /// Group by `experiences.task_category`.
+    Category,
+}
+
+/// A named tally inside [`PerformanceStats`]: an error string or a tool name
+/// with the number of distinct experiences it appears in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamedCount {
+    pub name: String,
+    pub count: usize,
+}
+
+/// Per-agent or per-category performance derived only from recorded
+/// experiences. Every count is a SQL aggregate over `experiences` rows;
+/// rates are `None` when the group has no rows (a group with `total == 0`
+/// cannot exist, but the rate helpers stay honest anyway).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PerformanceStats {
+    /// The `agent_id` or `task_category` value this row aggregates.
+    pub key: String,
+    pub total: usize,
+    pub success: usize,
+    pub failure: usize,
+    pub partial: usize,
+    /// Experiences that failed *or* recorded at least one error (union).
+    pub problems: usize,
+    /// Mean of `metadata.duration_ms` over experiences that recorded it.
+    pub avg_duration_ms: Option<u64>,
+    /// Most frequent error strings, capped at [`TOP_PERFORMANCE_ITEMS`].
+    pub top_errors: Vec<NamedCount>,
+    /// Tool names by number of distinct experiences that used them, capped
+    /// at [`TOP_PERFORMANCE_ITEMS`].
+    pub tool_usage: Vec<NamedCount>,
+}
+
+impl PerformanceStats {
+    /// Share of this group's experiences that succeeded outright.
+    pub fn success_rate(&self) -> Option<f32> {
+        self.rate(self.success)
+    }
+    /// Share of this group's experiences that failed outright.
+    pub fn failure_rate(&self) -> Option<f32> {
+        self.rate(self.failure)
+    }
+    /// Share of this group's experiences that failed or recorded an error.
+    pub fn problem_rate(&self) -> Option<f32> {
+        self.rate(self.problems)
+    }
+    fn rate(&self, n: usize) -> Option<f32> {
+        if self.total == 0 {
+            None
+        } else {
+            Some(n as f32 / self.total as f32)
+        }
+    }
+}
+
+/// Cap on `top_errors`/`tool_usage` entries per [`PerformanceStats`] row so
+/// a group with pathological error/tool cardinality cannot produce an
+/// unbounded payload.
+pub const TOP_PERFORMANCE_ITEMS: usize = 5;
 
 // ---------- proposals ----------
 
@@ -455,6 +523,135 @@ impl EvolutionStore {
         })
     }
 
+    /// Per-agent or per-category performance tallies over recorded
+    /// experiences, highest volume first (`key` ascending on ties), capped
+    /// at `limit` groups. Restricted to experiences at or after `since_ms`
+    /// when given.
+    ///
+    /// Outcome counts, the `metadata.duration_ms` average and the
+    /// `problems` union are SQL aggregates like [`Self::category_stats`].
+    /// `top_errors`/`tool_usage` expand the JSON-array `errors`/
+    /// `tools_used` columns through `json_each` (guarded by `json_valid`,
+    /// so a malformed row contributes nothing rather than failing the
+    /// query) and count each name once per experience via
+    /// `COUNT(DISTINCT id)`.
+    pub fn performance_stats(
+        &self,
+        dimension: PerformanceDimension,
+        since_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<PerformanceStats>> {
+        let key_col = match dimension {
+            PerformanceDimension::Agent => "agent_id",
+            PerformanceDimension::Category => "task_category",
+        };
+        let since = since_ms.map(|ms| ms as i64);
+        self.with_conn(|conn| {
+            let groups_sql = format!(
+                "SELECT {key_col},
+                        COUNT(*),
+                        COALESCE(SUM(outcome = 'success'), 0),
+                        COALESCE(SUM(outcome = 'failure'), 0),
+                        COALESCE(SUM(outcome = 'partial'), 0),
+                        COALESCE(SUM(outcome = 'failure' OR errors <> '[]'), 0),
+                        AVG(CASE WHEN json_valid(metadata)
+                                  AND typeof(json_extract(metadata, '$.{META_DURATION_MS}'))
+                                      IN ('integer', 'real')
+                                 THEN json_extract(metadata, '$.{META_DURATION_MS}')
+                            END)
+                 FROM experiences
+                 WHERE (?1 IS NULL OR timestamp_ms >= ?1)
+                 GROUP BY {key_col}
+                 ORDER BY COUNT(*) DESC, {key_col} ASC
+                 LIMIT ?2"
+            );
+            let mut groups_stmt = conn.prepare(&groups_sql).map_err(store_err)?;
+            let group_rows = groups_stmt
+                .query_map(rusqlite::params![since, limit as i64], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)? as usize,
+                        r.get::<_, i64>(2)? as usize,
+                        r.get::<_, i64>(3)? as usize,
+                        r.get::<_, i64>(4)? as usize,
+                        r.get::<_, i64>(5)? as usize,
+                        r.get::<_, Option<f64>>(6)?,
+                    ))
+                })
+                .map_err(store_err)?;
+            let mut stats: Vec<PerformanceStats> = Vec::new();
+            for row in group_rows {
+                let (key, total, success, failure, partial, problems, avg_dur) =
+                    row.map_err(store_err)?;
+                stats.push(PerformanceStats {
+                    key,
+                    total,
+                    success,
+                    failure,
+                    partial,
+                    problems,
+                    avg_duration_ms: positive(avg_dur),
+                    top_errors: Vec::new(),
+                    tool_usage: Vec::new(),
+                });
+            }
+            if stats.is_empty() {
+                return Ok(stats);
+            }
+
+            // Error strings and tool names per group key. `json_each` over a
+            // `CASE`-guarded column yields '[]' for malformed JSON instead of
+            // raising; `typeof(...) = 'text'` skips non-string array items.
+            for (column, is_errors) in [("errors", true), ("tools_used", false)] {
+                let detail_sql = format!(
+                    "SELECT {key_col}, e.value, COUNT(DISTINCT experiences.id)
+                     FROM experiences,
+                          json_each(CASE WHEN json_valid(experiences.{column})
+                                         THEN experiences.{column}
+                                         ELSE '[]' END) AS e
+                     WHERE (?1 IS NULL OR experiences.timestamp_ms >= ?1)
+                       AND typeof(e.value) = 'text'
+                     GROUP BY {key_col}, e.value
+                     ORDER BY {key_col} ASC, 3 DESC, e.value ASC"
+                );
+                let mut detail_stmt = conn.prepare(&detail_sql).map_err(store_err)?;
+                let detail_rows = detail_stmt
+                    .query_map(rusqlite::params![since], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)? as usize,
+                        ))
+                    })
+                    .map_err(store_err)?;
+                let mut by_key: std::collections::HashMap<String, Vec<NamedCount>> =
+                    std::collections::HashMap::new();
+                for row in detail_rows {
+                    let (key, name, count) = row.map_err(store_err)?;
+                    by_key
+                        .entry(key)
+                        .or_default()
+                        .push(NamedCount { name, count });
+                }
+                for group in stats.iter_mut() {
+                    let Some(items) = by_key.remove(&group.key) else {
+                        continue;
+                    };
+                    let items = items
+                        .into_iter()
+                        .take(TOP_PERFORMANCE_ITEMS)
+                        .collect::<Vec<_>>();
+                    if is_errors {
+                        group.top_errors = items;
+                    } else {
+                        group.tool_usage = items;
+                    }
+                }
+            }
+            Ok(stats)
+        })
+    }
+
     /// Proposal tallies by status, plus the number of unresolved
     /// `record_issue` proposals.
     pub fn proposal_stats(&self) -> Result<ProposalStats> {
@@ -651,6 +848,196 @@ mod tests {
         assert_eq!(categories[0].problem_rate(), Some(0.5));
         assert_eq!(categories[1].category, "shell");
         assert_eq!(categories[1].problems, 0);
+    }
+
+    fn perf_exp(
+        id: &str,
+        agent: &str,
+        category: &str,
+        outcome: ExperienceOutcome,
+        tools: Vec<String>,
+        errors: Vec<String>,
+        duration_ms: Option<u64>,
+    ) -> Experience {
+        Experience {
+            id: id.to_string(),
+            timestamp_ms: now_ms(),
+            agent_id: agent.to_string(),
+            project_id: None,
+            task_category: category.to_string(),
+            user_request: "req".to_string(),
+            outcome,
+            tools_used: tools,
+            errors,
+            corrections: vec![],
+            feedback: None,
+            reusable: false,
+            sensitivity: Sensitivity::Public,
+            metadata: duration_ms
+                .map(|d| serde_json::json!({ META_DURATION_MS: d }))
+                .unwrap_or_else(|| serde_json::json!({})),
+        }
+    }
+
+    #[test]
+    fn performance_stats_group_by_agent_and_category() {
+        let store = EvolutionStore::open_in_memory().unwrap();
+        let s = |v: &str| vec![v.to_string()];
+        store
+            .save_experience(&perf_exp(
+                "e1",
+                "a1",
+                "coding",
+                ExperienceOutcome::Success,
+                vec!["read".to_string(), "bash".to_string()],
+                vec![],
+                Some(1000),
+            ))
+            .unwrap();
+        store
+            .save_experience(&perf_exp(
+                "e2",
+                "a1",
+                "coding",
+                ExperienceOutcome::Failure,
+                s("bash"),
+                vec!["timeout".to_string(), "denied".to_string()],
+                Some(3000),
+            ))
+            .unwrap();
+        // Same error string twice in one experience must count once.
+        store
+            .save_experience(&perf_exp(
+                "e3",
+                "a2",
+                "coding",
+                ExperienceOutcome::Partial,
+                vec![],
+                vec!["timeout".to_string(), "timeout".to_string()],
+                None,
+            ))
+            .unwrap();
+        store
+            .save_experience(&perf_exp(
+                "e4",
+                "a2",
+                "shell",
+                ExperienceOutcome::Success,
+                s("read"),
+                vec![],
+                Some(500),
+            ))
+            .unwrap();
+
+        let agents = store
+            .performance_stats(PerformanceDimension::Agent, None, 10)
+            .unwrap();
+        assert_eq!(agents.len(), 2);
+        // a1 and a2 tie on volume; key ascending breaks the tie.
+        assert_eq!(agents[0].key, "a1");
+        assert_eq!(agents[0].total, 2);
+        assert_eq!(agents[0].success, 1);
+        assert_eq!(agents[0].failure, 1);
+        assert_eq!(agents[0].partial, 0);
+        assert_eq!(agents[0].problems, 1);
+        assert_eq!(agents[0].success_rate(), Some(0.5));
+        assert_eq!(agents[0].failure_rate(), Some(0.5));
+        assert_eq!(agents[0].avg_duration_ms, Some(2000));
+        // Tied error counts order by name ascending.
+        assert_eq!(
+            agents[0].top_errors,
+            vec![
+                NamedCount {
+                    name: "denied".to_string(),
+                    count: 1
+                },
+                NamedCount {
+                    name: "timeout".to_string(),
+                    count: 1
+                },
+            ]
+        );
+        assert_eq!(
+            agents[0].tool_usage,
+            vec![
+                NamedCount {
+                    name: "bash".to_string(),
+                    count: 2
+                },
+                NamedCount {
+                    name: "read".to_string(),
+                    count: 1
+                },
+            ]
+        );
+
+        assert_eq!(agents[1].key, "a2");
+        assert_eq!(agents[1].total, 2);
+        assert_eq!(agents[1].partial, 1);
+        // e3 recorded errors without failing: still a problem.
+        assert_eq!(agents[1].problems, 1);
+        assert_eq!(agents[1].problem_rate(), Some(0.5));
+        // Only e4 recorded a duration.
+        assert_eq!(agents[1].avg_duration_ms, Some(500));
+        assert_eq!(
+            agents[1].top_errors,
+            vec![NamedCount {
+                name: "timeout".to_string(),
+                count: 1
+            }]
+        );
+        assert_eq!(
+            agents[1].tool_usage,
+            vec![NamedCount {
+                name: "read".to_string(),
+                count: 1
+            }]
+        );
+
+        let categories = store
+            .performance_stats(PerformanceDimension::Category, None, 10)
+            .unwrap();
+        assert_eq!(categories.len(), 2);
+        assert_eq!(categories[0].key, "coding");
+        assert_eq!(categories[0].total, 3);
+        assert_eq!(categories[0].problems, 2);
+        // e1+e2 recorded durations; e3 did not and must not dilute the mean.
+        assert_eq!(categories[0].avg_duration_ms, Some(2000));
+        assert_eq!(categories[1].key, "shell");
+        assert_eq!(categories[1].total, 1);
+        assert_eq!(categories[1].tool_usage[0].name, "read");
+
+        // `limit` caps the group list, `since_ms` filters rows.
+        assert_eq!(
+            store
+                .performance_stats(PerformanceDimension::Agent, None, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .performance_stats(PerformanceDimension::Agent, Some(u64::MAX / 2), 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn performance_stats_empty_store_is_empty() {
+        let store = EvolutionStore::open_in_memory().unwrap();
+        assert!(
+            store
+                .performance_stats(PerformanceDimension::Agent, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .performance_stats(PerformanceDimension::Category, None, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

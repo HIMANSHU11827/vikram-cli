@@ -18,6 +18,7 @@
 
 use crate::error::{EvolutionError, Result};
 use crate::mapek::{HealthStatus, MapekLoop};
+use crate::metrics::PerformanceDimension;
 use crate::self_improvement::SelfImprovementEngine;
 use crate::store::EvolutionStore;
 use crate::types::{CandidateStatus, now_ms};
@@ -621,8 +622,16 @@ impl ConversationalControl {
             }
         }
 
+        let performance = if wants_performance(trimmed) {
+            Some(self.performance_payload(&search_terms)?)
+        } else {
+            None
+        };
+
         let total = events.len() + memories.len() + proposals.len() + experiences.len();
-        let message = if trimmed.is_empty() {
+        let message = if let Some(perf) = &performance {
+            perf_message(perf, trimmed)
+        } else if trimmed.is_empty() {
             "Empty question — nothing to search the store for.".to_string()
         } else if total == 0 {
             format!(
@@ -652,9 +661,46 @@ impl ConversationalControl {
                 "memories": memories,
                 "proposals": proposals,
                 "experiences": experiences,
+                "performance": performance,
             })),
             timestamp_ms: now_ms(),
         })
+    }
+
+    /// Store-backed per-agent/per-category performance for Ask questions
+    /// like "how is X performing". `agents`/`categories` carry the top
+    /// groups by volume; `matched_*` narrows them to keys a query term
+    /// names. All numbers are SQL aggregates over recorded experiences.
+    fn performance_payload(&self, terms: &[String]) -> Result<serde_json::Value> {
+        let agents = self
+            .store
+            .performance_stats(PerformanceDimension::Agent, None, 10)?;
+        let categories = self
+            .store
+            .performance_stats(PerformanceDimension::Category, None, 10)?;
+        let matches = |key: &str| {
+            let k = key.to_lowercase();
+            !k.is_empty()
+                && terms
+                    .iter()
+                    .any(|t| k == *t || k.contains(t.as_str()) || t.contains(k.as_str()))
+        };
+        let encode = |v: &Vec<crate::metrics::PerformanceStats>| -> Result<serde_json::Value> {
+            serde_json::to_value(v)
+                .map_err(|e| EvolutionError::Serde(format!("performance stats: {e}")))
+        };
+        let matched_agents: Vec<_> = agents.iter().filter(|s| matches(&s.key)).cloned().collect();
+        let matched_categories: Vec<_> = categories
+            .iter()
+            .filter(|s| matches(&s.key))
+            .cloned()
+            .collect();
+        Ok(serde_json::json!({
+            "agents": encode(&agents)?,
+            "categories": encode(&categories)?,
+            "matched_agents": encode(&matched_agents)?,
+            "matched_categories": encode(&matched_categories)?,
+        }))
     }
 
     fn report_improvements(&self) -> Result<CommandResponse> {
@@ -733,6 +779,65 @@ fn question_keywords(question: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// True when a free-form question asks about agent/category performance
+/// rather than plain record retrieval.
+fn wants_performance(question: &str) -> bool {
+    let q = question.to_lowercase();
+    [
+        "perform",
+        "success rate",
+        "failure rate",
+        "track record",
+        "how is ",
+        "how are ",
+    ]
+    .iter()
+    .any(|p| q.contains(p))
+}
+
+/// Human-readable summary for a `performance_payload` result; counts only,
+/// the rates live in `data`.
+fn perf_message(payload: &serde_json::Value, question: &str) -> String {
+    let len = |k: &str| payload[k].as_array().map(|a| a.len()).unwrap_or(0);
+    let (agents, categories) = (len("agents"), len("categories"));
+    let matched = len("matched_agents") + len("matched_categories");
+    if agents == 0 && categories == 0 {
+        return "No experiences recorded yet — there is no performance data to report.".to_string();
+    }
+    if matched > 0 {
+        let mut parts = Vec::new();
+        for section in ["matched_agents", "matched_categories"] {
+            if let Some(groups) = payload[section].as_array() {
+                for g in groups.iter().take(3) {
+                    let key = g["key"].as_str().unwrap_or("?");
+                    let total = g["total"].as_u64().unwrap_or(0);
+                    let pct = |field: &str| {
+                        let n = g[field].as_u64().unwrap_or(0);
+                        if total == 0 {
+                            "n/a".to_string()
+                        } else {
+                            format!("{:.0}%", n as f64 * 100.0 / total as f64)
+                        }
+                    };
+                    parts.push(format!(
+                        "{key}: {total} experience(s), {} success, {} failure",
+                        pct("success"),
+                        pct("failure")
+                    ));
+                }
+            }
+        }
+        format!(
+            "Performance from recorded experiences matching '{question}': {}. Mean recorded duration, top errors and tool usage are in `data.performance` — computed only from stored outcomes, not estimated.",
+            parts.join("; ")
+        )
+    } else {
+        format!(
+            "No recorded agent or task category matches '{question}'. Performance data covers {agents} agent(s) and {categories} categor(ies) — see `data.performance` for the top groups by volume."
+        )
+    }
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -1136,5 +1241,72 @@ mod tests {
             .unwrap();
         assert!(response.success);
         assert!(response.message.contains("Empty question"));
+    }
+
+    #[test]
+    fn ask_performance_question_reports_store_aggregates() {
+        let (mut control, store) = control();
+        seed_experience(&store, "exp-1", ExperienceOutcome::Success);
+        seed_experience(&store, "exp-2", ExperienceOutcome::Failure);
+
+        let command = control.parse_command("how is agent-1 performing?").unwrap();
+        let response = control.handle_command(command).unwrap();
+        assert!(response.success);
+        assert!(response.message.contains("Performance"));
+        let data = response.data.unwrap();
+        let perf = &data["performance"];
+        let agents = perf["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["key"], "agent-1");
+        assert_eq!(agents[0]["total"], 2);
+        assert_eq!(agents[0]["success"], 1);
+        assert_eq!(agents[0]["failure"], 1);
+        assert!(response.message.contains("agent-1"));
+        assert!(response.message.contains("50% success"));
+        assert!(response.message.contains("50% failure"));
+        let matched = perf["matched_agents"].as_array().unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0]["key"], "agent-1");
+        assert_eq!(perf["categories"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ask_performance_question_on_empty_store_is_honest() {
+        let (mut control, _) = control();
+        let response = control
+            .handle_command(ConversationalCommand::Ask {
+                question: "how is agent-9 performing?".to_string(),
+            })
+            .unwrap();
+        assert!(response.success);
+        assert!(response.message.contains("No experiences recorded"));
+        let data = response.data.unwrap();
+        assert_eq!(data["performance"]["agents"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn ask_performance_question_with_unknown_key_still_reports_groups() {
+        let (mut control, store) = control();
+        seed_experience(&store, "exp-1", ExperienceOutcome::Success);
+        let response = control
+            .handle_command(ConversationalCommand::Ask {
+                question: "what is the success rate for nobody?".to_string(),
+            })
+            .unwrap();
+        assert!(response.success);
+        assert!(
+            response
+                .message
+                .contains("No recorded agent or task category")
+        );
+        let data = response.data.unwrap();
+        assert_eq!(data["performance"]["agents"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            data["performance"]["matched_agents"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
     }
 }

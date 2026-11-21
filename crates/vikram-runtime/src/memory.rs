@@ -571,6 +571,11 @@ impl MemoryStore {
         let key = key.as_ref();
         let scope = scope.as_ref();
         let conn = self.lock();
+        // Drop the FTS rows before the memory rows so the index never points at a gone id.
+        let _ = conn.execute(
+            "DELETE FROM memory_fts WHERE id IN (SELECT id FROM memory WHERE key = ?1 AND scope = ?2)",
+            params![key, scope],
+        );
         let n = conn
             .execute(
                 "DELETE FROM memory WHERE key = ?1 AND scope = ?2",
@@ -1204,6 +1209,38 @@ mod tests {
         assert!(store.delete("k", "global").unwrap());
         assert!(!store.delete("k", "global").unwrap());
         assert_eq!(store.get("k", "global").unwrap(), None);
+    }
+
+    #[test]
+    fn delete_removes_from_recall_and_search() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store.save("deploy", "ship the gateway", "global").unwrap();
+        let terms = vec!["gateway".to_string()];
+        assert_eq!(
+            store
+                .recall_terms(&terms, &["global".into()], 8)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!store.search("gateway", "global").unwrap().is_empty());
+        assert!(store.delete("deploy", "global").unwrap());
+        assert!(
+            store
+                .recall_terms(&terms, &["global".into()], 8)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.search("gateway", "global").unwrap().is_empty());
+        // A same-key entry in another scope survives: delete is scope-confined.
+        store
+            .save("deploy", "other scope note", "session-1")
+            .unwrap();
+        assert!(!store.delete("deploy", "global").unwrap());
+        assert_eq!(
+            store.get("deploy", "session-1").unwrap(),
+            Some("other scope note".to_string())
+        );
     }
 
     #[test]

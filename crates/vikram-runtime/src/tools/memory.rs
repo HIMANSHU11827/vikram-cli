@@ -562,6 +562,59 @@ mod tests {
     }
 
     #[test]
+    fn delete_is_a_destructive_write_on_the_key() {
+        let req = MemoryDelete
+            .permission(&json!({"key": "prefs.theme", "scope": "global"}))
+            .unwrap();
+        assert_eq!(req.action, ActionKind::Write);
+        assert_eq!(req.side_effect, SideEffect::Destructive);
+        assert_eq!(req.verb, "memory.delete");
+        assert_eq!(req.resource, "memory:prefs.theme");
+    }
+
+    #[test]
+    fn a_bot_cannot_delete_from_the_global_scope() {
+        let ctx = context_with_bot(Some("b1"));
+        let err = MemoryDelete
+            .run(&json!({"key": "k", "scope": "global"}), &ctx)
+            .unwrap_err();
+        assert!(
+            matches!(err, VikramError::Storage(_)),
+            "bot delete into global must fail scope check: {err:?}"
+        );
+    }
+
+    #[test]
+    fn delete_removes_the_key_and_reports_missing_keys_honestly() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = crate::config::lock_security_env();
+        unsafe { std::env::set_var("VIKRAM_HOME", dir.path().join("home")) };
+        let ctx = context_with_bot(Some("b1"));
+
+        MemorySave
+            .run(&json!({"key": "prefs", "value": "dark"}), &ctx)
+            .unwrap();
+        let gone = MemoryDelete.run(&json!({"key": "prefs"}), &ctx).unwrap();
+        assert!(gone.ok, "{}", gone.content);
+        assert!(
+            gone.content.contains("deleted memory `prefs`"),
+            "{}",
+            gone.content
+        );
+
+        let missing = MemoryDelete.run(&json!({"key": "prefs"}), &ctx).unwrap();
+        assert!(!missing.ok, "a second delete must not pretend success");
+        assert!(
+            missing.content.contains("no memory entry"),
+            "{}",
+            missing.content
+        );
+
+        let store = MemoryStore::open(database_path()).unwrap();
+        assert_eq!(store.list("bot:b1").unwrap(), Vec::new());
+    }
+
+    #[test]
     fn a_bot_cannot_capture_or_consolidate_into_the_global_scope() {
         let ctx = context_with_bot(Some("b1"));
         for action in ["capture", "run"] {
