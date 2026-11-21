@@ -3218,6 +3218,7 @@ dependencies = [
 name = "vikram-cli"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "clap",
  "crossterm",
  "futures-util",

@@ -14,25 +14,27 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::gateway_config::{self, env};
-use vikram_contracts::{ImageSource, Message, PermissionMode};
+use vikram_contracts::{ImageSource, Message, PermissionMode, Role};
 use vikram_gateway::access::{
     AuthzInput, EnvLookup, PairingVerdict, PlatformAuthSpec, authorize_source,
 };
-use vikram_gateway::delivery::DeliveryLedger;
+use vikram_gateway::delivery::{DeliveryLedger, now_unix};
 use vikram_gateway::event::MessageEvent;
 use vikram_gateway::host::{
     BuzzPlatform, ChannelPlatform, DingTalkStreamPlatform, DiscordPlatform, EmailPlatform,
     GatewayPlatform, IrcPlatform, MatrixPlatform, MattermostPlatform, NtfyPlatform, PhotonPlatform,
     SignalPlatform, SimplexPlatform, TelegramPlatform, WeComPlatform, WeixinPlatform,
-    WhatsAppPlatform, YuanbaoPlatform, serve_with_ledger,
+    WhatsAppPlatform, YuanbaoPlatform, deliver_verb, serve_with_ledger,
 };
 use vikram_gateway::ingress::{
     WebhookHandler, WebhookHub, WebhookPlatform, event_route, serve as serve_webhooks,
 };
 use vikram_gateway::media_fetch::{MediaFetchLimits, fetch_images_with_skips};
 use vikram_gateway::pairing::PairingStore;
-use vikram_gateway::platform::MessageHandler;
-use vikram_gateway::platform::PlatformAdapter;
+use vikram_gateway::platform::{
+    MediaKind, MediaSource as GatewayMediaSource, MessageHandler, OutboundMedia, OutboundVerb,
+    PlatformAdapter,
+};
 use vikram_gateway::platforms::bluebubbles::BlueBubblesAdapter;
 use vikram_gateway::platforms::buzz::{BuzzAdapter, BuzzConfig, BuzzKeypair};
 use vikram_gateway::platforms::dingtalk_stream::Credential as DingTalkCredential;
@@ -1267,6 +1269,10 @@ pub async fn run(config: Config) -> Result<(), String> {
         let auth = Arc::clone(&auth);
         let ledger = ledger.clone();
         let spec = auth_spec(platform.name());
+        let outbound = Outbound {
+            platform: Arc::clone(&platform),
+            ledger: ledger.clone(),
+        };
         let handler: vikram_gateway::host::ReplyHandler = Arc::new(move |event| {
             turn(
                 handle.clone(),
@@ -1274,6 +1280,7 @@ pub async fn run(config: Config) -> Result<(), String> {
                 media.clone(),
                 Arc::clone(&auth),
                 spec.clone(),
+                outbound.clone(),
                 event,
             )
         });
@@ -1332,6 +1339,92 @@ fn message_for_event(text: &str, images: Vec<ImageSource>) -> Message {
     Message::user_with_images(caption, images)
 }
 
+/// Media blocks an assistant message committed during the turn asks the gateway to send back.
+/// Only `Role::Assistant` counts: image blocks on user or tool messages are inbound content and
+/// must never be echoed to the chat. The contract (`Block::Image`) already carries them; today no
+/// producer emits them on assistant turns, so this is the delivery path waiting for one.
+fn assistant_media(message: &Message) -> Vec<ImageSource> {
+    if message.role != Role::Assistant {
+        return Vec::new();
+    }
+    message.images().cloned().collect()
+}
+
+/// One contract image as an outbound attachment. Inline base64 becomes held bytes (a `data:` URL
+/// is not something platform adapters can fetch); a fetch failure or undecodable payload is
+/// `None` so the caller can log and skip rather than send a broken verb.
+fn outbound_media(source: &ImageSource) -> Option<OutboundMedia> {
+    match source {
+        ImageSource::Url { url } => Some(OutboundMedia::image_url(url.clone())),
+        ImageSource::Data { media_type, data } => {
+            let bytes = crate::transforms::base64_decode(data).ok()?;
+            Some(
+                OutboundMedia::new(MediaKind::Image, GatewayMediaSource::Bytes(bytes))
+                    .with_mime(media_type.clone()),
+            )
+        }
+    }
+}
+
+/// Deliver the media an assistant turn produced, one ledgered [`OutboundVerb::Media`] each.
+/// Ids hang off the event's delivery identity (`{base}:media:{n}`) so a redelivered event dedups
+/// exactly like the text reply does; without a platform message id the fallback is unique per
+/// event, matching what the host does for text.
+async fn deliver_assistant_media(
+    platform: &Arc<dyn GatewayPlatform>,
+    ledger: Option<&DeliveryLedger>,
+    event: &MessageEvent,
+    chat_id: &str,
+    sources: &[ImageSource],
+) {
+    if sources.is_empty() {
+        return;
+    }
+    let base = event
+        .ledger_message_id
+        .clone()
+        .or_else(|| event.message_id.clone())
+        .unwrap_or_else(|| format!("{}:{chat_id}:{}", platform.name(), now_unix()));
+    for (index, source) in sources.iter().enumerate() {
+        let Some(media) = outbound_media(source) else {
+            eprintln!(
+                "[gateway:{}] assistant media could not be encoded; skipped",
+                platform.name()
+            );
+            continue;
+        };
+        let verb = OutboundVerb::media(media);
+        let result = deliver_verb(
+            platform,
+            ledger,
+            &format!("{base}:media:{index}"),
+            chat_id,
+            &verb,
+            None,
+        )
+        .await;
+        if !result.success {
+            eprintln!(
+                "[gateway:{}] media reply to {chat_id} failed: {}",
+                platform.name(),
+                result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".into())
+            );
+        }
+    }
+}
+
+/// What a turn needs to deliver non-text outbound verbs itself: the platform to send through
+/// and the ledger that dedups and retries the send. The text reply still returns through the
+/// host's own path.
+#[derive(Clone)]
+struct Outbound {
+    platform: Arc<dyn GatewayPlatform>,
+    ledger: Option<Arc<DeliveryLedger>>,
+}
+
 /// One inbound event → one runtime turn → the turn's text.
 ///
 /// Authorization runs first: `access::authorize_source` decides whether this sender may talk to
@@ -1344,6 +1437,7 @@ fn turn(
     media_transport: SharedTransport,
     auth: Arc<IngressAuth>,
     spec: PlatformAuthSpec,
+    outbound: Outbound,
     event: MessageEvent,
 ) -> vikram_gateway::host::ReplyFuture {
     Box::pin(async move {
@@ -1431,6 +1525,9 @@ fn turn(
             }
         }
         let mut reply = String::new();
+        // Assistant messages committed mid-turn can carry media blocks; they are collected here
+        // and sent as verbs once the turn's text is known not to be a lagged prefix.
+        let mut reply_media: Vec<ImageSource> = Vec::new();
         // A lagged receiver skipped events, so what was collected may be a prefix of the real
         // reply. Keep draining for the turn's end (bounded — a flooded channel must not spin
         // forever), but never send the partial text as if it were the final answer.
@@ -1442,6 +1539,13 @@ fn turn(
                     session: sid, text, ..
                 }) if sid == session => {
                     reply.push_str(&text);
+                    lags = 0;
+                }
+                Ok(RuntimeEvent::MessageCommitted {
+                    session: sid,
+                    message,
+                }) if sid == session => {
+                    reply_media.extend(assistant_media(&message));
                     lags = 0;
                 }
                 Ok(RuntimeEvent::TurnFinished {
@@ -1483,6 +1587,14 @@ fn turn(
             );
             return None;
         }
+        deliver_assistant_media(
+            &outbound.platform,
+            outbound.ledger.as_deref(),
+            &event,
+            &chat,
+            &reply_media,
+        )
+        .await;
         if reply.trim().is_empty() {
             None
         } else {
@@ -1588,5 +1700,138 @@ mod tests {
             assert_eq!(message.text_body(), IMAGE_ONLY_CAPTION, "{blank:?}");
             assert_eq!(message.images().count(), 1, "{blank:?}");
         }
+    }
+
+    fn assistant_with_image(source: ImageSource) -> Message {
+        Message {
+            role: Role::Assistant,
+            blocks: vec![vikram_contracts::Block::Image {
+                source,
+                trust: Trust::Model,
+            }],
+        }
+    }
+
+    #[test]
+    fn only_assistant_messages_yield_outbound_media() {
+        let image = ImageSource::url("https://example.test/out.png");
+        let assistant = assistant_with_image(image.clone());
+        assert_eq!(assistant_media(&assistant), vec![image]);
+
+        // The same block on a user or tool message is inbound content, never echoed back.
+        for role in [Role::User, Role::Tool, Role::System] {
+            let mut message = assistant_with_image(ImageSource::url("https://x/y.png"));
+            message.role = role;
+            assert!(assistant_media(&message).is_empty(), "{role:?}");
+        }
+        assert!(assistant_media(&Message::user("plain")).is_empty());
+    }
+
+    #[test]
+    fn a_url_image_becomes_a_media_verb_with_a_fetchable_source() {
+        let media = outbound_media(&ImageSource::url("https://example.test/a.png"))
+            .expect("url images always convert");
+        assert_eq!(media.kind, MediaKind::Image);
+        assert_eq!(
+            media.source,
+            GatewayMediaSource::Url("https://example.test/a.png".into())
+        );
+    }
+
+    #[test]
+    fn inline_image_bytes_become_held_media_with_their_mime() {
+        // "hello" in base64.
+        let media = outbound_media(&ImageSource::data("image/png", "aGVsbG8="))
+            .expect("valid base64 converts");
+        assert_eq!(media.kind, MediaKind::Image);
+        assert_eq!(media.mime.as_deref(), Some("image/png"));
+        assert_eq!(media.source, GatewayMediaSource::Bytes(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn undecodable_inline_media_is_refused_not_sent_broken() {
+        assert!(outbound_media(&ImageSource::data("image/png", "!!!not-base64!!!")).is_none());
+        assert!(outbound_media(&ImageSource::data("image/png", "a")).is_none());
+    }
+
+    /// A platform that records every verb `send_verb` receives; the text path stays a plain
+    /// `send` so a regression that bypasses verb dispatch is visible.
+    #[derive(Default)]
+    struct RecordingPlatform {
+        verbs: Mutex<Vec<OutboundVerb>>,
+    }
+
+    #[async_trait::async_trait]
+    impl GatewayPlatform for RecordingPlatform {
+        fn name(&self) -> &str {
+            "rec"
+        }
+
+        async fn next_events(&self) -> Result<Vec<MessageEvent>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn send(
+            &self,
+            _chat_id: &str,
+            _content: &str,
+        ) -> vikram_gateway::platform::SendResult {
+            vikram_gateway::platform::SendResult::ok("text-id")
+        }
+
+        async fn send_verb(
+            &self,
+            _chat_id: &str,
+            verb: &OutboundVerb,
+            _reply_to: Option<&str>,
+        ) -> vikram_gateway::platform::SendResult {
+            self.verbs.lock().unwrap().push(verb.clone());
+            vikram_gateway::platform::SendResult::ok("media-id")
+        }
+    }
+
+    fn test_event() -> MessageEvent {
+        let source = vikram_gateway::event::SessionSource::new(
+            vikram_gateway::event::Platform::new("rec").expect("valid platform"),
+            "chat-1",
+        );
+        let mut event = MessageEvent::new("look", source);
+        event.message_id = Some("m-1".to_string());
+        event
+    }
+
+    #[tokio::test]
+    async fn assistant_media_is_delivered_as_ledgered_media_verbs() {
+        let platform = Arc::new(RecordingPlatform::default());
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        let ledger = DeliveryLedger::in_memory().expect("in-memory ledger");
+        let event = test_event();
+        let sources = vec![
+            ImageSource::url("https://example.test/a.png"),
+            ImageSource::data("image/png", "aGVsbG8="),
+        ];
+
+        deliver_assistant_media(&dyn_platform, Some(&ledger), &event, "chat-1", &sources).await;
+        // A redelivery of the same event must not enqueue or send a second copy.
+        deliver_assistant_media(&dyn_platform, Some(&ledger), &event, "chat-1", &sources).await;
+
+        let verbs = platform.verbs.lock().unwrap();
+        assert_eq!(verbs.len(), 2, "each image becomes exactly one media verb");
+        for verb in verbs.iter() {
+            let OutboundVerb::Media { media } = verb else {
+                panic!("expected a media verb, got {verb:?}");
+            };
+            assert_eq!(media.kind, MediaKind::Image);
+        }
+        assert_eq!(ledger.len().expect("ledger len"), 2);
+    }
+
+    #[tokio::test]
+    async fn text_only_turns_send_no_verbs() {
+        let platform = Arc::new(RecordingPlatform::default());
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        let event = test_event();
+        deliver_assistant_media(&dyn_platform, None, &event, "chat-1", &[]).await;
+        assert!(platform.verbs.lock().unwrap().is_empty());
     }
 }

@@ -66,23 +66,36 @@ impl Tool for SessionSearch {
             .search_session_text_filtered(&q, agent.as_ref(), project.as_ref(), since, limit)
             .map_err(|e| VikramError::Storage(e.to_string()))?;
         if hits.is_empty() {
-            // Fallback to LIKE-based search_sessions. It searches titles and journal payloads,
-            // not message bodies, and it knows nothing about the filters — so they are applied
-            // here, and an empty answer says so instead of returning "" with ok:true.
-            let rows = store
-                .search_sessions(&q, true)
-                .map_err(|e| VikramError::Storage(e.to_string()))?;
-            let out: Vec<String> = rows
-                .iter()
-                .filter(|r| agent.as_ref().is_none_or(|a| r.bot.as_ref() == Some(a)))
-                .filter(|r| {
-                    project
-                        .as_ref()
-                        .is_none_or(|p| r.project_id.as_ref() == Some(p))
-                })
-                .filter(|r| r.updated_ms >= since)
-                .map(|r| format!("{}: {}", r.id, r.title))
-                .collect();
+            // Fallback to LIKE-based search_sessions_page. It searches titles and journal
+            // payloads, not message bodies, and it knows nothing about the filters — so they
+            // are applied here. Pages are walked until `limit` rows survive the filters or the
+            // matches run out, honouring the same bound the FTS path above does; an empty
+            // answer says so instead of returning "" with ok:true.
+            let page_size = limit.max(1);
+            let mut out: Vec<String> = Vec::new();
+            let mut offset = 0usize;
+            loop {
+                let page = store
+                    .search_sessions_page(&q, true, Some(page_size), offset)
+                    .map_err(|e| VikramError::Storage(e.to_string()))?;
+                let exhausted = page.len() < page_size;
+                offset += page.len();
+                out.extend(
+                    page.iter()
+                        .filter(|r| agent.as_ref().is_none_or(|a| r.bot.as_ref() == Some(a)))
+                        .filter(|r| {
+                            project
+                                .as_ref()
+                                .is_none_or(|p| r.project_id.as_ref() == Some(p))
+                        })
+                        .filter(|r| r.updated_ms >= since)
+                        .map(|r| format!("{}: {}", r.id, r.title)),
+                );
+                out.truncate(limit);
+                if exhausted || out.len() >= limit {
+                    break;
+                }
+            }
             if out.is_empty() {
                 return Ok(ToolOutput {
                     content: format!("no sessions match `{q}`"),
