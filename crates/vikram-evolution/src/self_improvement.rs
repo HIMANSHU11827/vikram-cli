@@ -14,14 +14,21 @@
 //! self-check and `vikram evolution evaluate` both call
 //! [`SelfImprovementEngine::identify_improvement_opportunities`]. The
 //! execution half (`execute_improvement`, `track_improvement`,
-//! `get_improvement_history`) is dormant: `opportunities`/`executions` are
-//! in-memory `Vec`s lost on restart and no caller schedules execution.
+//! `get_improvement_history`) is still dormant — no caller schedules
+//! execution — but its records are durable: `executions` is persisted to
+//! the store's `engine_records` table under [`EXECUTION_NAMESPACE`] and
+//! reloaded by [`SelfImprovementEngine::new`]. `opportunities` stays
+//! process-local: every scan rebuilds it wholesale from store evidence, so
+//! persisting it would only duplicate what the next scan recomputes.
 
 use crate::error::Result;
 use crate::metrics;
-use crate::store::EvolutionStore;
+use crate::store::{EvolutionStore, from_json_value, to_json_value};
 use crate::types::{gen_id, now_ms};
 use serde::{Deserialize, Serialize};
+
+/// `engine_records` namespace holding every [`ImprovementExecution`].
+const EXECUTION_NAMESPACE: &str = "self_improvement.execution";
 
 /// Recency window failure evidence is taken from.
 const WINDOW_MS: u64 = metrics::DEFAULT_WINDOW_MS;
@@ -111,13 +118,18 @@ pub struct SelfImprovementEngine {
 }
 
 impl SelfImprovementEngine {
-    pub fn new(store: EvolutionStore) -> Self {
-        Self {
+    pub fn new(store: EvolutionStore) -> Result<Self> {
+        let executions = store
+            .list_engine_records(EXECUTION_NAMESPACE)?
+            .into_iter()
+            .map(|(_, payload)| from_json_value::<ImprovementExecution>(payload))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
             store,
             opportunities: Vec::new(),
-            executions: Vec::new(),
+            executions,
             last_scan_note: None,
-        }
+        })
     }
 
     /// The shared store every subsystem reads and writes through.
@@ -302,12 +314,31 @@ impl SelfImprovementEngine {
         };
 
         self.executions.push(execution.clone());
+        if let Err(e) = self.persist_execution(&execution) {
+            self.executions.pop();
+            return Err(e);
+        }
         Ok(execution)
     }
 
     /// Track improvement history.
-    pub fn track_improvement(&mut self, execution: ImprovementExecution) {
-        self.executions.push(execution);
+    pub fn track_improvement(&mut self, execution: ImprovementExecution) -> Result<()> {
+        self.executions.push(execution.clone());
+        if let Err(e) = self.persist_execution(&execution) {
+            self.executions.pop();
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Write one execution record to the store; called at every mutation
+    /// boundary so the durable history never lags the in-memory list.
+    fn persist_execution(&self, execution: &ImprovementExecution) -> Result<()> {
+        self.store.save_engine_record(
+            EXECUTION_NAMESPACE,
+            &execution.id,
+            &to_json_value(execution)?,
+        )
     }
 
     /// Verify that an improvement actually worked.
@@ -372,5 +403,49 @@ fn area_for_category(category: &str) -> ImprovementArea {
         ImprovementArea::ExecutionEfficiency
     } else {
         ImprovementArea::ErrorHandling
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opportunity(id: &str) -> ImprovementOpportunity {
+        ImprovementOpportunity {
+            id: id.to_string(),
+            area: ImprovementArea::ErrorHandling,
+            description: "test".to_string(),
+            evidence: vec![],
+            expected_value: 0.5,
+            estimated_cost: 0.3,
+            risk_level: RiskLevel::Low,
+            priority: 5,
+        }
+    }
+
+    #[test]
+    fn executions_survive_a_store_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("evolution.db");
+        let execution_id;
+
+        {
+            let store = EvolutionStore::open(&path).unwrap();
+            let mut engine = SelfImprovementEngine::new(store).unwrap();
+            let execution = engine.execute_improvement(&opportunity("imp-1")).unwrap();
+            execution_id = execution.id.clone();
+        }
+
+        let store = EvolutionStore::open(&path).unwrap();
+        let engine = SelfImprovementEngine::new(store).unwrap();
+        assert_eq!(engine.get_improvement_history().len(), 1);
+        assert_eq!(engine.get_improvement_history()[0].id, execution_id);
+        assert!(!engine.verify_improvement(&execution_id).unwrap());
+    }
+
+    #[test]
+    fn a_fresh_store_starts_with_no_executions() {
+        let engine = SelfImprovementEngine::new(EvolutionStore::open_in_memory().unwrap()).unwrap();
+        assert!(engine.get_improvement_history().is_empty());
     }
 }

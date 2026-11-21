@@ -47,14 +47,17 @@
 //! PARTIALLY LIVE: [`MapekLoop::monitor`] and [`MapekLoop::analyze`] are
 //! read-only store probes called by the runtime's hourly self-check and by
 //! `vikram evolution mapek`. [`MapekLoop::plan`],
-//! [`MapekLoop::execute`], [`MapekLoop::run_cycle`] and the `KnowledgeBase`
-//! are dormant — nothing schedules a mutating cycle, `knowledge`/`cycle_count`
-//! are process-local (lost on restart), and only failed-cycle events reach
-//! the durable store.
+//! [`MapekLoop::execute`] and [`MapekLoop::run_cycle`] are still dormant —
+//! nothing schedules a mutating cycle — but the state they mutate
+//! (`KnowledgeBase`, `cycle_count`) is now durable: it is written to the
+//! store's `engine_records` table by [`MapekLoop::update_knowledge`] and
+//! reloaded by [`MapekLoop::new`], so decisions, outcomes and cycle
+//! numbering survive a restart. `monitor`/`analyze`/`plan` stay pure reads
+//! and write nothing.
 
 use crate::error::Result;
 use crate::metrics;
-use crate::store::EvolutionStore;
+use crate::store::{EvolutionStore, from_json_value, to_json_value};
 use crate::types::{
     ExperienceOutcome, LearningEvent, LearningProposal, ProposalKind, ProposalStatus,
     ReflectionJobStatus, gen_id, now_ms,
@@ -92,6 +95,10 @@ const REFLECTION_TARGET: &str = "reflection";
 const MAX_REFLECTION_ATTEMPTS: u32 = 3;
 /// `agent_id` the loop stamps on the records it persists.
 const MAPEK_AGENT: &str = "mapek";
+/// `engine_records` namespace + id holding the persisted loop state
+/// ([`MapekState`]).
+const STATE_NAMESPACE: &str = "mapek.state";
+const STATE_ID: &str = "state";
 
 /// Monitoring data.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -432,16 +439,18 @@ pub struct AdaptationStrategy {
     pub effectiveness: f32,
 }
 
-pub struct MapekLoop {
-    store: EvolutionStore,
+/// Durable form of the loop's mutable state: the knowledge base plus the
+/// cycle counter, stored as one `engine_records` payload so the two can
+/// never diverge across a partial write.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MapekState {
     knowledge: KnowledgeBase,
     cycle_count: u32,
 }
 
-impl MapekLoop {
-    pub fn new(store: EvolutionStore) -> Self {
+impl MapekState {
+    fn empty() -> Self {
         Self {
-            store,
             knowledge: KnowledgeBase {
                 decisions: Vec::new(),
                 outcomes: Vec::new(),
@@ -452,10 +461,45 @@ impl MapekLoop {
             cycle_count: 0,
         }
     }
+}
+
+pub struct MapekLoop {
+    store: EvolutionStore,
+    knowledge: KnowledgeBase,
+    cycle_count: u32,
+}
+
+impl MapekLoop {
+    pub fn new(store: EvolutionStore) -> Result<Self> {
+        // An absent record means a fresh database; anything present must
+        // decode — a corrupt payload is an error, not silently-empty state.
+        let state = store
+            .list_engine_records(STATE_NAMESPACE)?
+            .into_iter()
+            .find(|(id, _)| id == STATE_ID)
+            .map(|(_, payload)| from_json_value::<MapekState>(payload))
+            .transpose()?
+            .unwrap_or_else(MapekState::empty);
+        Ok(Self {
+            store,
+            knowledge: state.knowledge,
+            cycle_count: state.cycle_count,
+        })
+    }
 
     /// The shared store every subsystem reads and writes through.
     pub fn store(&self) -> &EvolutionStore {
         &self.store
+    }
+
+    /// Write the current knowledge base and cycle count to the store.
+    fn persist_state(&self) -> Result<()> {
+        let state = MapekState {
+            knowledge: self.knowledge.clone(),
+            cycle_count: self.cycle_count,
+        };
+        self.store
+            .save_engine_record(STATE_NAMESPACE, STATE_ID, &to_json_value(&state)?)
     }
 
     /// Monitor: Collect data about runtime health and status.
@@ -664,7 +708,14 @@ impl MapekLoop {
     /// ([`ExecutionResult::overall_success`]); a plan that was merely recorded
     /// for an operator is stored as a failure with `0.0`, so the knowledge
     /// base cannot later "remember" work that never happened.
-    pub fn update_knowledge(&mut self, plan: &ActionPlan, execution: &ExecutionResult) {
+    ///
+    /// This is the loop's only state mutation, so it is also where the
+    /// knowledge base and cycle count are persisted.
+    pub fn update_knowledge(
+        &mut self,
+        plan: &ActionPlan,
+        execution: &ExecutionResult,
+    ) -> Result<()> {
         for action in &plan.actions {
             self.knowledge.decisions.push(DecisionRecord {
                 id: gen_id("decision"),
@@ -686,6 +737,8 @@ impl MapekLoop {
             effectiveness: if execution.overall_success { 1.0 } else { 0.0 },
             timestamp_ms: now_ms(),
         });
+
+        self.persist_state()
     }
 
     /// Run a complete MAPE-K cycle.
@@ -703,7 +756,7 @@ impl MapekLoop {
         let analysis = self.analyze(&monitoring_data)?;
         let plan = self.plan(&analysis)?;
         let execution = self.execute(&plan)?;
-        self.update_knowledge(&plan, &execution);
+        self.update_knowledge(&plan, &execution)?;
 
         let failure_reason = execution.failure_reason();
         if let Some(reason) = &failure_reason {
@@ -1464,4 +1517,43 @@ fn host_cpu_pressure() -> Option<f32> {
     let text = std::fs::read_to_string("/proc/loadavg").ok()?;
     let one_minute: f32 = text.split_whitespace().next()?.parse().ok()?;
     Some((one_minute / host_cpu_count() as f32).clamp(0.0, 1.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn knowledge_and_cycle_count_survive_a_store_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("evolution.db");
+
+        {
+            let store = EvolutionStore::open(&path).unwrap();
+            let mut loop_ = MapekLoop::new(store).unwrap();
+            let result = loop_.run_cycle().unwrap();
+            assert_eq!(result.cycle_number, 1);
+            assert_eq!(loop_.knowledge.decisions.len(), 1);
+            assert_eq!(loop_.knowledge.outcomes.len(), 1);
+        }
+
+        let store = EvolutionStore::open(&path).unwrap();
+        let mut loop_ = MapekLoop::new(store).unwrap();
+        assert_eq!(loop_.cycle_count, 1);
+        assert_eq!(loop_.knowledge.decisions.len(), 1);
+        assert_eq!(loop_.knowledge.outcomes.len(), 1);
+
+        // Cycle numbering continues from the persisted count, not zero.
+        let result = loop_.run_cycle().unwrap();
+        assert_eq!(result.cycle_number, 2);
+        assert_eq!(loop_.knowledge.decisions.len(), 2);
+    }
+
+    #[test]
+    fn a_fresh_store_starts_with_empty_knowledge() {
+        let loop_ = MapekLoop::new(EvolutionStore::open_in_memory().unwrap()).unwrap();
+        assert_eq!(loop_.cycle_count, 0);
+        assert!(loop_.knowledge.decisions.is_empty());
+        assert!(loop_.knowledge.outcomes.is_empty());
+    }
 }

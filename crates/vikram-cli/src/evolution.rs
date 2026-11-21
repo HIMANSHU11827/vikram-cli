@@ -1,10 +1,13 @@
-//! `vikram evolution` — read-only inspection of the self-evolution engine.
+//! `vikram evolution` — inspection of the self-evolution engine.
 //!
 //! The engine's durable state lives in `~/.vikram/evolution.db` (SQLite) with
 //! evolution-tracked skills under `~/.vikram/skills`. This command opens that
-//! store directly — no runtime, no daemon — and only reads: counts, listings,
-//! and the store-backed analyses the self-* engines already implement.
-//! Approvals and every other mutation stay in `vikram learning`.
+//! store directly — no runtime, no daemon. Most subcommands only read:
+//! counts, listings, and the store-backed analyses the self-* engines already
+//! implement. The conversational, autonomy-approval and self-recovery
+//! engines keep their working state in process-local `Vec`s, so their
+//! commands report that state honestly and never persist it. Proposals and
+//! every other durable mutation stay in `vikram learning`.
 
 use std::path::Path;
 
@@ -53,6 +56,15 @@ pub enum EvolutionAction {
     Evaluate,
     /// Run one MAPE-K monitoring pass and report subsystem health.
     Mapek,
+    /// Natural-language command handled by the conversational engine.
+    Ask {
+        /// Free text, e.g. `"analyze yourself"` or `"what can you improve"`.
+        text: String,
+    },
+    /// List pending autonomy approval requests.
+    Approvals,
+    /// Report self-recovery state and run the restart-recovery pass.
+    Recover,
 }
 
 pub fn run(action: Option<EvolutionAction>) -> Result<(), String> {
@@ -92,6 +104,9 @@ fn dispatch(engine: &mut EvolutionEngine, action: &EvolutionAction) -> Result<Ve
         EvolutionAction::Skills { name } => skills_lines(engine, name.as_deref()),
         EvolutionAction::Evaluate => evaluate_lines(engine),
         EvolutionAction::Mapek => mapek_lines(engine),
+        EvolutionAction::Ask { text } => ask_lines(engine, text),
+        EvolutionAction::Approvals => approvals_lines(engine),
+        EvolutionAction::Recover => recover_lines(engine),
     }
 }
 
@@ -421,6 +436,90 @@ fn mapek_lines(engine: &mut EvolutionEngine) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+fn ask_lines(engine: &mut EvolutionEngine, text: &str) -> Result<Vec<String>, String> {
+    let Some(command) = engine.conversational.parse_command(text) else {
+        return Err(format!(
+            "unrecognized command `{text}` — the conversational engine only understands phrases like \
+             \"analyze yourself\", \"what can you improve\", \"find your weaknesses\", \
+             \"what have you improved recently\""
+        ));
+    };
+    let response = engine
+        .conversational
+        .handle_command(command)
+        .map_err(|e| e.to_string())?;
+    let mut out = vec![
+        "note: the conversational engine is a scaffold — its responses are canned, \
+         not verified against real engine state"
+            .to_string(),
+        format!("success: {}", response.success),
+        response.message.clone(),
+    ];
+    if let Some(data) = &response.data {
+        out.push(format!(
+            "data: {}",
+            serde_json::to_string(data).unwrap_or_else(|_| "<unserializable>".to_string())
+        ));
+    }
+    Ok(out)
+}
+
+fn approvals_lines(engine: &EvolutionEngine) -> Result<Vec<String>, String> {
+    let pending = engine.autonomy.get_pending_approvals();
+    let mut out = vec![
+        "note: autonomy approvals are process-local — requests are never persisted, \
+         so a fresh CLI invocation always starts with none"
+            .to_string(),
+    ];
+    if pending.is_empty() {
+        out.push("no pending approval requests".to_string());
+        return Ok(out);
+    }
+    for r in pending {
+        out.push(format!(
+            "{}  {:?}  {:?}  {}  {}",
+            r.id,
+            r.risk_level,
+            r.action_type,
+            crate::format_age(now_ms(), r.timestamp_ms),
+            truncate(&r.description, 90)
+        ));
+    }
+    Ok(out)
+}
+
+fn recover_lines(engine: &mut EvolutionEngine) -> Result<Vec<String>, String> {
+    let mut out = vec![
+        "note: self-recovery state is process-local — snapshots, recovery operations \
+         and failed changes do not persist across invocations"
+            .to_string(),
+    ];
+    let operations = engine
+        .self_recovery
+        .recover_after_restart()
+        .map_err(|e| e.to_string())?;
+    out.push(format!(
+        "restart recovery pass: {} operation(s) queued",
+        operations.len()
+    ));
+    for op in &operations {
+        out.push(format!(
+            "  {}  {:?}  target={}  {}",
+            op.id,
+            op.recovery_type,
+            op.target,
+            truncate(&op.reason, 70)
+        ));
+    }
+    out.push(format!(
+        "state: {} snapshot(s), {} failed change(s), {} recovery operation(s)",
+        engine.self_recovery.get_snapshots().len(),
+        engine.self_recovery.get_failed_changes().len(),
+        engine.self_recovery.get_recovery_history().len()
+    ));
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,5 +826,124 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("no evolution store"), "{err}");
+    }
+
+    #[test]
+    fn ask_parses_known_phrases_and_rejects_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_at(&tmp);
+
+        let lines = dispatch(
+            &mut engine,
+            &EvolutionAction::Ask {
+                text: "analyze yourself".into(),
+            },
+        )
+        .unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("scaffold") && l.contains("canned")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("success: true")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("Self-analysis complete")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("\"runtime_status\"")),
+            "{lines:?}"
+        );
+
+        let err = dispatch(
+            &mut engine,
+            &EvolutionAction::Ask {
+                text: "do my laundry".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("unrecognized command"), "{err}");
+        assert!(err.contains("analyze yourself"), "{err}");
+    }
+
+    #[test]
+    fn ask_covers_every_parseable_phrase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_at(&tmp);
+        for text in [
+            "analyze yourself",
+            "self-analysis",
+            "what can you improve",
+            "find your weaknesses",
+            "improve your memory",
+            "optimize your model",
+            "review your agent",
+            "learn coding workflow",
+            "what have you improved",
+            "why did you change the timeout",
+            "undo last change",
+            "stop autonomous improvements",
+            "resume autonomous management",
+            "explain action act-1",
+            "report improvements",
+        ] {
+            assert!(
+                engine.conversational.parse_command(text).is_some(),
+                "phrase not parsed: {text}"
+            );
+            let lines = dispatch(&mut engine, &EvolutionAction::Ask { text: text.into() }).unwrap();
+            assert!(
+                lines.iter().any(|l| l.starts_with("success:")),
+                "{text}: {lines:?}"
+            );
+        }
+        assert!(
+            engine.conversational.parse_command("status").is_none(),
+            "`status` is not a conversational phrase — it is a subcommand"
+        );
+    }
+
+    #[test]
+    fn approvals_reports_process_local_empty_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_at(&tmp);
+        let lines = dispatch(&mut engine, &EvolutionAction::Approvals).unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("process-local") && l.contains("never persisted")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "no pending approval requests"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn recover_reports_process_local_state_and_empty_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_at(&tmp);
+        let lines = dispatch(&mut engine, &EvolutionAction::Recover).unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("process-local") && l.contains("do not persist")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("0 operation(s) queued")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("0 snapshot(s)") && l.contains("0 failed change(s)")),
+            "{lines:?}"
+        );
     }
 }

@@ -29,12 +29,22 @@
 //! - **Store-backed but dormant**: `hive` — lessons persist to the store,
 //!   but no production path calls `HiveLearning::record`, so the table
 //!   stays empty outside tests.
-//! - **Process-local analysis**: the `self_*` engines, `mapek`'s mutating
-//!   half (`plan`/`execute`/`run_cycle` + `KnowledgeBase`), `autonomy`,
-//!   and `conversational`. Their analyses read the durable store, but
-//!   their own state (`Vec`s, in-memory knowledge, approval queues) is
-//!   lost on restart and nothing in the runtime schedules or calls the
-//!   mutating paths. They are kept as honest scaffolding, not wired fakes.
+//! - **Durable but dormant**: `autonomy` (approval requests persist to
+//!   `engine_records` and reload on open), `self_evaluation` (benchmarks,
+//!   results and metric history), `mapek`'s mutating half (`KnowledgeBase`
+//!   and `cycle_count`), and `self_improvement`'s execution history. Their
+//!   state now survives restarts, but nothing in the runtime schedules
+//!   or calls the mutating paths — durability removes the restart blocker,
+//!   not the missing caller.
+//! - **Still process-local**: `self_awareness`, `self_config`,
+//!   `self_adaptation`, `self_development`, `self_recovery` and
+//!   `conversational`. Their analyses read the durable store, but their
+//!   bookkeeping is either derived-and-rebuilt (`self_improvement`'s
+//!   `opportunities`, `autonomy`'s `action_history` — executed actions
+//!   already emit `action_executed` learning events) or scaffold state
+//!   that records intent without real effect (`self_recovery` snapshots,
+//!   `conversational` canned responses). Persisting intent-only state
+//!   would fake durability, so it stays in memory and documented.
 //!
 //! # Concurrency model
 //!
@@ -154,14 +164,14 @@ pub struct EvolutionEngine {
 impl EvolutionEngine {
     pub fn open(db_path: PathBuf, skills_root: PathBuf) -> Result<Self> {
         let store = EvolutionStore::open(db_path)?;
-        Ok(Self::from_store(store, skills_root))
+        Self::from_store(store, skills_root)
     }
     pub fn open_in_memory(skills_root: PathBuf) -> Result<Self> {
         let store = EvolutionStore::open_in_memory()?;
-        Ok(Self::from_store(store, skills_root))
+        Self::from_store(store, skills_root)
     }
 
-    fn from_store(store: EvolutionStore, skills_root: PathBuf) -> Self {
+    fn from_store(store: EvolutionStore, skills_root: PathBuf) -> Result<Self> {
         let experience = ExperienceCollector::new(store.clone());
         let memory = LayeredMemory::new(store.clone());
         let reflection = ReflectionEngine::new(store.clone(), Arc::new(HeuristicReflector));
@@ -172,14 +182,14 @@ impl EvolutionEngine {
         let self_awareness = SelfAwarenessEngine::new(store.clone());
         let self_config = SelfConfigurationEngine::new(store.clone());
         let self_adaptation = SelfAdaptationEngine::new(store.clone());
-        let self_improvement = SelfImprovementEngine::new(store.clone());
+        let self_improvement = SelfImprovementEngine::new(store.clone())?;
         let self_development = SelfDevelopmentEngine::new(store.clone());
-        let self_evaluation = SelfEvaluationEngine::new(store.clone());
+        let self_evaluation = SelfEvaluationEngine::new(store.clone())?;
         let self_recovery = SelfRecoveryEngine::new(store.clone());
-        let mapek = MapekLoop::new(store.clone());
-        let autonomy = AutonomyManager::new(store.clone());
+        let mapek = MapekLoop::new(store.clone())?;
+        let autonomy = AutonomyManager::new(store.clone())?;
         let conversational = ConversationalControl::new(store.clone());
-        Self {
+        Ok(Self {
             store,
             experience,
             memory,
@@ -198,7 +208,7 @@ impl EvolutionEngine {
             mapek,
             autonomy,
             conversational,
-        }
+        })
     }
 
     /// Recover interrupted reflection jobs (e.g. after a crash) and drain

@@ -12,16 +12,23 @@
 //! recovery/regression rates, skill effectiveness — are reported as `0.0` and
 //! named in `notes` as *not measured*, never estimated.
 //!
-//! DORMANT / process-local: nothing in the runtime or CLI calls this engine.
-//! `metrics_history`, `benchmarks` and `evaluation_results` are in-memory
-//! `Vec`s — a restart loses every tracked metric, benchmark and result.
-//! Only the store-derived parts of a benchmark run reflect durable data.
+//! Persistence: benchmarks, evaluation results and the tracked-metric
+//! history are written to the store's `engine_records` table and reloaded by
+//! [`SelfEvaluationEngine::new`], so `aggregate_results`,
+//! `detect_regression` and `compare_performance` see history from before a
+//! restart. Persisted on mutation boundaries only (`create_benchmark`,
+//! `track_metric`, `run_benchmark`).
 
 use crate::error::{EvolutionError, Result};
 use crate::metrics;
-use crate::store::EvolutionStore;
+use crate::store::{EvolutionStore, from_json_value, to_json_value};
 use crate::types::{gen_id, now_ms};
 use serde::{Deserialize, Serialize};
+
+/// `engine_records` namespaces for the three persisted lists.
+const BENCHMARK_NAMESPACE: &str = "self_evaluation.benchmark";
+const RESULT_NAMESPACE: &str = "self_evaluation.result";
+const METRIC_NAMESPACE: &str = "self_evaluation.metric";
 
 /// Performance metrics.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -99,13 +106,21 @@ pub struct SelfEvaluationEngine {
 }
 
 impl SelfEvaluationEngine {
-    pub fn new(store: EvolutionStore) -> Self {
-        Self {
+    pub fn new(store: EvolutionStore) -> Result<Self> {
+        let benchmarks = load_records(&store, BENCHMARK_NAMESPACE)?;
+        let evaluation_results = load_records(&store, RESULT_NAMESPACE)?;
+        let mut metrics_history: Vec<(u64, PerformanceMetrics)> =
+            load_records(&store, METRIC_NAMESPACE)?;
+        // `list_engine_records` orders by write time; the metric timestamp
+        // inside each payload is the ordering `detect_regression` and
+        // `compare_performance` actually reason about.
+        metrics_history.sort_by_key(|(ts, _)| *ts);
+        Ok(Self {
             store,
-            metrics_history: Vec::new(),
-            benchmarks: Vec::new(),
-            evaluation_results: Vec::new(),
-        }
+            metrics_history,
+            benchmarks,
+            evaluation_results,
+        })
     }
 
     /// The shared store every subsystem reads and writes through.
@@ -113,9 +128,23 @@ impl SelfEvaluationEngine {
         &self.store
     }
 
+    /// Persist one record under `namespace`; on failure the caller rolls its
+    /// in-memory append back so memory and store never disagree.
+    fn persist<T: serde::Serialize>(&self, namespace: &str, id: &str, record: &T) -> Result<()> {
+        self.store
+            .save_engine_record(namespace, id, &to_json_value(record)?)
+    }
+
     /// Track a performance metric.
-    pub fn track_metric(&mut self, metrics: PerformanceMetrics) {
-        self.metrics_history.push((now_ms(), metrics));
+    pub fn track_metric(&mut self, metrics: PerformanceMetrics) -> Result<()> {
+        let timestamp_ms = now_ms();
+        let id = gen_id("metric");
+        self.metrics_history.push((timestamp_ms, metrics.clone()));
+        if let Err(e) = self.persist(METRIC_NAMESPACE, &id, &(timestamp_ms, metrics)) {
+            self.metrics_history.pop();
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Create an evaluation benchmark.
@@ -125,7 +154,7 @@ impl SelfEvaluationEngine {
         description: &str,
         task_type: &str,
         expected: PerformanceMetrics,
-    ) -> EvaluationBenchmark {
+    ) -> Result<EvaluationBenchmark> {
         let benchmark = EvaluationBenchmark {
             id: gen_id("bench"),
             name: name.to_string(),
@@ -136,7 +165,11 @@ impl SelfEvaluationEngine {
         };
 
         self.benchmarks.push(benchmark.clone());
-        benchmark
+        if let Err(e) = self.persist(BENCHMARK_NAMESPACE, &benchmark.id, &benchmark) {
+            self.benchmarks.pop();
+            return Err(e);
+        }
+        Ok(benchmark)
     }
 
     /// Run a benchmark.
@@ -187,6 +220,10 @@ impl SelfEvaluationEngine {
         };
 
         self.evaluation_results.push(result.clone());
+        if let Err(e) = self.persist(RESULT_NAMESPACE, &result.id, &result) {
+            self.evaluation_results.pop();
+            return Err(e);
+        }
         Ok(result)
     }
 
@@ -455,6 +492,20 @@ impl SelfEvaluationEngine {
     }
 }
 
+/// Load every record in `namespace` as `T`. A payload that does not decode
+/// is an error, not a skipped row — dropping it would silently shrink the
+/// history the engine reasons over.
+fn load_records<T>(store: &EvolutionStore, namespace: &str) -> Result<Vec<T>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    store
+        .list_engine_records(namespace)?
+        .into_iter()
+        .map(|(_, payload)| from_json_value::<T>(payload))
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct PerformanceComparison {
     pub before: Option<PerformanceMetrics>,
@@ -503,4 +554,68 @@ pub struct EvaluationSummary {
     pub passed_evaluations: usize,
     pub failed_evaluations: usize,
     pub average_score: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metrics(score: f32) -> PerformanceMetrics {
+        PerformanceMetrics {
+            task_completion_rate: score,
+            task_correctness: score,
+            tool_success_rate: score,
+            model_performance: 0.0,
+            agent_performance: 0.0,
+            execution_time_ms: 100,
+            token_consumption: 10,
+            resource_consumption: 0.0,
+            failure_rate: 1.0 - score,
+            recovery_rate: 0.0,
+            regression_rate: 0.0,
+            user_corrections: 0,
+            skill_effectiveness: 0.0,
+        }
+    }
+
+    #[test]
+    fn evaluation_state_survives_a_store_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("evolution.db");
+
+        let benchmark_id;
+        {
+            let store = EvolutionStore::open(&path).unwrap();
+            let mut engine = SelfEvaluationEngine::new(store).unwrap();
+            let benchmark = engine
+                .create_benchmark("bench", "desc", "coding", metrics(0.9))
+                .unwrap();
+            benchmark_id = benchmark.id.clone();
+            engine.track_metric(metrics(0.5)).unwrap();
+            engine.track_metric(metrics(0.3)).unwrap();
+            engine.run_benchmark(&benchmark.id).unwrap();
+        }
+
+        let store = EvolutionStore::open(&path).unwrap();
+        let engine = SelfEvaluationEngine::new(store).unwrap();
+        assert_eq!(engine.benchmarks.len(), 1);
+        assert_eq!(engine.benchmarks[0].id, benchmark_id);
+        assert_eq!(engine.evaluation_results.len(), 1);
+        assert_eq!(engine.evaluation_results[0].benchmark_id, benchmark_id);
+        assert_eq!(engine.metrics_history.len(), 2);
+
+        // Restored history still drives the read paths.
+        let summary = engine.aggregate_results().unwrap();
+        assert_eq!(summary.total_evaluations, 1);
+        let regression = engine.detect_regression().unwrap();
+        assert!(regression.regression_detected);
+    }
+
+    #[test]
+    fn a_fresh_store_starts_empty() {
+        let engine = SelfEvaluationEngine::new(EvolutionStore::open_in_memory().unwrap()).unwrap();
+        assert!(engine.benchmarks.is_empty());
+        assert!(engine.evaluation_results.is_empty());
+        assert!(engine.metrics_history.is_empty());
+    }
 }

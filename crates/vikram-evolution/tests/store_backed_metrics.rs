@@ -426,12 +426,15 @@ fn expected_metrics() -> PerformanceMetrics {
 #[test]
 fn benchmark_without_data_says_insufficient_data() {
     let mut engine = engine();
-    let benchmark = engine.self_evaluation.create_benchmark(
-        "coding bench",
-        "does coding work?",
-        "coding",
-        expected_metrics(),
-    );
+    let benchmark = engine
+        .self_evaluation
+        .create_benchmark(
+            "coding bench",
+            "does coding work?",
+            "coding",
+            expected_metrics(),
+        )
+        .unwrap();
 
     let result = engine.self_evaluation.run_benchmark(&benchmark.id).unwrap();
     assert_eq!(result.data_points, 0);
@@ -530,12 +533,15 @@ fn benchmark_metrics_are_computed_from_recorded_experiences() {
         ),
     );
 
-    let benchmark = engine.self_evaluation.create_benchmark(
-        "coding bench",
-        "does coding work?",
-        "coding",
-        expected_metrics(),
-    );
+    let benchmark = engine
+        .self_evaluation
+        .create_benchmark(
+            "coding bench",
+            "does coding work?",
+            "coding",
+            expected_metrics(),
+        )
+        .unwrap();
     let result = engine.self_evaluation.run_benchmark(&benchmark.id).unwrap();
 
     assert_eq!(result.data_points, 5);

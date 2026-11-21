@@ -144,7 +144,7 @@ fn test_self_evaluation_benchmark_creation() {
             token_consumption: 10000, resource_consumption: 0.7, failure_rate: 0.1,
             recovery_rate: 0.9, regression_rate: 0.05, user_corrections: 2, skill_effectiveness: 0.8,
         },
-    );
+    ).unwrap();
     assert_eq!(benchmark.name, "Test Benchmark");
 }
 
@@ -167,7 +167,8 @@ fn test_autonomy_level_classification() {
         EvolutionEngine::open_in_memory(std::path::PathBuf::from("/tmp/skills"))
             .unwrap()
             .store,
-    );
+    )
+    .unwrap();
 
     assert_eq!(
         manager.determine_autonomy_level(&vikram_evolution::ActionType::AdjustModelRouting),
@@ -189,7 +190,8 @@ fn test_autonomy_automatic_execution() {
         EvolutionEngine::open_in_memory(std::path::PathBuf::from("/tmp/skills"))
             .unwrap()
             .store,
-    );
+    )
+    .unwrap();
 
     let record = manager
         .execute_automatic(vikram_evolution::ActionType::AdjustModelRouting, "test")

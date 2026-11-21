@@ -34,7 +34,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Current schema version. Bump when adding a migration step.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Default retention horizon for [`EvolutionStore::prune_older_than`].
 /// 30 days is conservative: it bounds growth of the append-only tables
@@ -545,6 +545,71 @@ impl EvolutionStore {
         Ok(count.max(0) as usize)
     }
 
+    // ---- engine state records ----
+    /// Persist a JSON state record for an engine whose bookkeeping must
+    /// survive a restart (autonomy approvals, evaluation history, MAPE-K
+    /// knowledge, improvement executions).
+    ///
+    /// `namespace` scopes the record to one engine concern and `id`
+    /// identifies it inside that namespace. Re-saving the same
+    /// `(namespace, id)` replaces the payload and bumps `updated_ms`;
+    /// `created_ms` keeps the first write's timestamp. Records are never
+    /// deleted here — engines that need removal do it through their own
+    /// domain tables.
+    pub fn save_engine_record(
+        &self,
+        namespace: &str,
+        id: &str,
+        payload: &serde_json::Value,
+    ) -> Result<()> {
+        if namespace.is_empty() || id.is_empty() {
+            return Err(EvolutionError::Validation(
+                "engine record namespace and id must not be empty".to_string(),
+            ));
+        }
+        let conn = self.lock();
+        let now = now_ms() as i64;
+        conn.execute(
+            "INSERT INTO engine_records (namespace,id,payload,created_ms,updated_ms) VALUES (?1,?2,?3,?4,?4)
+             ON CONFLICT(namespace,id) DO UPDATE SET payload=excluded.payload, updated_ms=excluded.updated_ms",
+            params![namespace, id, to_json(payload)?, now],
+        )
+        .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        Ok(())
+    }
+    /// All records in a namespace as `(id, payload)`, oldest first — the
+    /// order engines append to their in-memory lists.
+    ///
+    /// A row whose payload does not decode is an error, not a skipped row:
+    /// silently dropping it would resurrect stale in-memory state on the
+    /// next save.
+    pub fn list_engine_records(&self, namespace: &str) -> Result<Vec<(String, serde_json::Value)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id,payload FROM engine_records WHERE namespace=?1 ORDER BY created_ms ASC, id ASC",
+            )
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![namespace], |r| {
+                let id: String = r.get(0)?;
+                let payload: String = r.get(1)?;
+                let value: serde_json::Value = serde_json::from_str(&payload).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            e.to_string(),
+                        )),
+                    )
+                })?;
+                Ok((id, value))
+            })
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        collect_rows(rows)
+    }
+
     /// Bound table growth: delete rows older than `max_age_ms` from the
     /// append-only, high-volume tables. Returns the number of rows removed.
     ///
@@ -586,6 +651,18 @@ fn to_json<T: serde::Serialize>(v: &T) -> Result<String> {
 
 fn from_json<T: for<'de> serde::Deserialize<'de>>(s: &str) -> Result<T> {
     serde_json::from_str(s).map_err(|e| EvolutionError::Serde(e.to_string()))
+}
+
+/// Serialize to a `serde_json::Value` for [`EvolutionStore::save_engine_record`].
+pub(crate) fn to_json_value<T: serde::Serialize>(v: &T) -> Result<serde_json::Value> {
+    serde_json::to_value(v).map_err(|e| EvolutionError::Serde(e.to_string()))
+}
+
+/// Deserialize a `serde_json::Value` read back from [`EvolutionStore::list_engine_records`].
+pub(crate) fn from_json_value<T: for<'de> serde::Deserialize<'de>>(
+    v: serde_json::Value,
+) -> Result<T> {
+    serde_json::from_value(v).map_err(|e| EvolutionError::Serde(e.to_string()))
 }
 
 /// Insert or replace a memory entry on an already-locked connection.
@@ -1090,6 +1167,29 @@ fn migrate(conn: &Connection) -> Result<()> {
             .map_err(|e| EvolutionError::Store(e.to_string()))?;
         }
         conn.pragma_update(None, "user_version", 2i64)
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+    }
+
+    if version < 3 {
+        // v3: generic JSON state records for engines whose bookkeeping must
+        // survive a restart — autonomy approval requests, self-evaluation
+        // benchmarks/results/metrics, MAPE-K knowledge, and improvement
+        // executions. Additive only; existing tables are untouched.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS engine_records (
+                namespace TEXT NOT NULL,
+                id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_ms INTEGER NOT NULL,
+                updated_ms INTEGER NOT NULL,
+                PRIMARY KEY (namespace, id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_engine_records_ns ON engine_records(namespace);
+            "#,
+        )
+        .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        conn.pragma_update(None, "user_version", 3i64)
             .map_err(|e| EvolutionError::Store(e.to_string()))?;
     }
 

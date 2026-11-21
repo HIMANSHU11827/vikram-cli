@@ -2,16 +2,25 @@
 //!
 //! This engine classifies actions by risk and determines approval requirements.
 //!
-//! DORMANT / process-local: nothing in the runtime, CLI or other crates calls
-//! this engine — the self-check path does not consult it before acting.
-//! `action_history` and `pending_approvals` are in-memory `Vec`s, so
-//! approvals granted in one process are gone after a restart and an operator
-//! cannot answer a pending request from another process.
+//! DORMANT / awaiting a caller: nothing in the runtime, CLI or other crates
+//! calls this engine — the self-check path does not consult it before acting.
+//!
+//! Persistence: every [`ApprovalRequest`] is written to the store's
+//! `engine_records` table under [`APPROVAL_NAMESPACE`] on creation and on
+//! every status transition, and reloaded by [`AutonomyManager::new`], so an
+//! approval granted in one process is still answerable — and still spendable
+//! exactly once — after a restart or from another process. `action_history`
+//! stays process-local: executed actions already emit `action_executed`
+//! learning events, and rebuilding the in-memory list from those events is
+//! a reporting concern, not a correctness one.
 
 use crate::error::{EvolutionError, Result};
-use crate::store::EvolutionStore;
+use crate::store::{EvolutionStore, from_json_value, to_json_value};
 use crate::types::{gen_id, now_ms};
 use serde::{Deserialize, Serialize};
+
+/// `engine_records` namespace holding every [`ApprovalRequest`].
+const APPROVAL_NAMESPACE: &str = "autonomy.approval";
 
 /// Autonomy levels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,12 +104,25 @@ pub struct AutonomyManager {
 }
 
 impl AutonomyManager {
-    pub fn new(store: EvolutionStore) -> Self {
-        Self {
+    pub fn new(store: EvolutionStore) -> Result<Self> {
+        let pending_approvals = store
+            .list_engine_records(APPROVAL_NAMESPACE)?
+            .into_iter()
+            .map(|(_, payload)| from_json_value::<ApprovalRequest>(payload))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
             store,
             action_history: Vec::new(),
-            pending_approvals: Vec::new(),
-        }
+            pending_approvals,
+        })
+    }
+
+    /// Write one request's current state to the store. Called at every
+    /// mutation boundary (`request_approval`, `approve_request`,
+    /// `reject_request`, `execute_controlled`) so the durable copy never
+    /// lags the in-memory one.
+    fn persist_request(store: &EvolutionStore, request: &ApprovalRequest) -> Result<()> {
+        store.save_engine_record(APPROVAL_NAMESPACE, &request.id, &to_json_value(request)?)
     }
 
     /// Determine autonomy level for an action.
@@ -138,12 +160,15 @@ impl AutonomyManager {
     }
 
     /// Request approval for an action.
+    ///
+    /// The request is persisted before it is returned: an approval that only
+    /// exists in memory would be unanswerable after a restart.
     pub fn request_approval(
         &mut self,
         action: ActionType,
         description: &str,
         reason: &str,
-    ) -> ApprovalRequest {
+    ) -> Result<ApprovalRequest> {
         let level = self.determine_autonomy_level(&action);
 
         let request = ApprovalRequest {
@@ -158,7 +183,11 @@ impl AutonomyManager {
         };
 
         self.pending_approvals.push(request.clone());
-        request
+        if let Err(e) = Self::persist_request(&self.store, &request) {
+            self.pending_approvals.pop();
+            return Err(e);
+        }
+        Ok(request)
     }
 
     /// Execute an automatic action.
@@ -258,8 +287,14 @@ impl AutonomyManager {
         // The approval is consumed by this execution: a second
         // `execute_controlled` with the same id fails the Approved check.
         // Marked only after the event is recorded, so a store failure
-        // leaves the approval usable for a retry.
+        // leaves the approval usable for a retry. The consumed state is
+        // persisted too — if that write fails the in-memory status is
+        // rolled back so a restart cannot resurrect a spent approval.
         self.pending_approvals[idx].status = ApprovalStatus::Executed;
+        if let Err(e) = Self::persist_request(&self.store, &self.pending_approvals[idx]) {
+            self.pending_approvals[idx].status = ApprovalStatus::Approved;
+            return Err(e);
+        }
         Ok(record)
     }
 
@@ -280,8 +315,18 @@ impl AutonomyManager {
             )));
         }
 
+        let prev_status = req.status.clone();
+        let prev_approved_by = req.approved_by.clone();
         req.status = ApprovalStatus::Approved;
         req.approved_by = Some(approved_by.to_string());
+        // Persist before recording history: a failed write rolls the
+        // in-memory approval back so memory and store never disagree about
+        // whether this request was granted.
+        if let Err(e) = Self::persist_request(&self.store, req) {
+            req.status = prev_status;
+            req.approved_by = prev_approved_by;
+            return Err(e);
+        }
         let record = ActionRecord {
             id: gen_id("action"),
             action_type: req.action_type.clone(),
@@ -313,7 +358,12 @@ impl AutonomyManager {
             )));
         }
 
+        let prev_status = req.status.clone();
         req.status = ApprovalStatus::Rejected;
+        if let Err(e) = Self::persist_request(&self.store, req) {
+            req.status = prev_status;
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -367,7 +417,7 @@ mod tests {
     use crate::store::EvolutionStore;
 
     fn manager() -> AutonomyManager {
-        AutonomyManager::new(EvolutionStore::open_in_memory().unwrap())
+        AutonomyManager::new(EvolutionStore::open_in_memory().unwrap()).unwrap()
     }
 
     #[test]
@@ -405,8 +455,9 @@ mod tests {
         );
 
         // A pending (unapproved) request is not enough.
-        let pending =
-            manager.request_approval(ActionType::ModifySourceCode, "change", "need approval");
+        let pending = manager
+            .request_approval(ActionType::ModifySourceCode, "change", "need approval")
+            .unwrap();
         assert!(
             manager
                 .execute_controlled(ActionType::ModifySourceCode, "change", &pending.id,)
@@ -414,7 +465,9 @@ mod tests {
         );
 
         // An approval for a different action does not cover this one.
-        let other = manager.request_approval(ActionType::RunTests, "run tests", "need approval");
+        let other = manager
+            .request_approval(ActionType::RunTests, "run tests", "need approval")
+            .unwrap();
         manager.approve_request(&other.id, "user").unwrap();
         assert!(
             manager
@@ -437,11 +490,13 @@ mod tests {
     fn approval_required_action_executes_only_after_approval() {
         let mut manager = manager();
 
-        let request = manager.request_approval(
-            ActionType::ChangeSecurityPolicy,
-            "loosen policy",
-            "requested",
-        );
+        let request = manager
+            .request_approval(
+                ActionType::ChangeSecurityPolicy,
+                "loosen policy",
+                "requested",
+            )
+            .unwrap();
         assert_eq!(request.risk_level, AutonomyLevel::ApprovalRequired);
         assert!(
             manager
@@ -469,8 +524,9 @@ mod tests {
     fn an_approval_authorizes_exactly_one_execution() {
         let mut manager = manager();
 
-        let request =
-            manager.request_approval(ActionType::ModifySourceCode, "change", "need approval");
+        let request = manager
+            .request_approval(ActionType::ModifySourceCode, "change", "need approval")
+            .unwrap();
         manager.approve_request(&request.id, "user").unwrap();
 
         manager
@@ -501,13 +557,72 @@ mod tests {
     fn approve_and_reject_fail_for_already_resolved_requests() {
         let mut manager = manager();
 
-        let request = manager.request_approval(ActionType::RunTests, "tests", "reason");
+        let request = manager
+            .request_approval(ActionType::RunTests, "tests", "reason")
+            .unwrap();
         manager.approve_request(&request.id, "user").unwrap();
         assert!(manager.approve_request(&request.id, "user").is_err());
         assert!(manager.reject_request(&request.id).is_err());
 
-        let rejected = manager.request_approval(ActionType::RunTests, "tests", "reason");
+        let rejected = manager
+            .request_approval(ActionType::RunTests, "tests", "reason")
+            .unwrap();
         manager.reject_request(&rejected.id).unwrap();
         assert!(manager.approve_request(&rejected.id, "user").is_err());
+    }
+
+    #[test]
+    fn approvals_survive_a_store_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("evolution.db");
+
+        let request_id;
+        {
+            let store = EvolutionStore::open(&path).unwrap();
+            let mut manager = AutonomyManager::new(store).unwrap();
+            let pending = manager
+                .request_approval(ActionType::ModifySourceCode, "change", "need approval")
+                .unwrap();
+            request_id = pending.id.clone();
+            manager.approve_request(&pending.id, "user").unwrap();
+        }
+
+        let store = EvolutionStore::open(&path).unwrap();
+        let mut manager = AutonomyManager::new(store).unwrap();
+        let restored = manager
+            .get_pending_approvals()
+            .iter()
+            .find(|r| r.id == request_id)
+            .expect("approved request must survive a reopen");
+        assert_eq!(restored.status, ApprovalStatus::Approved);
+        assert_eq!(restored.approved_by.as_deref(), Some("user"));
+
+        // The restored approval is still spendable exactly once.
+        let record = manager
+            .execute_controlled(ActionType::ModifySourceCode, "change", &request_id)
+            .unwrap();
+        assert_eq!(record.approved_by.as_deref(), Some("user"));
+        assert!(
+            manager
+                .execute_controlled(ActionType::ModifySourceCode, "change", &request_id)
+                .is_err()
+        );
+
+        // And the spent state is durable too.
+        let store = EvolutionStore::open(&path).unwrap();
+        let manager = AutonomyManager::new(store).unwrap();
+        let spent = manager
+            .get_pending_approvals()
+            .iter()
+            .find(|r| r.id == request_id)
+            .unwrap();
+        assert_eq!(spent.status, ApprovalStatus::Executed);
+    }
+
+    #[test]
+    fn a_fresh_store_starts_with_no_approvals() {
+        let manager = manager();
+        assert!(manager.get_pending_approvals().is_empty());
+        assert!(manager.get_action_history().is_empty());
     }
 }
