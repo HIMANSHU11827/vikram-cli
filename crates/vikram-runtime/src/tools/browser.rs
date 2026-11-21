@@ -344,7 +344,11 @@ impl Tool for BrowserScreenshot {
         let height = height.clamp(1, u64::from(crate::browser::MAX_DIMENSION)) as u32;
         match crate::browser::screenshot(&url, &path, width, height) {
             Ok(written) => Ok(ToolOutput {
-                content: format!("wrote {width}x{height} screenshot of {url} to {written}"),
+                // The `IMAGE:` line is the host's artifact marker: the turn loop reads it back
+                // off this result and attaches the file to the assistant reply it belongs to.
+                content: format!(
+                    "wrote {width}x{height} screenshot of {url} to {written}\nIMAGE:{written}"
+                ),
                 ok: true,
             }),
             Err(e) => Ok(ToolOutput {

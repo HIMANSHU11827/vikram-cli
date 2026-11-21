@@ -49,7 +49,13 @@ impl Tool for VerifyRun {
         let steps = outcome
             .steps
             .iter()
-            .map(|s| json!({"name": s.name, "ok": s.ok, "duration_ms": s.duration_ms}))
+            .map(|s| {
+                let mut entry = json!({"name": s.name, "ok": s.ok, "duration_ms": s.duration_ms});
+                if !s.ok {
+                    entry["detail"] = json!(output_tail(&s.output, MAX_STEP_DETAIL));
+                }
+                entry
+            })
             .collect::<Vec<_>>();
         let payload = json!({
             "ok": outcome.ok,
@@ -86,6 +92,21 @@ impl Tool for VerifyRun {
 }
 
 use std::time::Duration;
+
+/// How much of a failing step's output the JSON report keeps per step. The tail carries the
+/// error; `failure_output` already holds the fuller (head-truncated) capture.
+const MAX_STEP_DETAIL: usize = 500;
+
+/// The last `max` chars of `text`, trimmed.
+fn output_tail(text: &str, max: usize) -> String {
+    let trimmed = text.trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() <= max {
+        trimmed.to_owned()
+    } else {
+        chars[chars.len() - max..].iter().collect()
+    }
+}
 
 macro_rules! cmd_check_tool {
     ($struct:ident, $tool:expr, $default:expr, $verb:expr, $desc:expr) => {
@@ -344,6 +365,15 @@ mod cmd_check_tests {
             .unwrap();
         assert!(out.ok, "{}", out.content);
         assert!(out.content.contains("hello-test"), "{}", out.content);
+    }
+
+    #[test]
+    fn output_tail_keeps_the_end_within_the_bound() {
+        let long = format!("{}\nerror: the failure", "y".repeat(2_000));
+        let tail = output_tail(&long, MAX_STEP_DETAIL);
+        assert!(tail.chars().count() <= MAX_STEP_DETAIL);
+        assert!(tail.contains("error: the failure"));
+        assert_eq!(output_tail("short", MAX_STEP_DETAIL), "short");
     }
 
     #[test]

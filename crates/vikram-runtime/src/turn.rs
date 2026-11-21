@@ -12,8 +12,8 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 use vikram_contracts::policy::Decision;
 use vikram_contracts::{
-    ActionKind, ApprovalId, Block, Message, PermissionMode, PermissionRequest, RecordKind, Role,
-    SideEffect, ToolCall, ToolCallId, Trust, TurnId,
+    ActionKind, ApprovalId, Block, ImageSource, Message, PermissionMode, PermissionRequest,
+    RecordKind, Role, SideEffect, ToolCall, ToolCallId, Trust, TurnId,
 };
 
 use crate::bots::ManagedBot;
@@ -1344,6 +1344,7 @@ async fn deliver_assistant_message(
     calls: &[ToolCall],
 ) {
     let mut delivered = text.to_owned();
+    let mut withheld = false;
     if !delivered.is_empty() {
         let hook = run_hook(
             inner,
@@ -1359,11 +1360,19 @@ async fn deliver_assistant_message(
         .await;
         if hook.effect.deny.is_some() {
             delivered.clear();
+            withheld = true;
         } else if let Some(rewritten) = hook.effect.text {
             delivered = rewritten;
         }
     }
-    commit_assistant_text(inner, session, &delivered, reasoning, calls);
+    // A denied reply sends nothing at all: the artifacts a tool produced stay in the workspace
+    // rather than riding out on a response the operator's plugin refused.
+    let images = if withheld {
+        Vec::new()
+    } else {
+        pending_image_artifacts(inner, session)
+    };
+    commit_assistant_text(inner, session, &delivered, reasoning, calls, &images);
 }
 
 /// The turn's closing dispatch: outcome, step count and token figures for observers. It runs
@@ -1445,6 +1454,7 @@ fn commit_assistant_text(
     text: &str,
     reasoning: &str,
     calls: &[ToolCall],
+    images: &[ImageSource],
 ) {
     let mut blocks = Vec::new();
     if !reasoning.is_empty() {
@@ -1461,6 +1471,13 @@ fn commit_assistant_text(
     }
     for call in calls {
         blocks.push(Block::ToolCall { call: call.clone() });
+    }
+    for source in images {
+        // Pixels are external content: they can inform the model, never authorize an action.
+        blocks.push(Block::Image {
+            source: source.clone(),
+            trust: Trust::External,
+        });
     }
     if blocks.is_empty() {
         return;
@@ -1479,6 +1496,129 @@ fn commit_assistant_text(
         session: session.id.clone(),
         message,
     });
+}
+
+/// The line a media-producing tool ends its output with to name the artifact file it wrote. The
+/// host reads it back off the committed tool result; the model only ever sees it as text.
+const IMAGE_ARTIFACT_PREFIX: &str = "IMAGE:";
+
+/// Tools whose `IMAGE:` lines name real files a reply may carry. Anything else — a fetched page,
+/// a file's contents — can print the marker but is never honored.
+const IMAGE_ARTIFACT_TOOLS: &[&str] = &["browser.screenshot"];
+
+/// One reply carries at most this many artifacts, each at most this many bytes. A skipped image
+/// loses delivery, not the artifact: the file stays in the workspace either way.
+const MAX_IMAGE_ARTIFACTS: usize = 4;
+const MAX_IMAGE_ARTIFACT_BYTES: u64 = 4 * 1024 * 1024;
+
+const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
+/// The images the tool results committed since the last assistant message asked the reply to
+/// carry. Scanning stops at the previous assistant or user message, so each artifact attaches to
+/// exactly one reply and a turn whose commit was refused cannot leak its artifacts into the next.
+fn pending_image_artifacts(
+    inner: &Arc<RuntimeInner>,
+    session: &Arc<SessionRuntime>,
+) -> Vec<ImageSource> {
+    let messages = session.messages();
+    let mut names: HashMap<&ToolCallId, &str> = HashMap::new();
+    for message in &messages {
+        for block in &message.blocks {
+            if let Block::ToolCall { call } = block {
+                names.insert(&call.id, call.name.as_str());
+            }
+        }
+    }
+    let mut artifacts = Vec::new();
+    let mut claimed = std::collections::HashSet::new();
+    'scan: for message in messages.iter().rev() {
+        if matches!(message.role, Role::Assistant | Role::User | Role::System) {
+            break;
+        }
+        for block in &message.blocks {
+            let Block::ToolResult {
+                call, content, ok, ..
+            } = block
+            else {
+                continue;
+            };
+            if !*ok
+                || !names
+                    .get(call)
+                    .is_some_and(|name| IMAGE_ARTIFACT_TOOLS.contains(name))
+            {
+                continue;
+            }
+            for line in content.lines() {
+                let Some(raw) = line.strip_prefix(IMAGE_ARTIFACT_PREFIX) else {
+                    continue;
+                };
+                if let Some(source) = image_artifact(inner, raw.trim(), &mut claimed) {
+                    artifacts.push(source);
+                    if artifacts.len() >= MAX_IMAGE_ARTIFACTS {
+                        break 'scan;
+                    }
+                }
+            }
+        }
+    }
+    artifacts.reverse();
+    artifacts
+}
+
+/// One `IMAGE:` path as inline image bytes, or `None` when the file is not a real, reasonably
+/// sized PNG inside the workspace. The signature check is what keeps a forged marker from
+/// turning the reply into a file reader.
+fn image_artifact(
+    inner: &Arc<RuntimeInner>,
+    raw: &str,
+    claimed: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> Option<ImageSource> {
+    let resolved = crate::config::resolve_within(&inner.workspace_root, std::path::Path::new(raw))?;
+    if !claimed.insert(resolved.clone()) {
+        return None;
+    }
+    let size = std::fs::metadata(&resolved).ok()?.len();
+    if size > MAX_IMAGE_ARTIFACT_BYTES {
+        inner.emit(RuntimeEvent::Notice {
+            level: NoticeLevel::Warn,
+            text: format!(
+                "image artifact `{}` is {} bytes, over the {} byte cap; not attached",
+                resolved.display(),
+                size,
+                MAX_IMAGE_ARTIFACT_BYTES
+            ),
+        });
+        return None;
+    }
+    let bytes = std::fs::read(&resolved).ok()?;
+    if bytes.len() < PNG_SIGNATURE.len() || bytes[..PNG_SIGNATURE.len()] != *PNG_SIGNATURE {
+        return None;
+    }
+    Some(ImageSource::data("image/png", base64_encode(&bytes)))
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let n = ((chunk[0] as u32) << 16)
+            | ((*chunk.get(1).unwrap_or(&0) as u32) << 8)
+            | (*chunk.get(2).unwrap_or(&0) as u32);
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// The unwind path `finish` cannot be. `run_turn` is spawned with its `JoinHandle` dropped, so
@@ -3532,6 +3672,15 @@ mod tests {
     /// conversation the next request would carry.
     #[allow(clippy::await_holding_lock)]
     async fn run_scripted(script: Vec<Vec<ProviderEvent>>) -> (Vec<Seen>, Vec<Message>) {
+        run_scripted_with(script, vec![Box::new(ProbeTool)]).await
+    }
+
+    /// [`run_scripted`] with the tool set the test chooses.
+    #[allow(clippy::await_holding_lock)]
+    async fn run_scripted_with(
+        script: Vec<Vec<ProviderEvent>>,
+        tools: Vec<Box<dyn Tool>>,
+    ) -> (Vec<Seen>, Vec<Message>) {
         let dir = tempfile::tempdir().expect("temp dir");
         let _home = isolated_home(dir.path());
         let runtime = Runtime::start_with_provider(
@@ -3541,7 +3690,9 @@ mod tests {
         .await
         .expect("runtime starts");
         let handle = runtime.handle();
-        handle.inner.tools.register(Box::new(ProbeTool));
+        for tool in tools {
+            handle.inner.tools.register(tool);
+        }
         let mut events = handle.events();
         let session = named_session(&handle);
         handle
@@ -3554,6 +3705,265 @@ mod tests {
             .expect("the session survives the turn")
             .messages();
         (seen, messages)
+    }
+
+    /// A real 1x1 PNG: the artifact tests need bytes a signature check accepts, not a mock.
+    const PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    /// Stands in for `browser.screenshot` without a browser: writes a real PNG into the workspace
+    /// and reports it with the same `IMAGE:` marker line the real tool emits.
+    struct FakeScreenshot;
+
+    impl Tool for FakeScreenshot {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "browser.screenshot".into(),
+                description: "writes a canned PNG".into(),
+                schema: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+
+        fn permission(&self, _args: &serde_json::Value) -> Result<PermissionRequest, VikramError> {
+            Ok(PermissionRequest::new(
+                ActionKind::Read,
+                "browser.screenshot",
+                "shot.png",
+                SideEffect::None,
+                Trust::Model,
+            ))
+        }
+
+        fn run(
+            &self,
+            _args: &serde_json::Value,
+            ctx: &ToolContext,
+        ) -> Result<ToolOutput, VikramError> {
+            let path = ctx.workspace_root.join("shot.png");
+            std::fs::write(&path, PNG_1X1).expect("the fake screenshot writes");
+            Ok(ToolOutput {
+                content: format!("wrote 1x1 screenshot\nIMAGE:{}", path.display()),
+                ok: true,
+            })
+        }
+    }
+
+    /// A tool that is not on the artifact allowlist but prints the marker anyway: a fetched page
+    /// or file contents could say the same words, so the host must not honor them.
+    struct MarkerTool;
+
+    impl Tool for MarkerTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "marker".into(),
+                description: "prints an IMAGE: line".into(),
+                schema: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+
+        fn permission(&self, _args: &serde_json::Value) -> Result<PermissionRequest, VikramError> {
+            Ok(PermissionRequest::new(
+                ActionKind::Read,
+                "marker.run",
+                "marker",
+                SideEffect::None,
+                Trust::Model,
+            ))
+        }
+
+        fn run(
+            &self,
+            _args: &serde_json::Value,
+            ctx: &ToolContext,
+        ) -> Result<ToolOutput, VikramError> {
+            let path = ctx.workspace_root.join("decoy.png");
+            std::fs::write(&path, PNG_1X1).expect("the decoy writes");
+            Ok(ToolOutput {
+                content: format!("look at this\nIMAGE:{}", path.display()),
+                ok: true,
+            })
+        }
+    }
+
+    #[test]
+    fn base64_encode_matches_the_rfc_vectors() {
+        for (raw, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(raw.as_bytes()), expected, "{raw:?}");
+        }
+        assert_eq!(base64_encode(&[0xFB, 0xFF, 0xFE]), "+//+");
+        assert_eq!(base64_encode(&[0xFB, 0xFF]), "+/8=");
+    }
+
+    #[tokio::test]
+    async fn a_screenshot_artifact_rides_the_reply_that_follows_its_result() {
+        let (_, messages) = run_scripted_with(
+            vec![
+                vec![
+                    ProviderEvent::ToolCall(ToolCall::new(
+                        "browser.screenshot",
+                        serde_json::json!({}),
+                    )),
+                    ProviderEvent::Finished {
+                        input_tokens: None,
+                        output_tokens: None,
+                    },
+                ],
+                vec![
+                    ProviderEvent::TextDelta("here is the shot".into()),
+                    ProviderEvent::Finished {
+                        input_tokens: None,
+                        output_tokens: None,
+                    },
+                ],
+            ],
+            vec![Box::new(FakeScreenshot)],
+        )
+        .await;
+
+        let with_images: Vec<&Message> = messages
+            .iter()
+            .filter(|message| message.images().next().is_some())
+            .collect();
+        assert_eq!(
+            with_images.len(),
+            1,
+            "the artifact attaches to exactly one assistant message: {messages:?}"
+        );
+        let reply = with_images[0];
+        assert_eq!(reply.role, Role::Assistant);
+        assert_eq!(reply.text_body(), "here is the shot");
+        let expected = ImageSource::data("image/png", base64_encode(PNG_1X1));
+        assert_eq!(reply.images().next(), Some(&expected));
+        // The message that carried the tool call must not carry the artifact: the file did not
+        // exist yet when it was committed.
+        let asking = messages
+            .iter()
+            .find(|message| message.tool_calls().next().is_some())
+            .expect("the call was committed");
+        assert_eq!(asking.images().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_image_marker_from_an_unlisted_tool_is_never_honored() {
+        let (_, messages) = run_scripted_with(
+            vec![
+                vec![
+                    ProviderEvent::ToolCall(ToolCall::new("marker", serde_json::json!({}))),
+                    ProviderEvent::Finished {
+                        input_tokens: None,
+                        output_tokens: None,
+                    },
+                ],
+                vec![
+                    ProviderEvent::TextDelta("done".into()),
+                    ProviderEvent::Finished {
+                        input_tokens: None,
+                        output_tokens: None,
+                    },
+                ],
+            ],
+            vec![Box::new(MarkerTool)],
+        )
+        .await;
+
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.images().next().is_none()),
+            "no message may carry an image the allowlist did not produce"
+        );
+    }
+
+    /// Push one tool round into a session by hand: an assistant message holding the call, then
+    /// the result that answers it.
+    fn push_tool_round(session: &Arc<SessionRuntime>, name: &str, result: &str, ok: bool) {
+        let call = ToolCall::new(name, serde_json::json!({}));
+        session.push_message(
+            Message {
+                role: Role::Assistant,
+                blocks: vec![Block::ToolCall { call: call.clone() }],
+            },
+            now_ms(),
+        );
+        session.push_message(
+            Message::tool_result(call.id, result.to_owned(), ok),
+            now_ms(),
+        );
+    }
+
+    #[tokio::test]
+    async fn image_artifacts_must_be_real_pngs_inside_the_workspace() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let outside = tempfile::tempdir().expect("outside temp dir");
+        std::fs::write(outside.path().join("out.png"), PNG_1X1).expect("outside png");
+        std::fs::write(dir.path().join("text.png"), b"not a png at all").expect("fake png");
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::new(ScriptedProvider::new(vec![])),
+        )
+        .await
+        .expect("runtime starts");
+        let handle = runtime.handle();
+        let session_id = named_session(&handle);
+        let session = handle.inner.session(&session_id).expect("session");
+        session.push_message(Message::user("audit"), now_ms());
+
+        let inside = dir.path().join("shot.png");
+        std::fs::write(&inside, PNG_1X1).expect("inside png");
+
+        // A real screenshot artifact attaches, once even when a result names the same file twice.
+        let marker = format!("wrote it\nIMAGE:{0}\nIMAGE:{0}", inside.display());
+        push_tool_round(&session, "browser.screenshot", &marker, true);
+        let artifacts = pending_image_artifacts(&handle.inner, &session);
+        assert_eq!(artifacts.len(), 1, "duplicates collapse to one image");
+        assert_eq!(
+            artifacts[0],
+            ImageSource::data("image/png", base64_encode(PNG_1X1))
+        );
+
+        // Committed means consumed: once an assistant message follows the results, the same
+        // artifacts are not offered again.
+        session.push_message(
+            Message::text(Role::Assistant, "here", Trust::Model),
+            now_ms(),
+        );
+        assert!(pending_image_artifacts(&handle.inner, &session).is_empty());
+
+        // Everything the marker could lie about is refused: other tools, failed results, paths
+        // outside the workspace, files that are not PNGs, and files over the size cap.
+        let mut big = PNG_1X1.to_vec();
+        big.resize(MAX_IMAGE_ARTIFACT_BYTES as usize + 1, 0);
+        std::fs::write(dir.path().join("big.png"), &big).expect("oversized png");
+        let outside_marker = format!("IMAGE:{}", outside.path().join("out.png").display());
+        let text_marker = format!("IMAGE:{}", dir.path().join("text.png").display());
+        let big_marker = format!("IMAGE:{}", dir.path().join("big.png").display());
+        for (name, result, ok) in [
+            ("web.fetch", marker.as_str(), true),
+            ("browser.screenshot", marker.as_str(), false),
+            ("browser.screenshot", outside_marker.as_str(), true),
+            ("browser.screenshot", text_marker.as_str(), true),
+            ("browser.screenshot", big_marker.as_str(), true),
+        ] {
+            push_tool_round(&session, name, result, ok);
+            assert!(
+                pending_image_artifacts(&handle.inner, &session).is_empty(),
+                "{name} result must not attach: {result}"
+            );
+        }
     }
 
     #[tokio::test]

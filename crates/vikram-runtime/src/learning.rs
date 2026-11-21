@@ -374,6 +374,8 @@ pub enum Verification {
     Failed {
         step: Option<String>,
         kind: Option<String>,
+        /// Bounded tail of the failing step's real output, when the verify report carried one.
+        detail: Option<String>,
     },
 }
 
@@ -420,9 +422,12 @@ impl TurnGrowth {
     /// is `ok && reported`: a plugin that flips the call's `ok` cannot make a failed verification
     /// pass, and a withheld pass is still a failure the turn saw.
     pub fn record_verification(&mut self, ok: bool, content: &str) {
-        let (reported, step, kind) = verification_signal(content);
+        let (reported, step, kind, detail) = verification_signal(content);
         let passed = ok && reported.unwrap_or(true);
-        let detail = match (&step, &kind) {
+        let detail = detail
+            .map(|d| bounded_tail(&d, MAX_VERIFICATION_DETAIL))
+            .filter(|d| !d.is_empty());
+        let location = match (&step, &kind) {
             (Some(step), Some(kind)) => format!(" {step}:{kind}"),
             (Some(step), None) => format!(" {step}"),
             (None, Some(kind)) => format!(" {kind}"),
@@ -431,13 +436,27 @@ impl TurnGrowth {
         self.verification = Some(if passed {
             Verification::Passed
         } else {
-            Verification::Failed { step, kind }
+            Verification::Failed {
+                step,
+                kind,
+                detail: detail.clone(),
+            }
         });
         if !passed {
-            if !detail.is_empty() {
-                self.errors.push(format!("verify: FAIL{detail}"));
-            } else if reported == Some(false) {
-                self.errors.push("verify: FAIL".to_owned());
+            if !location.is_empty() || reported == Some(false) {
+                let mut note = format!("verify: FAIL{location}");
+                if let Some(detail) = &detail {
+                    let flat = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let room = MAX_GROWTH_ERROR_LEN.saturating_sub(note.chars().count() + 3);
+                    if room > 0 && !flat.is_empty() {
+                        note.push_str(" — ");
+                        note.push_str(&bounded_tail(&flat, room));
+                    }
+                }
+                if note.chars().count() > MAX_GROWTH_ERROR_LEN {
+                    note = note.chars().take(MAX_GROWTH_ERROR_LEN).collect();
+                }
+                self.errors.push(note);
             } else {
                 self.record_failure("verify", content);
             }
@@ -449,18 +468,39 @@ impl TurnGrowth {
     }
 }
 
+/// How much of the failing step's output a growth record keeps. The tail is what matters:
+/// the last lines of a compiler or test run carry the error.
+pub const MAX_VERIFICATION_DETAIL: usize = 400;
+
+/// The last `max` chars of `text`, trimmed — the end of a check's output is where the
+/// failure is reported.
+fn bounded_tail(text: &str, max: usize) -> String {
+    let trimmed = text.trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() <= max {
+        trimmed.to_owned()
+    } else {
+        chars[chars.len() - max..].iter().collect()
+    }
+}
+
 /// Read the `verify` tool's verdict out of its output: the leading verdict line first, then the
-/// JSON report's `ok`/`failure` fields, else `None` (caller falls back to the call's `ok`).
-fn verification_signal(content: &str) -> (Option<bool>, Option<String>, Option<String>) {
+/// JSON report's `ok`/`failure`/`failure_output` fields, else `None` (caller falls back to the
+/// call's `ok`). The report may be truncated mid-JSON, so `failure_output` is also recovered by
+/// a tolerant string-field scan when a full parse fails.
+fn verification_signal(
+    content: &str,
+) -> (Option<bool>, Option<String>, Option<String>, Option<String>) {
     let verdict = content.lines().next().unwrap_or_default();
     if verdict == "verify: PASS" {
-        return (Some(true), None, None);
+        return (Some(true), None, None, None);
     }
     if let Some(detail) = verdict.strip_prefix("verify: FAIL") {
         return (
             Some(false),
             verdict_field(detail, "step"),
             verdict_field(detail, "kind"),
+            json_string_field(content, "failure_output"),
         );
     }
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
@@ -480,9 +520,59 @@ fn verification_signal(content: &str) -> (Option<bool>, Option<String>, Option<S
                 )
             })
             .unwrap_or((None, None));
-        return (Some(reported), step, kind);
+        let output = value
+            .get("failure_output")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        return (Some(reported), step, kind, output);
     }
-    (None, None, None)
+    (None, None, None, None)
+}
+
+/// Pull a `"key": "..."` string field out of possibly-truncated JSON: locate the key, then scan
+/// the string literal honouring backslash escapes. Returns `None` when the field is absent or
+/// the literal is unterminated and unparseable.
+fn json_string_field(content: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let start = content.find(&needle)? + needle.len();
+    let rest = content[start..]
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let mut raw = String::new();
+    let mut escaped = false;
+    let mut closed = false;
+    for c in rest.chars() {
+        if escaped {
+            raw.push('\\');
+            raw.push(c);
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '"' => {
+                closed = true;
+                break;
+            }
+            _ => raw.push(c),
+        }
+    }
+    // A trailing `\` with no following char was a truncation artifact; it was never pushed.
+    let candidate = format!("\"{raw}\"");
+    if closed {
+        serde_json::from_str::<String>(&candidate).ok()
+    } else {
+        // Truncated mid-string: unescape what survived rather than drop the signal entirely.
+        serde_json::from_str::<String>(&candidate).ok().or_else(|| {
+            Some(
+                raw.replace("\\n", "\n")
+                    .replace("\\t", "\t")
+                    .replace("\\\"", "\""),
+            )
+        })
+    }
 }
 
 /// Pull `key=value` out of the `verify: FAIL …` detail text.
@@ -751,12 +841,18 @@ fn experience_metadata(
     if let Some(verification) = &growth.verification {
         metadata["verification"] = match verification {
             Verification::Passed => serde_json::json!({"ran": true, "passed": true}),
-            Verification::Failed { step, kind } => serde_json::json!({
-                "ran": true,
-                "passed": false,
-                "step": step,
-                "kind": kind,
-            }),
+            Verification::Failed { step, kind, detail } => {
+                let mut report = serde_json::json!({
+                    "ran": true,
+                    "passed": false,
+                    "step": step,
+                    "kind": kind,
+                });
+                if let Some(detail) = detail {
+                    report["detail"] = serde_json::json!(detail);
+                }
+                report
+            }
         };
     }
     let mut texts = Vec::with_capacity(corrections.len() + 1);
@@ -2119,12 +2215,94 @@ mod tests {
             Some(Verification::Failed {
                 step: Some("test".to_owned()),
                 kind: Some("test_failure".to_owned()),
+                detail: None,
             })
         );
         assert_eq!(
             growth.errors,
             vec!["verify: FAIL test:test_failure".to_owned()]
         );
+    }
+
+    #[test]
+    fn a_verify_fail_carries_the_failing_output_into_metadata() {
+        let content = concat!(
+            "verify: FAIL step=test kind=test_failure\n",
+            "{\"ok\":false,\"failure\":{\"step\":\"test\",\"kind\":\"test_failure\"},",
+            "\"failure_output\":\"running 3 tests\\ntest a ... ok\\nerror[E0308]: mismatched types\\nfailures: 1\"}"
+        );
+        let growth = verify_growth(content, false);
+        let Some(Verification::Failed { step, kind, detail }) = &growth.verification else {
+            panic!(
+                "expected a failed verification, got {:?}",
+                growth.verification
+            );
+        };
+        assert_eq!(step.as_deref(), Some("test"));
+        assert_eq!(kind.as_deref(), Some("test_failure"));
+        let detail = detail.as_deref().expect("failure output should be kept");
+        assert!(detail.contains("error[E0308]"), "{detail}");
+        assert!(detail.contains("failures: 1"), "{detail}");
+
+        let metadata = experience_metadata(&session(), &growth, "fix the tests", &[]);
+        assert_eq!(metadata["verification"]["step"], "test");
+        assert_eq!(metadata["verification"]["kind"], "test_failure");
+        assert!(
+            metadata["verification"]["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("error[E0308]"),
+            "{}",
+            metadata["verification"]
+        );
+
+        let note = growth
+            .errors
+            .iter()
+            .find(|e| e.starts_with("verify: FAIL"))
+            .unwrap();
+        assert!(note.contains("test:test_failure"), "{note}");
+        assert!(note.contains("error[E0308]"), "{note}");
+        assert!(note.chars().count() <= MAX_GROWTH_ERROR_LEN, "{note}");
+    }
+
+    #[test]
+    fn verify_detail_survives_a_json_report_truncated_mid_string() {
+        // The tool truncates its whole output; the failure_output literal can be cut before
+        // its closing quote and before `steps` — the tail must still be recovered.
+        let content = concat!(
+            "verify: FAIL step=build kind=compile_error\n",
+            "{\"ok\":false,\"attempts\":1,\"failure\":{\"step\":\"build\",\"kind\":\"compile_error\"},",
+            "\"failure_output\":\"error[E0433]: failed to resolve: use of undeclared\\n   --> src/main.rs:4:5\\nerror: could not compile `app`"
+        );
+        let growth = verify_growth(content, false);
+        let Some(Verification::Failed { detail, .. }) = &growth.verification else {
+            panic!(
+                "expected a failed verification, got {:?}",
+                growth.verification
+            );
+        };
+        let detail = detail
+            .as_deref()
+            .expect("truncated output should still be kept");
+        assert!(detail.contains("could not compile"), "{detail}");
+    }
+
+    #[test]
+    fn verify_detail_is_bounded_to_a_tail() {
+        let long_output = format!("{}\nerror: the real failure", "x".repeat(5_000));
+        let content = format!(
+            "verify: FAIL step=test kind=unknown\n{}",
+            serde_json::json!({"ok": false, "failure_output": long_output})
+        );
+        let growth = verify_growth(&content, false);
+        let Some(Verification::Failed { detail, .. }) = &growth.verification else {
+            panic!("expected a failed verification");
+        };
+        let detail = detail.as_deref().expect("detail kept");
+        assert!(detail.chars().count() <= MAX_VERIFICATION_DETAIL);
+        assert!(detail.contains("the real failure"));
+        assert!(!detail.contains(&"x".repeat(1_000)));
     }
 
     #[test]
@@ -2138,6 +2316,7 @@ mod tests {
             Some(Verification::Failed {
                 step: Some("build".to_owned()),
                 kind: Some("compile_error".to_owned()),
+                detail: None,
             })
         );
         assert_eq!(
@@ -2153,7 +2332,8 @@ mod tests {
             growth.verification,
             Some(Verification::Failed {
                 step: None,
-                kind: None
+                kind: None,
+                detail: None,
             })
         );
         assert_eq!(
