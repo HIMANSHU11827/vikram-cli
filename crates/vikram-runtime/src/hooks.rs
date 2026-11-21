@@ -5,16 +5,21 @@
 //! runtime is about to do and may deny it, rewrite it, or add context around it. Disabling the
 //! plugin restores the default behaviour because the code path itself is unchanged.
 //!
-//! Two kinds of hook share one contract:
+//! Three kinds of hook share one contract:
 //!
 //! * **Declarative** — `hook_rules` in `plugin.json`. The host evaluates the rule in-process, so
 //!   there is no subprocess and no trust question beyond the manifest's declared permissions.
 //! * **Process** — the plugin's `entry` script is spawned for each dispatch, with the hook point as
 //!   `argv[1]` and the context JSON on stdin. It replies with one JSON object on stdout. A process
 //!   hook may only be declared by a manifest that grants an execution permission (`process`).
+//! * **Wasm** — a `.wasm` module declared under `components.wasm` (or a `.wasm` manifest `entry`)
+//!   runs in-process through wasmi under the same execution-permission gate. It receives the same
+//!   context JSON and replies with the same effect object; instead of [`HOOK_TIMEOUT`] the guest
+//!   is bounded by a fuel budget, and a fuel trap is an ordinary hook failure, not a hang.
 //!
 //! Permissions are deny-first: a rule for `tool_call`/`tool_result` needs `tools`, every other
-//! point needs `agents`, and a process hook additionally needs `process` (or `network`). A plugin
+//! point needs `agents`, and an executable hook (process or wasm) additionally needs `process`
+//! (or `network`). A plugin
 //! that does not declare what a point requires is not registered, and the refusal is reported
 //! through [`HookRegistry::rejected`] rather than silently dropped.
 //!
@@ -943,6 +948,77 @@ fn run_process_hook(command: Command, ctx: &HookContext) -> Result<HookEffect, S
     HookEffect::from_json(&value)
 }
 
+/// A hook implemented by a wasm module — the in-process counterpart of [`ProcessHook`].
+///
+/// The guest receives the same [`HookContext`] JSON a process hook reads on stdin and replies
+/// with the same [`HookEffect`]-shaped object. The execution envelope differs: there is no
+/// subprocess and no [`HOOK_TIMEOUT`]. wasmi runs the module inline under a fuel budget
+/// (`WASM_FUEL_LIMIT` in [`crate::plugins::wasm`]), so a guest that never returns traps with
+/// `OutOfFuel` and surfaces as an ordinary hook failure — recorded and skipped by
+/// [`HookRegistry::dispatch`], exactly like a timed-out or crashed process hook.
+pub struct WasmHook {
+    plugin: String,
+    wasm: Arc<WasmPlugin>,
+    priority: i32,
+    points: Vec<HookPoint>,
+    entry: String,
+}
+
+impl WasmHook {
+    /// Build a wasm hook for `entry` inside `dir`, gated by `manifest` permissions — the same
+    /// checks [`WasmPlugin::new`] applies to stage entries, plus an eager compile so an invalid
+    /// module is refused at load time instead of failing on every dispatch.
+    pub fn new(
+        plugin: impl Into<String>,
+        priority: i32,
+        points: Vec<HookPoint>,
+        dir: impl Into<std::path::PathBuf>,
+        entry: &str,
+        manifest: &PluginManifest,
+    ) -> Result<Self, String> {
+        let plugin: String = plugin.into();
+        let wasm = WasmPlugin::new(plugin.clone(), dir, entry, manifest)?;
+        wasm.validate().map_err(|err| err.to_string())?;
+        Ok(Self {
+            plugin,
+            wasm: Arc::new(wasm),
+            priority,
+            points,
+            entry: entry.to_owned(),
+        })
+    }
+}
+
+impl Hook for WasmHook {
+    fn plugin(&self) -> &str {
+        &self.plugin
+    }
+
+    fn kind(&self) -> &'static str {
+        "wasm"
+    }
+
+    fn priority(&self) -> i32 {
+        self.priority
+    }
+
+    fn points(&self) -> &[HookPoint] {
+        &self.points
+    }
+
+    fn describe(&self) -> String {
+        self.entry.clone()
+    }
+
+    fn run(&self, ctx: &HookContext) -> Result<HookEffect, String> {
+        let reply = self
+            .wasm
+            .request(&ctx.to_json())
+            .map_err(|err| err.to_string())?;
+        HookEffect::from_json(&reply)
+    }
+}
+
 /// What one hook did, for the journal and for `vikram plugins hooks`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HookApplication {
@@ -1080,24 +1156,51 @@ impl HookRegistry {
                 rules,
             )));
         }
-        if let Some(entry) = manifest.entry_point() {
-            if let Err(reason) = ensure_execution_permitted(&id, manifest) {
-                self.rejected.push(HookRejection { plugin: id, reason });
-                return;
-            }
-            if let Err(reason) = entry_path(dir, entry) {
-                self.rejected.push(HookRejection {
-                    plugin: id,
-                    reason: format!("entry point: {reason}"),
-                });
-                return;
-            }
-            let inherit_env = granted.contains(&PluginPermission::Environment);
-            self.register(Arc::new(
-                ProcessHook::new(id, manifest.priority, points, dir, entry)
-                    .with_inherited_env(inherit_env),
-            ));
+        // Executable hooks come in two envelopes: `components.wasm` entries (or a `.wasm`
+        // manifest `entry`) run in-process through wasmi, any other `entry` is spawned as a
+        // subprocess — the same split stage handlers make.
+        let wasm_entries = WasmPlugin::declared_entries(manifest);
+        let process_entry = manifest
+            .entry_point()
+            .filter(|entry| !entry.to_ascii_lowercase().ends_with(".wasm"));
+        if wasm_entries.is_empty() && process_entry.is_none() {
+            return;
         }
+        if let Err(reason) = ensure_execution_permitted(&id, manifest) {
+            self.rejected.push(HookRejection { plugin: id, reason });
+            return;
+        }
+        for entry in &wasm_entries {
+            match WasmHook::new(
+                id.clone(),
+                manifest.priority,
+                points.clone(),
+                dir,
+                entry,
+                manifest,
+            ) {
+                Ok(hook) => self.register(Arc::new(hook)),
+                Err(reason) => self.rejected.push(HookRejection {
+                    plugin: id.clone(),
+                    reason: format!("wasm entry `{entry}`: {reason}"),
+                }),
+            }
+        }
+        let Some(entry) = process_entry else {
+            return;
+        };
+        if let Err(reason) = entry_path(dir, entry) {
+            self.rejected.push(HookRejection {
+                plugin: id.clone(),
+                reason: format!("entry point: {reason}"),
+            });
+            return;
+        }
+        let inherit_env = granted.contains(&PluginPermission::Environment);
+        self.register(Arc::new(
+            ProcessHook::new(id, manifest.priority, points, dir, entry)
+                .with_inherited_env(inherit_env),
+        ));
     }
 
     /// Add a hook, restoring priority order (higher first, then plugin id).
@@ -1593,5 +1696,305 @@ mod tests {
         registry.register(append_hook("alpha", 0, "second"));
         let outcome = registry.dispatch(&HookContext::new(HookPoint::ContextBuild));
         assert_eq!(outcome.effect.append, vec!["second", "first"]);
+    }
+
+    // Scans the request bytes for `Z` (0x5A): found -> `{"deny":"z"}` at offset 512,
+    // otherwise `{"append":"w"}` at offset 600. Hook context JSON is all-lowercase keys, so
+    // the marker only appears when the context text carries it.
+    const WASM_MARKER_WAT: &str = r#"(module
+  (memory (export "memory") 1)
+  (data (i32.const 512) "{\"deny\":\"z\"}")
+  (data (i32.const 600) "{\"append\":\"w\"}")
+  (global $heap (mut i32) (i32.const 4096))
+  (func (export "alloc") (param $size i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (local.get $size)))
+    (local.get $ptr))
+  (func (export "dealloc") (param i32 i32))
+  (func (export "handle") (param $ptr i32) (param $len i32) (result i64)
+    (local $i i32)
+    (local $hit i32)
+    (block $done
+      (loop $scan
+        (br_if $done (i32.ge_u (local.get $i) (local.get $len)))
+        (if
+          (i32.eq
+            (i32.load8_u (i32.add (local.get $ptr) (local.get $i)))
+            (i32.const 90))
+          (then
+            (local.set $hit (i32.const 1))
+            (br $done)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $scan)))
+    (if (result i64)
+      (local.get $hit)
+      (then
+        (i64.add
+          (i64.shl (i64.extend_i32_u (i32.const 512)) (i64.const 32))
+          (i64.extend_i32_u (i32.const 12))))
+      (else
+        (i64.add
+          (i64.shl (i64.extend_i32_u (i32.const 600)) (i64.const 32))
+          (i64.extend_i32_u (i32.const 14)))))))
+"#;
+
+    const WASM_LOOP_WAT: &str = r#"(module
+  (memory (export "memory") 1)
+  (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+  (func (export "dealloc") (param i32 i32))
+  (func (export "handle") (param i32 i32) (result i64)
+    (loop (br 0))
+    unreachable))
+"#;
+
+    fn wasm_hook_manifest(permissions: &[&str]) -> PluginManifest {
+        PluginManifest {
+            name: "wasmy".to_owned(),
+            version: "0.1.0".to_owned(),
+            entry: "hook.wasm".to_owned(),
+            permissions: permissions.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn install_plugin(root: &Path, name: &str, manifest: Value, files: &[(&str, Vec<u8>)]) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).expect("plugin dir");
+        std::fs::write(dir.join("plugin.json"), manifest.to_string()).expect("manifest");
+        for (file, bytes) in files {
+            std::fs::write(dir.join(file), bytes).expect("plugin file");
+        }
+    }
+
+    #[test]
+    fn a_wasm_hook_sees_the_context_and_returns_an_effect() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("hook.wasm"),
+            wat::parse_str(WASM_MARKER_WAT).expect("wat compiles"),
+        )
+        .expect("write wasm");
+        let hook = WasmHook::new(
+            "wasmy",
+            10,
+            vec![HookPoint::UserInput],
+            dir.path(),
+            "hook.wasm",
+            &wasm_hook_manifest(&["agents", "process"]),
+        )
+        .expect("wasm hook builds");
+        assert_eq!(hook.kind(), "wasm");
+        assert_eq!(hook.describe(), "hook.wasm");
+
+        let mut registry = HookRegistry::new();
+        registry.register(Arc::new(hook));
+
+        let denied =
+            registry.dispatch(&HookContext::new(HookPoint::UserInput).with_text("a Z hides here"));
+        assert_eq!(denied.effect.deny.as_deref(), Some("z"));
+        assert_eq!(denied.applied.len(), 1);
+
+        let allowed =
+            registry.dispatch(&HookContext::new(HookPoint::UserInput).with_text("plain words"));
+        assert!(allowed.effect.deny.is_none());
+        assert_eq!(allowed.effect.append, vec!["w".to_owned()]);
+    }
+
+    #[test]
+    fn a_wasm_hook_that_traps_is_a_recorded_failure_not_a_crash() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("hook.wasm"),
+            wat::parse_str(WASM_LOOP_WAT).expect("wat compiles"),
+        )
+        .expect("write wasm");
+        let hook = WasmHook::new(
+            "wasmy",
+            10,
+            vec![HookPoint::ContextBuild],
+            dir.path(),
+            "hook.wasm",
+            &wasm_hook_manifest(&["agents", "process"]),
+        )
+        .expect("an infinite loop still compiles; the trap happens at call time");
+        let err = hook
+            .run(&HookContext::new(HookPoint::ContextBuild))
+            .unwrap_err();
+        assert!(err.contains("wasm execution failed"), "{err}");
+
+        let mut registry = HookRegistry::new();
+        registry.register(Arc::new(hook));
+        registry.register(append_hook("survivor", 0, "still ran"));
+        let outcome = registry.dispatch(&HookContext::new(HookPoint::ContextBuild));
+        assert!(
+            outcome
+                .applied
+                .iter()
+                .any(|a| a.plugin == "wasmy" && a.effect.contains("failed:")),
+            "the fuel trap is journaled as a failure: {:?}",
+            outcome.applied
+        );
+        assert_eq!(outcome.effect.append, vec!["still ran".to_owned()]);
+    }
+
+    #[test]
+    fn from_plugins_registers_wasm_hooks_for_components_wasm_and_wasm_entries() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let plugins = root.path().join("plugins");
+        let wasm_bytes = wat::parse_str(WASM_MARKER_WAT).expect("wat compiles");
+
+        install_plugin(
+            &plugins,
+            "wasm-components",
+            json!({
+                "id": "wasm-components",
+                "components": {"hooks": ["user_input"], "wasm": ["hook.wasm"]},
+                "permissions": ["agents", "process"]
+            }),
+            &[("hook.wasm", wasm_bytes.clone())],
+        );
+        install_plugin(
+            &plugins,
+            "wasm-entry",
+            json!({
+                "id": "wasm-entry",
+                "entry": "hook.wasm",
+                "components": {"hooks": ["user_input"]},
+                "permissions": ["agents", "process"]
+            }),
+            &[("hook.wasm", wasm_bytes)],
+        );
+
+        let scanned = PluginRegistry::scan(&plugins);
+        let hooks = HookRegistry::from_plugins(&scanned);
+        assert!(
+            hooks.rejected().is_empty(),
+            "no refusals expected: {:?}",
+            hooks.rejected()
+        );
+        assert_eq!(hooks.hooks().len(), 2, "{:?}", hooks.entries());
+        assert!(hooks.hooks().iter().all(|hook| hook.kind() == "wasm"));
+
+        let outcome =
+            hooks.dispatch(&HookContext::new(HookPoint::UserInput).with_text("a Z hides here"));
+        assert_eq!(outcome.effect.deny.as_deref(), Some("z"));
+    }
+
+    #[test]
+    fn a_manifest_can_run_wasm_and_process_hooks_together() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let plugins = root.path().join("plugins");
+        install_plugin(
+            &plugins,
+            "mixed",
+            json!({
+                "id": "mixed",
+                "entry": "hook.sh",
+                "components": {"hooks": ["turn_start"], "wasm": ["hook.wasm"]},
+                "permissions": ["agents", "process"]
+            }),
+            &[
+                (
+                    "hook.sh",
+                    b"#!/bin/sh\ncat >/dev/null\nprintf '{\"append\":\"from process\"}'\n".to_vec(),
+                ),
+                (
+                    "hook.wasm",
+                    wat::parse_str(WASM_MARKER_WAT).expect("wat compiles"),
+                ),
+            ],
+        );
+
+        let scanned = PluginRegistry::scan(&plugins);
+        let hooks = HookRegistry::from_plugins(&scanned);
+        assert!(
+            hooks.rejected().is_empty(),
+            "no refusals expected: {:?}",
+            hooks.rejected()
+        );
+        let mut kinds: Vec<&str> = hooks.hooks().iter().map(|hook| hook.kind()).collect();
+        kinds.sort_unstable();
+        assert_eq!(kinds, vec!["process", "wasm"]);
+
+        let outcome = hooks.dispatch(&HookContext::new(HookPoint::TurnStart));
+        assert_eq!(
+            outcome.effect.append,
+            vec!["w".to_owned(), "from process".to_owned()]
+        );
+    }
+
+    #[test]
+    fn wasm_hooks_obey_the_same_permission_gates_as_process_hooks() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let plugins = root.path().join("plugins");
+        let wasm_bytes = wat::parse_str(WASM_MARKER_WAT).expect("wat compiles");
+        install_plugin(
+            &plugins,
+            "sneaky-wasm",
+            json!({
+                "id": "sneaky-wasm",
+                "components": {"hooks": ["tool_call"], "wasm": ["hook.wasm"]},
+                "permissions": ["process"]
+            }),
+            &[("hook.wasm", wasm_bytes.clone())],
+        );
+        install_plugin(
+            &plugins,
+            "noexec-wasm",
+            json!({
+                "id": "noexec-wasm",
+                "components": {"hooks": ["context_build"], "wasm": ["hook.wasm"]},
+                "permissions": ["agents"]
+            }),
+            &[("hook.wasm", wasm_bytes)],
+        );
+
+        let scanned = PluginRegistry::scan(&plugins);
+        let hooks = HookRegistry::from_plugins(&scanned);
+        assert!(hooks.hooks().is_empty(), "{:?}", hooks.entries());
+        assert!(
+            hooks.rejected().iter().any(|r| r.plugin == "sneaky-wasm"
+                && r.reason.contains("requires the `tools` permission")),
+            "tool surface needs `tools`: {:?}",
+            hooks.rejected()
+        );
+        assert!(
+            hooks
+                .rejected()
+                .iter()
+                .any(|r| r.plugin == "noexec-wasm" && r.reason.contains("no execution permission")),
+            "executable hooks need `process`/`network`: {:?}",
+            hooks.rejected()
+        );
+    }
+
+    #[test]
+    fn an_invalid_wasm_hook_module_is_refused_at_load() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let plugins = root.path().join("plugins");
+        install_plugin(
+            &plugins,
+            "broken-wasm",
+            json!({
+                "id": "broken-wasm",
+                "components": {"hooks": ["turn_start"], "wasm": ["bad.wasm"]},
+                "permissions": ["agents", "process"]
+            }),
+            &[("bad.wasm", b"not wasm at all".to_vec())],
+        );
+
+        let scanned = PluginRegistry::scan(&plugins);
+        let hooks = HookRegistry::from_plugins(&scanned);
+        assert!(hooks.hooks().is_empty(), "{:?}", hooks.entries());
+        assert!(
+            hooks
+                .rejected()
+                .iter()
+                .any(|r| r.reason.contains("wasm entry `bad.wasm`")
+                    && r.reason.contains("failed to compile")),
+            "the refusal names the entry and the compile failure: {:?}",
+            hooks.rejected()
+        );
     }
 }

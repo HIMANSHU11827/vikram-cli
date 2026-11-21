@@ -13,27 +13,35 @@
 //!
 //! # Applying an adaptation is bounded by what the engine owns
 //!
-//! [`SelfAdaptationEngine`] owns one handle — the [`EvolutionStore`]. It has no
-//! model catalogue, provider registry, agent configuration or tool registry
-//! handle, so it cannot switch a model, switch a provider, reconfigure an
-//! agent or enable/disable a tool. [`SelfAdaptationEngine::execute_action`]
-//! therefore returns `Err` with a reason for every
-//! [`AdaptationAction`] variant instead of silently returning `Ok(())`, and
-//! [`SelfAdaptationEngine::apply_adaptation`] turns each such error into a
-//! persisted, operator-visible `record_issue` proposal plus a machine-readable
-//! entry in [`AdaptationResult::not_applied`]. `AdaptationResult::applied` is
-//! `true` only when an action was actually carried out, so a strategy that was
-//! merely recorded never reads as applied.
+//! [`SelfAdaptationEngine`] owns one handle — the [`EvolutionStore`]. It has
+//! no model catalogue, provider registry, agent configuration or tool
+//! registry handle, so it cannot switch a model, switch a provider,
+//! reconfigure an agent or enable/disable a tool — those
+//! [`AdaptationAction`] variants return `Err` with a reason and become
+//! persisted, operator-visible `record_issue` proposals. Exactly one action
+//! is real: [`AdaptationAction::ConsolidateMemory`] runs
+//! [`crate::memory::LayeredMemory::consolidate`] against the store,
+//! superseding duplicate live memory entries — an observable mutation this
+//! engine can truthfully perform, so it is the only variant
+//! [`SelfAdaptationEngine::execute_action`] answers `Ok(())` for.
+//! [`AdaptationResult::applied`] is `true` only when an action was actually
+//! carried out, so a strategy that was merely recorded never reads as
+//! applied.
 //!
-//! DORMANT / process-local: no runtime or CLI path calls this engine today.
-//! Its detection reads the durable store, but `adaptation_history` is an
-//! in-memory `Vec` — applied/attempted results are lost on restart.
+//! DORMANT / store-scoped: no runtime or CLI path calls this engine today.
+//! Detection reads the durable store and `adaptation_history` is persisted
+//! to `engine_records` under `self_adaptation.result`, rehydrated on the
+//! first [`SelfAdaptationEngine::apply_adaptation`].
 
 use crate::error::{EvolutionError, Result};
+use crate::memory::LayeredMemory;
 use crate::metrics;
-use crate::store::EvolutionStore;
-use crate::types::{LearningProposal, ProposalKind, ProposalStatus, gen_id, now_ms};
+use crate::store::{EvolutionStore, from_json_value, to_json_value};
+use crate::types::{LearningEvent, LearningProposal, ProposalKind, ProposalStatus, gen_id, now_ms};
 use serde::{Deserialize, Serialize};
+
+/// `engine_records` namespace holding every [`AdaptationResult`].
+const RESULT_NAMESPACE: &str = "self_adaptation.result";
 
 /// Adaptation trigger types.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +100,10 @@ pub enum AdaptationAction {
     ChangeWorkflow(String),
     EnableTool(String),
     DisableTool(String),
+    /// Run memory consolidation against the store: supersede duplicate
+    /// live memory entries. The only action this engine can actually
+    /// carry out — it mutates store state it owns.
+    ConsolidateMemory,
 }
 
 impl AdaptationAction {
@@ -105,11 +117,12 @@ impl AdaptationAction {
             Self::ChangeWorkflow(_) => "change_workflow",
             Self::EnableTool(_) => "enable_tool",
             Self::DisableTool(_) => "disable_tool",
+            Self::ConsolidateMemory => "consolidate_memory",
         }
     }
 
     /// The value the action wants applied (model id, provider id, …), if it
-    /// carries one.
+    /// carries one. [`AdaptationAction::ConsolidateMemory`] carries none.
     pub fn value(&self) -> &str {
         match self {
             Self::SwitchModel(v)
@@ -119,12 +132,18 @@ impl AdaptationAction {
             | Self::ChangeWorkflow(v)
             | Self::EnableTool(v)
             | Self::DisableTool(v) => v,
+            Self::ConsolidateMemory => "",
         }
     }
 
     /// One-line description, e.g. `"switch_model -> gpt-3.5-turbo"`.
     pub fn describe(&self) -> String {
-        format!("{} -> {}", self.kind(), self.value())
+        let value = self.value();
+        if value.is_empty() {
+            self.kind().to_string()
+        } else {
+            format!("{} -> {}", self.kind(), value)
+        }
     }
 }
 
@@ -160,6 +179,8 @@ pub struct AdaptationResult {
 pub struct SelfAdaptationEngine {
     store: EvolutionStore,
     adaptation_history: Vec<AdaptationResult>,
+    /// Whether `adaptation_history` has been rehydrated from `engine_records`.
+    hydrated: bool,
 }
 
 impl SelfAdaptationEngine {
@@ -167,12 +188,36 @@ impl SelfAdaptationEngine {
         Self {
             store,
             adaptation_history: Vec::new(),
+            hydrated: false,
         }
     }
 
     /// The shared store every subsystem reads and writes through.
     pub fn store(&self) -> &EvolutionStore {
         &self.store
+    }
+
+    /// Recorded adaptation results so far (rehydrated from the store on
+    /// the first [`Self::apply_adaptation`]).
+    pub fn get_adaptation_history(&self) -> &[AdaptationResult] {
+        &self.adaptation_history
+    }
+
+    /// Load persisted results into memory once. Mutating entry points call
+    /// this first so post-restart callers see the durable history; a
+    /// corrupt payload is an error, not a silently-empty list.
+    fn hydrate(&mut self) -> Result<()> {
+        if self.hydrated {
+            return Ok(());
+        }
+        let mut results = Vec::new();
+        for (_id, payload) in self.store.list_engine_records(RESULT_NAMESPACE)? {
+            results.push(from_json_value::<AdaptationResult>(payload)?);
+        }
+        results.sort_by_key(|r| r.timestamp_ms);
+        self.adaptation_history = results;
+        self.hydrated = true;
+        Ok(())
     }
 
     /// Detect adaptation opportunities.
@@ -235,16 +280,27 @@ impl SelfAdaptationEngine {
                 estimated_cost: "Possible API differences".to_string(),
                 risk_level: RiskLevel::Medium,
             }]),
-            AdaptationTrigger::ExcessiveContext => Ok(vec![AdaptationStrategy {
-                id: gen_id("strategy"),
-                description: "Enable context compression".to_string(),
-                actions: vec![AdaptationAction::AdjustContextBudget(
-                    "compress".to_string(),
-                )],
-                expected_benefit: "Reduced token usage".to_string(),
-                estimated_cost: "Information loss".to_string(),
-                risk_level: RiskLevel::Low,
-            }]),
+            AdaptationTrigger::ExcessiveContext => Ok(vec![
+                AdaptationStrategy {
+                    id: gen_id("strategy"),
+                    description: "Enable context compression".to_string(),
+                    actions: vec![AdaptationAction::AdjustContextBudget(
+                        "compress".to_string(),
+                    )],
+                    expected_benefit: "Reduced token usage".to_string(),
+                    estimated_cost: "Information loss".to_string(),
+                    risk_level: RiskLevel::Low,
+                },
+                AdaptationStrategy {
+                    id: gen_id("strategy"),
+                    description: "Consolidate duplicate memory entries".to_string(),
+                    actions: vec![AdaptationAction::ConsolidateMemory],
+                    expected_benefit: "Fewer live memory entries for context retrieval to load"
+                        .to_string(),
+                    estimated_cost: "None; superseded entries remain for audit".to_string(),
+                    risk_level: RiskLevel::Low,
+                },
+            ]),
             _ => Ok(vec![]),
         }
     }
@@ -292,7 +348,11 @@ impl SelfAdaptationEngine {
     /// was carried out. The only error this method returns is a store failure
     /// while persisting that record: an adaptation the engine cannot apply and
     /// cannot even record is a genuine failure, never a silent success.
+    ///
+    /// Each result is also persisted to `engine_records` so the history
+    /// survives a restart.
     pub fn apply_adaptation(&mut self, strategy: &AdaptationStrategy) -> Result<AdaptationResult> {
+        self.hydrate()?;
         let before_metrics = self.get_current_metrics()?;
 
         let mut not_applied = Vec::new();
@@ -323,6 +383,11 @@ impl SelfAdaptationEngine {
         };
 
         self.adaptation_history.push(result.clone());
+        self.store.save_engine_record(
+            RESULT_NAMESPACE,
+            &gen_id("adapt"),
+            &to_json_value(&result)?,
+        )?;
         Ok(result)
     }
 
@@ -417,19 +482,39 @@ impl SelfAdaptationEngine {
     /// has no model catalogue, provider registry, context-budget control,
     /// agent configuration or tool registry to write to, and the store schema
     /// has no table that a model/provider/tool switch could be applied
-    /// through. Every [`AdaptationAction`] variant therefore returns `Err`
-    /// naming the missing handle; writing a proposal into the store would only
-    /// *record* the request, so it is not claimed here — the caller
-    /// ( [`Self::apply_adaptation`] ) persists that record and surfaces it,
-    /// which keeps "recorded" and "applied" distinguishable. If this engine
-    /// ever grows a configuration handle it owns, it must apply the change here
-    /// and only then return `Ok(())`.
+    /// through. [`AdaptationAction::ConsolidateMemory`] is the single
+    /// exception: it runs [`LayeredMemory::consolidate`], a real mutation of
+    /// store state this engine owns, and records the outcome as a learning
+    /// event. Every other variant returns `Err` naming the missing handle;
+    /// writing a proposal into the store would only *record* the request, so
+    /// it is not claimed here — the caller ([`Self::apply_adaptation`])
+    /// persists that record and surfaces it, which keeps "recorded" and
+    /// "applied" distinguishable.
     fn execute_action(&self, action: &AdaptationAction) -> Result<()> {
-        Err(EvolutionError::Validation(format!(
-            "no automatic remediation for {}: this engine holds only the evolution store, not a {} control handle",
-            action.describe(),
-            action.kind()
-        )))
+        match action {
+            AdaptationAction::ConsolidateMemory => {
+                let removed = LayeredMemory::new(self.store.clone()).consolidate()?;
+                self.store.save_event(&LearningEvent {
+                    id: gen_id("evt"),
+                    timestamp_ms: now_ms(),
+                    agent_id: "self_adaptation".to_string(),
+                    kind: "adaptation".to_string(),
+                    summary: format!(
+                        "memory consolidation superseded {removed} duplicate live entries"
+                    ),
+                    payload: serde_json::json!({
+                        "action": "consolidate_memory",
+                        "removed": removed,
+                    }),
+                })?;
+                Ok(())
+            }
+            _ => Err(EvolutionError::Validation(format!(
+                "no automatic remediation for {}: this engine holds only the evolution store, not a {} control handle",
+                action.describe(),
+                action.kind()
+            ))),
+        }
     }
 
     /// Persist an adaptation action the engine cannot apply as a pending
@@ -494,4 +579,105 @@ pub struct AdaptationConstraints {
     pub max_risk: RiskLevel,
     pub max_cost_tokens: Option<u64>,
     pub require_improvement: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{KnowledgeStatus, MemoryEntry, MemoryLayer};
+
+    fn engine(store: EvolutionStore) -> SelfAdaptationEngine {
+        SelfAdaptationEngine::new(store)
+    }
+
+    fn memory(id: &str, confidence: f32) -> MemoryEntry {
+        MemoryEntry {
+            id: id.to_string(),
+            layer: MemoryLayer::Semantic,
+            scope: "global".to_string(),
+            key: "dup".to_string(),
+            value: format!("v-{id}"),
+            status: KnowledgeStatus::Observed,
+            confidence,
+            source_experience: None,
+            provenance: "test".to_string(),
+            created_ms: now_ms(),
+            updated_ms: now_ms(),
+            expires_ms: None,
+            superseded_by: None,
+        }
+    }
+
+    fn strategy(actions: Vec<AdaptationAction>) -> AdaptationStrategy {
+        AdaptationStrategy {
+            id: gen_id("strategy"),
+            description: "test strategy".to_string(),
+            actions,
+            expected_benefit: "test".to_string(),
+            estimated_cost: "test".to_string(),
+            risk_level: RiskLevel::Low,
+        }
+    }
+
+    #[test]
+    fn consolidate_memory_is_a_real_applied_action() {
+        let store = EvolutionStore::open_in_memory().unwrap();
+        store.save_memory(&memory("mem-a", 0.4)).unwrap();
+        store.save_memory(&memory("mem-b", 0.9)).unwrap();
+        assert_eq!(store.count_memory().unwrap(), 2);
+
+        let mut engine = engine(store.clone());
+        let result = engine
+            .apply_adaptation(&strategy(vec![AdaptationAction::ConsolidateMemory]))
+            .unwrap();
+
+        assert!(result.applied);
+        assert!(result.not_applied.is_empty());
+        assert!(result.review_proposal_ids.is_empty());
+        // The action really mutated the store: one duplicate superseded.
+        assert_eq!(store.count_memory().unwrap(), 1);
+        let events = store.list_events(None, 10).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == "adaptation" && e.summary.contains("consolidation"))
+        );
+    }
+
+    #[test]
+    fn non_owned_actions_still_error_and_become_proposals() {
+        let store = EvolutionStore::open_in_memory().unwrap();
+        let mut engine = engine(store.clone());
+        let result = engine
+            .apply_adaptation(&strategy(vec![AdaptationAction::SwitchModel(
+                "gpt-4".to_string(),
+            )]))
+            .unwrap();
+
+        assert!(!result.applied);
+        assert_eq!(result.not_applied.len(), 1);
+        assert_eq!(result.review_proposal_ids.len(), 1);
+        let proposal = store
+            .get_proposal(&result.review_proposal_ids[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Pending);
+    }
+
+    #[test]
+    fn adaptation_history_is_durable() {
+        let store = EvolutionStore::open_in_memory().unwrap();
+        {
+            let mut engine = engine(store.clone());
+            engine
+                .apply_adaptation(&strategy(vec![AdaptationAction::ConsolidateMemory]))
+                .unwrap();
+        }
+        let mut engine = engine(store);
+        engine
+            .apply_adaptation(&strategy(vec![AdaptationAction::ConsolidateMemory]))
+            .unwrap();
+        // Hydration on the second apply must have loaded the first result.
+        assert_eq!(engine.get_adaptation_history().len(), 2);
+    }
 }

@@ -149,6 +149,19 @@ impl WasmPlugin {
         Ok(value)
     }
 
+    /// Compile the module eagerly so a broken guest is refused at load time. The result is
+    /// cached in the same slot [`Self::request`] uses, so the first call does not compile twice.
+    pub fn validate(&self) -> Result<(), WasmError> {
+        self.compiled
+            .get_or_init(|| self.compile())
+            .as_ref()
+            .map(|_| ())
+            .map_err(|reason| WasmError::Compile {
+                plugin: self.plugin.clone(),
+                reason: reason.clone(),
+            })
+    }
+
     /// Validate a wasm file without executing it: magic bytes plus a full wasmi compile.
     pub fn validate_file(path: &Path) -> Result<(), WasmError> {
         let bytes = std::fs::read(path).map_err(|reason| WasmError::Execution {

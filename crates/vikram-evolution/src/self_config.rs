@@ -3,15 +3,23 @@
 //! This engine allows Vikram to independently manage models, providers, runtime
 //! settings, context, interface, agents, tools, and MCP integrations.
 //!
-//! DORMANT / process-local: nothing in the runtime or CLI calls this engine,
-//! and `change_history` is an in-memory `Vec` — a restart loses every
-//! recorded change. The engine only ever records *intent*; see
-//! [`ConfigChange::applied`].
+//! DORMANT / store-scoped: nothing in the runtime or CLI calls this engine,
+//! but `change_history` is durable — every [`ConfigChange`] is persisted to
+//! `engine_records` under `self_config.change` and rehydrated on the first
+//! mutating call, so recorded intent survives a restart.
+//!
+//! Application stays operator-side: this engine has no live configuration
+//! surface, so `applied` remains `false` forever here — see
+//! [`ConfigChange::applied`]. An operator applies a recorded change outside
+//! this engine; the record keeps describing the *intent*.
 
 use crate::error::{EvolutionError, Result};
-use crate::store::EvolutionStore;
+use crate::store::{EvolutionStore, from_json_value, to_json_value};
 use crate::types::{gen_id, now_ms};
 use serde::{Deserialize, Serialize};
+
+/// `engine_records` namespace holding every recorded [`ConfigChange`].
+const CHANGE_NAMESPACE: &str = "self_config.change";
 
 /// Configuration target types.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,11 +36,14 @@ pub enum ConfigTarget {
 
 /// Configuration change record.
 ///
-/// This crate has no live configuration surface: nothing outside this
-/// in-memory history reads these records, so `applied` can never become
-/// `true` through [`SelfConfigurationEngine::apply_change`] — see that
-/// method for why. `previous_value`/`rollback_value` describe the *intended*
-/// transition only; no runtime value is ever mutated.
+/// This crate has no live configuration surface: nothing outside the
+/// recorded history reads these records, so `applied` can never become
+/// `true` — see [`SelfConfigurationEngine::apply_change`] for why. An
+/// operator applies the intended change outside this engine; the record
+/// then remains a faithful description of the intent, not a claim that
+/// this engine mutated anything. `previous_value`/`rollback_value`
+/// describe the *intended* transition only; no runtime value is ever
+/// mutated.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConfigChange {
     pub id: String,
@@ -42,7 +53,9 @@ pub struct ConfigChange {
     pub reason: String,
     pub created_ms: u64,
     /// Whether the change was applied to a live configuration target.
-    /// Always `false` today: this engine only records intent.
+    /// Always `false`: application is operator-side and this engine never
+    /// observes the live target, so it cannot truthfully mark a change
+    /// applied.
     pub applied: bool,
     pub rollback_value: Option<String>,
 }
@@ -95,6 +108,8 @@ pub struct AgentConfig {
 pub struct SelfConfigurationEngine {
     store: EvolutionStore,
     change_history: Vec<ConfigChange>,
+    /// Whether `change_history` has been rehydrated from `engine_records`.
+    hydrated: bool,
 }
 
 impl SelfConfigurationEngine {
@@ -102,12 +117,38 @@ impl SelfConfigurationEngine {
         Self {
             store,
             change_history: Vec::new(),
+            hydrated: false,
         }
     }
 
     /// The shared store every subsystem reads and writes through.
     pub fn store(&self) -> &EvolutionStore {
         &self.store
+    }
+
+    /// Load persisted changes into memory once. Mutating entry points call
+    /// this first so post-restart callers see the durable history; a
+    /// corrupt payload is an error, not a silently-empty list.
+    fn hydrate(&mut self) -> Result<()> {
+        if self.hydrated {
+            return Ok(());
+        }
+        let mut changes = Vec::new();
+        for (id, payload) in self.store.list_engine_records(CHANGE_NAMESPACE)? {
+            let mut change: ConfigChange = from_json_value(payload)?;
+            if change.id.is_empty() {
+                change.id = id;
+            }
+            changes.push(change);
+        }
+        changes.sort_by(|a, b| {
+            a.created_ms
+                .cmp(&b.created_ms)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        self.change_history = changes;
+        self.hydrated = true;
+        Ok(())
     }
 
     /// Select optimal model for a task based on criteria.
@@ -153,7 +194,7 @@ impl SelfConfigurationEngine {
             rollback_value: None,
         };
 
-        self.record_change(change.clone());
+        self.record_change(change.clone())?;
         Ok(change)
     }
 
@@ -175,7 +216,7 @@ impl SelfConfigurationEngine {
             rollback_value: None,
         };
 
-        self.record_change(change.clone());
+        self.record_change(change.clone())?;
         Ok(change)
     }
 
@@ -192,7 +233,7 @@ impl SelfConfigurationEngine {
             rollback_value: None,
         };
 
-        self.record_change(change.clone());
+        self.record_change(change.clone())?;
         Ok(change)
     }
 
@@ -212,7 +253,7 @@ impl SelfConfigurationEngine {
             rollback_value: None,
         };
 
-        self.record_change(change.clone());
+        self.record_change(change.clone())?;
         Ok(change)
     }
 
@@ -229,7 +270,7 @@ impl SelfConfigurationEngine {
             rollback_value: Some("disabled".to_string()),
         };
 
-        self.record_change(change.clone());
+        self.record_change(change.clone())?;
         Ok(change)
     }
 
@@ -246,12 +287,16 @@ impl SelfConfigurationEngine {
             rollback_value: Some("enabled".to_string()),
         };
 
-        self.record_change(change.clone());
+        self.record_change(change.clone())?;
         Ok(change)
     }
 
     /// Validate current configuration.
-    pub fn validate_configuration(&self) -> Result<Vec<String>> {
+    ///
+    /// Hydrates the persisted history first, so a fresh engine reports the
+    /// durable pending changes, not just this session's.
+    pub fn validate_configuration(&mut self) -> Result<Vec<String>> {
+        self.hydrate()?;
         let mut issues = Vec::new();
 
         for change in &self.change_history {
@@ -274,6 +319,7 @@ impl SelfConfigurationEngine {
     /// restoration that never happened, so this reports the situation
     /// honestly instead. Unknown change ids are rejected.
     pub fn rollback_change(&mut self, change_id: &str) -> Result<()> {
+        self.hydrate()?;
         let change = self
             .change_history
             .iter()
@@ -296,8 +342,12 @@ impl SelfConfigurationEngine {
     }
 
     /// Get change history.
-    pub fn get_change_history(&self) -> &[ConfigChange] {
-        &self.change_history
+    ///
+    /// Hydrates the persisted history first, so a fresh engine returns the
+    /// durable record, not an empty slice.
+    pub fn get_change_history(&mut self) -> Result<&[ConfigChange]> {
+        self.hydrate()?;
+        Ok(&self.change_history)
     }
 
     /// Apply a configuration change.
@@ -310,6 +360,7 @@ impl SelfConfigurationEngine {
     /// rejects unknown ids. The `configure_*`/`set_*`/`enable_*`/`disable_*`
     /// methods remain the way to record intended changes.
     pub fn apply_change(&mut self, change_id: &str) -> Result<()> {
+        self.hydrate()?;
         let change = self
             .change_history
             .iter()
@@ -326,8 +377,15 @@ impl SelfConfigurationEngine {
         )))
     }
 
-    fn record_change(&mut self, change: ConfigChange) {
+    /// Persist the change, then record it in memory. Persistence comes
+    /// first so a store failure never leaves memory claiming a change the
+    /// durable record does not have.
+    fn record_change(&mut self, change: ConfigChange) -> Result<()> {
+        self.hydrate()?;
+        self.store
+            .save_engine_record(CHANGE_NAMESPACE, &change.id, &to_json_value(&change)?)?;
         self.change_history.push(change);
+        Ok(())
     }
 }
 
@@ -347,7 +405,22 @@ mod tests {
             .set_runtime_setting("timeout_ms", "5000", "tune")
             .unwrap();
         assert!(!change.applied);
-        assert_eq!(engine.get_change_history().len(), 1);
+        assert_eq!(engine.get_change_history().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn change_history_survives_a_new_engine_over_the_same_store() {
+        let store = EvolutionStore::open_in_memory().unwrap();
+        {
+            let mut engine = SelfConfigurationEngine::new(store.clone());
+            engine.enable_tool("read_file", "needed").unwrap();
+        }
+        // A fresh engine rehydrates the durable record on first use.
+        let mut engine = SelfConfigurationEngine::new(store);
+        let history = engine.get_change_history().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].new_value, "enabled");
+        assert!(!history[0].applied);
     }
 
     #[test]
@@ -367,7 +440,7 @@ mod tests {
         assert!(msg.contains("no live configuration surface"), "{msg}");
 
         // The record must remain unapplied — nothing was mutated.
-        assert!(!engine.get_change_history()[0].applied);
+        assert!(!engine.get_change_history().unwrap()[0].applied);
     }
 
     #[test]
@@ -379,7 +452,7 @@ mod tests {
         assert!(err.to_string().contains("nothing to roll back"));
 
         // The recorded intent is untouched: no fabricated value swap.
-        let stored = &engine.get_change_history()[0];
+        let stored = &engine.get_change_history().unwrap()[0];
         assert_eq!(stored.new_value, "disabled");
         assert_eq!(stored.rollback_value.as_deref(), Some("enabled"));
     }
