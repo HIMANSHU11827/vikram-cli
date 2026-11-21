@@ -165,24 +165,27 @@ fn declared_non_image(declared: &str) -> Option<String> {
     Some(mime)
 }
 
-/// Fetch one URL and vouch for the result. `Err` carries a reason safe to log.
-async fn fetch_one(
+/// Fetch the raw bytes of one attachment URL through the same guarded path inbound images
+/// use: scheme and private-target checks first, then the byte-capped, DNS-pinned transport.
+/// No content sniffing — the caller decides what the bytes are for, which is what an outbound
+/// `MediaSource::Url` needs when the platform requires held bytes rather than a remote reference.
+///
+/// The reasons never contain the URL or any part of a payload; they are safe to log.
+pub async fn fetch_media_bytes(
     transport: &dyn Transport,
     url: &str,
     limits: &MediaFetchLimits,
-) -> Result<FetchedImage, String> {
+) -> Result<Vec<u8>, String> {
     let host = host_of(url)?;
     if !limits.allow_private
         && let Some(reason) = private_target(&host)
     {
         return Err(reason.to_string());
     }
-    let request =
-        HttpRequest::get(url).header("Accept", "image/png,image/jpeg,image/gif,image/webp");
     // The transport's error text can quote the URL (query string included), so it is replaced
     // rather than forwarded.
     let body = transport
-        .execute_bytes(request, limits.max_bytes)
+        .execute_bytes(HttpRequest::get(url), limits.max_bytes)
         .await
         .map_err(|err| match err {
             TransportError::TooLarge(_) => format!(
@@ -200,6 +203,16 @@ async fn fetch_one(
             limits.max_bytes
         ));
     }
+    Ok(body)
+}
+
+/// Fetch one URL and vouch for the result. `Err` carries a reason safe to log.
+async fn fetch_one(
+    transport: &dyn Transport,
+    url: &str,
+    limits: &MediaFetchLimits,
+) -> Result<FetchedImage, String> {
+    let body = fetch_media_bytes(transport, url, limits).await?;
     let mime = sniff_image(&body)
         .ok_or_else(|| "the attachment is not a png, jpeg, gif or webp image".to_string())?;
     Ok(FetchedImage {
@@ -339,7 +352,7 @@ fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
 
 /// Standard, padded base64 (RFC 4648 §4). Hand-rolled because this crate may not add a
 /// dependency for sixteen lines of arithmetic.
-fn base64_encode(data: &[u8]) -> String {
+pub(crate) fn base64_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
@@ -361,6 +374,47 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     out
+}
+
+/// The inverse of [`base64_encode`]: standard padded base64 back to bytes. `Err` on a length
+/// that is not a multiple of four, padding anywhere but the tail, or a non-alphabet byte.
+pub(crate) fn base64_decode(data: &str) -> Result<Vec<u8>, String> {
+    fn value(byte: u8) -> Option<u32> {
+        match byte {
+            b'A'..=b'Z' => Some(u32::from(byte - b'A')),
+            b'a'..=b'z' => Some(u32::from(byte - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(byte - b'0') + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    if !data.len().is_multiple_of(4) {
+        return Err("base64 length is not a multiple of four".to_string());
+    }
+    let mut out = Vec::with_capacity(data.len() / 4 * 3);
+    for chunk in data.as_bytes().chunks(4) {
+        let padding = chunk.iter().rev().take_while(|&&byte| byte == b'=').count();
+        if padding > 2 || chunk[..4 - padding].contains(&b'=') {
+            return Err("malformed base64 padding".to_string());
+        }
+        let mut triple = 0u32;
+        for (index, &byte) in chunk.iter().enumerate() {
+            triple <<= 6;
+            if index < 4 - padding {
+                triple |=
+                    value(byte).ok_or_else(|| "base64 holds a non-alphabet byte".to_string())?;
+            }
+        }
+        out.push((triple >> 16) as u8);
+        if padding < 2 {
+            out.push((triple >> 8) as u8);
+        }
+        if padding < 1 {
+            out.push(triple as u8);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -939,5 +993,95 @@ mod tests {
         assert_eq!(limits.max_items, 4);
         assert_eq!(limits.max_bytes, 10 * 1024 * 1024);
         assert!(!limits.allow_private);
+    }
+
+    #[test]
+    fn base64_round_trips_and_rejects_malformed_input() {
+        for data in [
+            Vec::new(),
+            b"f".to_vec(),
+            b"fo".to_vec(),
+            b"foo".to_vec(),
+            b"foobar".to_vec(),
+            (0u8..=255).collect::<Vec<u8>>(),
+        ] {
+            assert_eq!(base64_decode(&base64_encode(&data)).unwrap(), data);
+        }
+        assert!(
+            base64_decode("Zg").is_err(),
+            "length not a multiple of four"
+        );
+        assert!(base64_decode("Z===").is_err(), "too much padding");
+        assert!(base64_decode("Zg=Z").is_err(), "padding mid-chunk");
+        assert!(
+            base64_decode("Zm9v\n").is_err(),
+            "whitespace is not alphabet"
+        );
+        assert!(base64_decode("Zm$v").is_err(), "non-alphabet byte");
+    }
+
+    #[tokio::test]
+    async fn fetch_media_bytes_returns_raw_bytes_without_sniffing() {
+        // Bytes that are deliberately not an image: the outbound path must not apply the
+        // inbound image sniff.
+        let payload = b"\x00\xff\x10not-an-image".to_vec();
+        let transport = MockTransport::with(&[("https://example.test/a.bin", payload.clone())]);
+        let fetched = fetch_media_bytes(
+            &transport,
+            "https://example.test/a.bin",
+            &MediaFetchLimits::default(),
+        )
+        .await
+        .expect("fetched");
+        assert_eq!(fetched, payload);
+        assert_eq!(transport.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_media_bytes_refuses_private_targets_without_a_request() {
+        let transport = MockTransport::with(&[]);
+        for url in [
+            "http://127.0.0.1/a.bin",
+            "http://localhost/a.bin",
+            "http://169.254.169.254/latest/meta-data",
+            "file:///etc/passwd",
+            "not-a-url",
+        ] {
+            assert!(
+                fetch_media_bytes(&transport, url, &MediaFetchLimits::default())
+                    .await
+                    .is_err(),
+                "{url} must be refused"
+            );
+        }
+        assert_eq!(
+            transport.calls(),
+            0,
+            "no refused URL may reach the transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_media_bytes_enforces_the_byte_cap() {
+        let transport = MockTransport::with(&[("https://example.test/big.bin", vec![0u8; 2048])]);
+        let limits = MediaFetchLimits {
+            max_bytes: 1024,
+            ..MediaFetchLimits::default()
+        };
+        let err = fetch_media_bytes(&transport, "https://example.test/big.bin", &limits)
+            .await
+            .expect_err("oversized body refused");
+        assert!(err.contains("1024"), "{err}");
+
+        let transport = MockTransport::with(&[("https://example.test/empty.bin", Vec::new())]);
+        assert!(
+            fetch_media_bytes(
+                &transport,
+                "https://example.test/empty.bin",
+                &MediaFetchLimits::default()
+            )
+            .await
+            .is_err()
+        );
     }
 }

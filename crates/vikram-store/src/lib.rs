@@ -646,13 +646,29 @@ impl Store {
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionRow>> {
+        self.list_sessions_page(None, 0)
+    }
+
+    /// Bounded variant of [`Self::list_sessions`]; see
+    /// [`Self::list_ticket_messages_page`] for the `limit`/`offset` contract.
+    pub fn list_sessions_page(
+        &self,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<SessionRow>> {
         let conn = self.lock();
         let sql = format!(
-            "SELECT {SESSION_COLS} FROM sessions WHERE status = 'active' ORDER BY created_ms ASC"
+            "SELECT {SESSION_COLS} FROM sessions WHERE status = 'active' ORDER BY created_ms ASC LIMIT ?1 OFFSET ?2"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], map_session_row)?
+            .query_map(
+                params![
+                    limit.map(|l| l.min(i64::MAX as usize) as i64).unwrap_or(-1),
+                    offset.min(i64::MAX as usize) as i64,
+                ],
+                map_session_row,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -660,24 +676,58 @@ impl Store {
     /// Active sessions ordered by most recent activity — the order the session list uses, so a
     /// conversation the operator just had floats to the top instead of hiding under its birth date.
     pub fn list_recent_sessions(&self) -> Result<Vec<SessionRow>> {
+        self.list_recent_sessions_page(None, 0)
+    }
+
+    /// Bounded variant of [`Self::list_recent_sessions`]; see
+    /// [`Self::list_ticket_messages_page`] for the `limit`/`offset` contract.
+    pub fn list_recent_sessions_page(
+        &self,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<SessionRow>> {
         let conn = self.lock();
         let sql = format!(
-            "SELECT {SESSION_COLS} FROM sessions WHERE status = 'active' ORDER BY updated_ms DESC"
+            "SELECT {SESSION_COLS} FROM sessions WHERE status = 'active' ORDER BY updated_ms DESC LIMIT ?1 OFFSET ?2"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], map_session_row)?
+            .query_map(
+                params![
+                    limit.map(|l| l.min(i64::MAX as usize) as i64).unwrap_or(-1),
+                    offset.min(i64::MAX as usize) as i64,
+                ],
+                map_session_row,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     /// Every session including archived ones, newest first.
     pub fn list_all_sessions(&self) -> Result<Vec<SessionRow>> {
+        self.list_all_sessions_page(None, 0)
+    }
+
+    /// Bounded variant of [`Self::list_all_sessions`]; see
+    /// [`Self::list_ticket_messages_page`] for the `limit`/`offset` contract.
+    pub fn list_all_sessions_page(
+        &self,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<SessionRow>> {
         let conn = self.lock();
-        let sql = format!("SELECT {SESSION_COLS} FROM sessions ORDER BY updated_ms DESC");
+        let sql = format!(
+            "SELECT {SESSION_COLS} FROM sessions ORDER BY updated_ms DESC LIMIT ?1 OFFSET ?2"
+        );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], map_session_row)?
+            .query_map(
+                params![
+                    limit.map(|l| l.min(i64::MAX as usize) as i64).unwrap_or(-1),
+                    offset.min(i64::MAX as usize) as i64,
+                ],
+                map_session_row,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -694,12 +744,24 @@ impl Store {
     /// Message content lives in the journal rather than the `sessions` row, so it is reached with an
     /// `EXISTS` rather than a join — a transcript with twenty matches must still list one session.
     pub fn search_sessions(&self, query: &str, include_archived: bool) -> Result<Vec<SessionRow>> {
+        self.search_sessions_page(query, include_archived, None, 0)
+    }
+
+    /// Bounded variant of [`Self::search_sessions`]; see
+    /// [`Self::list_ticket_messages_page`] for the `limit`/`offset` contract.
+    pub fn search_sessions_page(
+        &self,
+        query: &str,
+        include_archived: bool,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<SessionRow>> {
         let query = query.trim();
         if query.is_empty() {
             return if include_archived {
-                self.list_all_sessions()
+                self.list_all_sessions_page(limit, offset)
             } else {
-                self.list_recent_sessions()
+                self.list_recent_sessions_page(limit, offset)
             };
         }
         let conn = self.lock();
@@ -715,11 +777,19 @@ impl Store {
                     OR EXISTS (SELECT 1 FROM journal j \
                                WHERE j.session = sessions.id \
                                  AND j.payload LIKE ?2 ESCAPE '\\')) {status} \
-             ORDER BY updated_ms DESC"
+             ORDER BY updated_ms DESC LIMIT ?3 OFFSET ?4"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![like, like], map_session_row)?
+            .query_map(
+                params![
+                    like,
+                    like,
+                    limit.map(|l| l.min(i64::MAX as usize) as i64).unwrap_or(-1),
+                    offset.min(i64::MAX as usize) as i64,
+                ],
+                map_session_row,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -805,16 +875,32 @@ impl Store {
     /// what they deleted. So this listing keeps `closed` rows — the catalogue uses it to offer them
     /// back — and excludes only `archived`, which is the deliberate retirement.
     pub fn browse_sessions(&self) -> Result<Vec<(SessionRow, u64)>> {
+        self.browse_sessions_page(None, 0)
+    }
+
+    /// Bounded variant of [`Self::browse_sessions`]; see
+    /// [`Self::list_ticket_messages_page`] for the `limit`/`offset` contract.
+    pub fn browse_sessions_page(
+        &self,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<(SessionRow, u64)>> {
         let conn = self.lock();
         let sql = format!(
             "SELECT {SESSION_COLS} FROM sessions WHERE status <> 'archived' \
-             ORDER BY updated_ms DESC"
+             ORDER BY updated_ms DESC LIMIT ?1 OFFSET ?2"
         );
         let sessions: Vec<SessionRow> = {
             let mut stmt = conn.prepare(&sql)?;
 
-            stmt.query_map([], map_session_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?
+            stmt.query_map(
+                params![
+                    limit.map(|l| l.min(i64::MAX as usize) as i64).unwrap_or(-1),
+                    offset.min(i64::MAX as usize) as i64,
+                ],
+                map_session_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut out = Vec::with_capacity(sessions.len());
         for s in sessions {
@@ -1516,24 +1602,37 @@ impl Store {
 
     /// List artifacts; `session` filters to one session, `None` lists across all sessions.
     pub fn list_artifacts(&self, session: Option<&SessionId>) -> Result<Vec<ArtifactRow>> {
+        self.list_artifacts_page(session, None, 0)
+    }
+
+    /// Bounded variant of [`Self::list_artifacts`]; see
+    /// [`Self::list_ticket_messages_page`] for the `limit`/`offset` contract.
+    pub fn list_artifacts_page(
+        &self,
+        session: Option<&SessionId>,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<ArtifactRow>> {
         let conn = self.lock();
+        let limit_i64 = limit.map(|l| l.min(i64::MAX as usize) as i64).unwrap_or(-1);
+        let offset_i64 = offset.min(i64::MAX as usize) as i64;
         let (sql, args): (&str, Vec<String>) = match session {
             Some(s) => (
                 "SELECT id, session, project_id, bot_id, name, path, kind, mime, size, checksum, source, created_ms, updated_ms
-                 FROM artifacts WHERE session = ?1 ORDER BY created_ms DESC",
+                 FROM artifacts WHERE session = ?1 ORDER BY created_ms DESC LIMIT ?2 OFFSET ?3",
                 vec![s.as_str().to_owned()],
             ),
             None => (
                 "SELECT id, session, project_id, bot_id, name, path, kind, mime, size, checksum, source, created_ms, updated_ms
-                 FROM artifacts ORDER BY created_ms DESC",
+                 FROM artifacts ORDER BY created_ms DESC LIMIT ?1 OFFSET ?2",
                 vec![],
             ),
         };
         let mut stmt = conn.prepare(sql)?;
         let rows = if args.is_empty() {
-            stmt.query_map([], map_artifact)?
+            stmt.query_map(params![limit_i64, offset_i64], map_artifact)?
         } else {
-            stmt.query_map(params![args[0]], map_artifact)?
+            stmt.query_map(params![args[0], limit_i64, offset_i64], map_artifact)?
         };
         let out = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(out)
@@ -1569,26 +1668,44 @@ impl Store {
     }
 
     pub fn list_file_changes(&self, session: &SessionId) -> Result<Vec<FileChangeRow>> {
+        self.list_file_changes_page(session, None, 0)
+    }
+
+    /// Bounded variant of [`Self::list_file_changes`]; see
+    /// [`Self::list_ticket_messages_page`] for the `limit`/`offset` contract.
+    pub fn list_file_changes_page(
+        &self,
+        session: &SessionId,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<FileChangeRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session, bot_id, path, operation, checksum_before, checksum_after, size, checkpoint_path, ts_ms
-             FROM file_changes WHERE session = ?1 ORDER BY ts_ms ASC",
+             FROM file_changes WHERE session = ?1 ORDER BY ts_ms ASC LIMIT ?2 OFFSET ?3",
         )?;
         let rows = stmt
-            .query_map(params![session.as_str()], |r| {
-                Ok(FileChangeRow {
-                    id: r.get(0)?,
-                    session: SessionId::new(r.get::<_, String>(1)?),
-                    bot: r.get::<_, Option<String>>(2)?.map(BotId::new),
-                    path: PathBuf::from(r.get::<_, String>(3)?),
-                    operation: r.get(4)?,
-                    checksum_before: r.get(5)?,
-                    checksum_after: r.get(6)?,
-                    size: r.get::<_, Option<i64>>(7)?.map(|s| s as u64),
-                    checkpoint_path: r.get::<_, Option<String>>(8)?.map(PathBuf::from),
-                    ts_ms: r.get::<_, i64>(9)? as u64,
-                })
-            })?
+            .query_map(
+                params![
+                    session.as_str(),
+                    limit.map(|l| l.min(i64::MAX as usize) as i64).unwrap_or(-1),
+                    offset.min(i64::MAX as usize) as i64,
+                ],
+                |r| {
+                    Ok(FileChangeRow {
+                        id: r.get(0)?,
+                        session: SessionId::new(r.get::<_, String>(1)?),
+                        bot: r.get::<_, Option<String>>(2)?.map(BotId::new),
+                        path: PathBuf::from(r.get::<_, String>(3)?),
+                        operation: r.get(4)?,
+                        checksum_before: r.get(5)?,
+                        checksum_after: r.get(6)?,
+                        size: r.get::<_, Option<i64>>(7)?.map(|s| s as u64),
+                        checkpoint_path: r.get::<_, Option<String>>(8)?.map(PathBuf::from),
+                        ts_ms: r.get::<_, i64>(9)? as u64,
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -1621,24 +1738,42 @@ impl Store {
     }
 
     pub fn list_usage(&self, session: &SessionId) -> Result<Vec<UsageRow>> {
+        self.list_usage_page(session, None, 0)
+    }
+
+    /// Bounded variant of [`Self::list_usage`]; see
+    /// [`Self::list_ticket_messages_page`] for the `limit`/`offset` contract.
+    pub fn list_usage_page(
+        &self,
+        session: &SessionId,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<UsageRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session, ts_ms, model, prompt_tokens, completion_tokens, total_tokens, measured
-             FROM usage WHERE session = ?1 ORDER BY ts_ms ASC, id ASC",
+             FROM usage WHERE session = ?1 ORDER BY ts_ms ASC, id ASC LIMIT ?2 OFFSET ?3",
         )?;
         let rows = stmt
-            .query_map(params![session.as_str()], |r| {
-                Ok(UsageRow {
-                    id: r.get(0)?,
-                    session: SessionId::new(r.get::<_, String>(1)?),
-                    ts_ms: r.get::<_, i64>(2)? as u64,
-                    model: r.get(3)?,
-                    prompt_tokens: r.get::<_, i64>(4)? as u64,
-                    completion_tokens: r.get::<_, i64>(5)? as u64,
-                    total_tokens: r.get::<_, i64>(6)? as u64,
-                    measured: r.get::<_, i64>(7)? != 0,
-                })
-            })?
+            .query_map(
+                params![
+                    session.as_str(),
+                    limit.map(|l| l.min(i64::MAX as usize) as i64).unwrap_or(-1),
+                    offset.min(i64::MAX as usize) as i64,
+                ],
+                |r| {
+                    Ok(UsageRow {
+                        id: r.get(0)?,
+                        session: SessionId::new(r.get::<_, String>(1)?),
+                        ts_ms: r.get::<_, i64>(2)? as u64,
+                        model: r.get(3)?,
+                        prompt_tokens: r.get::<_, i64>(4)? as u64,
+                        completion_tokens: r.get::<_, i64>(5)? as u64,
+                        total_tokens: r.get::<_, i64>(6)? as u64,
+                        measured: r.get::<_, i64>(7)? != 0,
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -2711,23 +2846,42 @@ impl Store {
     }
 
     pub fn list_hive_messages(&self, hive: &HiveId) -> Result<Vec<HiveMessageRow>> {
+        self.list_hive_messages_page(hive, None, 0)
+    }
+
+    /// Bounded variant of [`Self::list_hive_messages`]: `limit`/`offset` map to SQL
+    /// `LIMIT`/`OFFSET`, so a caller paging a long transcript never materializes all of it.
+    /// `None` for `limit` reads the whole hive, same as [`Self::list_hive_messages`].
+    pub fn list_hive_messages_page(
+        &self,
+        hive: &HiveId,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<HiveMessageRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, hive, sender, sender_kind, content, task_ref, ts_ms
-             FROM hive_messages WHERE hive = ?1 ORDER BY ts_ms ASC",
+             FROM hive_messages WHERE hive = ?1 ORDER BY ts_ms ASC LIMIT ?2 OFFSET ?3",
         )?;
         let rows = stmt
-            .query_map(params![hive.as_str()], |row| {
-                Ok(HiveMessageRow {
-                    id: HiveMessageId::new(row.get::<_, String>(0)?),
-                    hive: HiveId::new(row.get::<_, String>(1)?),
-                    sender: row.get(2)?,
-                    sender_kind: row.get(3)?,
-                    content: row.get(4)?,
-                    task_ref: row.get(5)?,
-                    ts_ms: row.get::<_, i64>(6)? as u64,
-                })
-            })?
+            .query_map(
+                params![
+                    hive.as_str(),
+                    limit.map(|l| l.min(i64::MAX as usize) as i64).unwrap_or(-1),
+                    offset.min(i64::MAX as usize) as i64,
+                ],
+                |row| {
+                    Ok(HiveMessageRow {
+                        id: HiveMessageId::new(row.get::<_, String>(0)?),
+                        hive: HiveId::new(row.get::<_, String>(1)?),
+                        sender: row.get(2)?,
+                        sender_kind: row.get(3)?,
+                        content: row.get(4)?,
+                        task_ref: row.get(5)?,
+                        ts_ms: row.get::<_, i64>(6)? as u64,
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -2776,61 +2930,145 @@ impl Store {
     }
 
     pub fn list_tickets(&self) -> Result<Vec<TicketRow>> {
+        self.list_tickets_page(None, 0)
+    }
+
+    /// Bounded variant of [`Self::list_tickets`]: `limit`/`offset` map to SQL
+    /// `LIMIT`/`OFFSET`. `None` for `limit` reads every ticket.
+    pub fn list_tickets_page(&self, limit: Option<usize>, offset: usize) -> Result<Vec<TicketRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, owner_key, owner_kind, title, description, request, kind, status, parent_ticket, hive_id, session_id, strategy, result, failure_reason, created_ms, updated_ms, closed_ms
-             FROM tickets ORDER BY created_ms ASC",
+             FROM tickets ORDER BY created_ms ASC LIMIT ?1 OFFSET ?2",
         )?;
         let rows = stmt
-            .query_map([], parse_ticket_row)?
+            .query_map(
+                params![
+                    limit.map(|l| l.min(i64::MAX as usize) as i64).unwrap_or(-1),
+                    offset.min(i64::MAX as usize) as i64,
+                ],
+                parse_ticket_row,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     pub fn list_tickets_by_owner(&self, owner_key: &str) -> Result<Vec<TicketRow>> {
+        self.list_tickets_by_owner_page(owner_key, None, 0)
+    }
+
+    /// Bounded variant of [`Self::list_tickets_by_owner`]; see
+    /// [`Self::list_ticket_messages_page`] for the `limit`/`offset` contract.
+    pub fn list_tickets_by_owner_page(
+        &self,
+        owner_key: &str,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<TicketRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, owner_key, owner_kind, title, description, request, kind, status, parent_ticket, hive_id, session_id, strategy, result, failure_reason, created_ms, updated_ms, closed_ms
-             FROM tickets WHERE owner_key = ?1 ORDER BY created_ms ASC",
+             FROM tickets WHERE owner_key = ?1 ORDER BY created_ms ASC LIMIT ?2 OFFSET ?3",
         )?;
         let rows = stmt
-            .query_map(params![owner_key], parse_ticket_row)?
+            .query_map(
+                params![
+                    owner_key,
+                    limit.map(|l| l.min(i64::MAX as usize) as i64).unwrap_or(-1),
+                    offset.min(i64::MAX as usize) as i64,
+                ],
+                parse_ticket_row,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     pub fn list_tickets_by_kind(&self, kind: &str) -> Result<Vec<TicketRow>> {
+        self.list_tickets_by_kind_page(kind, None, 0)
+    }
+
+    /// Bounded variant of [`Self::list_tickets_by_kind`]; see
+    /// [`Self::list_ticket_messages_page`] for the `limit`/`offset` contract.
+    pub fn list_tickets_by_kind_page(
+        &self,
+        kind: &str,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<TicketRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, owner_key, owner_kind, title, description, request, kind, status, parent_ticket, hive_id, session_id, strategy, result, failure_reason, created_ms, updated_ms, closed_ms
-             FROM tickets WHERE kind = ?1 ORDER BY created_ms ASC",
+             FROM tickets WHERE kind = ?1 ORDER BY created_ms ASC LIMIT ?2 OFFSET ?3",
         )?;
         let rows = stmt
-            .query_map(params![kind], parse_ticket_row)?
+            .query_map(
+                params![
+                    kind,
+                    limit.map(|l| l.min(i64::MAX as usize) as i64).unwrap_or(-1),
+                    offset.min(i64::MAX as usize) as i64,
+                ],
+                parse_ticket_row,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     pub fn list_tickets_by_status(&self, status: &str) -> Result<Vec<TicketRow>> {
+        self.list_tickets_by_status_page(status, None, 0)
+    }
+
+    /// Bounded variant of [`Self::list_tickets_by_status`]; see
+    /// [`Self::list_ticket_messages_page`] for the `limit`/`offset` contract.
+    pub fn list_tickets_by_status_page(
+        &self,
+        status: &str,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<TicketRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, owner_key, owner_kind, title, description, request, kind, status, parent_ticket, hive_id, session_id, strategy, result, failure_reason, created_ms, updated_ms, closed_ms
-             FROM tickets WHERE status = ?1 ORDER BY created_ms ASC",
+             FROM tickets WHERE status = ?1 ORDER BY created_ms ASC LIMIT ?2 OFFSET ?3",
         )?;
         let rows = stmt
-            .query_map(params![status], parse_ticket_row)?
+            .query_map(
+                params![
+                    status,
+                    limit.map(|l| l.min(i64::MAX as usize) as i64).unwrap_or(-1),
+                    offset.min(i64::MAX as usize) as i64,
+                ],
+                parse_ticket_row,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     pub fn list_child_tickets(&self, parent: &TicketId) -> Result<Vec<TicketRow>> {
+        self.list_child_tickets_page(parent, None, 0)
+    }
+
+    /// Bounded variant of [`Self::list_child_tickets`]; see
+    /// [`Self::list_ticket_messages_page`] for the `limit`/`offset` contract.
+    pub fn list_child_tickets_page(
+        &self,
+        parent: &TicketId,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<TicketRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, owner_key, owner_kind, title, description, request, kind, status, parent_ticket, hive_id, session_id, strategy, result, failure_reason, created_ms, updated_ms, closed_ms
-             FROM tickets WHERE parent_ticket = ?1 ORDER BY created_ms ASC",
+             FROM tickets WHERE parent_ticket = ?1 ORDER BY created_ms ASC LIMIT ?2 OFFSET ?3",
         )?;
         let rows = stmt
-            .query_map(params![parent.as_str()], parse_ticket_row)?
+            .query_map(
+                params![
+                    parent.as_str(),
+                    limit.map(|l| l.min(i64::MAX as usize) as i64).unwrap_or(-1),
+                    offset.min(i64::MAX as usize) as i64,
+                ],
+                parse_ticket_row,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -3159,25 +3397,61 @@ impl Store {
     }
 
     pub fn list_assignments(&self, ticket: &TicketId) -> Result<Vec<AssignmentRow>> {
+        self.list_assignments_page(ticket, None, 0)
+    }
+
+    /// Bounded variant of [`Self::list_assignments`]; see
+    /// [`Self::list_ticket_messages_page`] for the `limit`/`offset` contract.
+    pub fn list_assignments_page(
+        &self,
+        ticket: &TicketId,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<AssignmentRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, ticket, parent_assignment, assignee_key, assignee_kind, entity_id, title, description, status, strategy, result, error, created_ms, updated_ms, completed_ms
-             FROM assignments WHERE ticket = ?1 ORDER BY created_ms ASC",
+             FROM assignments WHERE ticket = ?1 ORDER BY created_ms ASC LIMIT ?2 OFFSET ?3",
         )?;
         let rows = stmt
-            .query_map(params![ticket.as_str()], parse_assignment_row)?
+            .query_map(
+                params![
+                    ticket.as_str(),
+                    limit.map(|l| l.min(i64::MAX as usize) as i64).unwrap_or(-1),
+                    offset.min(i64::MAX as usize) as i64,
+                ],
+                parse_assignment_row,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     pub fn list_assignments_by_assignee(&self, key: &str) -> Result<Vec<AssignmentRow>> {
+        self.list_assignments_by_assignee_page(key, None, 0)
+    }
+
+    /// Bounded variant of [`Self::list_assignments_by_assignee`]; see
+    /// [`Self::list_ticket_messages_page`] for the `limit`/`offset` contract.
+    pub fn list_assignments_by_assignee_page(
+        &self,
+        key: &str,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<AssignmentRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, ticket, parent_assignment, assignee_key, assignee_kind, entity_id, title, description, status, strategy, result, error, created_ms, updated_ms, completed_ms
-             FROM assignments WHERE assignee_key = ?1 ORDER BY created_ms ASC",
+             FROM assignments WHERE assignee_key = ?1 ORDER BY created_ms ASC LIMIT ?2 OFFSET ?3",
         )?;
         let rows = stmt
-            .query_map(params![key], parse_assignment_row)?
+            .query_map(
+                params![
+                    key,
+                    limit.map(|l| l.min(i64::MAX as usize) as i64).unwrap_or(-1),
+                    offset.min(i64::MAX as usize) as i64,
+                ],
+                parse_assignment_row,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -3300,21 +3574,39 @@ impl Store {
     }
 
     pub fn list_ticket_events(&self, ticket: &TicketId) -> Result<Vec<TicketEventRow>> {
+        self.list_ticket_events_page(ticket, None, 0)
+    }
+
+    /// Bounded variant of [`Self::list_ticket_events`]; see
+    /// [`Self::list_ticket_messages_page`] for the `limit`/`offset` contract.
+    pub fn list_ticket_events_page(
+        &self,
+        ticket: &TicketId,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<TicketEventRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, ticket, ts_ms, kind, actor_key, payload FROM ticket_events WHERE ticket = ?1 ORDER BY ts_ms ASC",
+            "SELECT id, ticket, ts_ms, kind, actor_key, payload FROM ticket_events WHERE ticket = ?1 ORDER BY ts_ms ASC LIMIT ?2 OFFSET ?3",
         )?;
         let rows = stmt
-            .query_map(params![ticket.as_str()], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, Option<String>>(4)?,
-                    r.get::<_, String>(5)?,
-                ))
-            })?
+            .query_map(
+                params![
+                    ticket.as_str(),
+                    limit.map(|l| l.min(i64::MAX as usize) as i64).unwrap_or(-1),
+                    offset.min(i64::MAX as usize) as i64,
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows
             .into_iter()
@@ -3336,23 +3628,82 @@ impl Store {
     /// Load a session's conversation blocks in journal order. Used to rehydrate a session after a
     /// restart; replay never re-applies effects because the journal already records them.
     pub fn replay_messages(&self, session: &SessionId) -> Result<Vec<JournalRecord>> {
+        self.replay_messages_page(session, None, 0)
+    }
+
+    /// Bounded variant of [`Self::replay_messages`]: `limit`/`offset` map to SQL
+    /// `LIMIT`/`OFFSET` over `seq` order. `None` for `limit` replays the whole journal, same as
+    /// [`Self::replay_messages`]. The journal is never retention-pruned, so this is the read most
+    /// likely to need a bound on long-lived sessions.
+    pub fn replay_messages_page(
+        &self,
+        session: &SessionId,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<JournalRecord>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT seq, session, ts_ms, kind, effect, payload FROM journal
-             WHERE session = ?1 ORDER BY seq ASC",
+             WHERE session = ?1 ORDER BY seq ASC LIMIT ?2 OFFSET ?3",
         )?;
         let rows = stmt
-            .query_map(params![session.as_str()], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            })?
+            .query_map(
+                params![
+                    session.as_str(),
+                    limit.map(|l| l.min(i64::MAX as usize) as i64).unwrap_or(-1),
+                    offset.min(i64::MAX as usize) as i64,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(seq, session, ts_ms, kind, effect, payload)| {
+                journal_record_from_raw(seq, session, ts_ms, kind, effect, payload)
+            })
+            .collect())
+    }
+
+    /// The most recent `limit` journal records for a session, still in ascending `seq` order —
+    /// the "tail" read for transcript previews and context rebuilds that must not materialize a
+    /// whole long journal. `limit` of 0 returns an empty vec; there is no unbounded form, callers
+    /// wanting everything use [`Self::replay_messages`]. Compare the returned length against
+    /// [`SqliteJournal::last_seq`] (or a follow-up count) to detect truncation.
+    pub fn replay_messages_tail(
+        &self,
+        session: &SessionId,
+        limit: usize,
+    ) -> Result<Vec<JournalRecord>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT seq, session, ts_ms, kind, effect, payload FROM journal
+             WHERE session = ?1 ORDER BY seq DESC LIMIT ?2",
+        )?;
+        let mut rows = stmt
+            .query_map(
+                params![session.as_str(), limit.min(i64::MAX as usize) as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.reverse();
         Ok(rows
             .into_iter()
             .filter_map(|(seq, session, ts_ms, kind, effect, payload)| {
@@ -4965,5 +5316,252 @@ mod tests {
                 .len(),
             5
         );
+    }
+
+    #[test]
+    fn hive_message_page_applies_limit_and_offset() {
+        let store = Store::open_in_memory().unwrap();
+        let hive = HiveId::generate();
+        for i in 0..5u64 {
+            store
+                .append_hive_message(&hive_message(&hive, 100 + i))
+                .unwrap();
+        }
+
+        let page = store.list_hive_messages_page(&hive, Some(2), 1).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].ts_ms, 101);
+        assert_eq!(page[1].ts_ms, 102);
+        assert!(
+            store
+                .list_hive_messages_page(&hive, Some(2), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.list_hive_messages_page(&hive, None, 0).unwrap().len(),
+            5
+        );
+        assert_eq!(store.list_hive_messages(&hive).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn ticket_event_page_applies_limit_and_offset() {
+        let store = Store::open_in_memory().unwrap();
+        let ticket = TicketId::generate();
+        for i in 0..5u64 {
+            store
+                .append_ticket_event(&ticket_event(&ticket, 100 + i))
+                .unwrap();
+        }
+
+        let page = store.list_ticket_events_page(&ticket, Some(2), 3).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].ts_ms, 103);
+        assert_eq!(page[1].ts_ms, 104);
+        assert!(
+            store
+                .list_ticket_events_page(&ticket, Some(2), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.list_ticket_events(&ticket).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn usage_page_applies_limit_and_offset() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store
+            .create_session("s", Path::new("/w"), None, 1)
+            .unwrap()
+            .id;
+        for i in 0..5u64 {
+            store.record_usage(&usage_row(&session, 100 + i)).unwrap();
+        }
+
+        let page = store.list_usage_page(&session, Some(2), 2).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].ts_ms, 102);
+        assert_eq!(page[1].ts_ms, 103);
+        assert!(
+            store
+                .list_usage_page(&session, Some(2), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.list_usage(&session).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn file_changes_page_applies_limit_and_offset() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store
+            .create_session("s", Path::new("/w"), None, 1)
+            .unwrap()
+            .id;
+        for i in 0..5u64 {
+            store
+                .record_file_change(&file_change(&session, 100 + i))
+                .unwrap();
+        }
+
+        let page = store.list_file_changes_page(&session, Some(2), 4).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].ts_ms, 104);
+        assert!(
+            store
+                .list_file_changes_page(&session, Some(2), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.list_file_changes(&session).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn assignment_pages_apply_limit_and_offset() {
+        let store = Store::open_in_memory().unwrap();
+        let ticket = TicketId::generate();
+        for i in 0..5u64 {
+            store
+                .create_assignment(&AssignmentRow {
+                    id: AssignmentId::generate(),
+                    ticket: ticket.clone(),
+                    parent_assignment: None,
+                    assignee_key: "agent".into(),
+                    assignee_kind: "agent".into(),
+                    entity_id: None,
+                    title: format!("a{i}"),
+                    description: String::new(),
+                    status: "open".into(),
+                    strategy: None,
+                    result: None,
+                    error: None,
+                    created_ms: 100 + i,
+                    updated_ms: 100 + i,
+                    completed_ms: None,
+                })
+                .unwrap();
+        }
+
+        let page = store.list_assignments_page(&ticket, Some(2), 1).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].title, "a1");
+        assert_eq!(page[1].title, "a2");
+        assert_eq!(store.list_assignments(&ticket).unwrap().len(), 5);
+
+        let by_assignee = store
+            .list_assignments_by_assignee_page("agent", Some(3), 2)
+            .unwrap();
+        assert_eq!(by_assignee.len(), 3);
+        assert_eq!(by_assignee[0].title, "a2");
+        assert_eq!(
+            store.list_assignments_by_assignee("agent").unwrap().len(),
+            5
+        );
+    }
+
+    #[test]
+    fn ticket_pages_apply_limit_and_offset() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..5u64 {
+            store
+                .create_ticket(&TicketRow {
+                    id: TicketId::generate(),
+                    owner_key: "u".into(),
+                    owner_kind: "user".into(),
+                    title: format!("t{i}"),
+                    description: String::new(),
+                    request: String::new(),
+                    kind: "task".into(),
+                    status: "open".into(),
+                    parent_ticket: None,
+                    hive_id: None,
+                    session_id: None,
+                    strategy: None,
+                    result: None,
+                    failure_reason: None,
+                    created_ms: 100 + i,
+                    updated_ms: 100 + i,
+                    closed_ms: None,
+                })
+                .unwrap();
+        }
+
+        let page = store.list_tickets_page(Some(2), 1).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].title, "t1");
+        assert_eq!(page[1].title, "t2");
+        assert!(store.list_tickets_page(Some(2), 10).unwrap().is_empty());
+        assert_eq!(store.list_tickets().unwrap().len(), 5);
+
+        let by_status = store
+            .list_tickets_by_status_page("open", Some(2), 3)
+            .unwrap();
+        assert_eq!(by_status.len(), 2);
+        assert_eq!(by_status[0].title, "t3");
+        assert_eq!(store.list_tickets_by_status("open").unwrap().len(), 5);
+    }
+
+    #[test]
+    fn session_pages_apply_limit_and_offset() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..5u64 {
+            store
+                .create_session(&format!("s{i}"), Path::new("/w"), None, 100 + i)
+                .unwrap();
+        }
+
+        let page = store.list_sessions_page(Some(2), 1).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].title, "s1");
+        assert_eq!(page[1].title, "s2");
+        assert!(store.list_sessions_page(Some(2), 10).unwrap().is_empty());
+        assert_eq!(store.list_sessions().unwrap().len(), 5);
+
+        let recent = store.list_recent_sessions_page(Some(2), 0).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].title, "s4");
+        assert_eq!(recent[1].title, "s3");
+        assert_eq!(store.list_recent_sessions().unwrap().len(), 5);
+
+        let browsed = store.browse_sessions_page(Some(3), 1).unwrap();
+        assert_eq!(browsed.len(), 3);
+        assert_eq!(browsed[0].0.title, "s3");
+        assert_eq!(store.browse_sessions().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn replay_messages_page_and_tail_bound_the_journal_read() {
+        let store = Store::open_in_memory().unwrap();
+        let session = SessionId::generate();
+        let journal = store.journal();
+        for i in 0..5 {
+            journal
+                .append(&NewRecord::new(
+                    session.clone(),
+                    RecordKind::Message,
+                    serde_json::json!(i),
+                ))
+                .unwrap();
+        }
+
+        let page = store.replay_messages_page(&session, Some(2), 1).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].seq, 2);
+        assert_eq!(page[1].seq, 3);
+        assert!(
+            store
+                .replay_messages_page(&session, Some(2), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.replay_messages(&session).unwrap().len(), 5);
+
+        let tail = store.replay_messages_tail(&session, 2).unwrap();
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].seq, 4);
+        assert_eq!(tail[1].seq, 5);
+        assert!(store.replay_messages_tail(&session, 0).unwrap().is_empty());
+        assert_eq!(store.replay_messages_tail(&session, 100).unwrap().len(), 5);
     }
 }

@@ -289,6 +289,10 @@ impl GatewayPlatform for WebhookPlatform {
         &self.name
     }
 
+    fn adapter(&self) -> Option<&dyn PlatformAdapter> {
+        Some(self.adapter.as_ref())
+    }
+
     async fn next_events(&self) -> Result<Vec<MessageEvent>, String> {
         let mut receiver = self.receiver.lock().await;
         match receiver.recv().await {

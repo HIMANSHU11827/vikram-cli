@@ -17,6 +17,7 @@
 //! - `SEND_ERROR_KINDS` is a plain const slice; classification lives in `delivery.rs`.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -190,7 +191,8 @@ pub fn utf16_len(text: &str) -> usize {
 }
 
 /// What an outbound attachment is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MediaKind {
     Image,
     Video,
@@ -199,15 +201,48 @@ pub enum MediaKind {
 }
 
 /// Where the bytes come from: already-held bytes, or a URL the platform fetches itself.
+///
+/// Serde is hand-rolled through [`MediaSourceWire`]: held bytes travel as padded base64 so a
+/// ledgered verb does not store megabytes as a JSON array of numbers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaSource {
     Bytes(Vec<u8>),
     Url(String),
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+enum MediaSourceWire {
+    Bytes { data: String },
+    Url { url: String },
+}
+
+impl Serialize for MediaSource {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Bytes(bytes) => MediaSourceWire::Bytes {
+                data: crate::media_fetch::base64_encode(bytes),
+            }
+            .serialize(serializer),
+            Self::Url(url) => MediaSourceWire::Url { url: url.clone() }.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MediaSource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match MediaSourceWire::deserialize(deserializer)? {
+            MediaSourceWire::Bytes { data } => crate::media_fetch::base64_decode(&data)
+                .map(Self::Bytes)
+                .map_err(serde::de::Error::custom),
+            MediaSourceWire::Url { url } => Ok(Self::Url(url)),
+        }
+    }
+}
+
 /// One outbound attachment. `caption` travels with the media where the platform supports it;
 /// otherwise the caller sends it as a follow-up text message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboundMedia {
     pub kind: MediaKind,
     pub source: MediaSource,
@@ -244,6 +279,105 @@ impl OutboundMedia {
     pub fn with_caption(mut self, caption: impl Into<String>) -> Self {
         self.caption = Some(caption.into());
         self
+    }
+}
+
+/// One outbound verb: the complete payload of a send, serializable so the delivery ledger can
+/// persist and retry it exactly.
+///
+/// This is deliberately not a lowest-common-denominator "rich message": each variant maps to
+/// the verb the platform trait actually exposes ([`PlatformAdapter::send_media`],
+/// [`PlatformAdapter::add_reaction`], [`PlatformAdapter::send_poll`],
+/// [`PlatformAdapter::send_card`], [`PlatformAdapter::send_draft`]). A platform without the
+/// matching API refuses the verb honestly; nothing is silently downgraded to text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OutboundVerb {
+    /// Plain text, the [`PlatformAdapter::send`] path.
+    Text { body: String },
+    /// One attachment through [`PlatformAdapter::send_media`].
+    Media { media: OutboundMedia },
+    /// Add (`remove: false`) or clear (`remove: true`) an emoji reaction on `message_id`.
+    Reaction {
+        message_id: String,
+        emoji: String,
+        remove: bool,
+    },
+    /// A native poll through [`PlatformAdapter::send_poll`].
+    Poll {
+        question: String,
+        options: Vec<String>,
+    },
+    /// A provider-native rich card payload through [`PlatformAdapter::send_card`]: the JSON is
+    /// passed through untouched (Slack blocks, Feishu card, Teams adaptive card, …).
+    Card { payload: Value },
+    /// One draft-streaming frame through [`PlatformAdapter::send_draft`].
+    Draft { draft_id: u64, content: String },
+}
+
+impl OutboundVerb {
+    pub fn text(body: impl Into<String>) -> Self {
+        Self::Text { body: body.into() }
+    }
+
+    pub fn media(media: OutboundMedia) -> Self {
+        Self::Media { media }
+    }
+
+    pub fn reaction(message_id: impl Into<String>, emoji: impl Into<String>) -> Self {
+        Self::Reaction {
+            message_id: message_id.into(),
+            emoji: emoji.into(),
+            remove: false,
+        }
+    }
+
+    pub fn remove_reaction(message_id: impl Into<String>, emoji: impl Into<String>) -> Self {
+        Self::Reaction {
+            message_id: message_id.into(),
+            emoji: emoji.into(),
+            remove: true,
+        }
+    }
+
+    pub fn poll(question: impl Into<String>, options: Vec<String>) -> Self {
+        Self::Poll {
+            question: question.into(),
+            options,
+        }
+    }
+
+    pub fn card(payload: Value) -> Self {
+        Self::Card { payload }
+    }
+
+    pub fn draft(draft_id: u64, content: impl Into<String>) -> Self {
+        Self::Draft {
+            draft_id,
+            content: content.into(),
+        }
+    }
+
+    /// Stable label for logs and metrics.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Text { .. } => "text",
+            Self::Media { .. } => "media",
+            Self::Reaction { .. } => "reaction",
+            Self::Poll { .. } => "poll",
+            Self::Card { .. } => "card",
+            Self::Draft { .. } => "draft",
+        }
+    }
+
+    /// The text a verb reduces to for the ledger's `body` column: the reply body for text, the
+    /// media caption (or empty) for media, empty for everything else.
+    pub fn body_text(&self) -> &str {
+        match self {
+            Self::Text { body } => body,
+            Self::Media { media } => media.caption.as_deref().unwrap_or(""),
+            _ => "",
+        }
     }
 }
 
@@ -520,6 +654,59 @@ mod tests {
             TurnReply::ephemeral("gone forever", Some(0)).ephemeral_ttl(),
             Some(Some(0))
         );
+    }
+
+    #[test]
+    fn outbound_verbs_serde_round_trip() {
+        let verbs = vec![
+            OutboundVerb::text("hello"),
+            OutboundVerb::media(
+                OutboundMedia::new(MediaKind::Image, MediaSource::Bytes(vec![1, 2, 3, 255]))
+                    .with_filename("a.png")
+                    .with_caption("look"),
+            ),
+            OutboundVerb::media(OutboundMedia::image_url("https://example.test/a.png")),
+            OutboundVerb::reaction("m1", "👍"),
+            OutboundVerb::remove_reaction("m1", "👍"),
+            OutboundVerb::poll("pick one", vec!["a".to_string(), "b".to_string()]),
+            OutboundVerb::card(serde_json::json!({"type": "AdaptiveCard", "body": []})),
+            OutboundVerb::draft(7, "partial frame"),
+        ];
+        for verb in verbs {
+            let json = serde_json::to_string(&verb).expect("serialize");
+            let back: OutboundVerb = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, verb, "{json}");
+        }
+    }
+
+    #[test]
+    fn media_source_bytes_travel_as_base64_not_an_array() {
+        let source = MediaSource::Bytes(vec![0xde, 0xad, 0xbe, 0xef]);
+        let json = serde_json::to_string(&source).expect("serialize");
+        assert!(json.contains("3q2+7w=="), "{json}");
+        assert!(!json.contains('['), "{json}");
+        let back: MediaSource = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, source);
+        assert!(
+            serde_json::from_str::<MediaSource>("{\"source\":\"bytes\",\"data\":\"!!\"}").is_err()
+        );
+    }
+
+    #[test]
+    fn verb_kind_and_body_text() {
+        assert_eq!(OutboundVerb::text("hi").kind(), "text");
+        assert_eq!(OutboundVerb::text("hi").body_text(), "hi");
+        let media = OutboundVerb::media(
+            OutboundMedia::image_url("https://x.test/a.png").with_caption("the caption"),
+        );
+        assert_eq!(media.kind(), "media");
+        assert_eq!(media.body_text(), "the caption");
+        let bare = OutboundVerb::media(OutboundMedia::image_url("https://x.test/a.png"));
+        assert_eq!(bare.body_text(), "");
+        assert_eq!(OutboundVerb::poll("q", vec![]).body_text(), "");
+        assert_eq!(OutboundVerb::card(serde_json::json!({})).kind(), "card");
+        assert_eq!(OutboundVerb::draft(1, "x").kind(), "draft");
+        assert_eq!(OutboundVerb::reaction("m", "e").kind(), "reaction");
     }
 
     #[tokio::test]

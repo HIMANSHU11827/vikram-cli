@@ -42,7 +42,7 @@ use std::sync::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::platform::SendResult;
+use crate::platform::{OutboundVerb, SendResult};
 
 /// Attempts a single message may make before it is abandoned.
 pub const MAX_ATTEMPTS: u32 = 3;
@@ -73,7 +73,8 @@ CREATE TABLE IF NOT EXISTS gateway_delivery_ledger (
     message_id       TEXT,
     flood_not_before INTEGER NOT NULL,
     created_at       INTEGER NOT NULL,
-    updated_at       INTEGER NOT NULL
+    updated_at       INTEGER NOT NULL,
+    verb             TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS gateway_delivery_ledger_due
     ON gateway_delivery_ledger (state, flood_not_before, created_at);
@@ -82,7 +83,7 @@ CREATE INDEX IF NOT EXISTS gateway_delivery_ledger_due
 /// Column list in the order [`row_to_entry`] reads it.
 const COLUMNS: &str = "ledger_id, platform, chat_id, reply_to, body, total_chunks, \
                        delivered_chunks, attempts, state, last_error, error_kind, message_id, \
-                       flood_not_before, created_at, updated_at";
+                       flood_not_before, created_at, updated_at, verb";
 
 /// Lifecycle of one outbound message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,13 +136,16 @@ impl LedgerState {
 }
 
 /// One ledger row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LedgerEntry {
     pub ledger_id: String,
     pub platform: String,
     pub chat_id: String,
     pub reply_to: Option<String>,
     pub body: String,
+    /// The full outbound verb, serialized as JSON in the `verb` column. Rows written before
+    /// verbs existed carry `""` and read back as [`OutboundVerb::Text`] over `body`.
+    pub verb: OutboundVerb,
     /// Chunks the rendered body splits into.
     pub total_chunks: u32,
     /// Chunks the platform has already accepted; a resumed send starts here.
@@ -181,13 +185,16 @@ impl LedgerEntry {
 }
 
 /// A message handed to the ledger.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NewDelivery {
     pub ledger_id: String,
     pub platform: String,
     pub chat_id: String,
     pub reply_to: Option<String>,
     pub body: String,
+    /// The verb to send on each attempt. `body` stays the text summary for inspection; `verb`
+    /// is what the sweep actually dispatches.
+    pub verb: OutboundVerb,
     pub total_chunks: u32,
     /// The message was already fully acknowledged by a streaming frame: no ledger obligation.
     pub streamed: bool,
@@ -202,12 +209,35 @@ impl NewDelivery {
         chat_id: impl Into<String>,
         body: impl Into<String>,
     ) -> Self {
+        let body = body.into();
         Self {
             ledger_id: ledger_id.into(),
             platform: platform.into(),
             chat_id: chat_id.into(),
             reply_to: None,
-            body: body.into(),
+            verb: OutboundVerb::text(body.clone()),
+            body,
+            total_chunks: 1,
+            streamed: false,
+        }
+    }
+
+    /// A non-text (or text) delivery built from a verb: media, reaction, poll, card or draft.
+    /// `body` keeps the verb's [`OutboundVerb::body_text`] summary for inspection.
+    pub fn for_verb(
+        ledger_id: impl Into<String>,
+        platform: impl Into<String>,
+        chat_id: impl Into<String>,
+        verb: OutboundVerb,
+    ) -> Self {
+        let body = verb.body_text().to_string();
+        Self {
+            ledger_id: ledger_id.into(),
+            platform: platform.into(),
+            chat_id: chat_id.into(),
+            reply_to: None,
+            verb,
+            body,
             total_chunks: 1,
             streamed: false,
         }
@@ -233,6 +263,14 @@ impl NewDelivery {
 
     pub fn reply_to(mut self, reply_to: impl Into<String>) -> Self {
         self.reply_to = Some(reply_to.into());
+        self
+    }
+
+    /// Set the reply anchor only when one is present.
+    pub fn reply_to_opt(mut self, reply_to: Option<&str>) -> Self {
+        if let Some(reply_to) = reply_to {
+            self.reply_to = Some(reply_to.to_string());
+        }
         self
     }
 }
@@ -280,6 +318,22 @@ impl DeliveryLedger {
 
     fn from_connection(conn: Connection) -> Result<Self, DeliveryError> {
         conn.execute_batch(SCHEMA)?;
+        // Databases created before verbs existed lack the column; add it with an empty default,
+        // which `row_to_entry` reads back as a plain text delivery over `body`.
+        let columns = {
+            let mut statement = conn.prepare("PRAGMA table_info(gateway_delivery_ledger)")?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            columns
+        };
+        if !columns.iter().any(|name| name == "verb") {
+            conn.execute(
+                "ALTER TABLE gateway_delivery_ledger ADD COLUMN verb TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -302,14 +356,15 @@ impl DeliveryLedger {
             return Ok(None);
         }
         let total_chunks = delivery.total_chunks.max(1);
+        let verb_json = serde_json::to_string(&delivery.verb).unwrap_or_else(|_| "{}".to_string());
         {
             let conn = self.lock();
             conn.execute(
                 "INSERT INTO gateway_delivery_ledger
-                 (ledger_id, platform, chat_id, reply_to, body, total_chunks, delivered_chunks,
-                  attempts, state, last_error, error_kind, message_id, flood_not_before,
-                  created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 'pending', NULL, NULL, NULL, 0, ?7, ?7)
+                 (ledger_id, platform, chat_id, reply_to, body, total_chunks, verb,
+                  delivered_chunks, attempts, state, last_error, error_kind, message_id,
+                  flood_not_before, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, 'pending', NULL, NULL, NULL, 0, ?8, ?8)
              ON CONFLICT(ledger_id) DO NOTHING",
                 params![
                     delivery.ledger_id,
@@ -318,6 +373,7 @@ impl DeliveryLedger {
                     delivery.reply_to,
                     delivery.body,
                     total_chunks,
+                    verb_json,
                     now,
                 ],
             )?;
@@ -653,12 +709,19 @@ pub fn now_unix() -> i64 {
 
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<LedgerEntry> {
     let state: String = row.get(8)?;
+    let body: String = row.get(4)?;
+    let verb_json: String = row.get(15)?;
+    // A missing or corrupt verb payload degrades to the text it was stored beside, never to a
+    // silently different send.
+    let verb = serde_json::from_str::<OutboundVerb>(&verb_json)
+        .unwrap_or_else(|_| OutboundVerb::text(body.clone()));
     Ok(LedgerEntry {
         ledger_id: row.get(0)?,
         platform: row.get(1)?,
         chat_id: row.get(2)?,
         reply_to: row.get(3)?,
-        body: row.get(4)?,
+        body,
+        verb,
         total_chunks: row.get::<_, i64>(5)?.max(1) as u32,
         delivered_chunks: row.get::<_, i64>(6)?.max(0) as u32,
         attempts: row.get::<_, i64>(7)?.max(0) as u32,
@@ -675,6 +738,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<LedgerEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::OutboundMedia;
 
     const NOW: i64 = 1_700_000_000;
 
@@ -1144,5 +1208,70 @@ mod tests {
     fn now_unix_is_plausible() {
         let now = now_unix();
         assert!(now > 1_600_000_000, "clock looks wrong: {now}");
+    }
+
+    #[test]
+    fn a_verb_delivery_round_trips_through_the_ledger() {
+        let ledger = ledger();
+        let verb = OutboundVerb::media(
+            OutboundMedia::image_url("https://example.test/a.png").with_caption("look"),
+        );
+        let entry = ledger
+            .enqueue(
+                NewDelivery::for_verb("v1", "telegram", "chat-1", verb.clone()),
+                NOW,
+            )
+            .expect("enqueue")
+            .expect("entry");
+        assert_eq!(entry.verb, verb);
+        assert_eq!(entry.body, "look", "body keeps the verb's text summary");
+
+        ledger.claim("v1", NOW).expect("claim");
+        let delivered = ledger
+            .record_send_result("v1", &SendResult::ok("platform-1"), NOW + 1)
+            .expect("record")
+            .expect("entry");
+        assert_eq!(delivered.state, LedgerState::Delivered);
+        assert_eq!(delivered.verb, verb, "the verb survives claim and record");
+    }
+
+    #[test]
+    fn a_text_delivery_still_records_a_text_verb() {
+        let ledger = ledger();
+        let entry = enqueued(&ledger, "m1");
+        assert_eq!(entry.verb, OutboundVerb::text("hello"));
+    }
+
+    #[test]
+    fn rows_without_a_verb_read_back_as_text() {
+        let ledger = ledger();
+        // A row written before the verb column existed: the column default is '', which must
+        // decode as the text delivery stored beside it.
+        ledger
+            .lock()
+            .execute(
+                "INSERT INTO gateway_delivery_ledger
+                 (ledger_id, platform, chat_id, reply_to, body, total_chunks, delivered_chunks,
+                  attempts, state, last_error, error_kind, message_id, flood_not_before,
+                  created_at, updated_at)
+             VALUES ('old', 'telegram', 'c', NULL, 'legacy', 1, 0, 0, 'pending',
+                     NULL, NULL, NULL, 0, ?1, ?1)",
+                params![NOW],
+            )
+            .expect("insert legacy row");
+        let entry = ledger.get("old").expect("get").expect("entry");
+        assert_eq!(entry.verb, OutboundVerb::text("legacy"));
+        assert_eq!(entry.body, "legacy");
+
+        // A corrupt verb payload degrades the same way rather than failing the read.
+        ledger
+            .lock()
+            .execute(
+                "UPDATE gateway_delivery_ledger SET verb = 'garbage' WHERE ledger_id = 'old'",
+                [],
+            )
+            .expect("corrupt verb");
+        let entry = ledger.get("old").expect("get").expect("entry");
+        assert_eq!(entry.verb, OutboundVerb::text("legacy"));
     }
 }

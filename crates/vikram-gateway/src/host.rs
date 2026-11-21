@@ -17,7 +17,7 @@ use tokio::sync::watch;
 
 use crate::delivery::{DeliveryLedger, NewDelivery, now_unix};
 use crate::event::MessageEvent;
-use crate::platform::{OutboundMedia, PlatformAdapter, SendResult};
+use crate::platform::{OutboundMedia, OutboundVerb, PlatformAdapter, SendResult};
 use crate::platforms::{
     a2a::A2aEngine,
     buzz::BuzzAdapter,
@@ -59,6 +59,74 @@ pub trait GatewayPlatform: Send + Sync {
         _reply_to: Option<&str>,
     ) -> SendResult {
         SendResult::failed("this platform does not send media", Some("bad_format"))
+    }
+
+    /// The [`PlatformAdapter`] this platform wraps, when it is a thin shell over one. Wrappers
+    /// override this so [`send_verb`](Self::send_verb) reaches the adapter's real verb surface;
+    /// platforms without an adapter keep the default dispatch.
+    fn adapter(&self) -> Option<&dyn PlatformAdapter> {
+        None
+    }
+
+    /// Send one outbound verb. The default dispatches through [`adapter`](Self::adapter) when
+    /// the platform wraps one — reaching media, reactions, polls, cards and drafts exactly as
+    /// the adapter implements them — and otherwise handles text and media through
+    /// [`send`](Self::send) / [`send_media`](Self::send_media), refusing every other verb
+    /// honestly rather than dropping it.
+    async fn send_verb(
+        &self,
+        chat_id: &str,
+        verb: &OutboundVerb,
+        reply_to: Option<&str>,
+    ) -> SendResult {
+        if let Some(adapter) = self.adapter() {
+            return send_verb_on_adapter(adapter, chat_id, verb, reply_to).await;
+        }
+        match verb {
+            OutboundVerb::Text { body } => self.send(chat_id, body).await,
+            OutboundVerb::Media { media } => self.send_media(chat_id, media, reply_to).await,
+            _ => SendResult::failed(
+                "this platform does not support this verb",
+                Some("bad_format"),
+            ),
+        }
+    }
+}
+
+/// Dispatch one verb onto a wrapped [`PlatformAdapter`]. Reactions report through [`SendResult`]
+/// even though the adapter answers `bool`: `false` is a refusal, never a silent drop.
+async fn send_verb_on_adapter(
+    adapter: &dyn PlatformAdapter,
+    chat_id: &str,
+    verb: &OutboundVerb,
+    reply_to: Option<&str>,
+) -> SendResult {
+    match verb {
+        OutboundVerb::Text { body } => adapter.send(chat_id, body, reply_to, None).await,
+        OutboundVerb::Media { media } => adapter.send_media(chat_id, media, reply_to).await,
+        OutboundVerb::Reaction {
+            message_id,
+            emoji,
+            remove,
+        } => {
+            let reacted = if *remove {
+                adapter.remove_reaction(chat_id, message_id, emoji).await
+            } else {
+                adapter.add_reaction(chat_id, message_id, emoji).await
+            };
+            if reacted {
+                SendResult::ok(message_id.clone())
+            } else {
+                SendResult::failed("the platform refused the reaction", Some("bad_format"))
+            }
+        }
+        OutboundVerb::Poll { question, options } => {
+            adapter.send_poll(chat_id, question, options).await
+        }
+        OutboundVerb::Card { payload } => adapter.send_card(chat_id, payload).await,
+        OutboundVerb::Draft { draft_id, content } => {
+            adapter.send_draft(chat_id, *draft_id, content).await
+        }
     }
 }
 
@@ -180,52 +248,80 @@ async fn deliver_text(
     text: &str,
     stats: &mut HostStats,
 ) {
+    let verb = OutboundVerb::text(text);
+    // `None` means the ledger already owns the row; the sweep delivers it.
+    if let Some(result) =
+        deliver_verb_inner(platform, ledger, ledger_id, chat_id, &verb, None).await
+    {
+        record_send_stats(stats, platform.name(), chat_id, &result);
+    }
+}
+
+/// Send one outbound verb — text, media, reaction, poll, card or draft — through the delivery
+/// ledger when one is supplied, so retries and dedup apply exactly as they do for text replies.
+///
+/// The returned [`SendResult`] describes the send this call performed. When the ledger already
+/// owns the row — delivered, in flight, or waiting out flood control — no second send happens
+/// and the result reports the ledger id as its message id.
+pub async fn deliver_verb(
+    platform: &Arc<dyn GatewayPlatform>,
+    ledger: Option<&DeliveryLedger>,
+    ledger_id: &str,
+    chat_id: &str,
+    verb: &OutboundVerb,
+    reply_to: Option<&str>,
+) -> SendResult {
+    match deliver_verb_inner(platform, ledger, ledger_id, chat_id, verb, reply_to).await {
+        Some(result) => result,
+        None => SendResult::ok(ledger_id),
+    }
+}
+
+/// The shared claim-then-record path. `None` means the ledger already owns the row and this
+/// call performed no send.
+async fn deliver_verb_inner(
+    platform: &Arc<dyn GatewayPlatform>,
+    ledger: Option<&DeliveryLedger>,
+    ledger_id: &str,
+    chat_id: &str,
+    verb: &OutboundVerb,
+    reply_to: Option<&str>,
+) -> Option<SendResult> {
     let Some(ledger) = ledger else {
-        send_direct(platform, chat_id, text, stats).await;
-        return;
+        return Some(platform.send_verb(chat_id, verb, reply_to).await);
     };
     let now = now_unix();
-    let delivery = NewDelivery::new(ledger_id, platform.name(), chat_id, text);
+    let delivery = NewDelivery::for_verb(ledger_id, platform.name(), chat_id, verb.clone())
+        .reply_to_opt(reply_to);
     if let Err(err) = ledger.enqueue(delivery, now) {
         eprintln!(
             "[gateway:{}] delivery ledger enqueue failed: {err}; sending directly",
             platform.name()
         );
-        send_direct(platform, chat_id, text, stats).await;
-        return;
+        return Some(platform.send_verb(chat_id, verb, reply_to).await);
     }
     match ledger.claim(ledger_id, now) {
         Ok(Some(_)) => {
-            let result = platform.send(chat_id, text).await;
+            let result = platform.send_verb(chat_id, verb, reply_to).await;
             if let Err(err) = ledger.record_send_result(ledger_id, &result, now_unix()) {
                 eprintln!(
                     "[gateway:{}] delivery ledger record failed for {ledger_id}: {err}",
                     platform.name()
                 );
             }
-            record_send_stats(stats, platform.name(), chat_id, &result);
+            Some(result)
         }
-        // The row is already delivered, in flight, or waiting out flood control: the ledger (and
-        // the sweep) owns it now, so a duplicate event must not send a second copy.
-        Ok(None) => {}
+        // The row is already delivered, in flight, or waiting out flood control: the ledger
+        // (and the sweep) owns it now, so a duplicate event must not send a second copy.
+        Ok(None) => None,
         Err(err) => {
             eprintln!(
                 "[gateway:{}] delivery ledger claim failed for {ledger_id}: {err}; sending directly",
                 platform.name()
             );
-            send_direct(platform, chat_id, text, stats).await;
+            Some(platform.send_verb(chat_id, verb, reply_to).await)
         }
     }
-}
-
-async fn send_direct(
-    platform: &Arc<dyn GatewayPlatform>,
-    chat_id: &str,
-    text: &str,
-    stats: &mut HostStats,
-) {
-    let result = platform.send(chat_id, text).await;
-    record_send_stats(stats, platform.name(), chat_id, &result);
 }
 
 fn record_send_stats(
@@ -291,7 +387,9 @@ async fn sweep_once(platform: &Arc<dyn GatewayPlatform>, ledger: &DeliveryLedger
         }
     };
     for entry in claimed {
-        let result = platform.send(&entry.chat_id, &entry.body).await;
+        let result = platform
+            .send_verb(&entry.chat_id, &entry.verb, entry.reply_to.as_deref())
+            .await;
         if let Err(err) = ledger.record_send_result(&entry.ledger_id, &result, now_unix()) {
             eprintln!(
                 "[gateway:{}] ledger record failed for {}: {err}",
@@ -344,6 +442,10 @@ impl GatewayPlatform for TelegramPlatform {
         "telegram"
     }
 
+    fn adapter(&self) -> Option<&dyn PlatformAdapter> {
+        Some(&self.adapter)
+    }
+
     async fn next_events(&self) -> Result<Vec<MessageEvent>, String> {
         let offset = *self.cursor.lock().unwrap_or_else(|err| err.into_inner());
         let updates = self.adapter.poll_once(offset, 25).await?;
@@ -392,6 +494,10 @@ impl GatewayPlatform for SignalPlatform {
         "signal"
     }
 
+    fn adapter(&self) -> Option<&dyn PlatformAdapter> {
+        Some(&self.adapter)
+    }
+
     async fn next_events(&self) -> Result<Vec<MessageEvent>, String> {
         self.adapter.poll_once(20).await
     }
@@ -428,6 +534,10 @@ impl NtfyPlatform {
 impl GatewayPlatform for NtfyPlatform {
     fn name(&self) -> &str {
         "ntfy"
+    }
+
+    fn adapter(&self) -> Option<&dyn PlatformAdapter> {
+        Some(&self.adapter)
     }
 
     async fn next_events(&self) -> Result<Vec<MessageEvent>, String> {
@@ -471,6 +581,10 @@ impl GatewayPlatform for WeixinPlatform {
         "weixin"
     }
 
+    fn adapter(&self) -> Option<&dyn PlatformAdapter> {
+        Some(&self.adapter)
+    }
+
     async fn next_events(&self) -> Result<Vec<MessageEvent>, String> {
         let since = self
             .cursor
@@ -512,6 +626,10 @@ impl GatewayPlatform for SimplexPlatform {
         "simplex"
     }
 
+    fn adapter(&self) -> Option<&dyn PlatformAdapter> {
+        Some(&self.adapter)
+    }
+
     async fn next_events(&self) -> Result<Vec<MessageEvent>, String> {
         Ok(self.adapter.next_event().await?.into_iter().collect())
     }
@@ -535,6 +653,10 @@ impl IrcPlatform {
 impl GatewayPlatform for IrcPlatform {
     fn name(&self) -> &str {
         "irc"
+    }
+
+    fn adapter(&self) -> Option<&dyn PlatformAdapter> {
+        Some(&self.adapter)
     }
 
     async fn next_events(&self) -> Result<Vec<MessageEvent>, String> {
@@ -601,6 +723,10 @@ impl YuanbaoPlatform {
 impl GatewayPlatform for YuanbaoPlatform {
     fn name(&self) -> &str {
         "yuanbao"
+    }
+
+    fn adapter(&self) -> Option<&dyn PlatformAdapter> {
+        Some(&self.adapter)
     }
 
     async fn next_events(&self) -> Result<Vec<MessageEvent>, String> {
@@ -742,6 +868,10 @@ impl GatewayPlatform for PhotonPlatform {
         "photon"
     }
 
+    fn adapter(&self) -> Option<&dyn PlatformAdapter> {
+        Some(&self.adapter)
+    }
+
     async fn next_events(&self) -> Result<Vec<MessageEvent>, String> {
         Ok(self
             .adapter
@@ -779,6 +909,10 @@ impl EmailPlatform {
 impl GatewayPlatform for EmailPlatform {
     fn name(&self) -> &str {
         "email"
+    }
+
+    fn adapter(&self) -> Option<&dyn PlatformAdapter> {
+        Some(&self.adapter)
     }
 
     async fn next_events(&self) -> Result<Vec<MessageEvent>, String> {
@@ -893,6 +1027,10 @@ impl GatewayPlatform for DiscordPlatform {
         "discord"
     }
 
+    fn adapter(&self) -> Option<&dyn PlatformAdapter> {
+        Some(&self.adapter)
+    }
+
     async fn next_events(&self) -> Result<Vec<MessageEvent>, String> {
         Ok(self.gateway.next_event().await?.into_iter().collect())
     }
@@ -932,6 +1070,10 @@ impl MattermostPlatform {
 impl GatewayPlatform for MattermostPlatform {
     fn name(&self) -> &str {
         "mattermost"
+    }
+
+    fn adapter(&self) -> Option<&dyn PlatformAdapter> {
+        Some(&self.adapter)
     }
 
     async fn next_events(&self) -> Result<Vec<MessageEvent>, String> {
@@ -983,6 +1125,10 @@ impl GatewayPlatform for MatrixPlatform {
         "matrix"
     }
 
+    fn adapter(&self) -> Option<&dyn PlatformAdapter> {
+        Some(&self.adapter)
+    }
+
     async fn next_events(&self) -> Result<Vec<MessageEvent>, String> {
         let since = self
             .cursor
@@ -1026,6 +1172,10 @@ impl GatewayPlatform for WhatsAppPlatform {
         "whatsapp"
     }
 
+    fn adapter(&self) -> Option<&dyn PlatformAdapter> {
+        Some(&self.adapter)
+    }
+
     async fn next_events(&self) -> Result<Vec<MessageEvent>, String> {
         self.adapter.poll_once().await
     }
@@ -1058,6 +1208,10 @@ impl WeComPlatform {
 impl GatewayPlatform for WeComPlatform {
     fn name(&self) -> &str {
         "wecom"
+    }
+
+    fn adapter(&self) -> Option<&dyn PlatformAdapter> {
+        Some(&self.adapter)
     }
 
     async fn next_events(&self) -> Result<Vec<MessageEvent>, String> {
@@ -1355,5 +1509,217 @@ mod tests {
         let _ = task.await.unwrap();
         assert_eq!(platform.sent.lock().unwrap().len(), 1);
         assert_eq!(ledger.len().unwrap(), 1);
+    }
+
+    /// An adapter that records every verb it is asked to perform. Card and draft keep the
+    /// trait's honest defaults, so they refuse.
+    struct VerbRecorder {
+        calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl PlatformAdapter for VerbRecorder {
+        async fn connect(&mut self, _is_reconnect: bool) -> bool {
+            true
+        }
+        async fn disconnect(&mut self) {}
+        async fn send(
+            &self,
+            chat_id: &str,
+            content: &str,
+            _reply_to: Option<&str>,
+            _metadata: Option<serde_json::Value>,
+        ) -> SendResult {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("send:{chat_id}:{content}"));
+            SendResult::ok("text-id")
+        }
+        async fn get_chat_info(&self, chat_id: &str) -> crate::platform::ChatInfo {
+            crate::platform::ChatInfo {
+                name: chat_id.to_string(),
+                chat_type: "dm".to_string(),
+            }
+        }
+        async fn send_media(
+            &self,
+            chat_id: &str,
+            media: &OutboundMedia,
+            reply_to: Option<&str>,
+        ) -> SendResult {
+            let detail = match &media.source {
+                crate::platform::MediaSource::Url(url) => url.clone(),
+                crate::platform::MediaSource::Bytes(bytes) => format!("{} bytes", bytes.len()),
+            };
+            self.calls.lock().unwrap().push(format!(
+                "media:{chat_id}:{:?}:{detail}:{:?}:{reply_to:?}",
+                media.kind, media.caption
+            ));
+            SendResult::ok("media-id")
+        }
+        async fn add_reaction(&self, chat_id: &str, message_id: &str, emoji: &str) -> bool {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("react:{chat_id}:{message_id}:{emoji}"));
+            true
+        }
+        async fn send_poll(&self, chat_id: &str, question: &str, options: &[String]) -> SendResult {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("poll:{chat_id}:{question}:{}", options.join(",")));
+            SendResult::ok("poll-id")
+        }
+    }
+
+    /// A platform that is only a shell over [`VerbRecorder`]: `send` is deliberately unusable so
+    /// a regression that bypasses `send_verb` fails loudly.
+    struct AdapterPlatform {
+        adapter: VerbRecorder,
+    }
+
+    impl AdapterPlatform {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                adapter: VerbRecorder {
+                    calls: Mutex::new(Vec::new()),
+                },
+            })
+        }
+    }
+
+    #[async_trait]
+    impl GatewayPlatform for AdapterPlatform {
+        fn name(&self) -> &str {
+            "rec"
+        }
+
+        fn adapter(&self) -> Option<&dyn PlatformAdapter> {
+            Some(&self.adapter)
+        }
+
+        async fn next_events(&self) -> Result<Vec<MessageEvent>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn send(&self, _chat_id: &str, _content: &str) -> SendResult {
+            SendResult::failed("AdapterPlatform::send is unused", None)
+        }
+    }
+
+    #[tokio::test]
+    async fn deliver_verb_routes_media_through_the_ledger_to_the_adapter() {
+        use crate::delivery::LedgerState;
+
+        let platform = AdapterPlatform::new();
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        let ledger = crate::delivery::DeliveryLedger::in_memory().unwrap();
+        let verb = OutboundVerb::media(
+            OutboundMedia::image_url("https://example.test/a.png").with_caption("cap"),
+        );
+        let result = deliver_verb(&dyn_platform, Some(&ledger), "v1", "chat-1", &verb, None).await;
+        assert!(result.success);
+        assert_eq!(result.message_id.as_deref(), Some("media-id"));
+
+        let entry = ledger.get("v1").unwrap().expect("ledger row");
+        assert_eq!(entry.state, LedgerState::Delivered);
+        assert_eq!(entry.verb, verb);
+        assert_eq!(entry.chat_id, "chat-1");
+        let calls = platform.adapter.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].starts_with("media:chat-1:Image:https://example.test/a.png"),
+            "{}",
+            calls[0]
+        );
+        assert!(calls[0].contains("Some(\"cap\")"), "{}", calls[0]);
+    }
+
+    #[tokio::test]
+    async fn deliver_verb_dedups_a_second_enqueue() {
+        let platform = AdapterPlatform::new();
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        let ledger = crate::delivery::DeliveryLedger::in_memory().unwrap();
+        let verb = OutboundVerb::reaction("m-9", "👍");
+        let first = deliver_verb(&dyn_platform, Some(&ledger), "r1", "chat-1", &verb, None).await;
+        assert!(first.success);
+        let second = deliver_verb(&dyn_platform, Some(&ledger), "r1", "chat-1", &verb, None).await;
+        assert!(second.success);
+        assert_eq!(second.message_id.as_deref(), Some("r1"));
+        let calls = platform.adapter.calls.lock().unwrap();
+        assert_eq!(calls.as_slice(), &["react:chat-1:m-9:👍".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_verb_fails_honestly_through_the_ledger() {
+        use crate::delivery::LedgerState;
+
+        let platform = AdapterPlatform::new();
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        let ledger = crate::delivery::DeliveryLedger::in_memory().unwrap();
+        let result = deliver_verb(
+            &dyn_platform,
+            Some(&ledger),
+            "c1",
+            "chat-1",
+            &OutboundVerb::card(serde_json::json!({"type": "AdaptiveCard"})),
+            None,
+        )
+        .await;
+        assert!(!result.success);
+        assert_eq!(result.error_kind.as_deref(), Some("bad_format"));
+        let entry = ledger.get("c1").unwrap().expect("ledger row");
+        assert_eq!(entry.state, LedgerState::Failed);
+        assert_eq!(entry.attempts, 1);
+        assert!(platform.adapter.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_sweep_dispatches_a_verb_delivery_to_the_adapter() {
+        use crate::delivery::LedgerState;
+
+        let platform = AdapterPlatform::new();
+        let ledger = crate::delivery::DeliveryLedger::in_memory().unwrap();
+        let now = now_unix();
+        ledger
+            .enqueue(
+                NewDelivery::for_verb(
+                    "p1",
+                    "rec",
+                    "chat-2",
+                    OutboundVerb::poll("pick one?", vec!["a".to_string(), "b".to_string()]),
+                ),
+                now,
+            )
+            .unwrap()
+            .unwrap();
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        sweep_once(&dyn_platform, &ledger, now + 1).await;
+        let entry = ledger.get("p1").unwrap().expect("ledger row");
+        assert_eq!(entry.state, LedgerState::Delivered);
+        assert_eq!(entry.verb.kind(), "poll");
+        assert_eq!(
+            platform.adapter.calls.lock().unwrap().as_slice(),
+            &["poll:chat-2:pick one?:a,b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn send_verb_without_an_adapter_refuses_what_it_cannot_do() {
+        let platform = FakePlatform::new(vec![]);
+        assert!(
+            platform
+                .send_verb("c", &OutboundVerb::text("hi"), None)
+                .await
+                .success
+        );
+        let media = OutboundVerb::media(OutboundMedia::image_url("https://x.test/a.png"));
+        let result = platform.send_verb("c", &media, None).await;
+        assert!(!result.success);
+        assert_eq!(result.error_kind.as_deref(), Some("bad_format"));
+        let poll = OutboundVerb::poll("q", vec!["a".to_string()]);
+        assert!(!platform.send_verb("c", &poll, None).await.success);
     }
 }
