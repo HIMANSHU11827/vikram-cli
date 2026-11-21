@@ -493,6 +493,47 @@ impl EvolutionStore {
         collect_rows(rows)
     }
 
+    /// Newest skill-version rows across *all* skills. [`Self::list_skill_versions`]
+    /// is per-skill; this is the cross-skill audit/history view.
+    pub fn list_recent_skill_versions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::types::SkillVersion>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT skill_name,version,content,created_ms,parent_version,change_description FROM skill_versions ORDER BY created_ms DESC, skill_name ASC, version DESC LIMIT ?1")
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(crate::types::SkillVersion {
+                    skill_name: r.get(0)?,
+                    version: r.get::<_, i64>(1)? as u32,
+                    content: r.get(2)?,
+                    created_ms: r.get::<_, i64>(3)? as u64,
+                    parent_version: r.get::<_, Option<i64>>(4)?.map(|x| x as u32),
+                    change_description: r.get(5)?,
+                })
+            })
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        collect_rows(rows)
+    }
+
+    /// Highest recorded version per skill — the "current version" map used
+    /// by audits and recovery fingerprints.
+    pub fn latest_skill_versions(&self) -> Result<Vec<(String, u32)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT skill_name, MAX(version) FROM skill_versions GROUP BY skill_name ORDER BY skill_name",
+            )
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))
+            })
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        collect_rows(rows)
+    }
+
     /// Remove one recorded skill version. Used to compensate a failed
     /// `SKILL.md` materialization so the version table never claims a
     /// version the skill directory does not contain.
@@ -543,6 +584,30 @@ impl EvolutionStore {
             .query_row("SELECT COUNT(*) FROM learning_events", [], |r| r.get(0))
             .map_err(|e| EvolutionError::Store(e.to_string()))?;
         Ok(count.max(0) as usize)
+    }
+
+    /// Events of one `kind` (e.g. `self_check`), uncapped.
+    pub fn count_events_of_kind(&self, kind: &str) -> Result<usize> {
+        count_rows_with(
+            &self.lock(),
+            "SELECT COUNT(*) FROM learning_events WHERE kind=?1",
+            params![kind],
+        )
+    }
+
+    /// Text search over learning events (`summary` or `payload`), newest
+    /// first. Same escape-then-`LIMIT` discipline as [`Self::search_memory`]:
+    /// the `LIKE` match runs in SQL before the limit so a page is never short
+    /// because of rows that did not match.
+    pub fn search_events(&self, query: &str, limit: usize) -> Result<Vec<LearningEvent>> {
+        let conn = self.lock();
+        let pattern = format!("%{}%", escape_like(&query.to_lowercase()));
+        let mut stmt = conn.prepare("SELECT id,timestamp_ms,agent_id,kind,summary,payload FROM learning_events WHERE LOWER(summary) LIKE ?1 ESCAPE '\\' OR LOWER(payload) LIKE ?1 ESCAPE '\\' ORDER BY timestamp_ms DESC LIMIT ?2")
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![pattern, limit as i64], map_event)
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        collect_rows(rows)
     }
 
     // ---- engine state records ----

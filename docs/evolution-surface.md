@@ -28,8 +28,19 @@ per invocation, process-local state is also invisible to `vikram evolution`
 (`crates/vikram-cli/src/evolution.rs`) opens the store at
 `~/.vikram/evolution.db` and reads it. `dashboard.snapshot`, store listings,
 `mapek.monitor`/`analyze`, the `self_improvement` scan, `conversational`
-NL parsing, `autonomy` pending approvals, and `self_recovery` restart
-recovery are all reachable — mutating paths stay unexposed.
+NL parsing (store-backed answers), `autonomy` pending approvals, and
+`self_recovery` restart recovery + drift detection are all reachable.
+
+## Operator-gated via `vikram evolution` CLI (mutating, confirmed)
+
+`cycle`, `benchmark`, `approve`, `reject` each require `--yes` or an
+interactive confirmation before mutating durable state:
+
+| Command | Engine call | Effect |
+|---|---|---|
+| `cycle` | `mapek.run_cycle` (one bounded cycle) | monitor→analyze→plan→execute; re-queues failed reflection jobs, records issues as proposals |
+| `benchmark [name]` | `self_evaluation.run_benchmark` | persists `EvaluationResult` from recorded experiences |
+| `approve`/`reject <id>` | `autonomy.approve_request`/`reject_request` | decides a durable approval request (spends it on approve) |
 
 ## Durable but dormant (state persists, no production caller)
 
@@ -40,9 +51,9 @@ paths yet.
 
 | Subsystem | Persisted (namespace) | Gap |
 |---|---|---|
-| `autonomy` | every `ApprovalRequest` incl. spent state (`autonomy.approval`) | nothing calls `request_approval`; `approvals` lists only what tests/other engines queued |
-| `self_evaluation` | benchmarks, results, metric history (`self_evaluation.*`) | no scheduler runs `run_benchmark`; CLI cannot create benchmarks yet |
-| `mapek` (mutating half) | `KnowledgeBase` + `cycle_count` (`mapek.state`) | `run_cycle`/`execute` still never scheduled; monitor/analyze are the live half |
+| `autonomy` | every `ApprovalRequest` incl. spent state (`autonomy.approval`) | decisions reachable via `vikram evolution approve/reject`; nothing calls `request_approval` automatically yet |
+| `self_evaluation` | benchmarks, results, metric history (`self_evaluation.*`) | benchmarks runnable via `vikram evolution benchmark`; no scheduler creates/runs them automatically |
+| `mapek` (mutating half) | `KnowledgeBase` + `cycle_count` (`mapek.state`) | one bounded cycle via `vikram evolution cycle`; still not scheduled |
 | `self_improvement` (execute half) | `executions` history (`self_improvement.execution`) | `execute_improvement`/`track_improvement` have no caller; opportunities rebuild per scan |
 | `hive` (`HiveLearning`) | lessons persist in `hive_lessons` | no production caller of `record`; dashboard `hive_lessons` count stays 0 |
 
@@ -54,18 +65,18 @@ paths yet.
 | `self_config` | `change_history` | records intent only; `applied` can never become `true` |
 | `self_adaptation` | `adaptation_history` | detection reads store metrics; every action errors with a reason → `record_issue` proposal |
 | `self_development` | `projects` | 14-stage lifecycle records intent; produces no deployable artifacts |
-| `self_recovery` | `snapshots`, `recovery_operations`, `failed_changes` | snapshots capture no real state; persisting intent-only records would fake durability |
-| `conversational` | `autonomous_enabled`, `command_history` | reachable via `vikram evolution ask`, but handlers return canned scaffold responses |
+| `self_recovery` | snapshots + state fingerprints persist (`self_recovery.snapshot`); in-session op queue stays local | drift detection live via `recover`; failed-change ops still record intent only |
+| `conversational` | `autonomous_enabled`, `command_history` | handlers answer from the real store; commands with no honest implementation return `success:false`; autonomous toggle still guards nothing real |
 
 ## What "wiring" would still require
 
-- **Scheduler ownership**: `mapek.run_cycle`, `self_evaluation.run_benchmark`,
-  and `autonomy` approval flows need a caller — the runtime self-check is
-  the natural host, but mutating cycles should stay operator-gated until
-  their actions are proven safe (they can re-queue reflection jobs and spend
-  approvals).
-- **Conversational handlers**: `ask` parses and routes, but responses are
-  canned — real answers need handlers that query the store instead of
-  returning templates.
-- **Self-recovery**: needs real state snapshots (config/skill/memory
-  fingerprints) before "rollback" means anything.
+- **Automatic scheduling**: `mapek.run_cycle`, `self_evaluation.run_benchmark`,
+  and autonomy approval *requests* are operator-gated via CLI — safe, but
+  nothing proposes them on a timer. The runtime self-check could queue
+  candidates; execution should stay confirmed until actions are proven.
+- **Conversational depth**: handlers now answer from the store, but NL
+  coverage is phrase-matched — free-form questions beyond the 15 patterns
+  still get an honest unsupported response.
+- **Self-recovery actions**: drift detection works; actual rollback still
+  records intent — wiring real restore (skills/memory/config) is future
+  work gated on snapshot coverage.

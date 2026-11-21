@@ -26,25 +26,32 @@
 //!   (same self-check).
 //! - **Live via `vikram evolution` CLI (read-only)**: `dashboard.snapshot`,
 //!   plus store listings of experiences, proposals, memory, skills, events.
+//! - **Operator-gated via `vikram evolution` CLI**: `cycle` (one bounded
+//!   `mapek.run_cycle`), `benchmark` (`self_evaluation.run_benchmark`),
+//!   `approve`/`reject` (`autonomy` decisions) — each requires `--yes` or
+//!   interactive confirmation.
+//! - **Live via `vikram evolution ask`/`recover`**: `conversational`
+//!   handlers answer from the real store (unsupported commands return
+//!   `success:false` honestly); `self_recovery` persists state
+//!   fingerprints and reports drift on restart.
 //! - **Store-backed but dormant**: `hive` — lessons persist to the store,
 //!   but no production path calls `HiveLearning::record`, so the table
 //!   stays empty outside tests.
 //! - **Durable but dormant**: `autonomy` (approval requests persist to
-//!   `engine_records` and reload on open), `self_evaluation` (benchmarks,
-//!   results and metric history), `mapek`'s mutating half (`KnowledgeBase`
-//!   and `cycle_count`), and `self_improvement`'s execution history. Their
-//!   state now survives restarts, but nothing in the runtime schedules
-//!   or calls the mutating paths — durability removes the restart blocker,
-//!   not the missing caller.
+//!   `engine_records` and reload on open — CLI can now decide them),
+//!   `self_evaluation` (benchmarks/results/metric history — CLI can now
+//!   run benchmarks), `mapek`'s mutating half (`KnowledgeBase` and
+//!   `cycle_count` — CLI `cycle` runs one bounded cycle), and
+//!   `self_improvement`'s execution history (`execute_improvement`/
+//!   `track_improvement` still have no caller).
 //! - **Still process-local**: `self_awareness`, `self_config`,
-//!   `self_adaptation`, `self_development`, `self_recovery` and
-//!   `conversational`. Their analyses read the durable store, but their
-//!   bookkeeping is either derived-and-rebuilt (`self_improvement`'s
-//!   `opportunities`, `autonomy`'s `action_history` — executed actions
-//!   already emit `action_executed` learning events) or scaffold state
-//!   that records intent without real effect (`self_recovery` snapshots,
-//!   `conversational` canned responses). Persisting intent-only state
-//!   would fake durability, so it stays in memory and documented.
+//!   `self_adaptation`, `self_development`, and bookkeeping that is
+//!   derived-and-rebuilt (`self_improvement`'s `opportunities`,
+//!   `autonomy`'s `action_history` — executed actions already emit
+//!   `action_executed` learning events) or intentionally ephemeral
+//!   (`conversational` command history, `self_recovery`'s in-session
+//!   operation queue). Persisting intent-only state would fake
+//!   durability, so it stays in memory and documented.
 //!
 //! # Concurrency model
 //!

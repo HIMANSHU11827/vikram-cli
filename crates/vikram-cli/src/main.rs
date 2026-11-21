@@ -193,7 +193,7 @@ enum Command {
         #[command(subcommand)]
         action: LearningAction,
     },
-    /// Inspect the self-evolution engine's store (read-only).
+    /// Inspect and operate the self-evolution engine's store.
     Evolution {
         #[command(subcommand)]
         action: Option<evolution::EvolutionAction>,

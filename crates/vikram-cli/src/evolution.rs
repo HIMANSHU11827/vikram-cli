@@ -1,19 +1,22 @@
-//! `vikram evolution` — inspection of the self-evolution engine.
+//! `vikram evolution` — inspection and operator-gated control of the
+//! self-evolution engine.
 //!
 //! The engine's durable state lives in `~/.vikram/evolution.db` (SQLite) with
 //! evolution-tracked skills under `~/.vikram/skills`. This command opens that
 //! store directly — no runtime, no daemon. Most subcommands only read:
 //! counts, listings, and the store-backed analyses the self-* engines already
-//! implement. The conversational, autonomy-approval and self-recovery
-//! engines keep their working state in process-local `Vec`s, so their
-//! commands report that state honestly and never persist it. Proposals and
-//! every other durable mutation stay in `vikram learning`.
+//! implement. Four subcommands mutate durable state — `cycle`, `benchmark`,
+//! `approve`, `reject` — and each requires `--yes` or an interactive
+//! confirmation before writing. The conversational handlers answer from
+//! the real store; self-recovery persists state fingerprints and reports
+//! drift. Proposal review and approval stay in `vikram learning`.
 
 use std::path::Path;
 
 use clap::Subcommand;
 use vikram_evolution::{
-    EvolutionEngine, ExperienceOutcome, ProposalStatus, metrics::DEFAULT_WINDOW_MS, now_ms,
+    EvaluationBenchmark, EvolutionEngine, ExperienceOutcome, ProposalStatus,
+    autonomy::ApprovalStatus, metrics::DEFAULT_WINDOW_MS, now_ms,
 };
 
 #[derive(Debug, Subcommand)]
@@ -65,6 +68,42 @@ pub enum EvolutionAction {
     Approvals,
     /// Report self-recovery state and run the restart-recovery pass.
     Recover,
+    /// Run one MAPE-K cycle: monitor → analyze → plan → execute.
+    ///
+    /// Mutates the store: bumps the durable cycle count, records decisions and
+    /// outcomes in the knowledge base, re-queues failed reflection jobs it can
+    /// remediate, and persists `record_issue` proposals for what it cannot.
+    Cycle {
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Run a self-evaluation benchmark, or list available benchmarks.
+    ///
+    /// A run records an `EvaluationResult` in the store; listing is read-only.
+    Benchmark {
+        /// Benchmark id or name. Lists benchmarks when omitted.
+        name: Option<String>,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Approve a pending autonomy request (durable decision).
+    Approve {
+        /// Approval request id (see `vikram evolution approvals`).
+        id: String,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Reject a pending autonomy request (durable decision).
+    Reject {
+        /// Approval request id (see `vikram evolution approvals`).
+        id: String,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 pub fn run(action: Option<EvolutionAction>) -> Result<(), String> {
@@ -107,6 +146,10 @@ fn dispatch(engine: &mut EvolutionEngine, action: &EvolutionAction) -> Result<Ve
         EvolutionAction::Ask { text } => ask_lines(engine, text),
         EvolutionAction::Approvals => approvals_lines(engine),
         EvolutionAction::Recover => recover_lines(engine),
+        EvolutionAction::Cycle { yes } => cycle_lines(engine, *yes),
+        EvolutionAction::Benchmark { name, yes } => benchmark_lines(engine, name.as_deref(), *yes),
+        EvolutionAction::Approve { id, yes } => approval_decision_lines(engine, id, true, *yes),
+        EvolutionAction::Reject { id, yes } => approval_decision_lines(engine, id, false, *yes),
     }
 }
 
@@ -449,8 +492,8 @@ fn ask_lines(engine: &mut EvolutionEngine, text: &str) -> Result<Vec<String>, St
         .handle_command(command)
         .map_err(|e| e.to_string())?;
     let mut out = vec![
-        "note: the conversational engine is a scaffold — its responses are canned, \
-         not verified against real engine state"
+        "note: conversational handlers answer from the real store; commands \
+         with no honest implementation return success:false with the reason"
             .to_string(),
         format!("success: {}", response.success),
         response.message.clone(),
@@ -465,24 +508,35 @@ fn ask_lines(engine: &mut EvolutionEngine, text: &str) -> Result<Vec<String>, St
 }
 
 fn approvals_lines(engine: &EvolutionEngine) -> Result<Vec<String>, String> {
-    let pending = engine.autonomy.get_pending_approvals();
+    let all = engine.autonomy.get_pending_approvals();
+    let pending: Vec<_> = all
+        .iter()
+        .filter(|r| r.status == ApprovalStatus::Pending)
+        .collect();
+    let resolved = all.len() - pending.len();
     let mut out = vec![
-        "note: autonomy approvals are process-local — requests are never persisted, \
-         so a fresh CLI invocation always starts with none"
+        "note: autonomy approvals are durable — requests and decisions persist in \
+         engine_records and survive restarts; an approval authorizes exactly one \
+         controlled execution"
             .to_string(),
     ];
     if pending.is_empty() {
         out.push("no pending approval requests".to_string());
-        return Ok(out);
+    } else {
+        for r in &pending {
+            out.push(format!(
+                "{}  {:?}  {:?}  {}  {}",
+                r.id,
+                r.risk_level,
+                r.action_type,
+                crate::format_age(now_ms(), r.timestamp_ms),
+                truncate(&r.description, 90)
+            ));
+        }
     }
-    for r in pending {
+    if resolved > 0 {
         out.push(format!(
-            "{}  {:?}  {:?}  {}  {}",
-            r.id,
-            r.risk_level,
-            r.action_type,
-            crate::format_age(now_ms(), r.timestamp_ms),
-            truncate(&r.description, 90)
+            "{resolved} request(s) already decided (approved/rejected/executed)"
         ));
     }
     Ok(out)
@@ -490,8 +544,8 @@ fn approvals_lines(engine: &EvolutionEngine) -> Result<Vec<String>, String> {
 
 fn recover_lines(engine: &mut EvolutionEngine) -> Result<Vec<String>, String> {
     let mut out = vec![
-        "note: self-recovery state is process-local — snapshots, recovery operations \
-         and failed changes do not persist across invocations"
+        "note: self-recovery snapshots and state fingerprints persist in \
+         engine_records; drift is detected against the live store"
             .to_string(),
     ];
     let operations = engine
@@ -518,6 +572,232 @@ fn recover_lines(engine: &mut EvolutionEngine) -> Result<Vec<String>, String> {
         engine.self_recovery.get_recovery_history().len()
     ));
     Ok(out)
+}
+
+fn confirm_or_abort(yes: bool, question: &str) -> Result<(), String> {
+    if yes {
+        Ok(())
+    } else {
+        crate::dist::confirm(question)
+    }
+}
+
+fn cycle_lines(engine: &mut EvolutionEngine, yes: bool) -> Result<Vec<String>, String> {
+    // monitor/analyze are documented pure reads; running them first lets the
+    // report name the issues the cycle is about to act on. Nothing is written
+    // here — the only mutation is `run_cycle` below.
+    let data = engine.mapek.monitor().map_err(|e| e.to_string())?;
+    let analysis = engine.mapek.analyze(&data).map_err(|e| e.to_string())?;
+
+    confirm_or_abort(
+        yes,
+        "run one MAPE-K cycle? This writes to the evolution store \
+         (knowledge base, cycle count, proposals, events). [y/N] ",
+    )?;
+
+    let result = engine.mapek.run_cycle().map_err(|e| e.to_string())?;
+    let mut out = vec![
+        format!(
+            "pre-cycle analysis: {} issue(s), {} opportunit(y/ies), {} anomal(y/ies)",
+            analysis.issues.len(),
+            analysis.opportunities.len(),
+            analysis.anomalies.len()
+        ),
+        format!(
+            "cycle {} complete (plan {})",
+            result.cycle_number, result.plan_id
+        ),
+    ];
+    for issue in &analysis.issues {
+        out.push(format!(
+            "  issue: {:?} on `{}` — {}",
+            issue.severity,
+            issue.component,
+            truncate(&issue.description, 90)
+        ));
+    }
+    out.push(format!(
+        "actions: {} planned, {} remediated, {} recorded for operator review",
+        result.planned_actions, result.remediated_actions, result.recorded_for_review
+    ));
+    out.push(format!(
+        "execution: {}",
+        if result.execution_success {
+            "every planned action remediated".to_string()
+        } else {
+            format!(
+                "not fully remediated — {}",
+                result
+                    .failure_reason
+                    .clone()
+                    .unwrap_or_else(|| "no reason recorded".to_string())
+            )
+        }
+    ));
+    out.push(
+        "state: cycle count and knowledge base persisted; unremediated actions leave \
+         pending record_issue proposals and a mapek_execution_incomplete event"
+            .to_string(),
+    );
+    Ok(out)
+}
+
+/// `engine_records` namespace the self-evaluation engine persists benchmarks
+/// under (mirrors `self_evaluation::BENCHMARK_NAMESPACE`, which is private).
+const BENCHMARK_NAMESPACE: &str = "self_evaluation.benchmark";
+
+fn list_benchmarks(engine: &EvolutionEngine) -> Result<Vec<EvaluationBenchmark>, String> {
+    engine
+        .store
+        .list_engine_records(BENCHMARK_NAMESPACE)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|(_, payload)| {
+            serde_json::from_value::<EvaluationBenchmark>(payload)
+                .map_err(|e| format!("corrupt benchmark record in store: {e}"))
+        })
+        .collect()
+}
+
+fn resolve_benchmark<'a>(
+    benchmarks: &'a [EvaluationBenchmark],
+    name: &str,
+) -> Result<&'a EvaluationBenchmark, String> {
+    if let Some(b) = benchmarks.iter().find(|b| b.id == name) {
+        return Ok(b);
+    }
+    let by_name: Vec<_> = benchmarks.iter().filter(|b| b.name == name).collect();
+    match by_name.as_slice() {
+        [b] => Ok(b),
+        [] => Err(format!(
+            "no benchmark with id or name `{name}` ({} recorded)",
+            benchmarks.len()
+        )),
+        _ => Err(format!("benchmark name `{name}` is ambiguous")),
+    }
+}
+
+fn benchmark_lines(
+    engine: &mut EvolutionEngine,
+    name: Option<&str>,
+    yes: bool,
+) -> Result<Vec<String>, String> {
+    let benchmarks = list_benchmarks(engine)?;
+    let Some(name) = name else {
+        if benchmarks.is_empty() {
+            return Ok(vec!["no evaluation benchmarks recorded".to_string()]);
+        }
+        let mut out = vec![format!("{} benchmark(s):", benchmarks.len())];
+        for b in &benchmarks {
+            out.push(format!(
+                "  {}  {}  task_type={}  {}",
+                b.id,
+                b.name,
+                b.task_type,
+                truncate(&b.description, 70)
+            ));
+        }
+        out.push("run one with `vikram evolution benchmark <id-or-name> --yes`".to_string());
+        return Ok(out);
+    };
+
+    let benchmark = resolve_benchmark(&benchmarks, name)?;
+    confirm_or_abort(
+        yes,
+        &format!(
+            "run benchmark `{}`? This records an evaluation result in the store. [y/N] ",
+            benchmark.name
+        ),
+    )?;
+
+    let result = engine
+        .self_evaluation
+        .run_benchmark(&benchmark.id)
+        .map_err(|e| e.to_string())?;
+    let summary = engine
+        .self_evaluation
+        .aggregate_results()
+        .map_err(|e| e.to_string())?;
+    let out = vec![
+        format!("benchmark: {} ({})", benchmark.name, benchmark.id),
+        format!(
+            "result: {}  score {:.2}  data_points={}  {}",
+            if result.passed { "passed" } else { "failed" },
+            result.score,
+            result.data_points,
+            if result.sufficient_data {
+                "sufficient data"
+            } else {
+                "insufficient data"
+            }
+        ),
+        format!("notes: {}", result.notes),
+        format!(
+            "state: {} evaluation(s) recorded — {} passed, {} failed, avg score {:.2}",
+            summary.total_evaluations,
+            summary.passed_evaluations,
+            summary.failed_evaluations,
+            summary.average_score
+        ),
+    ];
+    Ok(out)
+}
+
+fn approval_decision_lines(
+    engine: &mut EvolutionEngine,
+    id: &str,
+    approve: bool,
+    yes: bool,
+) -> Result<Vec<String>, String> {
+    let request = engine
+        .autonomy
+        .get_pending_approvals()
+        .iter()
+        .find(|r| r.id == id)
+        .cloned()
+        .ok_or_else(|| format!("approval request `{id}` not found"))?;
+
+    let verb = if approve { "approve" } else { "reject" };
+    confirm_or_abort(
+        yes,
+        &format!(
+            "{verb} request {} ({:?} {:?}) — \"{}\"? This decision is durable. [y/N] ",
+            request.id, request.risk_level, request.action_type, request.description
+        ),
+    )?;
+
+    if approve {
+        let approver = std::env::var("USER").unwrap_or_else(|_| "operator".to_string());
+        engine
+            .autonomy
+            .approve_request(id, &approver)
+            .map_err(|e| e.to_string())?;
+    } else {
+        engine
+            .autonomy
+            .reject_request(id)
+            .map_err(|e| e.to_string())?;
+    }
+
+    let status = engine
+        .autonomy
+        .get_pending_approvals()
+        .iter()
+        .find(|r| r.id == id)
+        .map(|r| format!("{:?}", r.status))
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok(vec![
+        format!(
+            "request {} {}: {:?} {:?} — {}",
+            request.id,
+            verb,
+            request.risk_level,
+            request.action_type,
+            truncate(&request.description, 90)
+        ),
+        format!("reason: {}", truncate(&request.reason, 90)),
+        format!("state: request {id} is now {status}"),
+    ])
 }
 
 #[cfg(test)]
@@ -843,7 +1123,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("scaffold") && l.contains("canned")),
+                .any(|l| l.contains("real store") && l.contains("success:false")),
             "{lines:?}"
         );
         assert!(
@@ -855,7 +1135,9 @@ mod tests {
             "{lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains("\"runtime_status\"")),
+            lines
+                .iter()
+                .any(|l| l.contains("\"runtime_health\"")),
             "{lines:?}"
         );
 
@@ -908,20 +1190,311 @@ mod tests {
     }
 
     #[test]
-    fn approvals_reports_process_local_empty_state() {
+    fn approvals_reports_durable_empty_state() {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = engine_at(&tmp);
         let lines = dispatch(&mut engine, &EvolutionAction::Approvals).unwrap();
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("process-local") && l.contains("never persisted")),
+                .any(|l| l.contains("durable") && l.contains("survive restarts")),
             "{lines:?}"
         );
         assert!(
             lines.iter().any(|l| l == "no pending approval requests"),
             "{lines:?}"
         );
+    }
+
+    fn seed_approval(engine: &mut EvolutionEngine) -> String {
+        engine
+            .autonomy
+            .request_approval(
+                vikram_evolution::ActionType::ChangeSecurityPolicy,
+                "loosen the egress policy",
+                "operator asked",
+            )
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn cycle_runs_once_and_reports_durable_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_at(&tmp);
+
+        let lines = dispatch(&mut engine, &EvolutionAction::Cycle { yes: true }).unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("cycle 1 complete")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("pre-cycle analysis") && l.contains("issue")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("knowledge base persisted")),
+            "{lines:?}"
+        );
+
+        // The cycle count is durable: a second run continues at 2, and a
+        // reopened engine sees the same state.
+        let lines = dispatch(&mut engine, &EvolutionAction::Cycle { yes: true }).unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("cycle 2 complete")),
+            "{lines:?}"
+        );
+        drop(engine);
+        let mut reopened =
+            EvolutionEngine::open(tmp.path().join("evolution.db"), tmp.path().join("skills"))
+                .unwrap();
+        let lines = dispatch(&mut reopened, &EvolutionAction::Cycle { yes: true }).unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("cycle 3 complete")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn cycle_without_yes_refuses_on_non_terminal_stdin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_at(&tmp);
+        let err = dispatch(&mut engine, &EvolutionAction::Cycle { yes: false }).unwrap_err();
+        assert!(err.contains("--yes"), "{err}");
+    }
+
+    #[test]
+    fn benchmark_lists_then_runs_and_reports_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_at(&tmp);
+
+        let empty = dispatch(
+            &mut engine,
+            &EvolutionAction::Benchmark {
+                name: None,
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(empty, vec!["no evaluation benchmarks recorded".to_string()]);
+
+        let benchmark = engine
+            .self_evaluation
+            .create_benchmark(
+                "chat-quality",
+                "chat task outcomes",
+                "chat",
+                vikram_evolution::PerformanceMetrics {
+                    task_completion_rate: 0.9,
+                    task_correctness: 0.9,
+                    tool_success_rate: 0.9,
+                    model_performance: 0.0,
+                    agent_performance: 0.0,
+                    execution_time_ms: 60_000,
+                    token_consumption: 100_000,
+                    resource_consumption: 0.0,
+                    failure_rate: 0.0,
+                    recovery_rate: 0.0,
+                    regression_rate: 0.0,
+                    user_corrections: 0,
+                    skill_effectiveness: 0.0,
+                },
+            )
+            .unwrap();
+
+        let listed = dispatch(
+            &mut engine,
+            &EvolutionAction::Benchmark {
+                name: None,
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|l| l.contains(&benchmark.id) && l.contains("chat-quality")),
+            "{listed:?}"
+        );
+
+        let ran = dispatch(
+            &mut engine,
+            &EvolutionAction::Benchmark {
+                name: Some("chat-quality".into()),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            ran.iter()
+                .any(|l| l.contains("result:") && l.contains("data_points=0")),
+            "{ran:?}"
+        );
+        assert!(
+            ran.iter().any(|l| l.contains("1 evaluation(s) recorded")),
+            "{ran:?}"
+        );
+
+        // Resolution also accepts the benchmark id.
+        let by_id = dispatch(
+            &mut engine,
+            &EvolutionAction::Benchmark {
+                name: Some(benchmark.id.clone()),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            by_id.iter().any(|l| l.contains("2 evaluation(s)")),
+            "{by_id:?}"
+        );
+
+        let missing = dispatch(
+            &mut engine,
+            &EvolutionAction::Benchmark {
+                name: Some("ghost".into()),
+                yes: true,
+            },
+        )
+        .unwrap_err();
+        assert!(missing.contains("no benchmark"), "{missing}");
+    }
+
+    #[test]
+    fn benchmark_run_without_yes_refuses_on_non_terminal_stdin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_at(&tmp);
+        engine
+            .self_evaluation
+            .create_benchmark(
+                "b",
+                "d",
+                "chat",
+                vikram_evolution::PerformanceMetrics {
+                    task_completion_rate: 0.0,
+                    task_correctness: 0.0,
+                    tool_success_rate: 0.0,
+                    model_performance: 0.0,
+                    agent_performance: 0.0,
+                    execution_time_ms: 0,
+                    token_consumption: 0,
+                    resource_consumption: 0.0,
+                    failure_rate: 0.0,
+                    recovery_rate: 0.0,
+                    regression_rate: 0.0,
+                    user_corrections: 0,
+                    skill_effectiveness: 0.0,
+                },
+            )
+            .unwrap();
+        let err = dispatch(
+            &mut engine,
+            &EvolutionAction::Benchmark {
+                name: Some("b".into()),
+                yes: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("--yes"), "{err}");
+    }
+
+    #[test]
+    fn approve_and_reject_decide_durably() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_at(&tmp);
+        let approved_id = seed_approval(&mut engine);
+        let rejected_id = seed_approval(&mut engine);
+
+        let lines = dispatch(
+            &mut engine,
+            &EvolutionAction::Approve {
+                id: approved_id.clone(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("now Approved")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("ChangeSecurityPolicy")),
+            "{lines:?}"
+        );
+
+        let lines = dispatch(
+            &mut engine,
+            &EvolutionAction::Reject {
+                id: rejected_id.clone(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("now Rejected")),
+            "{lines:?}"
+        );
+
+        // Decisions are durable: a reopened engine still sees them resolved.
+        drop(engine);
+        let mut reopened =
+            EvolutionEngine::open(tmp.path().join("evolution.db"), tmp.path().join("skills"))
+                .unwrap();
+        let approvals = dispatch(&mut reopened, &EvolutionAction::Approvals).unwrap();
+        assert!(
+            approvals
+                .iter()
+                .any(|l| l.contains("2 request(s) already decided")),
+            "{approvals:?}"
+        );
+        assert!(
+            approvals
+                .iter()
+                .any(|l| l == "no pending approval requests"),
+            "{approvals:?}"
+        );
+        // A decided request cannot be decided again.
+        let err = dispatch(
+            &mut reopened,
+            &EvolutionAction::Approve {
+                id: approved_id,
+                yes: true,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("already"), "{err}");
+    }
+
+    #[test]
+    fn approval_decision_unknown_id_and_missing_yes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_at(&tmp);
+
+        let err = dispatch(
+            &mut engine,
+            &EvolutionAction::Approve {
+                id: "approval-nope".into(),
+                yes: true,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+
+        let id = seed_approval(&mut engine);
+        let err = dispatch(
+            &mut engine,
+            &EvolutionAction::Reject {
+                id: id.clone(),
+                yes: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("--yes"), "{err}");
+        // The refused decision changed nothing.
+        let approvals = dispatch(&mut engine, &EvolutionAction::Approvals).unwrap();
+        assert!(approvals.iter().any(|l| l.contains(&id)), "{approvals:?}");
     }
 
     #[test]
@@ -932,7 +1505,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("process-local") && l.contains("do not persist")),
+                .any(|l| l.contains("fingerprints") && l.contains("drift")),
             "{lines:?}"
         );
         assert!(
