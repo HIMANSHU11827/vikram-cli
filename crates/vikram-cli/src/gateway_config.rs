@@ -501,7 +501,7 @@ fn add(name: &str, yes: bool) -> Result<(), String> {
 fn collect_values(
     spec: &PlatformSpec,
     vars: &[&'static str],
-    mut ask: impl FnMut(&str) -> Result<String, String>,
+    mut ask: impl FnMut(&str, bool) -> Result<String, String>,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut values = BTreeMap::new();
     for var in vars {
@@ -512,7 +512,7 @@ fn collect_values(
             format!("{var} (optional, empty to skip): ")
         };
         loop {
-            let value = ask(&prompt)?.trim().to_string();
+            let value = ask(&prompt, secret_var(var))?.trim().to_string();
             if value.is_empty() {
                 if required {
                     eprintln!("{var} is required; try again");
@@ -527,20 +527,100 @@ fn collect_values(
     Ok(values)
 }
 
-/// One prompted line on stderr (stdout stays script-clean). There is no password-prompt helper
-/// in the workspace, so values echo while typing; EOF aborts instead of hanging.
-fn tty_ask(prompt: &str) -> Result<String, String> {
-    use std::io::Write;
+/// Variables whose values are credentials: their prompts read a line without terminal echo.
+fn secret_var(var: &str) -> bool {
+    ["TOKEN", "SECRET", "PASSWORD", "PRIVATE", "KEY"]
+        .iter()
+        .any(|needle| var.contains(needle))
+}
+
+/// One prompted line on stderr (stdout stays script-clean). `masked` answers read with
+/// terminal echo off; EOF aborts instead of hanging.
+fn tty_ask(prompt: &str, masked: bool) -> Result<String, String> {
+    use std::io::{BufRead, Write};
     eprint!("{prompt}");
     std::io::stderr().flush().map_err(|err| err.to_string())?;
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    if masked {
+        let line = read_secret(&mut input)?;
+        // Nothing was echoed, so the Enter key left no newline behind.
+        eprintln!();
+        return Ok(line);
+    }
     let mut line = String::new();
-    let read = std::io::stdin()
+    let read = input
         .read_line(&mut line)
         .map_err(|err| format!("cannot read the answer: {err}"))?;
     if read == 0 {
         return Err("aborted: end of input".to_string());
     }
     Ok(line)
+}
+
+/// One line from `input` with terminal echo disabled for the duration of the read. On unix
+/// the guard clears `ECHO` on stdin's termios settings; non-terminal input (pipes, tests)
+/// reads plainly since there is nothing to echo to.
+fn read_secret(input: &mut impl std::io::BufRead) -> Result<String, String> {
+    #[cfg(unix)]
+    let _guard = EchoGuard::disable()?;
+    let mut line = String::new();
+    let read = input
+        .read_line(&mut line)
+        .map_err(|err| format!("cannot read the answer: {err}"))?;
+    if read == 0 {
+        return Err("aborted: end of input".to_string());
+    }
+    Ok(line)
+}
+
+/// Restores stdin's original termios on drop, so an aborted prompt cannot leave the
+/// terminal muted.
+#[cfg(unix)]
+struct EchoGuard {
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl EchoGuard {
+    /// `Some` only when stdin is a terminal whose echo was actually disabled; `None` for
+    /// piped or redirected input.
+    fn disable() -> Result<Option<Self>, String> {
+        if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 {
+            return Ok(None);
+        }
+        let mut original: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut original) } != 0 {
+            return Err(format!(
+                "cannot read terminal settings: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut muted: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut muted) } != 0 {
+            return Err(format!(
+                "cannot read terminal settings: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        muted.c_lflag &= !libc::ECHO;
+        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &muted) } != 0 {
+            return Err(format!(
+                "cannot disable terminal echo: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Some(Self { original }))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original);
+        }
+    }
 }
 
 /// Print a collected value without leaking it back to the terminal scrollback.
@@ -1559,7 +1639,7 @@ mod tests {
         let spec = find_spec("signal").unwrap();
         let vars = spec.required;
         let mut answers = ["https://signal.example\n", "acct-1\n"].into_iter();
-        let values = collect_values(spec, vars, |_| Ok(answers.next().unwrap().to_string()))
+        let values = collect_values(spec, vars, |_, _| Ok(answers.next().unwrap().to_string()))
             .expect("both required values supplied");
         assert_eq!(values.len(), 2);
         assert_eq!(
@@ -1591,7 +1671,7 @@ mod tests {
         ]
         .into_iter();
         let values =
-            collect_values(spec, &vars, |_| Ok(answers.next().unwrap().to_string())).unwrap();
+            collect_values(spec, &vars, |_, _| Ok(answers.next().unwrap().to_string())).unwrap();
         assert_eq!(
             values.get("IRC_SERVER").map(String::as_str),
             Some("irc.example.com")
@@ -1605,13 +1685,49 @@ mod tests {
 
         // EOF on a required variable aborts instead of looping forever.
         let mut empty = std::iter::empty::<String>();
-        let err = collect_values(spec, &["IRC_SERVER"], |_| {
+        let err = collect_values(spec, &["IRC_SERVER"], |_, _| {
             empty
                 .next()
                 .map(Ok)
                 .unwrap_or_else(|| Err("aborted: end of input".to_string()))
         })
         .unwrap_err();
+        assert!(err.contains("aborted"), "{err}");
+    }
+
+    #[test]
+    fn secret_prompts_are_masked_and_plain_ones_are_not() {
+        let spec = find_spec("telegram").unwrap();
+        let vars: Vec<&'static str> = spec
+            .required
+            .iter()
+            .chain(spec.optional.iter())
+            .copied()
+            .collect();
+        let mut masked = Vec::new();
+        let mut answers = vars.iter().map(|_| "value\n".to_string());
+        collect_values(spec, &vars, |_, mask| {
+            masked.push(mask);
+            Ok(answers.next().unwrap())
+        })
+        .unwrap();
+        assert_eq!(
+            masked,
+            vars.iter().map(|var| secret_var(var)).collect::<Vec<_>>()
+        );
+        assert!(secret_var("TELEGRAM_BOT_TOKEN"));
+        assert!(secret_var("BLUEBUBBLES_PASSWORD"));
+        assert!(secret_var("BUZZ_PRIVATE_KEY"));
+        assert!(!secret_var("TELEGRAM_API_BASE"));
+        assert!(!secret_var("IRC_CHANNEL"));
+    }
+
+    #[test]
+    fn read_secret_reads_a_line_and_aborts_on_eof() {
+        let mut input: &[u8] = b"hunter2\n";
+        assert_eq!(read_secret(&mut input).unwrap(), "hunter2\n");
+        let mut empty: &[u8] = b"";
+        let err = read_secret(&mut empty).unwrap_err();
         assert!(err.contains("aborted"), "{err}");
     }
 

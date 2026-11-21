@@ -4,6 +4,7 @@
 //! network, no marketplace fetch. The source registry at `~/.vikram/plugin-registry` is listed by
 //! `plugins registry` and searched for dependencies at install time.
 
+use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
@@ -40,11 +41,12 @@ pub enum PluginsAction {
     Update {
         /// Plugin id to update.
         id: Option<String>,
-        /// Update every installed plugin that has a copy in the local source registry.
+        /// Update every installed plugin that has a recorded source or a copy in the local
+        /// source registry.
         #[arg(long)]
         all: bool,
-        /// Source plugin directory, or a directory containing `<id>`; without it the local
-        /// source registry is searched.
+        /// Source plugin directory or `.tar.gz`; without it the recorded install source is
+        /// used, then the local source registry.
         #[arg(long)]
         from: Option<PathBuf>,
         /// Skip the confirmation prompt.
@@ -193,6 +195,82 @@ fn install(registry: &PluginRegistry, path: &Path, yes: bool) -> Result<(), Stri
     install_dir(registry, path, yes, path)
 }
 
+/// Where each installed plugin came from, so `plugins update` can reinstall without
+/// `--from`. The runtime registry keeps no source path, so the CLI records one per plugin
+/// in `$VIKRAM_HOME/plugin-sources.json`: plugin id -> the directory or `.tar.gz` path
+/// `plugins install` was given.
+fn sources_path() -> PathBuf {
+    vikram_runtime::config::vikram_home().join("plugin-sources.json")
+}
+
+fn load_sources() -> Result<BTreeMap<String, String>, String> {
+    let path = sources_path();
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(err) => return Err(format!("could not read {}: {err}", path.display())),
+    };
+    serde_json::from_str(&raw).map_err(|err| format!("could not parse {}: {err}", path.display()))
+}
+
+fn save_sources(sources: &BTreeMap<String, String>) -> Result<(), String> {
+    let path = sources_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("could not create {}: {err}", parent.display()))?;
+    }
+    let body = serde_json::to_string_pretty(sources).expect("plugin sources are serializable");
+    std::fs::write(&path, format!("{body}\n"))
+        .map_err(|err| format!("could not write {}: {err}", path.display()))
+}
+
+/// Record the canonical source path so a later `plugins update` finds it again. Relative
+/// paths are made absolute because the update may run from another directory.
+fn record_source(id: &str, source: &Path) -> Result<(), String> {
+    let mut sources = load_sources()?;
+    let canonical = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
+    sources.insert(id.to_string(), canonical.to_string_lossy().into_owned());
+    save_sources(&sources)
+}
+
+fn forget_source(id: &str) -> Result<(), String> {
+    let mut sources = load_sources()?;
+    if sources.remove(id).is_some() {
+        save_sources(&sources)?;
+    }
+    Ok(())
+}
+
+/// Resolve a recorded source path to a plugin directory. An archive is extracted fresh —
+/// the temp dir is parked in `extractions` so it outlives the update that reads it.
+fn recorded_source(
+    recorded: &Path,
+    id: &str,
+    extractions: &mut Vec<crate::archive::ExtractedModule>,
+) -> Result<PathBuf, String> {
+    if crate::archive::looks_like_archive(recorded) {
+        let extracted = crate::archive::extract_module_dir(recorded)?;
+        let root = extracted.path().to_path_buf();
+        extractions.push(extracted);
+        return Ok(root);
+    }
+    if recorded.join("plugin.json").is_file() {
+        return Ok(recorded.to_path_buf());
+    }
+    if recorded.exists() {
+        return Err(format!(
+            "recorded source {} for `{id}` is not a plugin directory; pass --from <dir>",
+            recorded.display()
+        ));
+    }
+    Err(format!(
+        "recorded source {} for `{id}` no longer exists; pass --from <dir> to update from a local copy",
+        recorded.display()
+    ))
+}
+
 fn install_dir(
     registry: &PluginRegistry,
     path: &Path,
@@ -209,13 +287,15 @@ fn install_dir(
         ))?;
     }
     let installed = registry.install(path)?;
+    record_source(id, shown)?;
     println!("installed {installed}");
     Ok(())
 }
 
-/// Reinstall plugins from a local source. Install records no source path, so without `--from`
-/// the only source is the local registry at `~/.vikram/plugin-registry/<id>`; a plugin with no
-/// copy there is reported and skipped rather than silently treated as up to date.
+/// Reinstall plugins from a local source. `plugins install` records where each plugin came
+/// from in `plugin-sources.json`, so without `--from` the recorded source is tried first and
+/// the local registry at `~/.vikram/plugin-registry/<id>` second; a plugin with neither is
+/// reported and skipped rather than silently treated as up to date.
 fn update(
     registry: &PluginRegistry,
     id: Option<&str>,
@@ -229,6 +309,8 @@ fn update(
     if !all && id.is_none() {
         return Err("name a plugin id, or pass --all".to_owned());
     }
+    let sources = load_sources()?;
+    let mut extractions: Vec<crate::archive::ExtractedModule> = Vec::new();
     let mut targets: Vec<(String, PathBuf)> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
     if let Some(id) = id {
@@ -246,18 +328,21 @@ fn update(
                     }
                 }
             }
-            None => {
-                let candidate = registry.registry_root().join(id);
-                if candidate.join("plugin.json").is_file() {
-                    candidate
-                } else {
-                    return Err(format!(
-                        "no recorded source for `{id}`: install keeps no source path and {} has \
-                         no `{id}` folder; pass --from <dir> to update from a local copy",
-                        registry.registry_root().display()
-                    ));
+            None => match sources.get(id) {
+                Some(recorded) => recorded_source(Path::new(recorded), id, &mut extractions)?,
+                None => {
+                    let candidate = registry.registry_root().join(id);
+                    if candidate.join("plugin.json").is_file() {
+                        candidate
+                    } else {
+                        return Err(format!(
+                            "no recorded source for `{id}` and {} has no `{id}` folder; \
+                             pass --from <dir> to update from a local copy",
+                            registry.registry_root().display()
+                        ));
+                    }
                 }
-            }
+            },
         };
         targets.push((id.to_owned(), source));
     } else {
@@ -270,19 +355,32 @@ fn update(
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| plugin.name.clone());
+            let id = plugin.id();
+            if let Some(recorded) = sources.get(&id).or_else(|| sources.get(&name)) {
+                match recorded_source(Path::new(recorded), &id, &mut extractions) {
+                    Ok(source) => {
+                        targets.push((id, source));
+                        continue;
+                    }
+                    Err(reason) => {
+                        missing.push(format!("{name}: {reason}"));
+                        continue;
+                    }
+                }
+            }
             let candidate = registry.registry_root().join(&name);
             if candidate.join("plugin.json").is_file() {
                 targets.push((name, candidate));
             } else {
-                missing.push(name);
+                missing.push(format!(
+                    "{name}: no copy in {}",
+                    registry.registry_root().display()
+                ));
             }
         }
     }
-    for name in &missing {
-        println!(
-            "skipped {name}: no copy in {}",
-            registry.registry_root().display()
-        );
+    for entry in &missing {
+        println!("skipped {entry}");
     }
     if targets.is_empty() {
         if missing.is_empty() {
@@ -336,6 +434,7 @@ fn uninstall(registry: &PluginRegistry, id: &str, yes: bool) -> Result<(), Strin
         confirm(&format!("uninstall plugin `{id}`? [y/N] "))?;
     }
     registry.uninstall(id)?;
+    forget_source(id)?;
     println!("uninstalled {id}");
     Ok(())
 }
@@ -454,6 +553,8 @@ mod tests {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
+        let _guard = vikram_runtime::config::lock_security_env();
+        unsafe { std::env::set_var("VIKRAM_HOME", tmp.path().join("home")) };
         let source = tmp.path().join("src");
         write_plugin(&source, "acme", "1.0.0");
         let archive = tmp.path().join("acme.tar.gz");
@@ -462,6 +563,93 @@ mod tests {
         let registry = PluginRegistry::scan(&installed);
         install(&registry, &archive, true).unwrap();
         assert!(installed.join("acme/plugin.json").is_file());
+    }
+
+    /// `install` records the source path; a later `update` without `--from` finds it.
+    #[test]
+    fn install_records_the_source_and_update_uses_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = vikram_runtime::config::lock_security_env();
+        unsafe { std::env::set_var("VIKRAM_HOME", tmp.path().join("home")) };
+        let src = tmp.path().join("src");
+        write_plugin(&src, "acme", "1.0.0");
+        let installed = tmp.path().join("plugins");
+        let registry = PluginRegistry::scan(&installed);
+        install(&registry, &src.join("acme"), true).unwrap();
+        let sources = load_sources().unwrap();
+        assert_eq!(
+            sources.get("acme").map(String::as_str),
+            Some(src.join("acme").canonicalize().unwrap().to_str().unwrap())
+        );
+
+        write_plugin(&src, "acme", "2.0.0");
+        let registry = PluginRegistry::scan(&installed);
+        update(&registry, Some("acme"), false, None, true).unwrap();
+        let manifest = PluginManifest::from_dir(&installed.join("acme")).unwrap();
+        assert_eq!(manifest.version, "2.0.0");
+    }
+
+    /// A recorded source that vanished is an honest error naming `--from`, not a silent skip.
+    #[test]
+    fn update_with_a_deleted_recorded_source_fails_honestly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = vikram_runtime::config::lock_security_env();
+        unsafe { std::env::set_var("VIKRAM_HOME", tmp.path().join("home")) };
+        let src = tmp.path().join("src");
+        write_plugin(&src, "acme", "1.0.0");
+        let installed = tmp.path().join("plugins");
+        let registry = PluginRegistry::scan(&installed);
+        install(&registry, &src.join("acme"), true).unwrap();
+        std::fs::remove_dir_all(&src).unwrap();
+
+        let registry = PluginRegistry::scan(&installed);
+        let err = update(&registry, Some("acme"), false, None, true).unwrap_err();
+        assert!(err.contains("no longer exists"), "{err}");
+        assert!(err.contains("--from"), "{err}");
+    }
+
+    /// An archive install records the `.tar.gz` path; `update` re-extracts it.
+    #[test]
+    fn update_reextracts_a_recorded_archive_source() {
+        if std::process::Command::new("tar")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = vikram_runtime::config::lock_security_env();
+        unsafe { std::env::set_var("VIKRAM_HOME", tmp.path().join("home")) };
+        let src = tmp.path().join("src");
+        write_plugin(&src, "acme", "1.0.0");
+        let archive = tmp.path().join("acme.tar.gz");
+        tar_dir(&src.join("acme"), &archive);
+        let installed = tmp.path().join("plugins");
+        let registry = PluginRegistry::scan(&installed);
+        install(&registry, &archive, true).unwrap();
+        assert!(load_sources().unwrap().contains_key("acme"));
+
+        write_plugin(&src, "acme", "2.0.0");
+        tar_dir(&src.join("acme"), &archive);
+        let registry = PluginRegistry::scan(&installed);
+        update(&registry, Some("acme"), false, None, true).unwrap();
+        let manifest = PluginManifest::from_dir(&installed.join("acme")).unwrap();
+        assert_eq!(manifest.version, "2.0.0");
+    }
+
+    #[test]
+    fn uninstall_forgets_the_recorded_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = vikram_runtime::config::lock_security_env();
+        unsafe { std::env::set_var("VIKRAM_HOME", tmp.path().join("home")) };
+        let src = tmp.path().join("src");
+        write_plugin(&src, "acme", "1.0.0");
+        let installed = tmp.path().join("plugins");
+        let registry = PluginRegistry::scan(&installed);
+        install(&registry, &src.join("acme"), true).unwrap();
+        uninstall(&registry, "acme", true).unwrap();
+        assert!(!load_sources().unwrap().contains_key("acme"));
     }
 
     #[test]

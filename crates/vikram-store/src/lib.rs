@@ -461,9 +461,29 @@ pub struct TicketEventRow {
 }
 
 /// Recommended retention window for append-only side tables (hive messages, ticket events, usage,
-/// file changes). The journal is exempt: `read_after` cursors and crash recovery depend on
-/// contiguous seqs, so it is never pruned.
+/// file changes). The journal is exempt from this sweep: `read_after` cursors, crash recovery and
+/// compaction replay all depend on it staying whole. [`Store::prune_journal`] is the only journal
+/// prune, and it removes only rows no session can reach.
 pub const RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// What [`Store::prune_journal`] removed and what it deliberately kept. The journal is the replay
+/// substrate, so the kept counts are the interesting half of the report: every row belonging to a
+/// live session survives on purpose.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JournalPruneReport {
+    /// Journal rows deleted: entries whose `session` has no `sessions` row and whose `ts_ms` is
+    /// older than the cutoff. Every read path — replay, export, recovery, `read_after` — is keyed
+    /// by a `SessionId` that only `sessions` can hand out, so these rows are unreachable.
+    pub deleted: u64,
+    /// Rows kept because their session still exists. This includes rows a compaction marker
+    /// already folded: `project_from_journal` applies a marker by draining `folded` messages out
+    /// of the journal's own history, so deleting the folded prefix would make the marker stop
+    /// lining up and silently drop its summary. Archived sessions keep their journal too —
+    /// unarchiving resumes the same transcript.
+    pub kept_sessions: u64,
+    /// Orphaned rows younger than the cutoff: unreachable like `deleted`, but too fresh to touch.
+    pub kept_recent_orphans: u64,
+}
 
 /// One connection guarded by a mutex. The runtime is single-process; contention is limited to
 /// journal appends and the occasional metadata write, both sub-millisecond.
@@ -509,6 +529,7 @@ impl Store {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let _ = store.prune_retention(now_ms, RETENTION_MS);
+        let _ = store.prune_journal(now_ms, RETENTION_MS);
         Ok(store)
     }
 
@@ -3633,8 +3654,9 @@ impl Store {
 
     /// Bounded variant of [`Self::replay_messages`]: `limit`/`offset` map to SQL
     /// `LIMIT`/`OFFSET` over `seq` order. `None` for `limit` replays the whole journal, same as
-    /// [`Self::replay_messages`]. The journal is never retention-pruned, so this is the read most
-    /// likely to need a bound on long-lived sessions.
+    /// [`Self::replay_messages`]. Live-session journal rows are never retention-pruned
+    /// ([`Self::prune_journal`] removes only rows no `sessions` row can reach), so this is the
+    /// read most likely to need a bound on long-lived sessions.
     pub fn replay_messages_page(
         &self,
         session: &SessionId,
@@ -3723,8 +3745,8 @@ impl Store {
     /// Delete rows older than `max_age_ms` before `now_ms` from the append-only side tables
     /// (`hive_messages`, `ticket_events`, `usage`, `file_changes`). All four are timestamped by
     /// `ts_ms`; nothing they feed depends on rows surviving past their usefulness window. The
-    /// `journal` is never touched — replay and recovery need contiguous seqs. Returns the total
-    /// number of rows deleted.
+    /// `journal` is never touched — replay and recovery need it whole; journal pruning is
+    /// [`Self::prune_journal`]'s job. Returns the total number of rows deleted.
     pub fn prune_retention(&self, now_ms: u64, max_age_ms: u64) -> Result<u64> {
         let cutoff = now_ms.saturating_sub(max_age_ms) as i64;
         let conn = self.lock();
@@ -3734,6 +3756,50 @@ impl Store {
         }
         Ok(deleted)
     }
+
+    /// The only safe journal prune: delete rows older than `max_age_ms` before `now_ms` whose
+    /// `session` has no `sessions` row. Orphans are unreachable — replay, export, crash recovery
+    /// and `read_after` are all keyed by a `SessionId` only `sessions` can produce — and the age
+    /// floor keeps a late append to a just-deleted session from being swept while its runtime
+    /// still holds the id.
+    ///
+    /// Everything else stays, by design. A compaction marker replays by draining `folded`
+    /// messages out of the journal's own prefix, so the folded rows must remain for the marker
+    /// to line up; archived sessions resume from the same journal; and `effect` ids dedupe
+    /// retried appends. Pruning any of those needs a compaction-marker redesign in the runtime,
+    /// not a store-side sweep.
+    pub fn prune_journal(&self, now_ms: u64, max_age_ms: u64) -> Result<JournalPruneReport> {
+        let cutoff = now_ms.saturating_sub(max_age_ms) as i64;
+        let conn = self.lock();
+        let deleted = conn.execute(
+            "DELETE FROM journal
+             WHERE ts_ms < ?1
+               AND session NOT IN (SELECT id FROM sessions)",
+            params![cutoff],
+        )? as u64;
+        let kept_sessions = count_where(
+            &conn,
+            "SELECT COUNT(*) FROM journal WHERE session IN (SELECT id FROM sessions)",
+            &[],
+        )?;
+        let cutoff_params: [&dyn rusqlite::ToSql; 1] = [&cutoff];
+        let kept_recent_orphans = count_where(
+            &conn,
+            "SELECT COUNT(*) FROM journal
+             WHERE ts_ms >= ?1 AND session NOT IN (SELECT id FROM sessions)",
+            &cutoff_params,
+        )?;
+        Ok(JournalPruneReport {
+            deleted,
+            kept_sessions,
+            kept_recent_orphans,
+        })
+    }
+}
+
+fn count_where(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Result<u64> {
+    let count: i64 = conn.query_row(sql, params, |r| r.get(0))?;
+    Ok(count as u64)
 }
 
 fn delete_before(conn: &Connection, table: &str, cutoff_ms: i64) -> Result<u64> {
@@ -5563,5 +5629,116 @@ mod tests {
         assert_eq!(tail[1].seq, 5);
         assert!(store.replay_messages_tail(&session, 0).unwrap().is_empty());
         assert_eq!(store.replay_messages_tail(&session, 100).unwrap().len(), 5);
+    }
+
+    fn journal_rows(store: &Store) -> i64 {
+        store
+            .lock()
+            .query_row("SELECT COUNT(*) FROM journal", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn prune_journal_removes_only_old_orphans_and_keeps_every_live_row() {
+        let store = Store::open_in_memory().unwrap();
+        let live = store
+            .create_session("live", Path::new("/work"), None, 1)
+            .unwrap();
+        let archived = store
+            .create_session("archived", Path::new("/work"), None, 1)
+            .unwrap();
+        store
+            .set_session_status(&archived.id, "archived", 2)
+            .unwrap();
+        let orphan = SessionId::generate();
+        let journal = store.journal();
+        for (session, ts) in [
+            (&live.id, 100u64),
+            (&live.id, 200),
+            (&archived.id, 100),
+            (&orphan, 100),
+            (&orphan, 900),
+        ] {
+            journal
+                .append(
+                    &NewRecord::new(
+                        session.clone(),
+                        RecordKind::Message,
+                        serde_json::json!({"ts": ts}),
+                    )
+                    .at(ts),
+                )
+                .unwrap();
+        }
+
+        let report = store.prune_journal(1_000, 500).unwrap();
+        assert_eq!(
+            report.deleted, 1,
+            "only the stale orphan row is unreachable"
+        );
+        assert_eq!(report.kept_sessions, 3);
+        assert_eq!(report.kept_recent_orphans, 1);
+        assert_eq!(journal_rows(&store), 4);
+
+        // Replay still sees the whole live and archived transcripts, seqs intact.
+        let live_records = store.replay_messages(&live.id).unwrap();
+        assert_eq!(live_records.len(), 2);
+        assert_eq!(live_records[0].seq, 1);
+        assert_eq!(live_records[1].seq, 2);
+        assert_eq!(store.journal().last_seq(&live.id).unwrap(), Some(2));
+        assert_eq!(store.replay_messages(&archived.id).unwrap().len(), 1);
+        assert_eq!(store.replay_messages(&orphan).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prune_journal_never_touches_rows_a_live_session_still_replays() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store
+            .create_session("old", Path::new("/work"), None, 1)
+            .unwrap();
+        let journal = store.journal();
+        // A compaction marker plus the folded prefix it summarizes: the prefix must survive or
+        // the marker can no longer line up on replay and its summary is dropped.
+        for i in 0..4u64 {
+            journal
+                .append(
+                    &NewRecord::new(
+                        session.id.clone(),
+                        RecordKind::Message,
+                        serde_json::json!({"i": i}),
+                    )
+                    .at(10 + i),
+                )
+                .unwrap();
+        }
+        journal
+            .append(
+                &NewRecord::new(
+                    session.id.clone(),
+                    RecordKind::Compaction,
+                    serde_json::json!({
+                        "summary": {"role": "system", "blocks": []},
+                        "through_seq": 4,
+                        "folded_messages": 3,
+                    }),
+                )
+                .at(20),
+            )
+            .unwrap();
+
+        // Far-future prune: age is not the safety boundary for live sessions, ownership is.
+        let report = store.prune_journal(u64::MAX / 2, RETENTION_MS).unwrap();
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.kept_sessions, 5);
+        let records = store.replay_messages(&session.id).unwrap();
+        assert_eq!(records.len(), 5);
+        assert_eq!(records[4].kind, RecordKind::Compaction);
+    }
+
+    #[test]
+    fn prune_journal_on_an_empty_store_is_a_noop() {
+        let store = Store::open_in_memory().unwrap();
+        let report = store.prune_journal(1_000_000, RETENTION_MS).unwrap();
+        assert_eq!(report, JournalPruneReport::default());
     }
 }
