@@ -28,7 +28,7 @@
 //! combination. [`status`] says all of this on a Wayland session instead of pretending.
 
 use serde_json::{Value, json};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -45,6 +45,9 @@ pub const OCR_TIMEOUT_SECS: u64 = 30;
 
 /// Longer than this and `xdotool type` is measured in minutes rather than seconds.
 const MAX_TYPED_CHARS: usize = 10_000;
+/// Clipboard payloads are bounded too: `wl-copy`/`xclip` read all of stdin, and an unbounded paste
+/// would let one tool call stall the helper pipe.
+const MAX_CLIPBOARD_CHARS: usize = 100_000;
 /// Upper bound on what one helper may write to stdout/stderr. Larger output is truncated rather
 /// than allowed to grow the runtime's memory.
 const MAX_HELPER_OUTPUT: u64 = 8 * 1024 * 1024;
@@ -56,7 +59,7 @@ const MAX_HELPER_OUTPUT: u64 = 8 * 1024 * 1024;
 ///
 /// The install commands reported for these helpers are platform-aware: `apt` on Linux, `brew` on
 /// macOS, and `choco`/`scoop` (or manual installation) on Windows. See [`install_hint`].
-pub const HELPERS: [&str; 7] = [
+pub const HELPERS: [&str; 11] = [
     "xdotool",
     "scrot",
     "import",
@@ -64,6 +67,10 @@ pub const HELPERS: [&str; 7] = [
     "wmctrl",
     "tesseract",
     "ydotool",
+    "wl-paste",
+    "wl-copy",
+    "xclip",
+    "notify-send",
 ];
 
 /// The command (or instructions) for installing a helper on the current target platform.
@@ -87,6 +94,8 @@ pub fn install_hint(name: &str) -> &'static str {
             "wmctrl" => "brew install wmctrl",
             "tesseract" => "brew install tesseract",
             "ydotool" => "brew install ydotool",
+            "wl-paste" | "wl-copy" => "brew install wl-clipboard",
+            "notify-send" => "install manually (macOS has no notify-send)",
             _ => "install it and keep it on PATH",
         };
     }
@@ -98,7 +107,8 @@ pub fn install_hint(name: &str) -> &'static str {
             "tesseract" => {
                 "choco install tesseract (or scoop install tesseract), or install manually"
             }
-            "xdotool" | "scrot" | "grim" | "wmctrl" | "ydotool" => "install manually",
+            "xdotool" | "scrot" | "grim" | "wmctrl" | "ydotool" | "xclip" | "wl-paste"
+            | "wl-copy" | "notify-send" => "install manually",
             _ => "install it and keep it on PATH",
         };
     }
@@ -111,6 +121,9 @@ pub fn install_hint(name: &str) -> &'static str {
         "wmctrl" => "apt install wmctrl",
         "tesseract" => "apt install tesseract-ocr",
         "ydotool" => "apt install ydotool",
+        "wl-paste" | "wl-copy" => "apt install wl-clipboard",
+        "xclip" => "apt install xclip",
+        "notify-send" => "apt install libnotify-bin",
         _ => "install it and keep it on PATH",
     }
 }
@@ -193,6 +206,38 @@ fn window_helper() -> Option<&'static str> {
         .find(|helper| which(helper).is_some())
 }
 
+/// The first clipboard-reading helper that is installed, if any.
+///
+/// On Wayland `wl-paste` is the native path; `xclip` only sees the XWayland clipboard, so it is a
+/// fallback there. On X11 the order is reversed.
+fn clipboard_read_helper() -> Option<&'static str> {
+    let order: [&'static str; 2] = if session_kind() == "wayland" {
+        ["wl-paste", "xclip"]
+    } else {
+        ["xclip", "wl-paste"]
+    };
+    order.into_iter().find(|helper| which(helper).is_some())
+}
+
+/// The first clipboard-writing helper that is installed, if any. Same session preference as
+/// [`clipboard_read_helper`], with `wl-copy` standing in for `wl-paste`.
+fn clipboard_write_helper() -> Option<&'static str> {
+    let order: [&'static str; 2] = if session_kind() == "wayland" {
+        ["wl-copy", "xclip"]
+    } else {
+        ["xclip", "wl-copy"]
+    };
+    order.into_iter().find(|helper| which(helper).is_some())
+}
+
+fn no_clipboard_helper(tool: &str) -> String {
+    format!(
+        "no clipboard helper found; install one: {} or {}",
+        install_hint(tool),
+        install_hint("xclip")
+    )
+}
+
 /// Which display protocol this process can talk to, as far as the environment admits.
 ///
 /// `XDG_SESSION_TYPE` is authoritative when a session manager set it; otherwise the presence of a
@@ -245,16 +290,26 @@ fn looks_like_ydotool_combo(combo: &str) -> bool {
 }
 
 /// Run one helper and collect its raw output, killing it after `timeout`.
+///
+/// `input`, when present, is written to the child's stdin on a detached thread before the wait
+/// loop, so a helper that reads all of stdin (`wl-copy`, `xclip -i`) gets its payload without a
+/// wedged child being able to block the write past the deadline. stdin is always closed
+/// afterwards, which is what tells those helpers the payload is complete.
 fn run_raw(
     program: &str,
     args: &[&str],
     cwd: Option<&Path>,
     timeout: Duration,
+    input: Option<&[u8]>,
 ) -> Result<Output, String> {
     let mut command = Command::new(program);
     command
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(dir) = cwd {
@@ -268,6 +323,16 @@ fn run_raw(
             format!("cannot run `{program}`: {e}")
         }
     })?;
+
+    if let Some(data) = input
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        let data = data.to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&data);
+            // `stdin` drops here, closing the pipe: helpers like `wl-copy` finish on EOF.
+        });
+    }
 
     let deadline = Instant::now() + timeout;
     let status: ExitStatus = loop {
@@ -336,7 +401,24 @@ fn run_raw(
 /// Returns `Err` for a missing binary, a timeout, or a non-zero exit — the three ways a helper
 /// fails that the caller can act on.
 fn run_command(program: &str, args: &[&str], cwd: Option<&Path>) -> Result<String, String> {
-    let output = run_raw(program, args, cwd, Duration::from_secs(TIMEOUT_SECS))?;
+    let output = run_raw(program, args, cwd, Duration::from_secs(TIMEOUT_SECS), None)?;
+    command_report(program, output)
+}
+
+/// Run one helper with `input` on its stdin and collect its output, like [`run_command`].
+fn run_command_stdin(program: &str, args: &[&str], input: &[u8]) -> Result<String, String> {
+    let output = run_raw(
+        program,
+        args,
+        None,
+        Duration::from_secs(TIMEOUT_SECS),
+        Some(input),
+    )?;
+    command_report(program, output)
+}
+
+/// Turn a finished helper invocation into its report or its failure.
+fn command_report(program: &str, output: Output) -> Result<String, String> {
     let mut body = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !stderr.trim().is_empty() {
@@ -362,7 +444,7 @@ fn run_command(program: &str, args: &[&str], cwd: Option<&Path>) -> Result<Strin
 /// `tesseract` writes progress chatter to stderr even when it succeeds, so OCR must not take the
 /// mixed report [`run_command`] builds — the recognised text would arrive next to log noise.
 fn run_stdout_only(program: &str, args: &[&str], timeout: Duration) -> Result<String, String> {
-    let output = run_raw(program, args, None, timeout)?;
+    let output = run_raw(program, args, None, timeout, None)?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -677,6 +759,73 @@ pub fn windows() -> Result<String, String> {
     Ok(truncated(body.to_string()))
 }
 
+/// Read the clipboard's text content.
+///
+/// `wl-paste` on Wayland, `xclip -o` on X11 (each a fallback for the other). A clipboard holding
+/// non-text data makes the helper fail, which surfaces as an error rather than an empty string.
+pub fn clipboard_read() -> Result<String, String> {
+    let helper = clipboard_read_helper().ok_or_else(|| no_clipboard_helper("wl-paste"))?;
+    let text = match helper {
+        "wl-paste" => run_stdout_only(
+            "wl-paste",
+            &["--no-newline"],
+            Duration::from_secs(TIMEOUT_SECS),
+        )?,
+        _ => run_stdout_only(
+            "xclip",
+            &["-selection", "clipboard", "-o"],
+            Duration::from_secs(TIMEOUT_SECS),
+        )?,
+    };
+    Ok(truncated(text))
+}
+
+/// Replace the clipboard's text content.
+///
+/// `wl-copy` on Wayland, `xclip -i` on X11; both take the payload on stdin so nothing is ever
+/// interpolated into a command line.
+pub fn clipboard_write(text: &str) -> Result<String, String> {
+    if text.is_empty() {
+        return Err("clipboard write needs non-empty text".to_string());
+    }
+    let length = text.chars().count();
+    if length > MAX_CLIPBOARD_CHARS {
+        return Err(format!(
+            "text is {length} characters; the limit for a single clipboard write is \
+             {MAX_CLIPBOARD_CHARS}"
+        ));
+    }
+    let helper = clipboard_write_helper().ok_or_else(|| no_clipboard_helper("wl-copy"))?;
+    match helper {
+        "wl-copy" => {
+            run_command_stdin("wl-copy", &[], text.as_bytes())?;
+        }
+        _ => {
+            run_command_stdin("xclip", &["-selection", "clipboard", "-i"], text.as_bytes())?;
+        }
+    }
+    Ok(format!(
+        "copied {length} characters to the clipboard via {helper}"
+    ))
+}
+
+/// Show a desktop notification through `notify-send`.
+pub fn notify(title: &str, body: &str) -> Result<String, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("notify needs a non-empty title".to_string());
+    }
+    let body = body.trim();
+    require_tool("notify-send")?;
+    let args: Vec<&str> = if body.is_empty() {
+        vec!["-a", "Vikram", title]
+    } else {
+        vec!["-a", "Vikram", title, body]
+    };
+    run_command("notify-send", &args, None)?;
+    Ok(format!("sent desktop notification \"{title}\""))
+}
+
 /// Which program synthetic input would actually go through, and why.
 fn input_summary() -> String {
     let has_xdotool = which("xdotool").is_some();
@@ -741,6 +890,20 @@ pub fn status() -> String {
         "\nwindows: {}",
         window_helper().unwrap_or("unavailable (no wmctrl or xdotool)")
     ));
+    out.push_str(&format!(
+        "\nclipboard: {}",
+        clipboard_read_helper()
+            .or_else(clipboard_write_helper)
+            .unwrap_or("unavailable (no wl-paste/wl-copy or xclip)")
+    ));
+    out.push_str(&format!(
+        "\nnotify: {}",
+        if which("notify-send").is_some() {
+            "notify-send"
+        } else {
+            "unavailable (no notify-send)"
+        }
+    ));
     out.push_str(&format!("\nsession: {}", session_kind()));
     if session_kind() == "wayland" {
         if which("ydotool").is_some() {
@@ -768,6 +931,30 @@ fn type_preview(text: &str) -> String {
     let head: String = chars.by_ref().take(120).collect();
     let ellipsis = if chars.next().is_some() { "…" } else { "" };
     format!("type \"{head}{ellipsis}\"")
+}
+
+/// Same one-line preview discipline as [`type_preview`], for the notification body an approval
+/// prompt would otherwise hide.
+fn notify_preview(title: &str, body: &str) -> String {
+    let text = if body.trim().is_empty() {
+        title.to_string()
+    } else {
+        format!("{title}: {}", body.trim())
+    };
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = flat.chars();
+    let head: String = chars.by_ref().take(120).collect();
+    let ellipsis = if chars.next().is_some() { "…" } else { "" };
+    format!("notify \"{head}{ellipsis}\"")
+}
+
+/// The clipboard payload an approval prompt would otherwise hide, previewed like [`type_preview`].
+fn clipboard_preview(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = flat.chars();
+    let head: String = chars.by_ref().take(120).collect();
+    let ellipsis = if chars.next().is_some() { "…" } else { "" };
+    format!("clipboard \"{head}{ellipsis}\"")
 }
 
 /// Tool output is unbounded from a busy desktop; cut it rather than flood the conversation.
@@ -1162,6 +1349,106 @@ impl Tool for ReadScreen {
     }
 }
 
+struct ClipboardRead;
+
+impl Tool for ClipboardRead {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "computer.clipboard_read".into(),
+            description: "Read the clipboard's text content (wl-paste on Wayland, xclip on X11)."
+                .into(),
+            schema: json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    fn permission(&self, _args: &Value) -> Result<PermissionRequest, VikramError> {
+        Ok(PermissionRequest::new(
+            ActionKind::Read,
+            "computer.clipboard_read",
+            "clipboard",
+            SideEffect::None,
+            Trust::Model,
+        ))
+    }
+
+    fn run(&self, _args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+        Ok(reported(clipboard_read()))
+    }
+}
+
+struct ClipboardWrite;
+
+impl Tool for ClipboardWrite {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "computer.clipboard_write".into(),
+            description: "Replace the clipboard's text content (wl-copy on Wayland, xclip on \
+                          X11)."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Literal text to place on the clipboard."}
+                },
+                "required": ["text"]
+            }),
+        }
+    }
+
+    fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
+        let text = arg_str(args, "text")?;
+        Ok(PermissionRequest::new(
+            ActionKind::Write,
+            "computer.clipboard_write",
+            clipboard_preview(&text),
+            SideEffect::LocalMutation,
+            Trust::Model,
+        ))
+    }
+
+    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+        let text = arg_str(args, "text")?;
+        Ok(reported(clipboard_write(&text)))
+    }
+}
+
+struct Notify;
+
+impl Tool for Notify {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "computer.notify".into(),
+            description: "Show a desktop notification via notify-send.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Notification summary."},
+                    "body": {"type": "string", "description": "Optional notification body."}
+                },
+                "required": ["title"]
+            }),
+        }
+    }
+
+    fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
+        let title = arg_str(args, "title")?;
+        let body = args.get("body").and_then(Value::as_str).unwrap_or_default();
+        Ok(PermissionRequest::new(
+            ActionKind::Execute,
+            "computer.notify",
+            notify_preview(&title, body),
+            SideEffect::LocalMutation,
+            Trust::Model,
+        ))
+    }
+
+    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+        let title = arg_str(args, "title")?;
+        let body = args.get("body").and_then(Value::as_str).unwrap_or_default();
+        Ok(reported(notify(&title, body)))
+    }
+}
+
 /// Register the desktop tools. Registered unconditionally: a machine without `xdotool` still gets
 /// `computer.status`, and the input tools fail with an install hint rather than disappearing from
 /// the tool list — a model that cannot see a tool cannot report that it is missing. The same holds
@@ -1176,6 +1463,9 @@ pub fn register(registry: &ToolRegistry) {
     registry.register(Box::new(Status));
     registry.register(Box::new(Ocr));
     registry.register(Box::new(ReadScreen));
+    registry.register(Box::new(ClipboardRead));
+    registry.register(Box::new(ClipboardWrite));
+    registry.register(Box::new(Notify));
 }
 
 #[cfg(test)]
@@ -1185,7 +1475,7 @@ mod tests {
     /// A name no package manager, PATH entry or test fixture will ever provide.
     const ABSENT: &str = "vikram-definitely-not-installed-9f3c";
 
-    const ALL: [&str; 9] = [
+    const ALL: [&str; 12] = [
         "computer.screenshot",
         "computer.click",
         "computer.type",
@@ -1195,6 +1485,9 @@ mod tests {
         "computer.status",
         "computer.ocr",
         "computer.read_screen",
+        "computer.clipboard_read",
+        "computer.clipboard_write",
+        "computer.notify",
     ];
 
     fn ctx() -> ToolContext {
@@ -1233,6 +1526,8 @@ mod tests {
         let _ = looks_like_ydotool_combo("");
         let _ = looks_like_ydotool_combo("KEY_LEFTCTRL+KEY_L");
         let _ = looks_like_ydotool_combo("ctrl+l");
+        let _ = clipboard_read_helper();
+        let _ = clipboard_write_helper();
     }
 
     #[test]
@@ -1329,6 +1624,22 @@ mod tests {
             "tesseract not found; install it: apt install tesseract-ocr"
         );
         assert!(missing_tool_message("ydotool").contains("apt install ydotool"));
+        assert_eq!(
+            missing_tool_message("wl-paste"),
+            "wl-paste not found; install it: apt install wl-clipboard"
+        );
+        assert_eq!(
+            missing_tool_message("wl-copy"),
+            "wl-copy not found; install it: apt install wl-clipboard"
+        );
+        assert_eq!(
+            missing_tool_message("xclip"),
+            "xclip not found; install it: apt install xclip"
+        );
+        assert_eq!(
+            missing_tool_message("notify-send"),
+            "notify-send not found; install it: apt install libnotify-bin"
+        );
         assert!(missing_tool_message("mystery").contains("PATH"));
     }
 
@@ -1834,5 +2145,116 @@ mod tests {
             .permission(&json!({"direction": "up"}))
             .unwrap();
         assert!(req.resource.contains("amount=3"), "{}", req.resource);
+    }
+
+    // --- clipboard and notifications -------------------------------------------------------------
+
+    #[test]
+    fn clipboard_helpers_come_from_the_wayland_or_x11_sets() {
+        for helper in [clipboard_read_helper(), clipboard_write_helper()]
+            .into_iter()
+            .flatten()
+        {
+            assert!(
+                ["wl-paste", "wl-copy", "xclip"].contains(&helper),
+                "unexpected clipboard helper `{helper}`"
+            );
+        }
+    }
+
+    #[test]
+    fn clipboard_write_rejects_empty_and_enormous_text() {
+        // Only the pre-helper checks run here: a passing payload would reach a real clipboard.
+        assert!(clipboard_write("").is_err());
+        let huge = "a".repeat(MAX_CLIPBOARD_CHARS + 1);
+        let err = clipboard_write(&huge).unwrap_err();
+        assert!(err.contains(&MAX_CLIPBOARD_CHARS.to_string()), "{err}");
+    }
+
+    #[test]
+    fn clipboard_tools_declare_the_expected_permissions() {
+        let registry = ToolRegistry::with_builtins();
+        let req = registry
+            .get("computer.clipboard_read")
+            .unwrap()
+            .permission(&json!({}))
+            .unwrap();
+        assert_eq!(req.action, ActionKind::Read);
+        assert_eq!(req.verb, "computer.clipboard_read");
+        assert_eq!(req.resource, "clipboard");
+        assert_eq!(req.side_effect, SideEffect::None);
+        assert_eq!(req.originating_trust, Trust::Model);
+
+        let req = registry
+            .get("computer.clipboard_write")
+            .unwrap()
+            .permission(&json!({"text": "hello clipboard"}))
+            .unwrap();
+        assert_eq!(req.action, ActionKind::Write);
+        assert_eq!(req.verb, "computer.clipboard_write");
+        assert!(req.resource.contains("hello clipboard"), "{}", req.resource);
+        assert_eq!(req.side_effect, SideEffect::LocalMutation);
+        assert_eq!(req.originating_trust, Trust::Model);
+    }
+
+    #[test]
+    fn notify_requires_a_title_and_previews_the_body() {
+        assert!(notify("", "").is_err());
+        assert!(notify("   ", "body").is_err());
+
+        let registry = ToolRegistry::with_builtins();
+        let tool = registry.get("computer.notify").unwrap();
+        let err = tool.permission(&json!({})).unwrap_err();
+        assert!(matches!(err, VikramError::ProviderRejected(_)), "{err:?}");
+        let req = tool
+            .permission(&json!({"title": "Build done", "body": "tests passed"}))
+            .unwrap();
+        assert_eq!(req.action, ActionKind::Execute);
+        assert_eq!(req.verb, "computer.notify");
+        assert!(req.resource.contains("Build done"), "{}", req.resource);
+        assert!(req.resource.contains("tests passed"), "{}", req.resource);
+        assert_eq!(req.side_effect, SideEffect::LocalMutation);
+        assert_eq!(req.originating_trust, Trust::Model);
+
+        // Title-only notifications still produce a resource.
+        let req = tool.permission(&json!({"title": "ping"})).unwrap();
+        assert!(req.resource.contains("ping"), "{}", req.resource);
+    }
+
+    #[test]
+    fn clipboard_and_notify_refuse_cleanly_when_no_helper_exists() {
+        // Only assert the degradation path on a machine with none of the helpers; where one is
+        // installed the call would touch a real clipboard/notification daemon.
+        if clipboard_read_helper().is_none()
+            && clipboard_write_helper().is_none()
+            && which("notify-send").is_none()
+        {
+            let err = clipboard_read().unwrap_err();
+            assert!(
+                err.contains("not found") || err.contains("no clipboard helper"),
+                "{err}"
+            );
+            let err = clipboard_write("x").unwrap_err();
+            assert!(
+                err.contains("not found") || err.contains("no clipboard helper"),
+                "{err}"
+            );
+            let err = notify("t", "").unwrap_err();
+            assert!(err.contains("notify-send not found"), "{err}");
+            assert!(err.contains("apt install libnotify-bin"), "{err}");
+        }
+    }
+
+    #[test]
+    fn clipboard_and_notify_runs_report_refusals_as_failed_output() {
+        let out = ClipboardWrite.run(&json!({"text": ""}), &ctx()).unwrap();
+        assert!(!out.ok);
+        let out = Notify.run(&json!({"title": "  "}), &ctx()).unwrap();
+        assert!(!out.ok);
+        // Missing arguments are provider rejections, not tool failures.
+        let err = ClipboardWrite.run(&json!({}), &ctx()).unwrap_err();
+        assert!(matches!(err, VikramError::ProviderRejected(_)), "{err:?}");
+        let err = Notify.run(&json!({}), &ctx()).unwrap_err();
+        assert!(matches!(err, VikramError::ProviderRejected(_)), "{err:?}");
     }
 }

@@ -43,6 +43,7 @@ pub enum ConversationalCommand {
     ExplainAction { action_id: String },
     ReportImprovements,
     Ask { question: String },
+    WhoIs { name: String },
 }
 
 /// Command response.
@@ -101,6 +102,7 @@ impl ConversationalControl {
             ConversationalCommand::ExplainAction { action_id } => self.explain_action(action_id),
             ConversationalCommand::ReportImprovements => self.report_improvements(),
             ConversationalCommand::Ask { question } => self.ask_freeform(question),
+            ConversationalCommand::WhoIs { name } => self.who_is(name),
         }?;
 
         self.command_history.push(response.clone());
@@ -149,6 +151,8 @@ impl ConversationalControl {
             Some(ConversationalCommand::ExplainAction { action_id })
         } else if input_lower.contains("report improvements") {
             Some(ConversationalCommand::ReportImprovements)
+        } else if let Some(name) = who_is_name(input) {
+            Some(ConversationalCommand::WhoIs { name })
         } else {
             let question = input.trim();
             if question.is_empty() {
@@ -667,6 +671,111 @@ impl ConversationalControl {
         })
     }
 
+    /// "Who is X" answers only from recorded evolution-store rows: live
+    /// memories whose key/value names X, experiences whose request,
+    /// category or project names X, and learning events matching X. The
+    /// runtime relation table (vikram.db, managed by vikram-store) is a
+    /// different database this engine cannot open, so the reply states that
+    /// scope plainly instead of implying relations were checked.
+    fn who_is(&self, name: &str) -> Result<CommandResponse> {
+        let trimmed = name.trim();
+        let command = ConversationalCommand::WhoIs {
+            name: trimmed.to_string(),
+        };
+        if trimmed.is_empty() {
+            return Ok(CommandResponse {
+                command,
+                success: true,
+                message:
+                    "No name given — ask e.g. \"who is Mom\" or \"what do you know about Vikram CLI\"."
+                        .to_string(),
+                data: None,
+                timestamp_ms: now_ms(),
+            });
+        }
+        let needle = trimmed.to_lowercase();
+
+        let memories: Vec<serde_json::Value> = self
+            .store
+            .search_memory(None, trimmed, 5)?
+            .into_iter()
+            .map(|m| {
+                serde_json::json!({
+                    "id": m.id,
+                    "layer": format!("{:?}", m.layer),
+                    "key": m.key,
+                    "value": truncate(&m.value, 160),
+                    "status": format!("{:?}", m.status),
+                    "confidence": m.confidence,
+                    "updated_ms": m.updated_ms,
+                })
+            })
+            .collect();
+
+        let mut experiences: Vec<serde_json::Value> = Vec::new();
+        for e in self.store.list_experiences(None, 200)? {
+            if experiences.len() >= 5 {
+                break;
+            }
+            let haystack = format!(
+                "{} {} {}",
+                e.user_request.to_lowercase(),
+                e.task_category.to_lowercase(),
+                e.project_id.as_deref().unwrap_or("").to_lowercase()
+            );
+            if haystack.contains(&needle) {
+                experiences.push(serde_json::json!({
+                    "id": e.id,
+                    "task_category": e.task_category,
+                    "outcome": format!("{:?}", e.outcome),
+                    "project_id": e.project_id,
+                    "user_request": truncate(&e.user_request, 120),
+                    "timestamp_ms": e.timestamp_ms,
+                }));
+            }
+        }
+
+        let events: Vec<serde_json::Value> = self
+            .store
+            .search_events(trimmed, 5)?
+            .into_iter()
+            .map(|e| {
+                serde_json::json!({
+                    "id": e.id,
+                    "kind": e.kind,
+                    "summary": truncate(&e.summary, 120),
+                    "timestamp_ms": e.timestamp_ms,
+                })
+            })
+            .collect();
+
+        let total = memories.len() + experiences.len() + events.len();
+        let message = if total == 0 {
+            format!(
+                "Nothing recorded about '{trimmed}' — no live memory, experience or learning event in the evolution store mentions them. Runtime relations are kept in a separate store (vikram.db) that `vikram evolution` does not read."
+            )
+        } else {
+            format!(
+                "Recorded mentions of '{trimmed}': {} memor(ies), {} experience(s), {} learning event(s) — retrieval over the evolution store only; runtime relations live in vikram.db, a separate store.",
+                memories.len(),
+                experiences.len(),
+                events.len()
+            )
+        };
+        Ok(CommandResponse {
+            command,
+            success: true,
+            message,
+            data: Some(serde_json::json!({
+                "name": trimmed,
+                "memories": memories,
+                "experiences": experiences,
+                "learning_events": events,
+            })),
+            timestamp_ms: now_ms(),
+        })
+    }
+
     /// Store-backed per-agent/per-category performance for Ask questions
     /// like "how is X performing". `agents`/`categories` carry the top
     /// groups by volume; `matched_*` narrows them to keys a query term
@@ -779,6 +888,28 @@ fn question_keywords(question: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Extract the name from a "who is X" / "who's X" / "what do you know
+/// about X" question, preserving the original casing. Returns `Some("")`
+/// when the prefix matched but nothing followed, so the handler can answer
+/// honestly instead of falling through to generic Ask.
+fn who_is_name(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    let lower = trimmed.to_lowercase();
+    for prefix in ["who is ", "who's ", "what do you know about "] {
+        if lower.starts_with(prefix) {
+            // The prefixes are pure ASCII, so the byte offset is a valid
+            // char boundary in the original string too.
+            let name = trimmed[prefix.len()..]
+                .trim()
+                .trim_end_matches(['?', '.', '!'])
+                .trim()
+                .to_string();
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// True when a free-form question asks about agent/category performance
@@ -1308,5 +1439,125 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    fn seed_experience_request(store: &EvolutionStore, id: &str, request: &str) {
+        store
+            .save_experience(&Experience {
+                id: id.to_string(),
+                timestamp_ms: now_ms(),
+                agent_id: "agent-1".to_string(),
+                project_id: None,
+                task_category: "coding".to_string(),
+                user_request: request.to_string(),
+                outcome: ExperienceOutcome::Success,
+                tools_used: vec![],
+                errors: vec![],
+                corrections: vec![],
+                feedback: None,
+                reusable: false,
+                sensitivity: Sensitivity::Public,
+                metadata: serde_json::json!({}),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn parse_command_routes_who_is_questions() {
+        let (control, _) = control();
+        match control.parse_command("who is Mom?") {
+            Some(ConversationalCommand::WhoIs { name }) => assert_eq!(name, "Mom"),
+            other => panic!("expected WhoIs, got {other:?}"),
+        }
+        match control.parse_command("what do you know about Vikram CLI") {
+            Some(ConversationalCommand::WhoIs { name }) => {
+                assert_eq!(name, "Vikram CLI")
+            }
+            other => panic!("expected WhoIs, got {other:?}"),
+        }
+        match control.parse_command("who's dad") {
+            Some(ConversationalCommand::WhoIs { name }) => assert_eq!(name, "dad"),
+            other => panic!("expected WhoIs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn who_is_reports_recorded_mentions_across_store_tables() {
+        let (mut control, store) = control();
+        store
+            .save_memory(&MemoryEntry {
+                id: "mem-mom".to_string(),
+                layer: MemoryLayer::Semantic,
+                scope: "user:u1".to_string(),
+                key: "mom-preferences".to_string(),
+                value: "Mom prefers window seats".to_string(),
+                status: KnowledgeStatus::UserStated,
+                confidence: 0.9,
+                source_experience: None,
+                provenance: "test".to_string(),
+                created_ms: now_ms(),
+                updated_ms: now_ms(),
+                expires_ms: None,
+                superseded_by: None,
+            })
+            .unwrap();
+        seed_experience_request(&store, "exp-mom", "book dinner with Mom");
+        seed_experience_request(&store, "exp-other", "unrelated task");
+        store
+            .save_event(&LearningEvent {
+                id: "evt-mom".to_string(),
+                timestamp_ms: now_ms(),
+                agent_id: "agent-1".to_string(),
+                kind: "note".to_string(),
+                summary: "Mom's birthday is in June".to_string(),
+                payload: serde_json::json!({}),
+            })
+            .unwrap();
+
+        let response = control
+            .handle_command(ConversationalCommand::WhoIs {
+                name: "Mom".to_string(),
+            })
+            .unwrap();
+        assert!(response.success);
+        assert!(response.message.contains("Recorded mentions of 'Mom'"));
+        let data = response.data.unwrap();
+        assert_eq!(data["memories"].as_array().unwrap().len(), 1);
+        assert_eq!(data["memories"][0]["id"], "mem-mom");
+        let experiences = data["experiences"].as_array().unwrap();
+        assert_eq!(experiences.len(), 1);
+        assert_eq!(experiences[0]["id"], "exp-mom");
+        assert_eq!(data["learning_events"].as_array().unwrap().len(), 1);
+        assert_eq!(data["learning_events"][0]["id"], "evt-mom");
+    }
+
+    #[test]
+    fn who_is_on_empty_store_is_honest() {
+        let (mut control, _) = control();
+        let response = control
+            .handle_command(ConversationalCommand::WhoIs {
+                name: "nobody".to_string(),
+            })
+            .unwrap();
+        assert!(response.success);
+        assert!(response.message.contains("Nothing recorded about 'nobody'"));
+        assert!(response.message.contains("separate store"));
+        let data = response.data.unwrap();
+        assert_eq!(data["memories"].as_array().unwrap().len(), 0);
+        assert_eq!(data["experiences"].as_array().unwrap().len(), 0);
+        assert_eq!(data["learning_events"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn who_is_with_no_name_is_honest() {
+        let (mut control, _) = control();
+        let response = control
+            .handle_command(ConversationalCommand::WhoIs {
+                name: "   ".to_string(),
+            })
+            .unwrap();
+        assert!(response.success);
+        assert!(response.message.contains("No name given"));
+        assert!(response.data.is_none());
     }
 }

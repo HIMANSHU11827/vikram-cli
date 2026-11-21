@@ -150,7 +150,9 @@ fn every_builtin_declares_a_permission_shape() {
             "computer.type" => json!({"text": "hello"}),
             "computer.key" => json!({"keys": "ctrl+l"}),
             "computer.scroll" => json!({"direction": "down"}),
-            "computer.windows" | "computer.status" => json!({}),
+            "computer.windows" | "computer.status" | "computer.clipboard_read" => json!({}),
+            "computer.clipboard_write" => json!({"text": "hello"}),
+            "computer.notify" => json!({"title": "t"}),
             "lsp.hover" | "lsp.definition" | "lsp.references" => {
                 json!({"path": "a.rs", "line": 0, "column": 0})
             }
