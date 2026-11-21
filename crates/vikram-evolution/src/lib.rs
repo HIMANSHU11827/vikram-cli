@@ -37,12 +37,14 @@
 //!   handlers answer from the real store (unsupported commands return
 //!   `success:false` honestly); `self_recovery` persists state
 //!   fingerprints and reports drift on restart.
-//! - **Durable but dormant**: `autonomy` (approval requests persist to
-//!   `engine_records` and reload on open — CLI can now decide them),
-//!   `self_evaluation` (benchmarks/results/metric history — CLI can now
-//!   run benchmarks), `mapek`'s mutating half (`KnowledgeBase` and
-//!   `cycle_count` — CLI `cycle` runs one bounded cycle), and
-//!   `self_improvement`'s `execute_improvement` lifecycle
+//! - **Produced by the runtime, decided via CLI**: `autonomy` — staged skill
+//!   proposals from the learning pipeline create approval requests (visible
+//!   under `vikram evolution approvals`), and `approve`/`reject` persist the
+//!   decision; the learning proposal stays the gate that performs the write.
+//! - **Durable but dormant**: `self_evaluation` (benchmarks/results/metric
+//!   history — CLI can now run benchmarks), `mapek`'s mutating half
+//!   (`KnowledgeBase` and `cycle_count` — CLI `cycle` runs one bounded
+//!   cycle), and `self_improvement`'s `execute_improvement` lifecycle
 //!   (`track_improvement` is wired — see above).
 //! - **Still process-local**: `self_awareness`, `self_config`,
 //!   `self_adaptation`, `self_development`, and bookkeeping that is

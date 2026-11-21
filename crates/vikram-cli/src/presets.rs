@@ -1257,6 +1257,53 @@ mod tests {
     }
 
     #[test]
+    fn suggest_picks_up_config_signals_the_learning_pipeline_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = home_guard(tmp.path());
+        let home = tmp.path();
+        let db = home.join("evolution.db");
+        let skills = home.join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let engine = vikram_evolution::EvolutionEngine::open(db.clone(), skills.clone()).unwrap();
+        // The producer side: a user correction mentioning a model and a context
+        // size becomes `metadata.config.*`, exactly as `record_and_reflect` writes it.
+        let signals = vikram_runtime::learning::config_signals(&[
+            "no, use gpt-4o instead".to_owned(),
+            "no, the context window of 200k was too small".to_owned(),
+        ]);
+        engine
+            .experience
+            .record(vikram_evolution::Experience {
+                id: String::new(),
+                timestamp_ms: 0,
+                agent_id: "main".to_owned(),
+                project_id: None,
+                task_category: "chat".to_owned(),
+                user_request: "hi".to_owned(),
+                outcome: vikram_evolution::ExperienceOutcome::Success,
+                tools_used: vec![],
+                errors: vec![],
+                corrections: vec!["no, use gpt-4o instead".to_owned()],
+                feedback: None,
+                reusable: false,
+                sensitivity: vikram_evolution::Sensitivity::Private,
+                metadata: serde_json::json!({
+                    "session": "s1",
+                    "config": signals,
+                }),
+            })
+            .unwrap();
+
+        let lines = suggest_at(&db, &skills, &home.join("learning.json")).unwrap();
+        let text = lines.join("\n");
+        assert!(text.contains("model"), "{text}");
+        assert!(text.contains("gpt-4o"), "{text}");
+        assert!(text.contains("context_window"), "{text}");
+        assert!(text.contains("200000"), "{text}");
+        assert!(text.contains("--set model=gpt-4o"), "{text}");
+    }
+
+    #[test]
     fn suggest_is_honest_when_nothing_is_recorded() {
         let tmp = tempfile::tempdir().unwrap();
         let lines = suggest_at(

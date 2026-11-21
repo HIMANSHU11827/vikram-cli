@@ -2,8 +2,11 @@
 //!
 //! This engine classifies actions by risk and determines approval requirements.
 //!
-//! DORMANT / awaiting a caller: nothing in the runtime, CLI or other crates
-//! calls this engine — the self-check path does not consult it before acting.
+//! Producer: the runtime's learning pipeline requests an approval whenever a
+//! skill proposal is staged for operator decision (a pending capability
+//! change), so `vikram evolution approvals` lists real work. Approving or
+//! rejecting is durable; `execute_controlled` still has no wired caller — the
+//! learning proposal remains the gate that performs the skill write.
 //!
 //! Persistence: every [`ApprovalRequest`] is written to the store's
 //! `engine_records` table under [`APPROVAL_NAMESPACE`] on creation and on

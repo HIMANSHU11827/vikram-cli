@@ -712,7 +712,7 @@ fn record_and_reflect(
         feedback: None,
         reusable: experience_reusable(growth, outcome),
         sensitivity: vikram_evolution::Sensitivity::Private,
-        metadata: experience_metadata(&session.id, growth),
+        metadata: experience_metadata(&session.id, growth, request, corrections),
     };
     let proposals = {
         let engine = inner.learning.evolution.lock().recover();
@@ -734,7 +734,15 @@ fn record_and_reflect(
 
 // `Experience` has no dedicated verification field and the evolution crate is not ours to
 // extend, so the verdict rides in `metadata` — free-form JSON the store already round-trips.
-fn experience_metadata(session: &SessionId, growth: &TurnGrowth) -> serde_json::Value {
+// The same channel carries config-shaped signals (`config.model`, `config.context_window`,
+// ...) when the user's own words steer a presettable field, so `vikram presets suggest` has
+// a real producer instead of scanning for keys nothing writes.
+fn experience_metadata(
+    session: &SessionId,
+    growth: &TurnGrowth,
+    request: &str,
+    corrections: &[String],
+) -> serde_json::Value {
     let mut metadata = serde_json::json!({"session": session.as_str()});
     if let Some(verification) = &growth.verification {
         metadata["verification"] = match verification {
@@ -747,7 +755,439 @@ fn experience_metadata(session: &SessionId, growth: &TurnGrowth) -> serde_json::
             }),
         };
     }
+    let mut texts = Vec::with_capacity(corrections.len() + 1);
+    texts.push(request.to_owned());
+    texts.extend(corrections.iter().cloned());
+    let signals = config_signals(&texts);
+    if !signals.is_empty() {
+        metadata["config"] = serde_json::Value::Object(signals);
+    }
     metadata
+}
+
+/// Model-name prefixes a user instruction can point at. A token only counts when it also
+/// carries a digit (or a `/`-qualified suffix that does), so "use the cache" or "run
+/// node-20" never reads as a model.
+const MODEL_PREFIXES: &[&str] = &[
+    "gpt", "claude", "gemini", "llama", "mistral", "qwen", "deepseek", "grok", "phi", "command",
+    "o1", "o3", "o4",
+];
+
+/// Words that may sit between an intent verb and the model name: "switch to gpt-4o",
+/// "set the model to claude-sonnet-4".
+const MODEL_INTENT: &[&str] = &[
+    "use",
+    "using",
+    "switch",
+    "switched",
+    "switching",
+    "try",
+    "tried",
+    "run",
+    "call",
+    "with",
+    "on",
+];
+
+/// Negations that void a model signal. `ADJACENT` covers "not gpt-4o"; `BEFORE_VERB`
+/// covers "don't use gpt-4o" / "do not use gpt-4o" — but deliberately not bare "no",
+/// which is also the correction marker in "no, use gpt-4o".
+const NEGATION_ADJACENT: &[&str] = &["not", "no", "never", "none", "cannot", "cant"];
+const NEGATION_BEFORE_VERB: &[&str] = &[
+    "not",
+    "never",
+    "don't",
+    "dont",
+    "doesn't",
+    "doesnt",
+    "didn't",
+    "didnt",
+    "shouldn't",
+    "shouldnt",
+    "mustn't",
+    "mustnt",
+    "won't",
+    "wont",
+    "cannot",
+    "cant",
+];
+
+/// Provider names recognized when a correction says "<provider> provider" or names one
+/// after the word "provider".
+const PROVIDER_NAMES: &[&str] = &[
+    "openai",
+    "anthropic",
+    "openrouter",
+    "ollama",
+    "groq",
+    "together",
+    "fireworks",
+    "azure",
+    "bedrock",
+    "vertex",
+    "xai",
+    "google",
+    "lmstudio",
+    "local",
+    "deepseek",
+    "mistral",
+    "perplexity",
+    "cohere",
+];
+
+/// Filler allowed between a config keyword and its value: "model is gpt-4o",
+/// "provider should be openrouter".
+const VALUE_FILLER: &[&str] = &[
+    "to", "is", "be", "the", "a", "an", "as", "for", "should", "use", "using", "model",
+];
+
+/// Words that may sit between "context" and a size: "context window of about 200k".
+const CONTEXT_LINK: &[&str] = &[
+    "window",
+    "windows",
+    "size",
+    "of",
+    "to",
+    "the",
+    "a",
+    "an",
+    "is",
+    "be",
+    "at",
+    "around",
+    "about",
+    "roughly",
+    "approximately",
+    "approx",
+    "token",
+    "tokens",
+    "ctx",
+];
+
+/// Words that can never be a config value, so "provider is down" stays silent.
+const VALUE_STOPWORDS: &[&str] = &[
+    "the",
+    "a",
+    "an",
+    "to",
+    "and",
+    "or",
+    "not",
+    "no",
+    "is",
+    "was",
+    "were",
+    "be",
+    "been",
+    "use",
+    "using",
+    "used",
+    "with",
+    "for",
+    "in",
+    "on",
+    "of",
+    "that",
+    "this",
+    "it",
+    "as",
+    "at",
+    "by",
+    "from",
+    "into",
+    "please",
+    "should",
+    "would",
+    "could",
+    "will",
+    "can",
+    "do",
+    "does",
+    "did",
+    "have",
+    "has",
+    "had",
+    "if",
+    "then",
+    "than",
+    "but",
+    "so",
+    "such",
+    "yes",
+    "new",
+    "old",
+    "same",
+    "different",
+    "another",
+    "other",
+    "first",
+    "last",
+    "next",
+    "current",
+    "default",
+    "right",
+    "wrong",
+    "correct",
+    "actual",
+    "actually",
+    "just",
+    "only",
+    "also",
+    "too",
+    "very",
+    "much",
+    "many",
+    "more",
+    "most",
+    "some",
+    "any",
+    "each",
+    "every",
+    "all",
+    "both",
+    "own",
+    "down",
+    "up",
+    "broken",
+    "error",
+    "failed",
+    "failing",
+    "working",
+    "slow",
+    "fast",
+    "bad",
+    "good",
+    "off",
+    "on",
+];
+
+fn strip_token(token: &str) -> &str {
+    token.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/')))
+}
+
+fn word(token: &str) -> String {
+    strip_token(token).to_ascii_lowercase()
+}
+
+fn prefix_boundary(lower: &str, prefix: &str) -> bool {
+    lower.strip_prefix(prefix).is_some_and(|rest| {
+        rest.is_empty()
+            || rest.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '-' | '_' | '.' | '/'))
+    })
+}
+
+fn is_model_name(token: &str) -> bool {
+    let t = strip_token(token);
+    if let Some((_, suffix)) = t.rsplit_once('/')
+        && is_model_name(suffix)
+    {
+        return true;
+    }
+    let lower = t.to_ascii_lowercase();
+    t.len() <= 80
+        && t.chars().any(|c| c.is_ascii_digit())
+        && MODEL_PREFIXES.iter().any(|p| prefix_boundary(&lower, p))
+}
+
+fn is_provider_name(token: &str) -> bool {
+    let t = strip_token(token);
+    let lower = t.to_ascii_lowercase();
+    !t.is_empty()
+        && t.len() <= 40
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && t.chars().any(|c| c.is_ascii_alphabetic())
+        && !VALUE_STOPWORDS.contains(&lower.as_str())
+}
+
+fn is_provider_value(token: &str) -> bool {
+    let t = strip_token(token);
+    let lower = t.to_ascii_lowercase();
+    PROVIDER_NAMES.contains(&lower.as_str())
+        || (is_provider_name(t)
+            && t.chars()
+                .any(|c| c.is_ascii_digit() || matches!(c, '-' | '.' | '/')))
+}
+
+/// A context size in tokens: "200k", "128000", "1.5m" is not supported (digits only),
+/// "200kb"/"2mb" accepted. Anything under 1024 is not a plausible window.
+fn parse_context_size(token: &str) -> Option<u64> {
+    let lower = strip_token(token).to_ascii_lowercase();
+    let (digits, mult) = [
+        ("kb", 1_000u64),
+        ("mb", 1_000_000u64),
+        ("gb", 1_000_000_000u64),
+        ("k", 1_000u64),
+        ("m", 1_000_000u64),
+        ("g", 1_000_000_000u64),
+    ]
+    .iter()
+    .find_map(|(suffix, mult)| lower.strip_suffix(suffix).map(|d| (d, *mult)))
+    .unwrap_or((lower.as_str(), 1));
+    let n: u64 = digits.parse().ok()?;
+    let value = n.checked_mul(mult)?;
+    (value >= 1024).then_some(value)
+}
+
+/// Whether the model-name token at `i` is negated: "not gpt-4o" or
+/// "don't use gpt-4o" / "do not use gpt-4o". Bare "no" is not a negation here —
+/// it is the correction marker in "no, use gpt-4o".
+fn negated(words: &[String], i: usize) -> bool {
+    if i >= 1 && NEGATION_ADJACENT.contains(&words[i - 1].as_str()) {
+        return true;
+    }
+    i >= 2
+        && MODEL_INTENT.contains(&words[i - 1].as_str())
+        && NEGATION_BEFORE_VERB.contains(&words[i - 2].as_str())
+}
+
+/// Whether a model-name token at `i` follows an intent verb, possibly through
+/// "to"/"model": "use gpt-4o", "switch to gpt-4o", "set model to gpt-4o".
+fn model_intent(words: &[String], i: usize) -> bool {
+    if i == 0 {
+        return false;
+    }
+    let prev = words[i - 1].as_str();
+    if MODEL_INTENT.contains(&prev) || prev == "model" {
+        return true;
+    }
+    prev == "to"
+        && i >= 2
+        && (MODEL_INTENT.contains(&words[i - 2].as_str()) || words[i - 2] == "model")
+}
+
+/// First non-filler token after position `i`, if it satisfies `pred`. Filler is
+/// skipped at most 3 deep so "model is not gpt-4o" ("not" is not filler) stays silent.
+fn next_value<'a>(tokens: &[&'a str], i: usize, pred: impl Fn(&str) -> bool) -> Option<&'a str> {
+    for t in tokens.get(i + 1..)?.iter().take(3) {
+        let w = word(t);
+        if VALUE_FILLER.contains(&w.as_str()) {
+            continue;
+        }
+        return pred(t).then_some(*t);
+    }
+    None
+}
+
+fn plausible_value(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    !VALUE_STOPWORDS.contains(&lower.as_str())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+}
+
+fn insert_value_signal(
+    signals: &mut serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    raw: &str,
+) {
+    let value = strip_token(raw);
+    if value.is_empty() || value.len() > 120 || !plausible_value(value) {
+        return;
+    }
+    if field == "context_window" {
+        if let Some(n) = parse_context_size(value) {
+            signals
+                .entry(field.to_owned())
+                .or_insert_with(|| serde_json::json!(n));
+        }
+        return;
+    }
+    signals
+        .entry(field.to_owned())
+        .or_insert_with(|| serde_json::Value::String(value.to_owned()));
+}
+
+fn scan_config_text(text: &str, signals: &mut serde_json::Map<String, serde_json::Value>) {
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    let words: Vec<String> = tokens.iter().map(|t| word(t)).collect();
+    for (i, raw) in tokens.iter().enumerate() {
+        if let Some((key, value)) = raw.split_once('=') {
+            let field = word(key).replace('-', "_");
+            if matches!(
+                field.as_str(),
+                "model" | "provider" | "fallback_model" | "context_window"
+            ) {
+                insert_value_signal(signals, &field, value);
+            }
+            continue;
+        }
+        let w = words[i].as_str();
+        match w {
+            "model" | "models" => {
+                if let Some(v) = next_value(&tokens, i, is_model_name) {
+                    insert_value_signal(signals, "model", v);
+                }
+            }
+            "provider" | "providers" => {
+                if let Some(v) = next_value(&tokens, i, is_provider_value) {
+                    insert_value_signal(signals, "provider", v);
+                }
+            }
+            "fallback" | "fallback_model" | "fallback-model" => {
+                if negated(&words, i) {
+                    continue;
+                }
+                if let Some(v) =
+                    next_value(&tokens, i, |t| is_model_name(t) || is_provider_value(t))
+                {
+                    insert_value_signal(signals, "fallback_model", v);
+                }
+            }
+            "context" | "context_window" | "context-window" => {
+                let mut found = None;
+                for t in tokens.get(i + 1..).unwrap_or(&[]).iter().take(5) {
+                    if let Some(n) = parse_context_size(t) {
+                        found = Some(n);
+                        break;
+                    }
+                    if !CONTEXT_LINK.contains(&word(t).as_str()) {
+                        break;
+                    }
+                }
+                if found.is_none()
+                    && i > 0
+                    // "don't use 200k context" is a negation, not a size request.
+                    && !(i >= 3
+                        && MODEL_INTENT.contains(&words[i - 2].as_str())
+                        && NEGATION_BEFORE_VERB.contains(&words[i - 3].as_str()))
+                    && let Some(t) = tokens.get(i - 1)
+                {
+                    found = parse_context_size(t);
+                }
+                if let Some(n) = found {
+                    signals
+                        .entry("context_window".to_owned())
+                        .or_insert_with(|| serde_json::json!(n));
+                }
+            }
+            _ => {
+                if PROVIDER_NAMES.contains(&w)
+                    && tokens.get(i + 1).is_some_and(|t| word(t) == "provider")
+                    && !negated(&words, i)
+                {
+                    insert_value_signal(signals, "provider", raw);
+                }
+                if is_model_name(raw) && model_intent(&words, i) && !negated(&words, i) {
+                    insert_value_signal(signals, "model", raw);
+                }
+            }
+        }
+    }
+}
+
+/// Config-shaped signals (`model`, `provider`, `fallback_model`, `context_window`) a
+/// piece of user text carries, as a JSON object `vikram presets suggest` can pick up
+/// from experience metadata. Only unambiguous intents emit: a model-name token after
+/// a use/switch verb, a config keyword followed by a plausible value, or an explicit
+/// `field=value` pair. Anything else stays silent.
+pub fn config_signals(texts: &[String]) -> serde_json::Map<String, serde_json::Value> {
+    let mut signals = serde_json::Map::new();
+    for text in texts {
+        scan_config_text(text, &mut signals);
+    }
+    signals
 }
 
 /// The coarse outcome the experience records: a failed turn is a failure, a turn whose tools
@@ -830,6 +1270,9 @@ pub(crate) fn apply_or_stage(
     }
     if policy != LearningPolicy::Auto {
         proposal.status = "pending".to_owned();
+        if proposal.kind == "skill" {
+            request_skill_approval(inner, &proposal);
+        }
         inner.learning.surface.stage_proposal(proposal.clone());
         audit(inner, &proposal, "staged", &proposal.reason.clone());
         inner.learning.surface.save();
@@ -863,6 +1306,51 @@ pub(crate) fn apply_or_stage(
         &outcome,
     );
     inner.learning.surface.save();
+}
+
+/// A staged skill proposal is a pending capability change, so it also lands on the
+/// autonomy approval queue where `vikram evolution approvals` lists it and
+/// `approve`/`reject` record a durable decision. This is a second record of the same
+/// pending change, not a second executor: the learning proposal remains the gate that
+/// performs the write (`vikram learning approve`), while the autonomy request is the
+/// capability-change ledger — rejecting it tells the operator the change should not
+/// proceed even though the staged proposal still exists. One request per proposal:
+/// a pending request already naming this proposal id is reused, not duplicated.
+/// Auto-policy skill proposals skip this entirely — the operator already chose to let
+/// the runtime apply them without a per-change decision.
+fn request_skill_approval(inner: &Arc<crate::runtime::RuntimeInner>, proposal: &LearningProposal) {
+    let mut engine = inner
+        .learning
+        .evolution
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let already_pending = engine.autonomy.get_pending_approvals().iter().any(|r| {
+        r.status == vikram_evolution::autonomy::ApprovalStatus::Pending
+            && r.reason.contains(&proposal.id)
+    });
+    if already_pending {
+        return;
+    }
+    // Create and patch both rewrite what the agent can do, so both are ModifySkill;
+    // the proposal's action is already named in the description.
+    let action = vikram_evolution::ActionType::ModifySkill;
+    let description = format!(
+        "skill {} {}: {}",
+        proposal.action,
+        proposal.target,
+        proposal.reason.trim()
+    );
+    let reason = format!(
+        "learning proposal {} staged under the skill {} policy",
+        proposal.id,
+        inner.learning.surface.policy_skill().as_str()
+    );
+    if let Err(err) = engine
+        .autonomy
+        .request_approval(action, &description, &reason)
+    {
+        eprintln!("vikram: could not record autonomy approval for skill proposal: {err}");
+    }
 }
 
 /// Memory writes land in the session's own scope: automatic recall only reads `global` +
@@ -1278,6 +1766,87 @@ mod tests {
         assert!(found[0].chars().count() <= MAX_CORRECTION_LEN);
     }
 
+    fn signals_of(texts: &[&str]) -> serde_json::Map<String, serde_json::Value> {
+        let owned: Vec<String> = texts.iter().map(|s| s.to_string()).collect();
+        config_signals(&owned)
+    }
+
+    #[test]
+    fn a_correction_naming_a_model_emits_a_config_signal() {
+        let signals = signals_of(&["no, use gpt-4o instead of gpt-3.5"]);
+        assert_eq!(signals["model"], "gpt-4o");
+        assert!(signals.get("provider").is_none());
+    }
+
+    #[test]
+    fn config_signals_cover_model_provider_fallback_and_context() {
+        let signals = signals_of(&[
+            "no, the model should be claude-sonnet-4",
+            "actually, switch the provider to openrouter",
+            "i meant fallback model to gpt-4o-mini",
+            "no, the context window of 200k was too small",
+        ]);
+        assert_eq!(signals["model"], "claude-sonnet-4");
+        assert_eq!(signals["provider"], "openrouter");
+        assert_eq!(signals["fallback_model"], "gpt-4o-mini");
+        assert_eq!(signals["context_window"], serde_json::json!(200000));
+    }
+
+    #[test]
+    fn config_signals_read_key_value_and_bare_model_forms() {
+        let signals = signals_of(&[
+            "please set model=gpt-4o in the config",
+            "use llama3.1-8b for this repo",
+            "context_window=131072",
+        ]);
+        assert_eq!(signals["model"], "gpt-4o");
+        assert_eq!(signals["context_window"], serde_json::json!(131072));
+        // "llama3.1-8b" also matches, but the first observed value wins.
+        assert!(signals.contains_key("model"));
+    }
+
+    #[test]
+    fn config_signals_stay_silent_without_a_real_intent() {
+        for text in [
+            "no, use pnpm not npm",
+            "actually, the endpoint is /v2",
+            "that's wrong — it should have used the cache",
+            "no, don't use gpt-4o for this",
+            "the provider is down",
+            "model is not gpt-4o",
+            "what does gpt-4o cost?",
+            "run node-20 tests",
+            "no, increase the context a bit",
+        ] {
+            let signals = signals_of(&[text]);
+            assert!(
+                signals.is_empty(),
+                "{text:?} must not emit config signals, got {signals:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn experience_metadata_carries_config_signals_for_preset_suggest() {
+        let corrections = detect_corrections("no, use gpt-4o instead");
+        let metadata = experience_metadata(
+            &session(),
+            &TurnGrowth::default(),
+            "summarize this file",
+            &corrections,
+        );
+        assert_eq!(metadata["config"]["model"], "gpt-4o");
+
+        // The same correction in the request itself is also a signal.
+        let metadata = experience_metadata(
+            &session(),
+            &TurnGrowth::default(),
+            "use claude-sonnet-4 for the review",
+            &[],
+        );
+        assert_eq!(metadata["config"]["model"], "claude-sonnet-4");
+    }
+
     #[test]
     fn approved_memory_scope_is_one_recall_reads() {
         let s = session();
@@ -1531,14 +2100,15 @@ mod tests {
     #[test]
     fn verification_metadata_carries_the_verdict() {
         let failed = verify_growth("verify: FAIL step=test kind=lint_failure", false);
-        let metadata = experience_metadata(&session(), &failed);
+        let metadata = experience_metadata(&session(), &failed, "fix the build", &[]);
         assert_eq!(metadata["verification"]["passed"], false);
         assert_eq!(metadata["verification"]["step"], "test");
         assert_eq!(metadata["verification"]["kind"], "lint_failure");
 
         let clean = TurnGrowth::default();
-        let metadata = experience_metadata(&session(), &clean);
+        let metadata = experience_metadata(&session(), &clean, "hello", &[]);
         assert!(metadata.get("verification").is_none());
+        assert!(metadata.get("config").is_none());
     }
 
     #[test]
@@ -1559,7 +2129,7 @@ mod tests {
             feedback: None,
             reusable: experience_reusable(&growth, crate::types::TurnState::Idle),
             sensitivity: vikram_evolution::Sensitivity::Private,
-            metadata: experience_metadata(&session(), &growth),
+            metadata: experience_metadata(&session(), &growth, "fix the build", &[]),
         };
         let proposals = vikram_evolution::HeuristicReflector
             .reflect(&experience)
@@ -1591,7 +2161,7 @@ mod tests {
             feedback: None,
             reusable: experience_reusable(&growth, crate::types::TurnState::Idle),
             sensitivity: vikram_evolution::Sensitivity::Private,
-            metadata: experience_metadata(&session(), &growth),
+            metadata: experience_metadata(&session(), &growth, "add the endpoint", &[]),
         };
         let proposals = vikram_evolution::HeuristicReflector
             .reflect(&experience)
@@ -1602,5 +2172,158 @@ mod tests {
                 .any(|p| p.kind == vikram_evolution::ProposalKind::CreateSkill),
             "a verified reusable turn should earn a skill candidate, got {proposals:?}"
         );
+    }
+
+    /// Boot a real runtime against a temp home so `apply_or_stage` has a genuine
+    /// `RuntimeInner` (evolution store + learning surface). The env guard is
+    /// process-global, so it is held for the whole test.
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "isolated_home guards process-global env vars; releasing it at an await would let a concurrent test repoint VIKRAM_HOME mid-run"
+    )]
+    async fn test_runtime(
+        dir: &std::path::Path,
+    ) -> (crate::Runtime, std::sync::MutexGuard<'static, ()>) {
+        let guard = crate::config::lock_security_env();
+        unsafe { std::env::set_var("VIKRAM_HOME", dir.join("home")) };
+        let config = crate::config::Config {
+            model: "test-model".into(),
+            workspace_root: Some(dir.to_path_buf()),
+            ..Default::default()
+        };
+        let runtime = crate::Runtime::start(config).await.unwrap();
+        (runtime, guard)
+    }
+
+    fn pending_autonomy_requests(
+        inner: &Arc<crate::runtime::RuntimeInner>,
+    ) -> Vec<vikram_evolution::autonomy::ApprovalRequest> {
+        inner
+            .learning
+            .evolution
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .autonomy
+            .get_pending_approvals()
+            .iter()
+            .filter(|r| r.status == vikram_evolution::autonomy::ApprovalStatus::Pending)
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_staged_skill_proposal_creates_an_autonomy_approval_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, _guard) = test_runtime(dir.path()).await;
+        let inner = runtime.handle().inner.clone();
+        inner
+            .learning
+            .surface
+            .set_policy_skill(LearningPolicy::ApprovalRequired);
+        inner
+            .learning
+            .surface
+            .set_policy_memory(LearningPolicy::Disabled);
+
+        let proposal = surface_proposal("skill", "create", "audit-flow");
+        apply_or_stage(&inner, proposal.clone());
+
+        let pending = pending_autonomy_requests(&inner);
+        assert_eq!(pending.len(), 1, "one staged skill change, one request");
+        assert_eq!(
+            pending[0].action_type,
+            vikram_evolution::ActionType::ModifySkill
+        );
+        assert_eq!(
+            pending[0].risk_level,
+            vikram_evolution::AutonomyLevel::ControlledDevelopment
+        );
+        assert!(
+            pending[0].reason.contains(&proposal.id),
+            "the request must name the learning proposal it records: {}",
+            pending[0].reason
+        );
+
+        // The learning flow is untouched: the proposal is still the pending gate.
+        assert_eq!(
+            inner
+                .learning
+                .surface
+                .find_proposal(&proposal.id)
+                .unwrap()
+                .status,
+            "pending"
+        );
+
+        // Deciding it through the autonomy surface does not apply or drop the
+        // learning proposal — the two records stay independent.
+        inner
+            .learning
+            .evolution
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .autonomy
+            .approve_request(&pending[0].id, "tester")
+            .unwrap();
+        assert_eq!(
+            inner
+                .learning
+                .surface
+                .find_proposal(&proposal.id)
+                .unwrap()
+                .status,
+            "pending"
+        );
+        assert!(pending_autonomy_requests(&inner).is_empty());
+    }
+
+    #[tokio::test]
+    async fn restaging_the_same_skill_proposal_does_not_duplicate_the_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, _guard) = test_runtime(dir.path()).await;
+        let inner = runtime.handle().inner.clone();
+        inner
+            .learning
+            .surface
+            .set_policy_skill(LearningPolicy::ApprovalRequired);
+        inner
+            .learning
+            .surface
+            .set_policy_memory(LearningPolicy::Disabled);
+
+        let proposal = surface_proposal("skill", "patch", "audit-flow");
+        apply_or_stage(&inner, proposal.clone());
+        apply_or_stage(&inner, proposal);
+
+        assert_eq!(pending_autonomy_requests(&inner).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_skill_proposals_and_auto_policy_create_no_autonomy_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, _guard) = test_runtime(dir.path()).await;
+        let inner = runtime.handle().inner.clone();
+        inner
+            .learning
+            .surface
+            .set_policy_skill(LearningPolicy::ApprovalRequired);
+        inner
+            .learning
+            .surface
+            .set_policy_memory(LearningPolicy::ApprovalRequired);
+
+        // A staged memory proposal is not a capability change: no autonomy request.
+        apply_or_stage(&inner, surface_proposal("memory", "add", "user"));
+        assert!(pending_autonomy_requests(&inner).is_empty());
+
+        // Auto policy means the operator already chose unattended application:
+        // staging never happens, so there is nothing to approve. (The apply may
+        // fail on this test's empty skills root — either way no request exists.)
+        inner
+            .learning
+            .surface
+            .set_policy_skill(LearningPolicy::Auto);
+        apply_or_stage(&inner, surface_proposal("skill", "create", "auto-skill"));
+        assert!(pending_autonomy_requests(&inner).is_empty());
     }
 }
