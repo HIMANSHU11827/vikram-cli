@@ -3235,6 +3235,7 @@ name = "vikram-acp"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "portable-pty",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

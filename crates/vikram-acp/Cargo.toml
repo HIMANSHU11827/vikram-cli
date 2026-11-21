@@ -11,3 +11,4 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
+portable-pty = "0.9"

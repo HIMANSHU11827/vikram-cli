@@ -5,18 +5,19 @@
 //! `session/request_permission`, `fs/read_text_file`, and `fs/write_text_file` for real,
 //! confined to a workspace root. The `terminal/*` methods stay `-32601` unless the handler is
 //! built with [`WorkspaceAgentRequestHandler::with_terminal_support`]; those terminals are
-//! pipe-backed (no PTY) and `cwd`-confined, so programs that require a controlling terminal
-//! will not behave correctly.
+//! real PTYs (portable-pty) and `cwd`-confined. ACP has no terminal-stdin method, so there is
+//! no way to feed a running program input after `terminal/create`.
 //!
 //! ACP connects a *client* (IDE/host) to an *agent* (Vikram or another compatible agent).
 //! It is distinct from MCP (agent↔tools) and A2A (agent↔agent).
 
+use portable_pty::{Child as PtyChild, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -372,6 +373,10 @@ const MAX_TERMINAL_OUTPUT: usize = 1024 * 1024;
 /// Per-call `terminal/output` byte limit when the agent does not send `outputByteLimit`.
 const DEFAULT_OUTPUT_LIMIT: usize = 256 * 1024;
 
+/// PTY window size for `terminal/create`; the ACP terminal API has no cols/rows fields.
+const TERMINAL_PTY_COLS: u16 = 80;
+const TERMINAL_PTY_ROWS: u16 = 24;
+
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 fn request_denied(message: &str) -> JsonRpcError {
@@ -387,11 +392,14 @@ fn request_denied(message: &str) -> JsonRpcError {
 pub type PermissionDecider =
     Box<dyn Fn(&RequestPermissionParams) -> RequestPermissionResult + Send + Sync>;
 
-/// A live `terminal/*` session: a shell command with piped stdout/stderr. There is no PTY —
-/// `cols`/`rows` do not exist in the ACP terminal API and stdin is `/dev/null` because ACP
-/// has no terminal-stdin method — so interactive programs are not supported.
+/// A live `terminal/*` session: a command running under a real PTY. `_master` and `_writer`
+/// are never read directly — they must simply stay alive: dropping the master hangs up the
+/// pty and dropping the writer sends EOF to the slave. There is no ACP method that writes to
+/// a terminal's stdin, so `_writer` is kept only to avoid that EOF.
 struct TerminalState {
-    child: Child,
+    _master: Box<dyn MasterPty + Send>,
+    _writer: Box<dyn Write + Send>,
+    child: Box<dyn PtyChild + Send + Sync>,
     output: Arc<Mutex<OutputBuffer>>,
     exit: Option<TerminalExitStatus>,
     /// Absolute offset of the next byte `terminal/output` has not yet returned.
@@ -407,7 +415,7 @@ struct OutputBuffer {
     base: u64,
 }
 
-fn terminal_shell_command(command: &str) -> Command {
+fn terminal_shell_command(command: &str) -> CommandBuilder {
     #[cfg(windows)]
     {
         let comspec = std::env::var("COMSPEC")
@@ -415,8 +423,9 @@ fn terminal_shell_command(command: &str) -> Command {
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "cmd".to_owned());
-        let mut cmd = Command::new(comspec);
-        cmd.args(["/C", command]);
+        let mut cmd = CommandBuilder::new(comspec);
+        cmd.arg("/C");
+        cmd.arg(command);
         cmd
     }
     #[cfg(not(windows))]
@@ -426,13 +435,14 @@ fn terminal_shell_command(command: &str) -> Command {
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "sh".to_owned());
-        let mut cmd = Command::new(shell);
-        cmd.args(["-c", command]);
+        let mut cmd = CommandBuilder::new(shell);
+        cmd.arg("-c");
+        cmd.arg(command);
         cmd
     }
 }
 
-/// Drain a pipe into the shared output buffer, dropping the oldest bytes past the cap.
+/// Drain a pty output stream into the shared buffer, dropping the oldest bytes past the cap.
 fn pump_terminal_output<R: Read + Send + 'static>(mut reader: R, output: Arc<Mutex<OutputBuffer>>) {
     std::thread::spawn(move || {
         let mut chunk = [0u8; 8192];
@@ -454,38 +464,16 @@ fn pump_terminal_output<R: Read + Send + 'static>(mut reader: R, output: Arc<Mut
     });
 }
 
-/// Signal numbers that mean the same thing on Linux and the BSDs/macOS; anything else is
-/// reported as `None` rather than guessed.
-#[cfg(unix)]
-fn unix_signal_name(status: ExitStatus) -> Option<String> {
-    use std::os::unix::process::ExitStatusExt;
-    let name = match status.signal()? {
-        1 => "SIGHUP",
-        2 => "SIGINT",
-        3 => "SIGQUIT",
-        4 => "SIGILL",
-        5 => "SIGTRAP",
-        6 => "SIGABRT",
-        8 => "SIGFPE",
-        9 => "SIGKILL",
-        11 => "SIGSEGV",
-        13 => "SIGPIPE",
-        14 => "SIGALRM",
-        15 => "SIGTERM",
-        _ => return None,
-    };
-    Some(name.to_string())
-}
-
-#[cfg(not(unix))]
-fn unix_signal_name(_status: ExitStatus) -> Option<String> {
-    None
-}
-
-fn exit_status(status: ExitStatus) -> TerminalExitStatus {
+/// portable-pty reports the signal name from `strsignal` (e.g. "Hangup", "Killed") rather
+/// than the `SIG*` constant name; pass it through verbatim rather than guess a mapping.
+fn pty_exit_status(status: portable_pty::ExitStatus) -> TerminalExitStatus {
     TerminalExitStatus {
-        exit_code: status.code(),
-        signal: unix_signal_name(status),
+        exit_code: if status.signal().is_some() {
+            None
+        } else {
+            Some(status.exit_code() as i32)
+        },
+        signal: status.signal().map(str::to_string),
     }
 }
 
@@ -535,7 +523,8 @@ impl WorkspaceAgentRequestHandler {
 
     /// Enable the `terminal/*` agent→client methods. Off by default — enabling is the host's
     /// policy decision, since `terminal/create` runs an arbitrary command line. Terminals are
-    /// pipe-backed, not PTYs, and `cwd` is confined to the workspace root.
+    /// real PTYs (default size 80x24; the ACP API carries no cols/rows), and `cwd` is confined
+    /// to the workspace root.
     pub fn with_terminal_support(mut self) -> Self {
         self.terminal_support = true;
         self
@@ -564,7 +553,7 @@ impl WorkspaceAgentRequestHandler {
         }
         match state.child.try_wait() {
             Ok(Some(status)) => {
-                state.exit = Some(exit_status(status));
+                state.exit = Some(pty_exit_status(status));
                 Ok(())
             }
             Ok(None) => Ok(()),
@@ -663,26 +652,36 @@ impl AgentRequestHandler for WorkspaceAgentRequestHandler {
         }
 
         let mut cmd = terminal_shell_command(params.command.trim());
-        cmd.current_dir(&cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.env("TERM", "xterm-256color");
+        cmd.cwd(cwd.as_path());
         for var in params.env.unwrap_or_default() {
             cmd.env(var.name, var.value);
         }
-        let mut child = cmd
-            .spawn()
+
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: TERMINAL_PTY_ROWS,
+                cols: TERMINAL_PTY_COLS,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| internal_error(&format!("cannot open terminal pty: {e}")))?;
+        let child = pair
+            .slave
+            .spawn_command(cmd)
             .map_err(|e| internal_error(&format!("cannot spawn terminal: {e}")))?;
-        let pipes = child.stdout.take().zip(child.stderr.take());
-        let Some((stdout, stderr)) = pipes else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(internal_error("terminal pipes unavailable"));
-        };
+        drop(pair.slave);
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| internal_error(&format!("cannot read terminal pty: {e}")))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|e| internal_error(&format!("cannot write terminal pty: {e}")))?;
 
         let output = Arc::new(Mutex::new(OutputBuffer::default()));
-        pump_terminal_output(stdout, Arc::clone(&output));
-        pump_terminal_output(stderr, Arc::clone(&output));
+        pump_terminal_output(reader, Arc::clone(&output));
 
         let id = format!(
             "term-{}-{}",
@@ -690,6 +689,8 @@ impl AgentRequestHandler for WorkspaceAgentRequestHandler {
             self.terminal_seq.fetch_add(1, Ordering::Relaxed)
         );
         let state = Arc::new(Mutex::new(TerminalState {
+            _master: pair.master,
+            _writer: writer,
             child,
             output,
             exit: None,
@@ -802,7 +803,7 @@ impl AgentRequestHandler for WorkspaceAgentRequestHandler {
             // records the real exit status either way.
             let _ = st.child.kill();
             match st.child.wait() {
-                Ok(status) => st.exit = Some(exit_status(status)),
+                Ok(status) => st.exit = Some(pty_exit_status(status)),
                 Err(e) => return Err(internal_error(&format!("cannot reap terminal: {e}"))),
             }
         }
@@ -1897,7 +1898,114 @@ mod tests {
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
         assert_eq!(result["exitCode"], serde_json::Value::Null);
-        assert_eq!(result["signal"], serde_json::json!("SIGKILL"));
+        // portable-pty reports the strsignal name (e.g. "Hangup"/"Killed"), not "SIGKILL".
+        assert!(result["signal"].is_string());
+    }
+
+    /// Poll `terminal/output` until `needle` appears or the deadline passes; returns the
+    /// accumulated output.
+    fn poll_terminal_output(
+        handler: &WorkspaceAgentRequestHandler,
+        terminal_id: &str,
+        needle: &str,
+    ) -> String {
+        let mut output = String::new();
+        for _ in 0..200 {
+            let resp = terminal_request(
+                handler,
+                2,
+                "terminal/output",
+                &format!(r#"{{"sessionId":"s","terminalId":"{terminal_id}"}}"#),
+            );
+            assert!(resp.error.is_none());
+            let result = resp.result.unwrap();
+            output.push_str(result["output"].as_str().unwrap());
+            if output.contains(needle) || result.get("exitStatus").is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        output
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_create_runs_command_on_a_real_pty() {
+        let (_dir, handler) = terminal_handler();
+        let resp = terminal_request(
+            &handler,
+            1,
+            "terminal/create",
+            r#"{"sessionId":"s","command":"test -t 0 && test -t 1 && echo pty-ok"}"#,
+        );
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let terminal_id = resp.result.unwrap()["terminalId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let output = poll_terminal_output(&handler, &terminal_id, "pty-ok");
+        assert!(output.contains("pty-ok"), "output was {output:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_create_applies_pty_window_size() {
+        let (_dir, handler) = terminal_handler();
+        let resp = terminal_request(
+            &handler,
+            1,
+            "terminal/create",
+            r#"{"sessionId":"s","command":"stty size"}"#,
+        );
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let terminal_id = resp.result.unwrap()["terminalId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let output = poll_terminal_output(&handler, &terminal_id, "24 80");
+        assert!(output.contains("24 80"), "output was {output:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_pty_accepts_stdin_written_to_the_master() {
+        // ACP has no terminal-stdin method, so this exercises the pty writer directly:
+        // `cat` proves bytes written to the master come back through the slave.
+        let (_dir, handler) = terminal_handler();
+        let resp = terminal_request(
+            &handler,
+            1,
+            "terminal/create",
+            r#"{"sessionId":"s","command":"cat"}"#,
+        );
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let terminal_id = resp.result.unwrap()["terminalId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        {
+            let state = handler
+                .terminals
+                .lock()
+                .unwrap()
+                .get(&terminal_id)
+                .cloned()
+                .unwrap();
+            let mut st = state.lock().unwrap();
+            st._writer.write_all(b"vikram-cat-marker\n").unwrap();
+            st._writer.flush().unwrap();
+        }
+        let output = poll_terminal_output(&handler, &terminal_id, "vikram-cat-marker");
+        assert!(
+            output.contains("vikram-cat-marker"),
+            "output was {output:?}"
+        );
+        terminal_request(
+            &handler,
+            3,
+            "terminal/kill",
+            &format!(r#"{{"sessionId":"s","terminalId":"{terminal_id}"}}"#),
+        );
     }
 
     #[test]

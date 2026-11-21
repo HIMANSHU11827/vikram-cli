@@ -11,6 +11,10 @@ const MAX_POLL_OPTIONS: usize = 10;
 /// [`MAX_TOOL_OUTPUT`] so truncation can never cut the JSON in half.
 const MAX_POLL_QUESTION: usize = 500;
 
+/// Largest serialized card payload the marker line will carry; same [`MAX_TOOL_OUTPUT`] budget
+/// as the poll marker, with headroom for the prefix and the trailing summary line.
+const MAX_CARD_BYTES: usize = 16_000;
+
 /// `message.poll` asks the chat a question with tappable answers. The tool itself only emits the
 /// `POLL:{...}` marker line the gateway parses out of the committed tool result and delivers as
 /// an outbound poll verb; like `ask_user`, the permission shape is a read of the conversation,
@@ -96,6 +100,66 @@ impl Tool for MessagePoll {
             serde_json::to_string(&marker).expect("poll marker serializes"),
             options.len()
         );
+        Ok(ToolOutput { content, ok: true })
+    }
+}
+
+/// `message.card` posts a provider-native rich card to the chat. The tool only emits the
+/// `CARD:{...}` marker line the gateway parses out of the committed tool result and delivers as
+/// an outbound card verb; the card schema itself is adapter-defined (Slack Block Kit `blocks`,
+/// Teams adaptive card, Google Chat `cardsV2`, …) and passed through untouched, so the model must
+/// shape `card` for the platform it is talking to. Like `message.poll`, the permission shape is
+/// a read of the conversation, not a mutation of the workspace.
+pub(crate) struct MessageCard;
+
+impl Tool for MessageCard {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "message.card".into(),
+            description: "Post a rich card to the chat; `card` is the provider-native JSON payload (schema is platform-defined, e.g. Slack blocks or a Teams adaptive card).".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "card": {"type": "object", "description": "the provider-native card JSON; its schema is defined by the chat platform's adapter"}
+                },
+                "required": ["card"]
+            }),
+        }
+    }
+
+    fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError> {
+        let target = args
+            .get("card")
+            .and_then(|card| card.get("title"))
+            .and_then(Value::as_str)
+            .unwrap_or("card");
+        Ok(PermissionRequest::new(
+            ActionKind::Read,
+            "message.card",
+            target,
+            SideEffect::None,
+            Trust::Model,
+        ))
+    }
+
+    fn run(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+        let card = args.get("card").ok_or_else(|| {
+            VikramError::ProviderRejected("missing object argument `card`".to_owned())
+        })?;
+        if !card.is_object() || card.as_object().is_some_and(|map| map.is_empty()) {
+            return Err(VikramError::ProviderRejected(
+                "`card` must be a non-empty JSON object".to_owned(),
+            ));
+        }
+        // The marker line must stay a single line of compact JSON under MAX_TOOL_OUTPUT;
+        // serde_json escapes any newline or quote inside the payload so `CARD:` never splits.
+        let body = serde_json::to_string(card).expect("card payload serializes");
+        if body.len() > MAX_CARD_BYTES {
+            return Err(VikramError::ProviderRejected(format!(
+                "`card` is capped at {MAX_CARD_BYTES} bytes of JSON"
+            )));
+        }
+        let content = format!("CARD:{body}\nCard sent.");
         Ok(ToolOutput { content, ok: true })
     }
 }
@@ -230,5 +294,74 @@ mod tests {
             registry.get("message.poll").unwrap().spec().name,
             "message.poll"
         );
+    }
+
+    #[test]
+    fn card_emits_a_marker_line_carrying_the_payload_verbatim() {
+        let card = json!({
+            "type": "AdaptiveCard",
+            "body": [{"type": "TextBlock", "text": "Deploy finished"}]
+        });
+        let out = MessageCard
+            .run(&json!({"card": card.clone()}), &ctx())
+            .unwrap();
+        assert!(out.ok);
+        let marker = out
+            .content
+            .lines()
+            .next()
+            .expect("marker is the first line");
+        assert!(marker.starts_with("CARD:{"), "{marker}");
+        let body: Value = serde_json::from_str(marker.trim_start_matches("CARD:")).unwrap();
+        assert_eq!(body, card);
+    }
+
+    #[test]
+    fn card_rejects_missing_empty_and_non_object_payloads() {
+        for args in [
+            json!({}),
+            json!({"card": {}}),
+            json!({"card": []}),
+            json!({"card": "blocks"}),
+            json!({"card": 42}),
+            json!({"card": null}),
+        ] {
+            assert!(
+                MessageCard.run(&args, &ctx()).is_err(),
+                "{args} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn card_payload_is_capped_under_the_tool_output_budget() {
+        let huge = json!({"pad": "x".repeat(MAX_CARD_BYTES)});
+        assert!(MessageCard.run(&json!({"card": huge}), &ctx()).is_err());
+        let fits = json!({"pad": "x".repeat(MAX_CARD_BYTES - 32)});
+        let out = MessageCard.run(&json!({"card": fits}), &ctx()).unwrap();
+        assert!(out.ok);
+        // The whole first line — prefix plus compact JSON — stays far under MAX_TOOL_OUTPUT.
+        let marker = out.content.lines().next().unwrap();
+        assert!(marker.len() < MAX_TOOL_OUTPUT, "{}", marker.len());
+        let kept = truncated(out.content);
+        let kept_marker = kept.lines().next().unwrap();
+        assert!(
+            serde_json::from_str::<Value>(kept_marker.trim_start_matches("CARD:")).is_ok(),
+            "truncation must not be able to split the marker"
+        );
+    }
+
+    #[test]
+    fn card_permission_matches_poll_shape() {
+        let req = MessageCard
+            .permission(&json!({"card": {"title": "Deploy status"}}))
+            .unwrap();
+        assert_eq!(req.action, ActionKind::Read);
+        assert_eq!(req.verb, "message.card");
+        assert_eq!(req.resource, "Deploy status");
+        assert_eq!(req.side_effect, SideEffect::None);
+        assert_eq!(req.originating_trust, Trust::Model);
+        let req = MessageCard.permission(&json!({})).unwrap();
+        assert_eq!(req.resource, "card");
     }
 }

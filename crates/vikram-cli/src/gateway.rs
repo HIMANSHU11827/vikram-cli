@@ -1426,6 +1426,19 @@ const POLL_MARKER_PREFIX: &str = "POLL:";
 /// One turn carries at most this many polls; a flooded tool batch must not spam the chat.
 const MAX_TURN_POLLS: usize = 4;
 
+/// The line a chat-facing tool ends its output with to ask the reply to carry a native card:
+/// `CARD:{...}` on its own line. The payload is already the shape [`OutboundVerb::Card`] sends —
+/// provider-native JSON passed through untouched — so, like the poll marker, the tool result
+/// message itself is the carrier and no contract block type is needed.
+const CARD_MARKER_PREFIX: &str = "CARD:";
+
+/// One turn carries at most this many cards; same flood guard as [`MAX_TURN_POLLS`].
+const MAX_TURN_CARDS: usize = 4;
+
+/// Longest `CARD:` payload the gateway will deliver. The marker must stay a single line, so the
+/// cap is on the raw JSON text, not the parsed value.
+const MAX_CARD_MARKER_BYTES: usize = 16_000;
+
 /// The JSON body of a [`POLL_MARKER_PREFIX`] line.
 #[derive(serde::Deserialize)]
 struct PollMarker {
@@ -1440,6 +1453,13 @@ struct PollMarker {
 /// is emitting the marker.
 fn poll_marker_tool(name: &str) -> bool {
     name.starts_with("mcp.") || name == "plugin.execute" || name == "message.poll"
+}
+
+/// Whether a tool's output may raise a card. Same deliberate-marker rule as
+/// [`poll_marker_tool`]: operator-installed code and `message.card`, the builtin whose entire
+/// purpose is emitting the marker.
+fn card_marker_tool(name: &str) -> bool {
+    name.starts_with("mcp.") || name == "plugin.execute" || name == "message.card"
 }
 
 /// Every well-formed `POLL:` line in a tool result, as `(question, options)`. A line whose JSON
@@ -1474,17 +1494,41 @@ fn poll_markers(content: &str) -> Vec<(String, Vec<String>)> {
     polls
 }
 
-/// The polls a turn's committed messages asked the gateway to send. Assistant messages carry
-/// the `ToolCall` blocks naming each call; tool messages carry the `ToolResult` content the
-/// marker rides in. Both arrive through `MessageCommitted` call-then-result, so the name map
-/// is always populated before the result that needs it.
-#[derive(Default)]
-struct TurnPolls {
-    names: HashMap<ToolCallId, String>,
-    polls: Vec<(String, Vec<String>)>,
+/// Every well-formed `CARD:` line in a tool result, as the card payload. A line whose JSON is
+/// not an object — or is too large to have come from a marker — is skipped rather than pushed
+/// onto a platform that would refuse it anyway.
+fn card_markers(content: &str) -> Vec<serde_json::Value> {
+    let mut cards = Vec::new();
+    for line in content.lines() {
+        let Some(raw) = line.strip_prefix(CARD_MARKER_PREFIX) else {
+            continue;
+        };
+        let raw = raw.trim();
+        if raw.len() > MAX_CARD_MARKER_BYTES {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(raw) else {
+            continue;
+        };
+        if payload.as_object().is_some_and(|map| !map.is_empty()) {
+            cards.push(payload);
+        }
+    }
+    cards
 }
 
-impl TurnPolls {
+/// The polls and cards a turn's committed messages asked the gateway to send. Assistant
+/// messages carry the `ToolCall` blocks naming each call; tool messages carry the `ToolResult`
+/// content the markers ride in. Both arrive through `MessageCommitted` call-then-result, so the
+/// name map is always populated before the result that needs it.
+#[derive(Default)]
+struct TurnMarkers {
+    names: HashMap<ToolCallId, String>,
+    polls: Vec<(String, Vec<String>)>,
+    cards: Vec<serde_json::Value>,
+}
+
+impl TurnMarkers {
     fn observe(&mut self, message: &Message) {
         match message.role {
             Role::Assistant => {
@@ -1502,21 +1546,27 @@ impl TurnPolls {
                     else {
                         continue;
                     };
-                    if !*ok || self.polls.len() >= MAX_TURN_POLLS {
+                    if !*ok {
                         continue;
                     }
-                    let allowed = self
-                        .names
-                        .get(call)
-                        .is_some_and(|name| poll_marker_tool(name));
-                    if !allowed {
+                    let Some(name) = self.names.get(call) else {
                         continue;
-                    }
-                    for poll in poll_markers(content) {
-                        if self.polls.len() >= MAX_TURN_POLLS {
-                            break;
+                    };
+                    if self.polls.len() < MAX_TURN_POLLS && poll_marker_tool(name) {
+                        for poll in poll_markers(content) {
+                            if self.polls.len() >= MAX_TURN_POLLS {
+                                break;
+                            }
+                            self.polls.push(poll);
                         }
-                        self.polls.push(poll);
+                    }
+                    if self.cards.len() < MAX_TURN_CARDS && card_marker_tool(name) {
+                        for card in card_markers(content) {
+                            if self.cards.len() >= MAX_TURN_CARDS {
+                                break;
+                            }
+                            self.cards.push(card);
+                        }
                     }
                 }
             }
@@ -1557,6 +1607,49 @@ async fn deliver_assistant_polls(
         if !result.success {
             eprintln!(
                 "[gateway:{}] poll reply to {chat_id} failed: {}",
+                platform.name(),
+                result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".into())
+            );
+        }
+    }
+}
+
+/// Deliver the cards a turn produced, one ledgered [`OutboundVerb::Card`] each. Ids hang off
+/// the event's delivery identity (`{base}:card:{n}`) so a redelivered event dedups exactly
+/// like the text reply, the media verbs and the polls do. A platform without card support
+/// refuses the verb honestly through [`PlatformAdapter::send_card`]'s default.
+async fn deliver_assistant_cards(
+    platform: &Arc<dyn GatewayPlatform>,
+    ledger: Option<&DeliveryLedger>,
+    event: &MessageEvent,
+    chat_id: &str,
+    cards: &[serde_json::Value],
+) {
+    if cards.is_empty() {
+        return;
+    }
+    let base = event
+        .ledger_message_id
+        .clone()
+        .or_else(|| event.message_id.clone())
+        .unwrap_or_else(|| format!("{}:{chat_id}:{}", platform.name(), now_unix()));
+    for (index, payload) in cards.iter().enumerate() {
+        let verb = OutboundVerb::card(payload.clone());
+        let result = deliver_verb(
+            platform,
+            ledger,
+            &format!("{base}:card:{index}"),
+            chat_id,
+            &verb,
+            None,
+        )
+        .await;
+        if !result.success {
+            eprintln!(
+                "[gateway:{}] card reply to {chat_id} failed: {}",
                 platform.name(),
                 result
                     .error
@@ -1679,9 +1772,9 @@ fn turn(
         // Assistant messages committed mid-turn can carry media blocks; they are collected here
         // and sent as verbs once the turn's text is known not to be a lagged prefix.
         let mut reply_media: Vec<ImageSource> = Vec::new();
-        // Tool results committed mid-turn can carry `POLL:` markers; they are collected here
-        // and sent as verbs once the turn's text is known not to be a lagged prefix.
-        let mut turn_polls = TurnPolls::default();
+        // Tool results committed mid-turn can carry `POLL:`/`CARD:` markers; they are collected
+        // here and sent as verbs once the turn's text is known not to be a lagged prefix.
+        let mut turn_markers = TurnMarkers::default();
         // A lagged receiver skipped events, so what was collected may be a prefix of the real
         // reply. Keep draining for the turn's end (bounded — a flooded channel must not spin
         // forever), but never send the partial text as if it were the final answer.
@@ -1700,7 +1793,7 @@ fn turn(
                     message,
                 }) if sid == session => {
                     reply_media.extend(assistant_media(&message));
-                    turn_polls.observe(&message);
+                    turn_markers.observe(&message);
                     lags = 0;
                 }
                 Ok(RuntimeEvent::TurnFinished {
@@ -1755,7 +1848,15 @@ fn turn(
             outbound.ledger.as_deref(),
             &event,
             &chat,
-            &turn_polls.polls,
+            &turn_markers.polls,
+        )
+        .await;
+        deliver_assistant_cards(
+            &outbound.platform,
+            outbound.ledger.as_deref(),
+            &event,
+            &chat,
+            &turn_markers.cards,
         )
         .await;
         if reply.trim().is_empty() {
@@ -2056,7 +2157,7 @@ mod tests {
 
     #[test]
     fn only_allowlisted_tools_raise_polls_from_their_results() {
-        let mut polls = TurnPolls::default();
+        let mut polls = TurnMarkers::default();
         let marker = "POLL:{\"question\":\"Lunch?\",\"options\":[\"Pizza\",\"Sushi\"]}";
 
         // An MCP tool's marker is honored once its call is known.
@@ -2101,7 +2202,7 @@ mod tests {
 
     #[test]
     fn a_turn_carries_at_most_the_poll_cap() {
-        let mut polls = TurnPolls::default();
+        let mut polls = TurnMarkers::default();
         let (call_msg, id) = tool_call_message("mcp.survey.create");
         polls.observe(&call_msg);
         let marker = "POLL:{\"question\":\"Q?\",\"options\":[\"a\",\"b\"]}";
@@ -2151,5 +2252,207 @@ mod tests {
         let event = test_event();
         deliver_assistant_polls(&dyn_platform, None, &event, "chat-1", &[]).await;
         assert!(platform.verbs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_card_marker_line_parses_to_its_payload() {
+        let content = "built the summary\nCARD:{\"blocks\":[{\"type\":\"section\",\"text\":{\"type\":\"mrkdwn\",\"text\":\"hi\"}}]}\ndone";
+        let cards = card_markers(content);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0]["blocks"][0]["type"], "section");
+    }
+
+    #[test]
+    fn malformed_or_oversized_card_markers_are_skipped() {
+        for content in [
+            "no marker here",
+            "CARD:{not json}",
+            "CARD:[1,2,3]",
+            "CARD:\"just a string\"",
+            "CARD:42",
+            "CARD:null",
+            "CARD:{}",
+            "CARD:{} trailing",
+        ] {
+            assert!(card_markers(content).is_empty(), "{content}");
+        }
+        // A payload over the byte cap is skipped even though it is valid JSON.
+        let huge = format!("CARD:{{\"pad\":\"{}\"}}", "x".repeat(MAX_CARD_MARKER_BYTES));
+        assert!(card_markers(&huge).is_empty());
+        // A marker embedded mid-line is not a marker.
+        assert!(card_markers("prefix CARD:{\"a\":1}").is_empty());
+    }
+
+    #[test]
+    fn only_allowlisted_tools_raise_cards_from_their_results() {
+        let mut markers = TurnMarkers::default();
+        let marker = "CARD:{\"type\":\"AdaptiveCard\",\"body\":[]}";
+
+        // An MCP tool's marker is honored once its call is known.
+        let (call_msg, mcp_id) = tool_call_message("mcp.cards.send");
+        markers.observe(&call_msg);
+        markers.observe(&tool_result_message(mcp_id, marker, true));
+        assert_eq!(markers.cards.len(), 1);
+
+        // Builtin tools whose output is fetched or computed content never qualify.
+        for name in [
+            "web.fetch",
+            "shell.run",
+            "fs.read",
+            "plugin.list",
+            "message.poll",
+        ] {
+            let (call_msg, id) = tool_call_message(name);
+            markers.observe(&call_msg);
+            markers.observe(&tool_result_message(id, marker, true));
+        }
+        // `plugin.execute` output is operator-installed plugin code, so it does qualify.
+        let (call_msg, plugin_id) = tool_call_message("plugin.execute");
+        markers.observe(&call_msg);
+        markers.observe(&tool_result_message(plugin_id, marker, true));
+        assert_eq!(markers.cards.len(), 2);
+
+        // `message.card` is the one builtin whose whole purpose is emitting the marker.
+        let (call_msg, card_id) = tool_call_message("message.card");
+        markers.observe(&call_msg);
+        markers.observe(&tool_result_message(card_id, marker, true));
+        assert_eq!(markers.cards.len(), 3);
+
+        // A failed result and an unknown call id raise nothing.
+        let (call_msg, failed_id) = tool_call_message("mcp.cards.send");
+        markers.observe(&call_msg);
+        markers.observe(&tool_result_message(failed_id, marker, false));
+        markers.observe(&tool_result_message(ToolCallId::generate(), marker, true));
+        assert_eq!(markers.cards.len(), 3);
+    }
+
+    #[test]
+    fn poll_and_card_markers_are_gated_independently() {
+        let mut markers = TurnMarkers::default();
+        // `message.poll` may raise polls but not cards; `message.card` the reverse.
+        let poll_marker = "POLL:{\"question\":\"Q?\",\"options\":[\"a\",\"b\"]}";
+        let card_marker = "CARD:{\"type\":\"AdaptiveCard\"}";
+
+        let (call_msg, poll_id) = tool_call_message("message.poll");
+        markers.observe(&call_msg);
+        markers.observe(&tool_result_message(
+            poll_id,
+            &format!("{poll_marker}\n{card_marker}"),
+            true,
+        ));
+        assert_eq!(markers.polls.len(), 1);
+        assert_eq!(markers.cards.len(), 0);
+
+        let (call_msg, card_id) = tool_call_message("message.card");
+        markers.observe(&call_msg);
+        markers.observe(&tool_result_message(
+            card_id,
+            &format!("{poll_marker}\n{card_marker}"),
+            true,
+        ));
+        assert_eq!(markers.polls.len(), 1);
+        assert_eq!(markers.cards.len(), 1);
+    }
+
+    #[test]
+    fn a_turn_carries_at_most_the_card_cap() {
+        let mut markers = TurnMarkers::default();
+        let (call_msg, id) = tool_call_message("mcp.cards.send");
+        markers.observe(&call_msg);
+        let marker = "CARD:{\"type\":\"AdaptiveCard\"}";
+        for _ in 0..MAX_TURN_CARDS + 2 {
+            markers.observe(&tool_result_message(id.clone(), marker, true));
+        }
+        assert_eq!(markers.cards.len(), MAX_TURN_CARDS);
+    }
+
+    #[tokio::test]
+    async fn assistant_cards_are_delivered_as_ledgered_card_verbs() {
+        let platform = Arc::new(RecordingPlatform::default());
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        let ledger = DeliveryLedger::in_memory().expect("in-memory ledger");
+        let event = test_event();
+        let cards = vec![
+            serde_json::json!({"type": "AdaptiveCard", "body": []}),
+            serde_json::json!({"blocks": [{"type": "section"}]}),
+        ];
+
+        deliver_assistant_cards(&dyn_platform, Some(&ledger), &event, "chat-1", &cards).await;
+        // A redelivery of the same event must not enqueue or send a second copy.
+        deliver_assistant_cards(&dyn_platform, Some(&ledger), &event, "chat-1", &cards).await;
+
+        let verbs = platform.verbs.lock().unwrap();
+        assert_eq!(verbs.len(), 2, "each card becomes exactly one card verb");
+        for verb in verbs.iter() {
+            let OutboundVerb::Card { payload } = verb else {
+                panic!("expected a card verb, got {verb:?}");
+            };
+            assert!(payload.is_object());
+        }
+        assert_eq!(ledger.len().expect("ledger len"), 2);
+    }
+
+    #[tokio::test]
+    async fn turns_without_cards_send_no_card_verbs() {
+        let platform = Arc::new(RecordingPlatform::default());
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        let event = test_event();
+        deliver_assistant_cards(&dyn_platform, None, &event, "chat-1", &[]).await;
+        assert!(platform.verbs.lock().unwrap().is_empty());
+    }
+
+    /// A platform whose adapter refuses cards the way the trait default does.
+    struct NoCardPlatform {
+        verbs: Mutex<Vec<OutboundVerb>>,
+    }
+
+    #[async_trait::async_trait]
+    impl GatewayPlatform for NoCardPlatform {
+        fn name(&self) -> &str {
+            "nocard"
+        }
+
+        async fn next_events(&self) -> Result<Vec<MessageEvent>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn send(
+            &self,
+            _chat_id: &str,
+            _content: &str,
+        ) -> vikram_gateway::platform::SendResult {
+            vikram_gateway::platform::SendResult::ok("text-id")
+        }
+
+        async fn send_verb(
+            &self,
+            _chat_id: &str,
+            verb: &OutboundVerb,
+            _reply_to: Option<&str>,
+        ) -> vikram_gateway::platform::SendResult {
+            self.verbs.lock().unwrap().push(verb.clone());
+            vikram_gateway::platform::SendResult::failed(
+                "this platform does not send rich cards",
+                Some("bad_format"),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_platform_refuses_the_card_honestly() {
+        let platform = Arc::new(NoCardPlatform {
+            verbs: Mutex::new(Vec::new()),
+        });
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        let ledger = DeliveryLedger::in_memory().expect("in-memory ledger");
+        let event = test_event();
+        let cards = vec![serde_json::json!({"type": "AdaptiveCard"})];
+
+        // The refusal surfaces as a failed SendResult — logged, ledgered, never retried into
+        // a fake success and never downgraded to text.
+        deliver_assistant_cards(&dyn_platform, Some(&ledger), &event, "chat-1", &cards).await;
+
+        assert_eq!(platform.verbs.lock().unwrap().len(), 1);
+        assert_eq!(ledger.len().expect("ledger len"), 1);
     }
 }
