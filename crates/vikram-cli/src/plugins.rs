@@ -19,6 +19,9 @@ pub enum PluginsAction {
     Show { id: String },
     /// Validate a plugin directory before installing it.
     Validate { path: PathBuf },
+    /// Check every installed plugin: manifest parses, entry point exists, declared
+    /// dependencies are satisfied and a shipped integrity hash matches.
+    Doctor,
     /// Install a plugin from a local directory or a `.tar.gz` from `vikram module pack`.
     Install {
         path: PathBuf,
@@ -89,6 +92,23 @@ pub fn run(action: PluginsAction) -> Result<(), String> {
                     println!("{issue}");
                 }
             }
+            Ok(())
+        }
+        PluginsAction::Doctor => {
+            let checked = registry
+                .plugins()
+                .iter()
+                .filter(|plugin| plugin.installed)
+                .count();
+            let (lines, problems) = doctor_report(&registry);
+            if lines.is_empty() {
+                println!("no installed plugins to check");
+            } else {
+                for line in &lines {
+                    println!("{line}");
+                }
+            }
+            println!("checked {checked} plugin(s), {problems} error(s)");
             Ok(())
         }
         PluginsAction::Install { path, yes } => install(&registry, &path, yes),
@@ -183,6 +203,34 @@ fn list(registry: &PluginRegistry) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Health-check every installed plugin through [`PluginRegistry::validate`], which already
+/// covers manifest shape, the entry point, version requirements, permissions, components and
+/// declared dependencies. Returns one line per clean plugin or per issue, plus the count of
+/// `error:`-level findings; `warning:` lines are reported but not counted.
+fn doctor_report(registry: &PluginRegistry) -> (Vec<String>, usize) {
+    let mut lines = Vec::new();
+    let mut problems = 0usize;
+    for plugin in registry.plugins().iter().filter(|p| p.installed) {
+        let id = plugin.id();
+        match registry.validate(&plugin.path) {
+            Ok(issues) if issues.is_empty() => lines.push(format!("{id}: ok")),
+            Ok(issues) => {
+                for issue in &issues {
+                    if issue.starts_with("error:") {
+                        problems += 1;
+                    }
+                    lines.push(format!("{id}: {issue}"));
+                }
+            }
+            Err(err) => {
+                problems += 1;
+                lines.push(format!("{id}: error: {err}"));
+            }
+        }
+    }
+    (lines, problems)
 }
 
 fn install(registry: &PluginRegistry, path: &Path, yes: bool) -> Result<(), String> {
@@ -682,5 +730,107 @@ mod tests {
         let registry = PluginRegistry::scan(&tmp.path().join("installed"));
         let err = install(&registry, &archive, true).unwrap_err();
         assert!(err.contains("not a plugin directory"), "{err}");
+    }
+
+    /// A manifest that passes `PluginRegistry::validate` cleanly: semver version, existing
+    /// entry point and a description so no warning is raised either.
+    fn write_plugin_with_entry(dir: &Path, name: &str, version: &str) {
+        let plugin = dir.join(name);
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(
+            plugin.join("plugin.json"),
+            format!(
+                r#"{{"id": "{name}", "name": "{name}", "version": "{version}", "description": "test", "entry": "main.sh"}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(plugin.join("main.sh"), "#!/bin/sh\n").unwrap();
+    }
+
+    #[test]
+    fn doctor_reports_a_clean_plugin_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_plugin_with_entry(tmp.path(), "acme", "1.0.0");
+        let registry = PluginRegistry::scan(tmp.path());
+        let (lines, problems) = doctor_report(&registry);
+        assert_eq!(lines, vec!["acme: ok".to_string()]);
+        assert_eq!(problems, 0);
+    }
+
+    #[test]
+    fn doctor_counts_errors_but_not_warnings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin = tmp.path().join("acme");
+        std::fs::create_dir_all(&plugin).unwrap();
+        // Non-semver version, a missing entry point and no description (a warning).
+        std::fs::write(
+            plugin.join("plugin.json"),
+            r#"{"id": "acme", "name": "acme", "version": "not-semver", "entry": "missing.sh"}"#,
+        )
+        .unwrap();
+        let registry = PluginRegistry::scan(tmp.path());
+        let (lines, problems) = doctor_report(&registry);
+        assert_eq!(problems, 2);
+        assert!(
+            lines.iter().any(|line| line.contains("not semver")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("does not exist")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("warning: manifest has no `description`")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_reports_an_unparseable_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin = tmp.path().join("acme");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(plugin.join("plugin.json"), "not json").unwrap();
+        let registry = PluginRegistry::scan(tmp.path());
+        let (lines, problems) = doctor_report(&registry);
+        assert_eq!(problems, 1);
+        assert!(
+            lines.iter().any(|line| line.contains("invalid manifest")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_reports_an_unsatisfied_dependency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin = tmp.path().join("acme");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(
+            plugin.join("plugin.json"),
+            r#"{"id": "acme", "name": "acme", "version": "1.0.0", "description": "test",
+                "entry": "main.sh", "dependencies": [{"name": "ghost", "version_req": ">=1.0.0"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(plugin.join("main.sh"), "#!/bin/sh\n").unwrap();
+        let registry = PluginRegistry::scan(tmp.path());
+        let (lines, problems) = doctor_report(&registry);
+        assert_eq!(problems, 1);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("dependency `ghost` is not installed")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_on_an_empty_plugins_dir_reports_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = PluginRegistry::scan(tmp.path());
+        let (lines, problems) = doctor_report(&registry);
+        assert!(lines.is_empty());
+        assert_eq!(problems, 0);
     }
 }

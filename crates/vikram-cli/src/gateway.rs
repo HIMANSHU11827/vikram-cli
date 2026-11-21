@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::gateway_config::{self, env};
-use vikram_contracts::{ImageSource, Message, PermissionMode, Role};
+use vikram_contracts::{Block, ImageSource, Message, PermissionMode, Role, ToolCallId};
 use vikram_gateway::access::{
     AuthzInput, EnvLookup, PairingVerdict, PlatformAuthSpec, authorize_source,
 };
@@ -1416,6 +1416,156 @@ async fn deliver_assistant_media(
     }
 }
 
+/// The line a chat-facing tool ends its output with to ask the reply to carry a native poll:
+/// `POLL:{"question":"…","options":["a","b"]}` on its own line. The marker rides the committed
+/// tool result the way `IMAGE:` does, but its payload is already the shape
+/// [`OutboundVerb::Poll`] sends, so no contract block type is needed: the tool result message
+/// itself is the carrier.
+const POLL_MARKER_PREFIX: &str = "POLL:";
+
+/// One turn carries at most this many polls; a flooded tool batch must not spam the chat.
+const MAX_TURN_POLLS: usize = 4;
+
+/// The JSON body of a [`POLL_MARKER_PREFIX`] line.
+#[derive(serde::Deserialize)]
+struct PollMarker {
+    question: String,
+    options: Vec<String>,
+}
+
+/// Whether a tool's output may raise a poll. Builtin tools never qualify: their results carry
+/// fetched or computed content (a page, a file, a shell log) where the marker could appear by
+/// accident or by injection. Only operator-installed surfaces — MCP tools (`mcp.<server>.<tool>`)
+/// and `plugin.execute` — may, because their output is code the operator chose to run.
+fn poll_marker_tool(name: &str) -> bool {
+    name.starts_with("mcp.") || name == "plugin.execute"
+}
+
+/// Every well-formed `POLL:` line in a tool result, as `(question, options)`. A line whose JSON
+/// does not describe a sendable poll — a blank question, or fewer than two usable options once
+/// blanks are dropped and duplicates collapsed — is skipped rather than pushed onto a platform
+/// that would refuse it anyway.
+fn poll_markers(content: &str) -> Vec<(String, Vec<String>)> {
+    let mut polls = Vec::new();
+    for line in content.lines() {
+        let Some(raw) = line.strip_prefix(POLL_MARKER_PREFIX) else {
+            continue;
+        };
+        let Ok(marker) = serde_json::from_str::<PollMarker>(raw.trim()) else {
+            continue;
+        };
+        let question = marker.question.trim();
+        if question.is_empty() {
+            continue;
+        }
+        let mut options: Vec<String> = Vec::new();
+        for option in marker.options {
+            let option = option.trim();
+            if !option.is_empty() && !options.iter().any(|seen| seen == option) {
+                options.push(option.to_owned());
+            }
+        }
+        if options.len() < 2 {
+            continue;
+        }
+        polls.push((question.to_owned(), options));
+    }
+    polls
+}
+
+/// The polls a turn's committed messages asked the gateway to send. Assistant messages carry
+/// the `ToolCall` blocks naming each call; tool messages carry the `ToolResult` content the
+/// marker rides in. Both arrive through `MessageCommitted` call-then-result, so the name map
+/// is always populated before the result that needs it.
+#[derive(Default)]
+struct TurnPolls {
+    names: HashMap<ToolCallId, String>,
+    polls: Vec<(String, Vec<String>)>,
+}
+
+impl TurnPolls {
+    fn observe(&mut self, message: &Message) {
+        match message.role {
+            Role::Assistant => {
+                for block in &message.blocks {
+                    if let Block::ToolCall { call } = block {
+                        self.names.insert(call.id.clone(), call.name.clone());
+                    }
+                }
+            }
+            Role::Tool => {
+                for block in &message.blocks {
+                    let Block::ToolResult {
+                        call, content, ok, ..
+                    } = block
+                    else {
+                        continue;
+                    };
+                    if !*ok || self.polls.len() >= MAX_TURN_POLLS {
+                        continue;
+                    }
+                    let allowed = self
+                        .names
+                        .get(call)
+                        .is_some_and(|name| poll_marker_tool(name));
+                    if !allowed {
+                        continue;
+                    }
+                    for poll in poll_markers(content) {
+                        if self.polls.len() >= MAX_TURN_POLLS {
+                            break;
+                        }
+                        self.polls.push(poll);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Deliver the polls a turn produced, one ledgered [`OutboundVerb::Poll`] each. Ids hang off
+/// the event's delivery identity (`{base}:poll:{n}`) so a redelivered event dedups exactly
+/// like the text reply and the media verbs do.
+async fn deliver_assistant_polls(
+    platform: &Arc<dyn GatewayPlatform>,
+    ledger: Option<&DeliveryLedger>,
+    event: &MessageEvent,
+    chat_id: &str,
+    polls: &[(String, Vec<String>)],
+) {
+    if polls.is_empty() {
+        return;
+    }
+    let base = event
+        .ledger_message_id
+        .clone()
+        .or_else(|| event.message_id.clone())
+        .unwrap_or_else(|| format!("{}:{chat_id}:{}", platform.name(), now_unix()));
+    for (index, (question, options)) in polls.iter().enumerate() {
+        let verb = OutboundVerb::poll(question.clone(), options.clone());
+        let result = deliver_verb(
+            platform,
+            ledger,
+            &format!("{base}:poll:{index}"),
+            chat_id,
+            &verb,
+            None,
+        )
+        .await;
+        if !result.success {
+            eprintln!(
+                "[gateway:{}] poll reply to {chat_id} failed: {}",
+                platform.name(),
+                result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".into())
+            );
+        }
+    }
+}
+
 /// What a turn needs to deliver non-text outbound verbs itself: the platform to send through
 /// and the ledger that dedups and retries the send. The text reply still returns through the
 /// host's own path.
@@ -1528,6 +1678,9 @@ fn turn(
         // Assistant messages committed mid-turn can carry media blocks; they are collected here
         // and sent as verbs once the turn's text is known not to be a lagged prefix.
         let mut reply_media: Vec<ImageSource> = Vec::new();
+        // Tool results committed mid-turn can carry `POLL:` markers; they are collected here
+        // and sent as verbs once the turn's text is known not to be a lagged prefix.
+        let mut turn_polls = TurnPolls::default();
         // A lagged receiver skipped events, so what was collected may be a prefix of the real
         // reply. Keep draining for the turn's end (bounded — a flooded channel must not spin
         // forever), but never send the partial text as if it were the final answer.
@@ -1546,6 +1699,7 @@ fn turn(
                     message,
                 }) if sid == session => {
                     reply_media.extend(assistant_media(&message));
+                    turn_polls.observe(&message);
                     lags = 0;
                 }
                 Ok(RuntimeEvent::TurnFinished {
@@ -1593,6 +1747,14 @@ fn turn(
             &event,
             &chat,
             &reply_media,
+        )
+        .await;
+        deliver_assistant_polls(
+            &outbound.platform,
+            outbound.ledger.as_deref(),
+            &event,
+            &chat,
+            &turn_polls.polls,
         )
         .await;
         if reply.trim().is_empty() {
@@ -1666,7 +1828,7 @@ fn query_value<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vikram_contracts::Trust;
+    use vikram_contracts::{ToolCall, Trust};
 
     #[test]
     fn configuration_names_are_read_from_the_environment() {
@@ -1832,6 +1994,155 @@ mod tests {
         let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
         let event = test_event();
         deliver_assistant_media(&dyn_platform, None, &event, "chat-1", &[]).await;
+        assert!(platform.verbs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_poll_marker_line_parses_to_question_and_options() {
+        let content = "created the survey\nPOLL:{\"question\":\"Lunch?\",\"options\":[\"Pizza\",\"Sushi\"]}\ndone";
+        assert_eq!(
+            poll_markers(content),
+            vec![(
+                "Lunch?".to_owned(),
+                vec!["Pizza".to_owned(), "Sushi".to_owned()]
+            )]
+        );
+    }
+
+    #[test]
+    fn malformed_or_unsendable_poll_markers_are_skipped() {
+        for content in [
+            "no marker here",
+            "POLL:{not json}",
+            "POLL:{\"question\":\"  \",\"options\":[\"a\",\"b\"]}",
+            "POLL:{\"question\":\"Pick?\",\"options\":[\"only\"]}",
+            "POLL:{\"question\":\"Pick?\",\"options\":[\"\",\" \"]}",
+            "POLL:{\"question\":\"Pick?\"}",
+        ] {
+            assert!(poll_markers(content).is_empty(), "{content}");
+        }
+        // Blank and duplicate options collapse before the two-option floor is checked.
+        let content = "POLL:{\"question\":\"Pick?\",\"options\":[\" a \",\"a\",\"\",\"b\"]}";
+        assert_eq!(
+            poll_markers(content),
+            vec![("Pick?".to_owned(), vec!["a".to_owned(), "b".to_owned()])]
+        );
+    }
+
+    fn tool_call_message(name: &str) -> (Message, ToolCallId) {
+        let call = ToolCall::new(name, serde_json::json!({}));
+        let id = call.id.clone();
+        (
+            Message {
+                role: Role::Assistant,
+                blocks: vec![Block::ToolCall { call }],
+            },
+            id,
+        )
+    }
+
+    fn tool_result_message(call: ToolCallId, content: &str, ok: bool) -> Message {
+        Message {
+            role: Role::Tool,
+            blocks: vec![Block::ToolResult {
+                call,
+                content: content.to_owned(),
+                trust: Trust::External,
+                ok,
+            }],
+        }
+    }
+
+    #[test]
+    fn only_allowlisted_tools_raise_polls_from_their_results() {
+        let mut polls = TurnPolls::default();
+        let marker = "POLL:{\"question\":\"Lunch?\",\"options\":[\"Pizza\",\"Sushi\"]}";
+
+        // An MCP tool's marker is honored once its call is known.
+        let (call_msg, mcp_id) = tool_call_message("mcp.survey.create");
+        polls.observe(&call_msg);
+        polls.observe(&tool_result_message(mcp_id, marker, true));
+        assert_eq!(polls.polls.len(), 1);
+        assert_eq!(polls.polls[0].0, "Lunch?");
+
+        // Builtin tools — even ones whose output is operator-influenced — never qualify:
+        // fetched pages and shell logs can print the marker by accident or by injection.
+        for name in [
+            "web.fetch",
+            "web.search",
+            "shell.run",
+            "fs.read",
+            "plugin.list",
+        ] {
+            let (call_msg, id) = tool_call_message(name);
+            polls.observe(&call_msg);
+            polls.observe(&tool_result_message(id, marker, true));
+        }
+        // `plugin.execute` output is operator-installed plugin code, so it does qualify.
+        let (call_msg, plugin_id) = tool_call_message("plugin.execute");
+        polls.observe(&call_msg);
+        polls.observe(&tool_result_message(plugin_id, marker, true));
+        assert_eq!(polls.polls.len(), 2);
+
+        // A failed result and an unknown call id raise nothing.
+        let (call_msg, failed_id) = tool_call_message("mcp.survey.create");
+        polls.observe(&call_msg);
+        polls.observe(&tool_result_message(failed_id, marker, false));
+        polls.observe(&tool_result_message(ToolCallId::generate(), marker, true));
+        assert_eq!(polls.polls.len(), 2);
+    }
+
+    #[test]
+    fn a_turn_carries_at_most_the_poll_cap() {
+        let mut polls = TurnPolls::default();
+        let (call_msg, id) = tool_call_message("mcp.survey.create");
+        polls.observe(&call_msg);
+        let marker = "POLL:{\"question\":\"Q?\",\"options\":[\"a\",\"b\"]}";
+        for _ in 0..MAX_TURN_POLLS + 2 {
+            polls.observe(&tool_result_message(id.clone(), marker, true));
+        }
+        assert_eq!(polls.polls.len(), MAX_TURN_POLLS);
+    }
+
+    #[tokio::test]
+    async fn assistant_polls_are_delivered_as_ledgered_poll_verbs() {
+        let platform = Arc::new(RecordingPlatform::default());
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        let ledger = DeliveryLedger::in_memory().expect("in-memory ledger");
+        let event = test_event();
+        let polls = vec![
+            (
+                "Lunch?".to_owned(),
+                vec!["Pizza".to_owned(), "Sushi".to_owned()],
+            ),
+            (
+                "Ship it?".to_owned(),
+                vec!["yes".to_owned(), "no".to_owned()],
+            ),
+        ];
+
+        deliver_assistant_polls(&dyn_platform, Some(&ledger), &event, "chat-1", &polls).await;
+        // A redelivery of the same event must not enqueue or send a second copy.
+        deliver_assistant_polls(&dyn_platform, Some(&ledger), &event, "chat-1", &polls).await;
+
+        let verbs = platform.verbs.lock().unwrap();
+        assert_eq!(verbs.len(), 2, "each poll becomes exactly one poll verb");
+        for verb in verbs.iter() {
+            let OutboundVerb::Poll { question, options } = verb else {
+                panic!("expected a poll verb, got {verb:?}");
+            };
+            assert!(!question.is_empty());
+            assert!(options.len() >= 2);
+        }
+        assert_eq!(ledger.len().expect("ledger len"), 2);
+    }
+
+    #[tokio::test]
+    async fn turns_without_polls_send_no_poll_verbs() {
+        let platform = Arc::new(RecordingPlatform::default());
+        let dyn_platform: Arc<dyn GatewayPlatform> = platform.clone();
+        let event = test_event();
+        deliver_assistant_polls(&dyn_platform, None, &event, "chat-1", &[]).await;
         assert!(platform.verbs.lock().unwrap().is_empty());
     }
 }
