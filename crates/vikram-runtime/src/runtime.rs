@@ -2083,12 +2083,16 @@ impl RuntimeInner {
             } else {
                 Vec::new()
             };
-            // The scan's top opportunity is acted on by surfacing it — the
-            // self-check notice is the action — so the tracked execution says
-            // exactly that rather than pretending an automated change ran.
-            // `track_improvement` persists it; the step description doubles as
-            // the dedup key so a still-failing category is not re-recorded on
-            // every scan.
+            // The scan's top opportunity is acted on, bounded to one per
+            // check. An AnalysisReport opportunity is executed for real —
+            // `execute_improvement` re-reads the store and records each
+            // step's actual output. Anything requiring a real change is only
+            // surfaced by the self-check notice, and the tracked execution
+            // says exactly that rather than pretending an automated change
+            // ran. `track_improvement` persists it; the step description
+            // doubles as the dedup key so a still-failing category is not
+            // re-recorded on every scan (the analysis report's final step
+            // carries the same description).
             let mut improvement_executions = 0usize;
             if scan_opportunities {
                 let prioritized = engine.self_improvement.prioritize_improvements(&opportunities);
@@ -2099,35 +2103,50 @@ impl RuntimeInner {
                         .iter()
                         .any(|e| e.steps.iter().any(|s| s.description == top.description));
                     if !seen {
-                        let now = vikram_evolution::now_ms();
-                        let execution = vikram_evolution::ImprovementExecution {
-                            id: vikram_evolution::gen_id("exec"),
-                            opportunity_id: top.id.clone(),
-                            steps: vec![
-                                vikram_evolution::self_improvement::ImprovementStep {
-                                    description: top.description.clone(),
-                                    status:
-                                        vikram_evolution::self_improvement::StepStatus::Completed,
-                                    output: Some(format!(
-                                        "self-check surfaced the opportunity; evidence: {}",
-                                        top.evidence.join("; ")
-                                    )),
-                                },
-                            ],
-                            status: vikram_evolution::ExecutionStatus::Completed,
-                            started_ms: now,
-                            completed_ms: Some(now),
-                            outcome: Some(
-                                "analysis-only: reported via self-check notice; no automated change applied"
-                                    .to_owned(),
-                            ),
-                        };
-                        if engine
-                            .self_improvement
-                            .track_improvement(execution)
-                            .is_ok()
-                        {
-                            improvement_executions = 1;
+                        match &top.action {
+                            vikram_evolution::self_improvement::OpportunityAction::AnalysisReport {
+                                ..
+                            } => {
+                                if engine
+                                    .self_improvement
+                                    .execute_improvement(top)
+                                    .is_ok()
+                                {
+                                    improvement_executions = 1;
+                                }
+                            }
+                            vikram_evolution::self_improvement::OpportunityAction::RequiresChange => {
+                                let now = vikram_evolution::now_ms();
+                                let execution = vikram_evolution::ImprovementExecution {
+                                    id: vikram_evolution::gen_id("exec"),
+                                    opportunity_id: top.id.clone(),
+                                    steps: vec![
+                                        vikram_evolution::self_improvement::ImprovementStep {
+                                            description: top.description.clone(),
+                                            status:
+                                                vikram_evolution::self_improvement::StepStatus::Completed,
+                                            output: Some(format!(
+                                                "self-check surfaced the opportunity; evidence: {}",
+                                                top.evidence.join("; ")
+                                            )),
+                                        },
+                                    ],
+                                    status: vikram_evolution::ExecutionStatus::Completed,
+                                    started_ms: now,
+                                    completed_ms: Some(now),
+                                    outcome: Some(
+                                        "analysis-only: reported via self-check notice; no automated change applied"
+                                            .to_owned(),
+                                    ),
+                                };
+                                if engine
+                                    .self_improvement
+                                    .track_improvement(execution)
+                                    .is_ok()
+                                {
+                                    improvement_executions = 1;
+                                }
+                            }
                         }
                     }
                 }
@@ -7877,11 +7896,19 @@ mod tests {
                 vikram_evolution::ExecutionStatus::Completed
             );
             assert!(
+                execution.steps.len() > 1,
+                "an analysis report records the steps it actually ran"
+            );
+            assert!(
+                execution.steps.iter().all(|s| s.output.is_some()),
+                "every executed step carries the output its work produced"
+            );
+            assert!(
                 execution
                     .outcome
                     .as_deref()
                     .unwrap_or_default()
-                    .contains("analysis-only"),
+                    .contains("no automated change applied"),
                 "the record must not claim an automated change ran"
             );
         }

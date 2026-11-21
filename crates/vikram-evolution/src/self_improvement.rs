@@ -13,13 +13,15 @@
 //! PARTIALLY LIVE: the opportunity scan is wired — the runtime's hourly
 //! self-check and `vikram evolution evaluate` both call
 //! [`SelfImprovementEngine::identify_improvement_opportunities`]. The same
-//! self-check also *acts* on the top opportunity by surfacing it as a
-//! notice, and records that honestly through
+//! self-check also *acts* on the top opportunity, bounded to one per scan:
+//! [`OpportunityAction::AnalysisReport`] opportunities are executed for
+//! real through [`SelfImprovementEngine::execute_improvement`], which
+//! re-reads the store and records each step's actual output;
+//! [`OpportunityAction::RequiresChange`] opportunities are only surfaced
+//! as a notice and recorded through
 //! [`SelfImprovementEngine::track_improvement`] — an `ImprovementExecution`
 //! whose single step says the opportunity was reported, not that an
-//! automated change ran. [`SelfImprovementEngine::execute_improvement`]
-//! remains the entry point for a future executor that drives the
-//! Pending → Completed lifecycle; its records are durable either way:
+//! automated change ran. Executions are durable either way:
 //! `executions` is persisted to the store's `engine_records` table under
 //! [`EXECUTION_NAMESPACE`] and reloaded by [`SelfImprovementEngine::new`].
 //! `opportunities` stays process-local: every scan rebuilds it wholesale
@@ -29,7 +31,7 @@
 use crate::error::Result;
 use crate::metrics;
 use crate::store::{EvolutionStore, from_json_value, to_json_value};
-use crate::types::{gen_id, now_ms};
+use crate::types::{ExperienceOutcome, gen_id, now_ms};
 use serde::{Deserialize, Serialize};
 
 /// `engine_records` namespace holding every [`ImprovementExecution`].
@@ -57,6 +59,19 @@ pub enum ImprovementArea {
     ExecutionEfficiency,
 }
 
+/// What an opportunity asks for. Only [`OpportunityAction::AnalysisReport`]
+/// may be auto-executed: it is read-only diagnostic work over recorded
+/// evidence. [`OpportunityAction::RequiresChange`] would mutate code,
+/// config, or job state, so it is never auto-executed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpportunityAction {
+    /// Re-scan the store for `category` and produce a report. The `category`
+    /// is the `task_category` the opportunity's evidence came from.
+    AnalysisReport { category: String },
+    /// The fix needs an actual change; stays pending for a human/agent.
+    RequiresChange,
+}
+
 /// Improvement opportunity.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImprovementOpportunity {
@@ -68,6 +83,7 @@ pub struct ImprovementOpportunity {
     pub estimated_cost: f32,
     pub risk_level: RiskLevel,
     pub priority: u32,
+    pub action: OpportunityAction,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,7 +121,7 @@ pub struct ImprovementStep {
     pub output: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepStatus {
     Pending,
     Running,
@@ -202,6 +218,9 @@ impl SelfImprovementEngine {
                 estimated_cost: 0.3,
                 risk_level: RiskLevel::Low,
                 priority: (problem_rate * 10.0).round().clamp(1.0, 10.0) as u32,
+                action: OpportunityAction::AnalysisReport {
+                    category: area.category.clone(),
+                },
             });
         }
 
@@ -221,6 +240,7 @@ impl SelfImprovementEngine {
                 priority: (reflection.failure_rate().unwrap_or(0.0) * 10.0)
                     .round()
                     .clamp(1.0, 10.0) as u32,
+                action: OpportunityAction::RequiresChange,
             });
         }
 
@@ -278,44 +298,38 @@ impl SelfImprovementEngine {
     }
 
     /// Execute an improvement.
+    ///
+    /// [`OpportunityAction::AnalysisReport`] opportunities are executed for
+    /// real: the engine re-reads the store and each recorded step carries
+    /// the output that work actually produced. [`OpportunityAction::RequiresChange`]
+    /// opportunities are never auto-executed — the returned execution stays
+    /// [`ExecutionStatus::Pending`] with a step saying why.
     pub fn execute_improvement(
         &mut self,
         opportunity: &ImprovementOpportunity,
     ) -> Result<ImprovementExecution> {
-        let execution = ImprovementExecution {
-            id: gen_id("exec"),
-            opportunity_id: opportunity.id.clone(),
-            steps: vec![
-                ImprovementStep {
-                    description: "Analyze current implementation".to_string(),
+        let execution = match &opportunity.action {
+            OpportunityAction::AnalysisReport { category } => {
+                self.run_analysis_report(opportunity, category)?
+            }
+            OpportunityAction::RequiresChange => ImprovementExecution {
+                id: gen_id("exec"),
+                opportunity_id: opportunity.id.clone(),
+                steps: vec![ImprovementStep {
+                    description: format!(
+                        "deferred: '{}' requires an actual change and is not auto-executed",
+                        opportunity.description
+                    ),
                     status: StepStatus::Pending,
                     output: None,
-                },
-                ImprovementStep {
-                    description: "Design improvement".to_string(),
-                    status: StepStatus::Pending,
-                    output: None,
-                },
-                ImprovementStep {
-                    description: "Implement improvement".to_string(),
-                    status: StepStatus::Pending,
-                    output: None,
-                },
-                ImprovementStep {
-                    description: "Test improvement".to_string(),
-                    status: StepStatus::Pending,
-                    output: None,
-                },
-                ImprovementStep {
-                    description: "Verify improvement".to_string(),
-                    status: StepStatus::Pending,
-                    output: None,
-                },
-            ],
-            status: ExecutionStatus::Pending,
-            started_ms: now_ms(),
-            completed_ms: None,
-            outcome: None,
+                }],
+                status: ExecutionStatus::Pending,
+                started_ms: now_ms(),
+                completed_ms: None,
+                outcome: Some(
+                    "requires-change: recorded as pending; no automated change applied".to_owned(),
+                ),
+            },
         };
 
         self.executions.push(execution.clone());
@@ -324,6 +338,165 @@ impl SelfImprovementEngine {
             return Err(e);
         }
         Ok(execution)
+    }
+
+    /// Perform the read-only analysis an [`OpportunityAction::AnalysisReport`]
+    /// opportunity asks for and record each step's real output.
+    fn run_analysis_report(
+        &self,
+        opportunity: &ImprovementOpportunity,
+        category: &str,
+    ) -> Result<ImprovementExecution> {
+        let started = now_ms();
+        let since = started.saturating_sub(WINDOW_MS);
+        let mut steps = Vec::new();
+
+        let stats = match self.store.experience_stats_for(Some(category), WINDOW_MS) {
+            Ok(stats) => {
+                steps.push(ImprovementStep {
+                    description: format!("Collect failure evidence for '{category}'"),
+                    status: StepStatus::Completed,
+                    output: Some(format!(
+                        "{} of {} recorded '{category}' experience(s) in the last {}h failed or errored \
+                         ({} failed outright, {} with errors, {} with corrections); all-time {}/{}",
+                        stats.recent.problems,
+                        stats.recent.total,
+                        WINDOW_MS / 3_600_000,
+                        stats.recent.failure,
+                        stats.recent.with_errors,
+                        stats.recent.with_corrections,
+                        stats.all_time.problems,
+                        stats.all_time.total,
+                    )),
+                });
+                stats
+            }
+            Err(e) => {
+                steps.push(ImprovementStep {
+                    description: format!("Collect failure evidence for '{category}'"),
+                    status: StepStatus::Failed,
+                    output: Some(format!("store read failed: {e}")),
+                });
+                return Ok(Self::analysis_execution(
+                    opportunity,
+                    steps,
+                    ExecutionStatus::Failed,
+                    started,
+                    Some(format!("evidence collection failed: {e}")),
+                ));
+            }
+        };
+
+        let failures = match self.store.list_failed_experiences_since(since, 200) {
+            Ok(experiences) => experiences
+                .into_iter()
+                .filter(|e| e.task_category == category)
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                steps.push(ImprovementStep {
+                    description: "Summarize recorded failure modes".to_string(),
+                    status: StepStatus::Failed,
+                    output: Some(format!("store read failed: {e}")),
+                });
+                return Ok(Self::analysis_execution(
+                    opportunity,
+                    steps,
+                    ExecutionStatus::Failed,
+                    started,
+                    Some(format!("failure enumeration failed: {e}")),
+                ));
+            }
+        };
+
+        let mut error_counts: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        let mut tool_counts: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        let mut outright_failures = 0usize;
+        for exp in &failures {
+            if exp.outcome == ExperienceOutcome::Failure {
+                outright_failures += 1;
+            }
+            for err in &exp.errors {
+                *error_counts.entry(err.as_str()).or_default() += 1;
+            }
+            for tool in &exp.tools_used {
+                *tool_counts.entry(tool.as_str()).or_default() += 1;
+            }
+        }
+        let top = |counts: &std::collections::BTreeMap<&str, usize>| {
+            counts
+                .iter()
+                .take(3)
+                .map(|(k, n)| format!("{n}x {k}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        steps.push(ImprovementStep {
+            description: "Summarize recorded failure modes".to_string(),
+            status: StepStatus::Completed,
+            output: Some(if failures.is_empty() {
+                format!("no failing '{category}' experience(s) remain in the last {}h window", WINDOW_MS / 3_600_000)
+            } else {
+                format!(
+                    "inspected {} failing '{category}' experience(s) ({} failed outright); tools: [{}]; top errors: [{}]",
+                    failures.len(),
+                    outright_failures,
+                    top(&tool_counts),
+                    top(&error_counts),
+                )
+            }),
+        });
+
+        let problem_rate = if stats.recent.total == 0 {
+            0.0
+        } else {
+            stats.recent.problems as f32 / stats.recent.total as f32 * 100.0
+        };
+        let report = format!(
+            "analysis report for '{}': {}/{} recent experience(s) failed or errored \
+             (problem rate {:.0}%), {} failing record(s) inspected; the underlying \
+             improvement still requires a manual change — nothing was modified",
+            category,
+            stats.recent.problems,
+            stats.recent.total,
+            problem_rate,
+            failures.len(),
+        );
+        steps.push(ImprovementStep {
+            description: opportunity.description.clone(),
+            status: StepStatus::Completed,
+            output: Some(report),
+        });
+
+        Ok(Self::analysis_execution(
+            opportunity,
+            steps,
+            ExecutionStatus::Completed,
+            started,
+            Some(format!(
+                "analysis report produced for '{category}'; no automated change applied"
+            )),
+        ))
+    }
+
+    fn analysis_execution(
+        opportunity: &ImprovementOpportunity,
+        steps: Vec<ImprovementStep>,
+        status: ExecutionStatus,
+        started_ms: u64,
+        outcome: Option<String>,
+    ) -> ImprovementExecution {
+        let finished = status != ExecutionStatus::Pending;
+        ImprovementExecution {
+            id: gen_id("exec"),
+            opportunity_id: opportunity.id.clone(),
+            steps,
+            status,
+            started_ms,
+            completed_ms: finished.then(now_ms),
+            outcome,
+        }
     }
 
     /// Track improvement history.
@@ -425,6 +598,26 @@ mod tests {
             estimated_cost: 0.3,
             risk_level: RiskLevel::Low,
             priority: 5,
+            action: OpportunityAction::RequiresChange,
+        }
+    }
+
+    fn failing_experience(i: usize, category: &str) -> crate::types::Experience {
+        crate::types::Experience {
+            id: String::new(),
+            timestamp_ms: crate::types::now_ms(),
+            agent_id: "main".to_string(),
+            project_id: None,
+            task_category: category.to_string(),
+            user_request: format!("failing request {i}"),
+            outcome: ExperienceOutcome::Failure,
+            tools_used: vec!["shell".to_string()],
+            errors: vec!["boom".to_string()],
+            corrections: Vec::new(),
+            feedback: None,
+            reusable: false,
+            sensitivity: crate::types::Sensitivity::Private,
+            metadata: serde_json::json!({}),
         }
     }
 
@@ -452,5 +645,77 @@ mod tests {
     fn a_fresh_store_starts_with_no_executions() {
         let engine = SelfImprovementEngine::new(EvolutionStore::open_in_memory().unwrap()).unwrap();
         assert!(engine.get_improvement_history().is_empty());
+    }
+
+    #[test]
+    fn analysis_report_executes_with_real_step_outputs() {
+        let store = EvolutionStore::open_in_memory().unwrap();
+        for i in 0..metrics::MIN_SAMPLE {
+            store
+                .save_experience(&failing_experience(i, "build"))
+                .unwrap();
+        }
+        let mut engine = SelfImprovementEngine::new(store).unwrap();
+        let opportunities = engine.identify_improvement_opportunities().unwrap();
+        let top = engine
+            .prioritize_improvements(&opportunities)
+            .into_iter()
+            .next()
+            .expect("failing 'build' experiences must produce an opportunity");
+        assert_eq!(
+            top.action,
+            OpportunityAction::AnalysisReport {
+                category: "build".to_string()
+            }
+        );
+
+        let execution = engine.execute_improvement(&top).unwrap();
+        assert_eq!(execution.status, ExecutionStatus::Completed);
+        assert!(execution.completed_ms.is_some());
+        assert_eq!(execution.steps.len(), 3);
+        for step in &execution.steps {
+            assert_eq!(step.status, StepStatus::Completed);
+            let output = step.output.as_deref().unwrap_or_default();
+            assert!(
+                !output.is_empty(),
+                "step '{}' has no real output",
+                step.description
+            );
+        }
+        assert!(
+            execution.steps[0]
+                .output
+                .as_deref()
+                .unwrap()
+                .contains("build"),
+            "evidence step must quote the category it analysed"
+        );
+        assert!(
+            execution
+                .outcome
+                .as_deref()
+                .unwrap()
+                .contains("no automated change applied")
+        );
+        assert!(engine.verify_improvement(&execution.id).unwrap());
+    }
+
+    #[test]
+    fn requires_change_never_auto_executes() {
+        let mut engine =
+            SelfImprovementEngine::new(EvolutionStore::open_in_memory().unwrap()).unwrap();
+        let execution = engine.execute_improvement(&opportunity("imp-rc")).unwrap();
+        assert_eq!(execution.status, ExecutionStatus::Pending);
+        assert!(execution.completed_ms.is_none());
+        assert_eq!(execution.steps.len(), 1);
+        assert_eq!(execution.steps[0].status, StepStatus::Pending);
+        assert!(
+            execution
+                .outcome
+                .as_deref()
+                .unwrap()
+                .contains("no automated change applied")
+        );
+        assert!(!engine.verify_improvement(&execution.id).unwrap());
     }
 }

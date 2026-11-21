@@ -41,6 +41,7 @@ pub enum ConversationalCommand {
     ResumeAutonomousManagement,
     ExplainAction { action_id: String },
     ReportImprovements,
+    Ask { question: String },
 }
 
 /// Command response.
@@ -98,6 +99,7 @@ impl ConversationalControl {
             }
             ConversationalCommand::ExplainAction { action_id } => self.explain_action(action_id),
             ConversationalCommand::ReportImprovements => self.report_improvements(),
+            ConversationalCommand::Ask { question } => self.ask_freeform(question),
         }?;
 
         self.command_history.push(response.clone());
@@ -147,7 +149,14 @@ impl ConversationalControl {
         } else if input_lower.contains("report improvements") {
             Some(ConversationalCommand::ReportImprovements)
         } else {
-            None
+            let question = input.trim();
+            if question.is_empty() {
+                None
+            } else {
+                Some(ConversationalCommand::Ask {
+                    question: question.to_string(),
+                })
+            }
         }
     }
 
@@ -530,6 +539,124 @@ impl ConversationalControl {
         })
     }
 
+    /// Free-form fallback: keyword retrieval over the store. This answers
+    /// "what was recorded about X", never "why X happened" — no inference.
+    fn ask_freeform(&self, question: &str) -> Result<CommandResponse> {
+        let trimmed = question.trim();
+        let terms = question_keywords(trimmed);
+        let search_terms: Vec<String> = if terms.is_empty() && !trimmed.is_empty() {
+            vec![trimmed.to_lowercase()]
+        } else {
+            terms
+        };
+
+        let mut events: Vec<serde_json::Value> = Vec::new();
+        let mut memories: Vec<serde_json::Value> = Vec::new();
+        let mut seen_events = std::collections::HashSet::new();
+        let mut seen_memories = std::collections::HashSet::new();
+        for term in search_terms.iter().take(6) {
+            for e in self.store.search_events(term, 3)? {
+                if seen_events.insert(e.id.clone()) && events.len() < 5 {
+                    events.push(serde_json::json!({
+                        "id": e.id,
+                        "kind": e.kind,
+                        "summary": truncate(&e.summary, 120),
+                    }));
+                }
+            }
+            for m in self.store.search_memory(None, term, 3)? {
+                if seen_memories.insert(m.id.clone()) && memories.len() < 5 {
+                    memories.push(serde_json::json!({
+                        "id": m.id,
+                        "key": m.key,
+                        "value": truncate(&m.value, 120),
+                    }));
+                }
+            }
+        }
+
+        let mut proposals: Vec<serde_json::Value> = Vec::new();
+        let mut seen_proposals = std::collections::HashSet::new();
+        for p in self.store.list_proposals(None)? {
+            if proposals.len() >= 5 {
+                break;
+            }
+            let haystack = format!(
+                "{} {}",
+                p.summary.to_lowercase(),
+                p.details.to_string().to_lowercase()
+            );
+            if search_terms.iter().any(|t| haystack.contains(t))
+                && seen_proposals.insert(p.id.clone())
+            {
+                proposals.push(serde_json::json!({
+                    "id": p.id,
+                    "summary": truncate(&p.summary, 120),
+                    "status": format!("{:?}", p.status),
+                }));
+            }
+        }
+
+        let mut experiences: Vec<serde_json::Value> = Vec::new();
+        let mut seen_experiences = std::collections::HashSet::new();
+        for e in self.store.list_experiences(None, 100)? {
+            if experiences.len() >= 5 {
+                break;
+            }
+            let haystack = format!(
+                "{} {} {}",
+                e.user_request.to_lowercase(),
+                e.task_category.to_lowercase(),
+                e.errors.join(" ").to_lowercase()
+            );
+            if search_terms.iter().any(|t| haystack.contains(t))
+                && seen_experiences.insert(e.id.clone())
+            {
+                experiences.push(serde_json::json!({
+                    "id": e.id,
+                    "task_category": e.task_category,
+                    "outcome": format!("{:?}", e.outcome),
+                    "user_request": truncate(&e.user_request, 120),
+                }));
+            }
+        }
+
+        let total = events.len() + memories.len() + proposals.len() + experiences.len();
+        let message = if trimmed.is_empty() {
+            "Empty question — nothing to search the store for.".to_string()
+        } else if total == 0 {
+            format!(
+                "No recorded activity matching '{}' — the store holds nothing about those terms. This is retrieval, not inference: ask about recorded events, memories, proposals, or experiences by name.",
+                trimmed
+            )
+        } else {
+            format!(
+                "Found {} related record(s) in the store for '{}': {} learning event(s), {} memor(ies), {} proposal(s), {} experience(s). These are recorded rows, not a diagnosis — see `data`.",
+                total,
+                trimmed,
+                events.len(),
+                memories.len(),
+                proposals.len(),
+                experiences.len()
+            )
+        };
+        Ok(CommandResponse {
+            command: ConversationalCommand::Ask {
+                question: trimmed.to_string(),
+            },
+            success: true,
+            message,
+            data: Some(serde_json::json!({
+                "terms": search_terms,
+                "learning_events": events,
+                "memories": memories,
+                "proposals": proposals,
+                "experiences": experiences,
+            })),
+            timestamp_ms: now_ms(),
+        })
+    }
+
     fn report_improvements(&self) -> Result<CommandResponse> {
         let store = self.store_snapshot()?;
         let improvement = SelfImprovementEngine::new(self.store.clone())?;
@@ -575,6 +702,45 @@ impl ConversationalControl {
     pub fn get_command_history(&self) -> &[CommandResponse] {
         &self.command_history
     }
+}
+
+const ASK_STOPWORDS: &[&str] = &[
+    "the", "and", "for", "are", "but", "not", "you", "your", "yours", "was", "were", "will",
+    "would", "could", "should", "have", "has", "had", "what", "when", "where", "which", "who",
+    "whom", "whose", "why", "how", "did", "does", "doing", "done", "can", "may", "might", "must",
+    "shall", "this", "that", "these", "those", "there", "here", "with", "from", "about", "into",
+    "over", "under", "than", "then", "them", "they", "their", "theirs", "our", "ours", "out",
+    "off", "any", "all", "some", "such", "own", "same", "too", "very", "just", "only", "also",
+    "been", "being", "because", "before", "after", "while", "during", "between", "through",
+    "please", "tell", "show", "give", "want", "need", "know", "think", "say", "said", "let", "get",
+    "got", "make", "made", "use", "used", "using", "see", "seen", "look", "looking", "much",
+    "many", "more", "most", "less", "least", "each", "every", "both", "few", "now", "still",
+    "again", "once", "ever", "never", "always", "often", "really", "actually",
+];
+
+/// Lowercase alphanumeric tokens of length >= 3 that are not stopwords,
+/// deduplicated, preserving question order.
+fn question_keywords(question: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for token in question
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3 && !ASK_STOPWORDS.contains(t))
+    {
+        if seen.insert(token.to_string()) {
+            out.push(token.to_string());
+        }
+    }
+    out
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{cut}…")
 }
 
 /// Collect `query_map` rows on an already-locked connection, mapping store
@@ -885,5 +1051,90 @@ mod tests {
             .unwrap();
         let data = response.data.unwrap();
         assert_eq!(data["agents_in_experience"], serde_json::json!(["agent-1"]));
+    }
+
+    #[test]
+    fn parse_command_routes_freeform_text_to_ask() {
+        let (control, _) = control();
+        match control.parse_command("why did the build fail?") {
+            Some(ConversationalCommand::Ask { question }) => {
+                assert_eq!(question, "why did the build fail?");
+            }
+            other => panic!("expected Ask, got {other:?}"),
+        }
+        assert!(control.parse_command("").is_none());
+        assert!(control.parse_command("   \n\t ").is_none());
+        assert_eq!(
+            control.parse_command("analyze yourself"),
+            Some(ConversationalCommand::AnalyzeYourself)
+        );
+        assert_eq!(
+            control.parse_command("what have you improved recently"),
+            Some(ConversationalCommand::WhatHaveYouImprovedRecently)
+        );
+    }
+
+    #[test]
+    fn ask_freeform_returns_store_derived_records() {
+        let (mut control, store) = control();
+        store
+            .save_event(&LearningEvent {
+                id: "evt-build".to_string(),
+                timestamp_ms: now_ms(),
+                agent_id: "agent-1".to_string(),
+                kind: "action_executed".to_string(),
+                summary: "build failed on tests".to_string(),
+                payload: serde_json::json!({}),
+            })
+            .unwrap();
+        seed_proposal(
+            &store,
+            "prop-test",
+            ProposalStatus::Pending,
+            "fix flaky tests in build",
+        );
+        seed_experience(&store, "exp-1", ExperienceOutcome::Failure);
+
+        let command = control.parse_command("why did the build fail?").unwrap();
+        let response = control.handle_command(command).unwrap();
+        assert!(response.success);
+        assert!(response.message.contains("related record"));
+        let data = response.data.unwrap();
+        let events = data["learning_events"].as_array().unwrap();
+        assert!(events.iter().any(|e| e["id"] == "evt-build"));
+        let proposals = data["proposals"].as_array().unwrap();
+        assert!(proposals.iter().any(|p| p["id"] == "prop-test"));
+    }
+
+    #[test]
+    fn ask_freeform_reports_no_match_honestly() {
+        let (mut control, store) = control();
+        seed_proposal(
+            &store,
+            "prop-1",
+            ProposalStatus::Applied,
+            "unrelated change",
+        );
+        let command = control
+            .parse_command("what did we work on yesterday?")
+            .unwrap();
+        let response = control.handle_command(command).unwrap();
+        assert!(response.success);
+        assert!(response.message.contains("No recorded activity matching"));
+        let data = response.data.unwrap();
+        assert_eq!(data["learning_events"].as_array().unwrap().len(), 0);
+        assert_eq!(data["proposals"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn ask_freeform_empty_question_is_honest() {
+        let (mut control, _) = control();
+        let response = control
+            .handle_command(ConversationalCommand::Ask {
+                question: "   ".to_string(),
+            })
+            .unwrap();
+        assert!(response.success);
+        assert!(response.message.contains("Empty question"));
     }
 }
