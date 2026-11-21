@@ -8,12 +8,13 @@ impl Tool for VerifyRun {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "verify".into(),
-            description: "Run the build+test verification loop (single attempt, no auto-repair) and return structured pass/fail."
+            description: "Run the build+test verification loop (single attempt, no auto-repair) and return structured pass/fail plus git change evidence."
                 .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "max_attempts": {"type": "integer", "description": "accepted for compatibility; only one attempt runs because no repair step is wired"}
+                    "max_attempts": {"type": "integer", "description": "accepted for compatibility; only one attempt runs because no repair step is wired"},
+                    "expected_changes": {"type": "array", "items": {"type": "string"}, "description": "workspace-relative paths you expect to have modified; compared against git status as warnings only, never affects pass/fail"}
                 }
             }),
         }
@@ -39,11 +40,23 @@ impl Tool for VerifyRun {
             .unwrap_or(1)
             .clamp(1, 1) as u32;
         let budget = crate::verification::Budget::attempts(max_attempts);
+        let expected_changes: Vec<String> = args
+            .get("expected_changes")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         let outcome = crate::verification::verify(
             &ctx.workspace_root,
             &crate::verification::VerificationPlan::cargo(),
             &budget,
             &ctx.sandbox,
+            &expected_changes,
             |_, _| None,
         )?;
         let steps = outcome
@@ -71,6 +84,11 @@ impl Tool for VerifyRun {
                 .find(|s| !s.ok)
                 .map(|s| truncated(s.output.clone())),
             "steps": steps,
+            "changes": {
+                "files": outcome.changes.files,
+                "note": outcome.changes.note,
+                "warnings": outcome.changes.warnings,
+            },
         });
         // The verdict leads the output on its own line: the growth pipeline reads it even when
         // the JSON report below is truncated or spooled.

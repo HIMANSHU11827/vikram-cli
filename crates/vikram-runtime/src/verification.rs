@@ -110,6 +110,137 @@ pub struct VerificationOutcome {
     /// The failing step of the last attempt, with the classified kind.
     pub failure: Option<(String, FailureKind)>,
     pub steps: Vec<StepResult>,
+    /// What the workspace actually changed, collected after the last attempt.
+    pub changes: ChangeReport,
+}
+
+/// Bounded evidence of what changed, not a judgment about whether the right thing
+/// changed. `files` is `git status --porcelain` output (repo-relative paths);
+/// `note` explains why the list may be empty or partial; `warnings` flags declared
+/// `expected_changes` that git does not observe. A green plan with zero changed
+/// files is reported as evidence, never scored.
+#[derive(Clone, Debug, Default)]
+pub struct ChangeReport {
+    pub files: Vec<String>,
+    pub note: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+const MAX_CHANGE_FILES: usize = 200;
+
+/// `git status --porcelain` evidence for `workspace_root`, plus a declared-vs-actual
+/// comparison. Paths in `files` are repository-root relative; `declared` entries are
+/// matched against both that form and the workspace-relative form.
+fn collect_changes(workspace_root: &Path, declared: &[String]) -> ChangeReport {
+    let inside = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output();
+    let available = inside.as_ref().map(|o| o.status.success()).unwrap_or(false);
+    if !available {
+        let note = if inside.is_err() {
+            "git is not available; change evidence unavailable".to_owned()
+        } else {
+            "workspace is not a git repository; change evidence unavailable".to_owned()
+        };
+        let mut report = ChangeReport {
+            note: Some(note),
+            ..ChangeReport::default()
+        };
+        if !declared.is_empty() {
+            report
+                .warnings
+                .push("declared changes could not be checked without git evidence".to_owned());
+        }
+        return report;
+    }
+
+    let prefix = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["rev-parse", "--show-prefix"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default();
+
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["status", "--porcelain"])
+        .output();
+    let (files, note) = match status {
+        Err(_) => (
+            Vec::new(),
+            Some("git is not available; change evidence unavailable".to_owned()),
+        ),
+        Ok(o) if !o.status.success() => (
+            Vec::new(),
+            Some(format!(
+                "git status failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            )),
+        ),
+        Ok(o) => {
+            let mut files = Vec::new();
+            let mut truncated = false;
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                if files.len() >= MAX_CHANGE_FILES {
+                    truncated = true;
+                    break;
+                }
+                // Porcelain v1: "XY <path>", renames as "XY old -> new", paths may be
+                // C-quoted when they contain unusual bytes.
+                let Some(rest) = line.get(3..) else {
+                    continue;
+                };
+                let path = rest
+                    .rsplit_once(" -> ")
+                    .map(|(_, new)| new)
+                    .unwrap_or(rest)
+                    .trim()
+                    .trim_matches('"');
+                if !path.is_empty() {
+                    files.push(path.to_owned());
+                }
+            }
+            let note = truncated
+                .then(|| format!("git status truncated to the first {MAX_CHANGE_FILES} entries"));
+            (files, note)
+        }
+    };
+
+    let mut warnings = Vec::new();
+    for declared_path in declared {
+        let normalized = normalize_declared_path(declared_path, workspace_root);
+        let prefixed = format!("{prefix}{normalized}");
+        let observed = files.iter().any(|f| f == &normalized || f == &prefixed);
+        if !observed {
+            warnings.push(format!(
+                "declared change '{declared_path}' not observed in git status"
+            ));
+        }
+    }
+    ChangeReport {
+        files,
+        note,
+        warnings,
+    }
+}
+
+/// Normalize a caller-declared path for comparison with porcelain output: absolute
+/// paths under the workspace become workspace-relative, separators unify on '/', and
+/// leading "./" is dropped.
+fn normalize_declared_path(declared: &str, workspace_root: &Path) -> String {
+    let trimmed = declared.trim();
+    let mut normalized = Path::new(trimmed)
+        .strip_prefix(workspace_root)
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| trimmed.replace('\\', "/"));
+    while let Some(rest) = normalized.strip_prefix("./") {
+        normalized = rest.to_owned();
+    }
+    normalized
 }
 
 /// The budget: how much work the loop may do before it must report honestly.
@@ -342,8 +473,23 @@ fn retryable(kind: &FailureKind) -> bool {
 
 /// The loop. `repair` is called with the failing step and its output, and is expected to edit
 /// the workspace in place. Each attempt runs its own steps so double-counting successes is
-/// impossible: the loop stops at the first fully green attempt.
+/// impossible: the loop stops at the first fully green attempt. `expected_changes` declares
+/// the paths the caller believes were modified; the outcome's `changes` report compares that
+/// declaration against `git status` as warnings only — it never affects `ok`.
 pub fn verify(
+    workspace_root: &Path,
+    plan: &VerificationPlan,
+    budget: &Budget,
+    sandbox: &Sandbox,
+    expected_changes: &[String],
+    mut repair: impl FnMut(&str, &str) -> Option<Vec<PathBuf>>,
+) -> Result<VerificationOutcome, VikramError> {
+    let mut outcome = verify_attempts(workspace_root, plan, budget, sandbox, &mut repair)?;
+    outcome.changes = collect_changes(workspace_root, expected_changes);
+    Ok(outcome)
+}
+
+fn verify_attempts(
     workspace_root: &Path,
     plan: &VerificationPlan,
     budget: &Budget,
@@ -381,6 +527,7 @@ pub fn verify(
                 attempts: attempt,
                 failure: None,
                 steps: all_steps,
+                changes: ChangeReport::default(),
             });
         }
 
@@ -403,6 +550,7 @@ pub fn verify(
                 attempts: attempt,
                 failure: Some((name, kind)),
                 steps: all_steps,
+                changes: ChangeReport::default(),
             });
         }
         let Some(edits) = repair(&name, &spent_out) else {
@@ -411,6 +559,7 @@ pub fn verify(
                 attempts: attempt,
                 failure: Some((name, kind)),
                 steps: all_steps,
+                changes: ChangeReport::default(),
             });
         };
         if edits.is_empty() {
@@ -420,6 +569,7 @@ pub fn verify(
                 attempts: attempt,
                 failure: Some((name, kind)),
                 steps: all_steps,
+                changes: ChangeReport::default(),
             });
         }
     }
@@ -492,6 +642,7 @@ mod tests {
             &plan,
             &Budget::attempts(3),
             &Sandbox::disabled("test"),
+            &[],
             |_, _| None,
         )
         .unwrap();
@@ -515,6 +666,7 @@ mod tests {
             &plan,
             &Budget::attempts(3),
             &Sandbox::disabled("test"),
+            &[],
             |_, _| {
                 let seen = counter_for_repair.metadata().map(|m| m.len()).unwrap_or(0);
                 let mut f = std::fs::OpenOptions::new()
@@ -550,6 +702,7 @@ mod tests {
             &plan,
             &Budget::attempts(2),
             &Sandbox::disabled("test"),
+            &[],
             |_, _| Some(vec![dir.join("untouched.txt")]),
         )
         .unwrap();
@@ -574,6 +727,7 @@ mod tests {
             &plan,
             &Budget::attempts(5),
             &Sandbox::disabled("test"),
+            &[],
             |_, _| Some(Vec::new()),
         )
         .unwrap();
@@ -606,6 +760,94 @@ mod tests {
         assert!(
             !marker.exists(),
             "the cancelled command's process tree was killed"
+        );
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// A committed git repo fixture; `None` when git is unavailable so the
+    /// change-evidence tests skip rather than fail on git-less hosts.
+    fn git_repo(name: &str) -> Option<PathBuf> {
+        let dir = workspace_with(name, "");
+        if !git(&dir, &["init", "-q"]) {
+            return None;
+        }
+        git(&dir, &["config", "user.email", "verify@test"]);
+        git(&dir, &["config", "user.name", "verify"]);
+        std::fs::write(dir.join("a.txt"), "one").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        Some(dir)
+    }
+
+    #[test]
+    fn change_evidence_lists_what_git_reports() {
+        let Some(dir) = git_repo("changes-listed") else {
+            return;
+        };
+        std::fs::write(dir.join("a.txt"), "two").unwrap();
+        std::fs::write(dir.join("b.txt"), "new").unwrap();
+        let report = collect_changes(&dir, &[]);
+        assert!(report.files.contains(&"a.txt".to_owned()), "{report:?}");
+        assert!(report.files.contains(&"b.txt".to_owned()), "{report:?}");
+        assert!(report.note.is_none(), "{report:?}");
+        assert!(report.warnings.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn a_non_git_workspace_reports_the_limitation_not_a_crash() {
+        let dir = workspace_with("changes-no-git", "");
+        let report = collect_changes(&dir, &["anything.rs".to_owned()]);
+        assert!(report.files.is_empty(), "{report:?}");
+        assert!(
+            report
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("not a git repository")),
+            "{report:?}"
+        );
+        assert_eq!(report.warnings.len(), 1, "{report:?}");
+    }
+
+    #[test]
+    fn declared_but_unobserved_changes_warn_without_failing() {
+        let Some(dir) = git_repo("changes-declared") else {
+            return;
+        };
+        std::fs::write(dir.join("a.txt"), "changed").unwrap();
+        let plan = VerificationPlan {
+            steps: vec![PlanStep::new("true", "true", Duration::from_secs(5))],
+        };
+        let declared = vec!["a.txt".to_owned(), "ghost.txt".to_owned()];
+        let outcome = verify(
+            &dir,
+            &plan,
+            &Budget::attempts(1),
+            &Sandbox::disabled("test"),
+            &declared,
+            |_, _| None,
+        )
+        .unwrap();
+        assert!(
+            outcome.ok,
+            "warnings must not affect the verdict: {outcome:?}"
+        );
+        assert!(
+            outcome.changes.files.contains(&"a.txt".to_owned()),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.changes.warnings.len(), 1, "{outcome:?}");
+        assert!(
+            outcome.changes.warnings[0].contains("ghost.txt"),
+            "{outcome:?}"
         );
     }
 

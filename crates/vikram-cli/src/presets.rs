@@ -94,6 +94,18 @@ pub enum PresetsAction {
     },
     /// Delete a preset.
     Delete { name: String },
+    /// Edit an existing preset in place: --from-current re-captures every
+    /// presettable field, --set overrides single fields, --notes replaces the
+    /// note. Bumps `revision`; `version` stays the format version.
+    Update {
+        name: String,
+        #[arg(long)]
+        from_current: bool,
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        #[arg(long)]
+        notes: Option<String>,
+    },
     /// Print a preset's JSON, or write it to --out.
     Export {
         name: String,
@@ -120,6 +132,12 @@ pub fn run(action: PresetsAction) -> Result<(), String> {
         } => create(&name, from_current, &set, notes.as_deref()),
         PresetsAction::Apply { name, yes } => apply(&name, yes),
         PresetsAction::Delete { name } => delete(&name),
+        PresetsAction::Update {
+            name,
+            from_current,
+            set,
+            notes,
+        } => update(&name, from_current, &set, notes.as_deref()),
         PresetsAction::Export { name, out } => export(&name, out.as_deref()),
         PresetsAction::Import { file } => import(&file),
         PresetsAction::Suggest => suggest(),
@@ -222,8 +240,15 @@ pub struct PresetConfig {
 #[serde(deny_unknown_fields)]
 struct Preset {
     name: String,
+    /// Format version; `parse_preset` refuses anything but PRESET_VERSION.
     version: u64,
+    /// Edit counter, bumped by `presets update`. Absent (0) on presets
+    /// written before revisions existed.
+    #[serde(default)]
+    revision: u64,
     created_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    updated_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     notes: Option<String>,
     config: PresetConfig,
@@ -731,7 +756,9 @@ fn create(
     let preset = Preset {
         name: name.to_owned(),
         version: PRESET_VERSION,
+        revision: 0,
         created_ms: vikram_runtime::types::now_ms(),
+        updated_ms: None,
         notes: notes.map(str::to_owned),
         config,
     };
@@ -785,6 +812,49 @@ fn apply(name: &str, yes: bool) -> Result<(), String> {
         .save()
         .map_err(|e| format!("cannot write {}: {e}", dst.display()))?;
     println!("applied preset `{name}` to {}", dst.display());
+    Ok(())
+}
+
+fn update(
+    name: &str,
+    from_current: bool,
+    sets: &[String],
+    notes: Option<&str>,
+) -> Result<(), String> {
+    let mut preset = load_preset(name)?;
+    if !from_current && sets.is_empty() && notes.is_none() {
+        return Err(
+            "nothing to change: pass --from-current, --set key=value, and/or --notes".to_owned(),
+        );
+    }
+    let before = preset.config.clone();
+    let before_notes = preset.notes.clone();
+    if from_current {
+        preset.config = capture(&Config::load().map_err(|e| e.to_string())?);
+    }
+    for pair in sets {
+        let Some((key, value)) = pair.split_once('=') else {
+            return Err(format!("--set expects KEY=VALUE, got `{pair}`"));
+        };
+        set_field(&mut preset.config, key.trim(), value)?;
+    }
+    if notes.is_some() {
+        preset.notes = notes.map(str::to_owned);
+    }
+    if preset.config == before && preset.notes == before_notes {
+        return Err(format!("preset `{name}` is unchanged; nothing to do"));
+    }
+    if flatten(&preset.config).is_empty() {
+        return Err("the preset would manage no config fields".to_owned());
+    }
+    preset.revision += 1;
+    preset.updated_ms = Some(vikram_runtime::types::now_ms());
+    write_preset(&preset)?;
+    println!(
+        "updated preset `{name}` to revision {} at {}",
+        preset.revision,
+        preset_path(name)?.display()
+    );
     Ok(())
 }
 
@@ -1202,6 +1272,56 @@ mod tests {
         let bogus = tmp.path().join("bogus.json");
         std::fs::write(&bogus, "{\"name\":\"x\"}").unwrap();
         assert!(import(&bogus).is_err());
+    }
+
+    #[test]
+    fn update_edits_in_place_and_bumps_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = home_guard(tmp.path());
+        write_config(tmp.path(), "gpt-config");
+        create("rev", false, &["model=gpt-one".to_owned()], Some("first")).unwrap();
+        let created = load_preset("rev").unwrap();
+        let created_ms = created.created_ms;
+
+        update(
+            "rev",
+            false,
+            &["model=gpt-two".to_owned(), "max_steps=7".to_owned()],
+            Some("second"),
+        )
+        .unwrap();
+        let preset = load_preset("rev").unwrap();
+        assert_eq!(preset.config.model.as_deref(), Some("gpt-two"));
+        assert_eq!(preset.config.max_steps, Some(7));
+        assert_eq!(preset.notes.as_deref(), Some("second"));
+        assert_eq!(preset.revision, 1);
+        assert!(preset.updated_ms.is_some());
+        assert_eq!(preset.created_ms, created_ms);
+
+        // --from-current re-captures every presettable field from config.json.
+        update("rev", true, &[], None).unwrap();
+        let preset = load_preset("rev").unwrap();
+        assert_eq!(preset.config.model.as_deref(), Some("gpt-config"));
+        assert_eq!(preset.revision, 2);
+        assert_eq!(preset.notes.as_deref(), Some("second"));
+
+        // Repeating the same edit is refused instead of bumping forever.
+        assert!(update("rev", false, &["model=gpt-config".to_owned()], None).is_err());
+        assert!(update("rev", false, &[], None).is_err());
+        assert!(update("missing", false, &["model=x".to_owned()], None).is_err());
+    }
+
+    #[test]
+    fn update_refuses_secret_and_unknown_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = home_guard(tmp.path());
+        create("locked", false, &["model=x".to_owned()], None).unwrap();
+        let err = update("locked", false, &["api_key=sk-live".to_owned()], None).unwrap_err();
+        assert!(err.contains("unknown preset key"), "{err}");
+        // A refused update must not have touched the file.
+        let preset = load_preset("locked").unwrap();
+        assert_eq!(preset.revision, 0);
+        assert_eq!(preset.config.model.as_deref(), Some("x"));
     }
 
     #[test]
