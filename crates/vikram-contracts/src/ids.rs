@@ -61,6 +61,7 @@ id_type!(TicketMessageId, "tmsg");
 id_type!(TicketEventId, "tev");
 id_type!(ProjectId, "proj");
 id_type!(WorkspaceId, "ws");
+id_type!(RelationId, "rel");
 
 #[cfg(test)]
 mod tests {

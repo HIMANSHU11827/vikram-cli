@@ -90,8 +90,9 @@ the legacy `{name, version, entry, enabled}` shape still parses.
 | `transforms` | TransformOp[] | file ops applied by `vikram transforms apply` |
 
 `components` keys: `tools`, `skills`, `agents`, `hooks`, `commands`, `mcp`, `providers`,
-`channels`, `services`, `ui`. `components.hooks` lists the hook points a process hook
-handles.
+`channels`, `services`, `ui`, `stages`, `wasm`. `components.hooks` lists the hook points a
+process or wasm hook handles; `components.stages` lists the stage points a plugin handles;
+`components.wasm` lists `.wasm` entries (a `.wasm` manifest `entry` is also honored).
 
 ### HookRule fields
 
@@ -123,11 +124,28 @@ Closed vocabulary (`parse_permission` in
 
 ## Stage points
 
-Native in-process modules can replace whole pipeline steps via
-`RuntimeHandle::register_stage` (`crates/vikram-runtime/src/pipeline.rs`, `StagePoint` —
+Ten ordered pipeline steps (`StagePoint` in `crates/vikram-runtime/src/pipeline.rs` —
 the enum is authoritative): `context_build`, `memory_recall`, `provider_request`,
-`tool_dispatch`, `result_commit`, `user_input`, `response_commit`, `turn_end`.
-Process plugins cannot register stages; they reach the same seams through hooks.
+`tool_dispatch`, `result_commit`, `user_input`, `response_commit`, `turn_end`,
+`session_lifecycle`, `agent_lifecycle`. A plugin declares `components.stages` and its
+entry runs as a stage handler: it may mutate the payload and answer
+`StageOutcome::Pass` to hand dispatch to the next registration, or resolve the stage
+itself. Process entries and `.wasm` entries both work (`ProcessStageHandler`,
+`WasmStageHandler`); native code can also call `RuntimeHandle::register_stage`.
+Lifecycle points dispatch through `run_blocking` (no async boundary); of the lifecycle
+operations only `create` may be vetoed.
+
+## WASM entries
+
+A `.wasm` module (declared under `components.wasm`, or as `entry` when it ends in
+`.wasm`) executes in-process through wasmi — no subprocess, no WASI
+(`crates/vikram-runtime/src/plugins/wasm.rs`). The guest exports
+`memory`/`alloc`/`dealloc`/`handle`; the request/response is JSON over linear memory
+(ABI v2). Host imports are limited to `vikram.log` (bounded diagnostics merged into
+the reply as `_logs`) and `vikram.read_resource` (file reads confined to the plugin's
+own directory). Each call runs under a fresh store with a fuel budget. The manifest
+still needs `process` or `network` permission for the entry to execute, and wasm
+hooks answer the same `HookEffect`-shaped JSON a process plugin writes to stdout.
 
 ## `validate`
 

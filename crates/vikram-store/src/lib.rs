@@ -12,7 +12,7 @@ use vikram_contracts::error::{Result as ContractResult, VikramError};
 use vikram_contracts::{
     Appended, AssignmentId, BotId, ContractDecl, EffectId, EntityId, HiveId, HiveMessageId,
     HiveRosterId, JournalRecord, JournalSink, NewRecord, ProfileId, ProjectId, RecordKind,
-    SessionId, TicketEventId, TicketId, TicketMessageId, UserId,
+    RelationId, SessionId, TicketEventId, TicketId, TicketMessageId, UserId,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -149,6 +149,65 @@ pub struct ProjectRow {
     pub status: String,
     pub created_ms: u64,
     pub updated_ms: u64,
+}
+
+/// A person, project, place, organisation or pet with a standing relationship to the user.
+/// `kind` is free text so a profile can extend the vocabulary without a migration; `closeness`
+/// belongs to the caller and is only clamped here so ordering stays meaningful.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelationRow {
+    pub id: RelationId,
+    pub user: UserId,
+    pub profile: ProfileId,
+    pub kind: String,
+    pub name: String,
+    pub aliases: Vec<String>,
+    /// -100 (adversarial) to 100 (immediate family); 0 when nothing is known.
+    pub closeness: i32,
+    pub notes: String,
+    pub last_seen_ms: Option<u64>,
+    pub created_ms: u64,
+    pub updated_ms: u64,
+}
+
+/// One durable assertion about a relation. `source` records how it was learned, so context
+/// assembly can prefer what the user said over what Vikram inferred.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RelationFactRow {
+    pub relation: RelationId,
+    pub key: String,
+    pub value: String,
+    pub confidence: f64,
+    pub source: String,
+    pub created_ms: u64,
+    pub updated_ms: u64,
+}
+
+fn relation_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RelationRow> {
+    let aliases: String = r.get(5)?;
+    Ok(RelationRow {
+        id: RelationId::new(r.get::<_, String>(0)?),
+        user: UserId::new(r.get::<_, String>(1)?),
+        profile: ProfileId::new(r.get::<_, String>(2)?),
+        kind: r.get(3)?,
+        name: r.get(4)?,
+        aliases: serde_json::from_str(&aliases).unwrap_or_default(),
+        closeness: r.get::<_, i64>(6)? as i32,
+        notes: r.get(7)?,
+        last_seen_ms: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+        created_ms: r.get::<_, i64>(9)? as u64,
+        updated_ms: r.get::<_, i64>(10)? as u64,
+    })
+}
+
+fn humanize_age(now_ms: u64, then_ms: u64) -> String {
+    let seconds = now_ms.saturating_sub(then_ms) / 1000;
+    match seconds {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", seconds / 60),
+        3600..=86_399 => format!("{}h ago", seconds / 3600),
+        _ => format!("{}d ago", seconds / 86_400),
+    }
 }
 
 /// The working-directory mode a session runs in: its own lazily created workspace, or a project.
@@ -1594,6 +1653,266 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    // ---- relationships -------------------------------------------------
+
+    /// Insert or refresh a relation's identity. Names match case-insensitively inside
+    /// (user, profile, kind); an existing row keeps its closeness, notes, aliases and facts.
+    pub fn upsert_relation(
+        &self,
+        user: &UserId,
+        profile: &ProfileId,
+        kind: &str,
+        name: &str,
+        now_ms: u64,
+    ) -> Result<RelationRow> {
+        let kind = kind.trim().to_lowercase();
+        let name = name.trim();
+        if kind.is_empty() || name.is_empty() {
+            return Err(StoreError::Parse(
+                "relation kind and name are required".into(),
+            ));
+        }
+        let id = RelationId::generate();
+        self.lock().execute(
+            "INSERT INTO relations (id, user, profile, kind, name, aliases, closeness, notes,
+                                    last_seen_ms, created_ms, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, '[]', 0, '', NULL, ?6, ?7)
+             ON CONFLICT DO UPDATE SET updated_ms = excluded.updated_ms",
+            params![
+                id.as_str(),
+                user.as_str(),
+                profile.as_str(),
+                kind,
+                name,
+                now_ms as i64,
+                now_ms as i64
+            ],
+        )?;
+        self.get_relation(user, profile, &kind, name)?
+            .ok_or_else(|| StoreError::NotFound(format!("relation {name}")))
+    }
+
+    pub fn get_relation(
+        &self,
+        user: &UserId,
+        profile: &ProfileId,
+        kind: &str,
+        name: &str,
+    ) -> Result<Option<RelationRow>> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT id, user, profile, kind, name, aliases, closeness, notes,
+                        last_seen_ms, created_ms, updated_ms
+                 FROM relations
+                 WHERE user = ?1 AND profile = ?2 AND kind = ?3 AND lower(name) = lower(?4)",
+                params![
+                    user.as_str(),
+                    profile.as_str(),
+                    kind.trim().to_lowercase(),
+                    name.trim()
+                ],
+                relation_from_row,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Closest first, then most recently seen, then alphabetical. Context assembly takes the
+    /// head of this list, so the ordering is what decides who Vikram thinks about by default.
+    pub fn list_relations(&self, user: &UserId, profile: &ProfileId) -> Result<Vec<RelationRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, user, profile, kind, name, aliases, closeness, notes,
+                    last_seen_ms, created_ms, updated_ms
+             FROM relations
+             WHERE user = ?1 AND profile = ?2
+             ORDER BY closeness DESC, last_seen_ms DESC NULLS LAST, lower(name) ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![user.as_str(), profile.as_str()], relation_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn touch_relation(&self, id: &RelationId, now_ms: u64) -> Result<()> {
+        let changed = self.lock().execute(
+            "UPDATE relations SET last_seen_ms = ?2, updated_ms = ?2 WHERE id = ?1",
+            params![id.as_str(), now_ms as i64],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("relation {}", id.as_str())));
+        }
+        Ok(())
+    }
+
+    /// Set how close a relation is. Clamped to -100..=100 so a caller cannot poison ordering.
+    pub fn set_relation_closeness(
+        &self,
+        id: &RelationId,
+        closeness: i32,
+        now_ms: u64,
+    ) -> Result<()> {
+        let changed = self.lock().execute(
+            "UPDATE relations SET closeness = ?2, updated_ms = ?3 WHERE id = ?1",
+            params![
+                id.as_str(),
+                closeness.clamp(-100, 100) as i64,
+                now_ms as i64
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("relation {}", id.as_str())));
+        }
+        Ok(())
+    }
+
+    /// Replace the alias list. Aliases are how "mom" resolves to the stored name later.
+    pub fn set_relation_aliases(
+        &self,
+        id: &RelationId,
+        aliases: &[String],
+        now_ms: u64,
+    ) -> Result<()> {
+        let encoded = serde_json::to_string(aliases)?;
+        let changed = self.lock().execute(
+            "UPDATE relations SET aliases = ?2, updated_ms = ?3 WHERE id = ?1",
+            params![id.as_str(), encoded, now_ms as i64],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("relation {}", id.as_str())));
+        }
+        Ok(())
+    }
+
+    /// Record one assertion about a relation. `source` is `observed`, `told` or `inferred`;
+    /// anything else is rejected so downstream code can trust the column.
+    pub fn set_relation_fact(
+        &self,
+        relation: &RelationId,
+        key: &str,
+        value: &str,
+        confidence: f64,
+        source: &str,
+        now_ms: u64,
+    ) -> Result<()> {
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(StoreError::Parse("relation fact key is required".into()));
+        }
+        if !matches!(source, "observed" | "told" | "inferred") {
+            return Err(StoreError::Parse(format!(
+                "unknown relation fact source: {source}"
+            )));
+        }
+        let exists = self.lock().query_row(
+            "SELECT 1 FROM relations WHERE id = ?1",
+            params![relation.as_str()],
+            |r| r.get::<_, i64>(0),
+        );
+        if exists.optional()?.is_none() {
+            return Err(StoreError::NotFound(format!(
+                "relation {}",
+                relation.as_str()
+            )));
+        }
+        self.lock().execute(
+            "INSERT INTO relation_facts
+                (relation, key, value, confidence, source, created_ms, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+             ON CONFLICT(relation, key) DO UPDATE SET
+                value = excluded.value,
+                confidence = excluded.confidence,
+                source = excluded.source,
+                updated_ms = excluded.updated_ms",
+            params![
+                relation.as_str(),
+                key,
+                value,
+                confidence.clamp(0.0, 1.0),
+                source,
+                now_ms as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn relation_facts(&self, relation: &RelationId) -> Result<Vec<RelationFactRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT relation, key, value, confidence, source, created_ms, updated_ms
+             FROM relation_facts WHERE relation = ?1
+             ORDER BY updated_ms DESC, key ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![relation.as_str()], |r| {
+                Ok(RelationFactRow {
+                    relation: RelationId::new(r.get::<_, String>(0)?),
+                    key: r.get(1)?,
+                    value: r.get(2)?,
+                    confidence: r.get(3)?,
+                    source: r.get(4)?,
+                    created_ms: r.get::<_, i64>(5)? as u64,
+                    updated_ms: r.get::<_, i64>(6)? as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_relation(&self, id: &RelationId) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM relation_facts WHERE relation = ?1",
+            params![id.as_str()],
+        )?;
+        let deleted = tx.execute("DELETE FROM relations WHERE id = ?1", params![id.as_str()])?;
+        if deleted == 0 {
+            return Err(StoreError::NotFound(format!("relation {}", id.as_str())));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Render the head of the relationship table as a compact prompt block. Empty when the
+    /// profile knows nobody, so callers can concatenate without a special case.
+    pub fn relation_context(
+        &self,
+        user: &UserId,
+        profile: &ProfileId,
+        max_relations: usize,
+        now_ms: u64,
+    ) -> Result<String> {
+        let mut out = String::new();
+        for relation in self
+            .list_relations(user, profile)?
+            .into_iter()
+            .take(max_relations)
+        {
+            let seen = match relation.last_seen_ms {
+                Some(ts) => format!(", last seen {}", humanize_age(now_ms, ts)),
+                None => String::new(),
+            };
+            out.push_str(&format!(
+                "\n- {} — {} (closeness {}{})",
+                relation.name, relation.kind, relation.closeness, seen
+            ));
+            for fact in self.relation_facts(&relation.id)?.into_iter().take(6) {
+                let inferred = if fact.source == "inferred" {
+                    " (inferred)"
+                } else {
+                    ""
+                };
+                out.push_str(&format!("\n  - {}: {}{}", fact.key, fact.value, inferred));
+            }
+        }
+        if out.is_empty() {
+            return Ok(String::new());
+        }
+        Ok(format!("## People and projects the user knows{out}"))
     }
 
     // ---- session workspaces --------------------------------------------
@@ -4286,6 +4605,35 @@ fn migrate(conn: &Connection) -> Result<()> {
         );
         CREATE UNIQUE INDEX IF NOT EXISTS projects_path ON projects(path);
 
+        -- Standing relationships: who and what the user cares about, durable across sessions.
+        -- Scoped by user and profile like memory, so two profiles never share a person.
+        CREATE TABLE IF NOT EXISTS relations (
+            id           TEXT PRIMARY KEY,
+            user         TEXT NOT NULL,
+            profile      TEXT NOT NULL,
+            kind         TEXT NOT NULL,
+            name         TEXT NOT NULL,
+            aliases      TEXT NOT NULL DEFAULT '[]',
+            closeness    INTEGER NOT NULL DEFAULT 0,
+            notes        TEXT NOT NULL DEFAULT '',
+            last_seen_ms INTEGER,
+            created_ms   INTEGER NOT NULL,
+            updated_ms   INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS relations_identity
+            ON relations(user, profile, kind, lower(name));
+
+        CREATE TABLE IF NOT EXISTS relation_facts (
+            relation    TEXT NOT NULL,
+            key         TEXT NOT NULL,
+            value       TEXT NOT NULL,
+            confidence  REAL NOT NULL DEFAULT 1.0,
+            source      TEXT NOT NULL DEFAULT 'observed',
+            created_ms  INTEGER NOT NULL,
+            updated_ms  INTEGER NOT NULL,
+            PRIMARY KEY (relation, key)
+        );
+
         CREATE TABLE IF NOT EXISTS session_workspaces (
             session         TEXT PRIMARY KEY,
             mode            TEXT NOT NULL DEFAULT 'session',
@@ -4603,12 +4951,18 @@ fn render_session_markdown(export: &SessionExport) -> String {
                     out.push_str(&message.text_body());
                     out.push('\n');
                     for block in &message.blocks {
-                        if let vikram_contracts::Block::ToolCall { call } = block {
-                            out.push_str(&format!(
-                                "\n- tool call `{}`: `{}`\n",
-                                call.id.as_str(),
-                                call.name
-                            ));
+                        match block {
+                            vikram_contracts::Block::ToolCall { call } => {
+                                out.push_str(&format!(
+                                    "\n- tool call `{}`: `{}`\n",
+                                    call.id.as_str(),
+                                    call.name
+                                ));
+                            }
+                            vikram_contracts::Block::Image { source, .. } => {
+                                out.push_str(&format!("\n- image: {}\n", image_label(source)));
+                            }
+                            _ => {}
                         }
                     }
                     out.push('\n');
@@ -4678,6 +5032,52 @@ fn render_session_markdown(export: &SessionExport) -> String {
         ));
     }
     out
+}
+
+/// The text an image block gets in an export: a URL names itself, inline data names its media
+/// type and decoded size — never the base64 payload. Mirrors the transcript label, minus the
+/// cache path the TUI writes.
+fn image_label(source: &vikram_contracts::ImageSource) -> String {
+    match source {
+        vikram_contracts::ImageSource::Url { url } => format!("{url} · linked image"),
+        vikram_contracts::ImageSource::Data { media_type, data } => match base64_len(data) {
+            Some(bytes) => format!("{media_type} · {}", size_bytes(bytes)),
+            None => format!("{media_type} · unreadable data"),
+        },
+    }
+}
+
+/// Decoded length of a base64 payload without decoding it, or `None` when the payload is not
+/// well-formed base64 — so an export never claims a size for bytes it cannot vouch for.
+fn base64_len(data: &str) -> Option<usize> {
+    let trimmed = data.trim();
+    if trimmed.is_empty() || !trimmed.len().is_multiple_of(4) {
+        return None;
+    }
+    let padding = trimmed.bytes().rev().take_while(|&b| b == b'=').count();
+    if padding > 2 {
+        return None;
+    }
+    let body = &trimmed[..trimmed.len() - padding];
+    if !body
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+    {
+        return None;
+    }
+    Some(trimmed.len() / 4 * 3 - padding)
+}
+
+fn size_bytes(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    if bytes < 1024 {
+        return format!("{bytes}B");
+    }
+    let kib = bytes as f64 / KIB;
+    if kib < 1024.0 {
+        return format!("{kib:.1}KiB");
+    }
+    format!("{:.1}MiB", kib / 1024.0)
 }
 
 fn map_session_row(row: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
@@ -6055,5 +6455,237 @@ mod tests {
         assert_eq!(interrupted[0].id, crashed.id);
         assert_eq!(interrupted[0].pending_calls.len(), 2);
         assert_eq!(interrupted[0].tool_preview.as_deref(), Some("shell.run"));
+    }
+
+    #[test]
+    fn relations_upsert_case_insensitively_and_keep_state() {
+        let store = Store::open_in_memory().unwrap();
+        let user = UserId::new("user-1");
+        let profile = ProfileId::new("prof-1");
+
+        let first = store
+            .upsert_relation(&user, &profile, "Person", "Priya", 1_000)
+            .unwrap();
+        assert_eq!(first.kind, "person");
+        store.set_relation_closeness(&first.id, 250, 1_100).unwrap();
+        store
+            .set_relation_fact(&first.id, "sister", "yes", 1.0, "told", 1_200)
+            .unwrap();
+
+        let again = store
+            .upsert_relation(&user, &profile, "person", "  priya ", 2_000)
+            .unwrap();
+        assert_eq!(again.id, first.id);
+        assert_eq!(again.name, "Priya");
+        assert_eq!(again.closeness, 100, "closeness is clamped to 100");
+        assert_eq!(again.updated_ms, 2_000);
+        assert_eq!(store.relation_facts(&again.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn relations_do_not_leak_between_profiles() {
+        let store = Store::open_in_memory().unwrap();
+        let user = UserId::new("user-1");
+        let work = ProfileId::new("prof-work");
+        let home = ProfileId::new("prof-home");
+
+        store
+            .upsert_relation(&user, &work, "person", "Sam", 1)
+            .unwrap();
+        store
+            .upsert_relation(&user, &home, "person", "Sam", 2)
+            .unwrap();
+
+        let work_rows = store.list_relations(&user, &work).unwrap();
+        let home_rows = store.list_relations(&user, &home).unwrap();
+        assert_eq!(work_rows.len(), 1);
+        assert_eq!(home_rows.len(), 1);
+        assert_ne!(work_rows[0].id, home_rows[0].id);
+    }
+
+    #[test]
+    fn relation_context_lists_closest_first_and_marks_inferred() {
+        let store = Store::open_in_memory().unwrap();
+        let user = UserId::new("user-1");
+        let profile = ProfileId::new("prof-1");
+
+        store
+            .upsert_relation(&user, &profile, "person", "Rao", 1_000)
+            .unwrap();
+        let priya = store
+            .upsert_relation(&user, &profile, "person", "Priya", 1_000)
+            .unwrap();
+        store.set_relation_closeness(&priya.id, 90, 1_000).unwrap();
+        store.touch_relation(&priya.id, 3_600_000).unwrap();
+        store
+            .set_relation_fact(&priya.id, "sister", "yes", 1.0, "told", 1_000)
+            .unwrap();
+        store
+            .set_relation_fact(&priya.id, "likes", "filter coffee", 0.6, "inferred", 2_000)
+            .unwrap();
+
+        let block = store
+            .relation_context(&user, &profile, 10, 7_200_000)
+            .unwrap();
+        assert!(block.starts_with("## People and projects the user knows"));
+        assert!(
+            block.find("Priya").unwrap() < block.find("Rao").unwrap(),
+            "closest relation comes first"
+        );
+        assert!(block.contains("- Priya — person (closeness 90, last seen 1h ago)"));
+        assert!(block.contains("  - likes: filter coffee (inferred)"));
+        assert!(block.contains("  - sister: yes"));
+        assert!(
+            store
+                .relation_context(&user, &profile, 0, 7_200_000)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn deleting_a_relation_removes_its_facts() {
+        let store = Store::open_in_memory().unwrap();
+        let user = UserId::new("user-1");
+        let profile = ProfileId::new("prof-1");
+        let rel = store
+            .upsert_relation(&user, &profile, "project", "Vikram", 1)
+            .unwrap();
+        store
+            .set_relation_fact(&rel.id, "status", "active", 1.0, "observed", 1)
+            .unwrap();
+
+        store.delete_relation(&rel.id).unwrap();
+        assert!(
+            store
+                .get_relation(&user, &profile, "project", "Vikram")
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.relation_facts(&rel.id).unwrap().is_empty());
+        assert!(matches!(
+            store.delete_relation(&rel.id),
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn relation_facts_reject_unknown_sources() {
+        let store = Store::open_in_memory().unwrap();
+        let user = UserId::new("user-1");
+        let profile = ProfileId::new("prof-1");
+        let rel = store
+            .upsert_relation(&user, &profile, "person", "Priya", 1)
+            .unwrap();
+
+        assert!(matches!(
+            store.set_relation_fact(&rel.id, "mood", "tired", 0.5, "guessed", 2),
+            Err(StoreError::Parse(_))
+        ));
+        assert!(store.relation_facts(&rel.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn markdown_export_names_image_blocks_without_dumping_bytes() {
+        let store = Store::open_in_memory().unwrap();
+        let row = store
+            .create_session("Session 1", Path::new("/work"), None, 10)
+            .unwrap();
+        let message = vikram_contracts::Message::user_with_images(
+            "what is this?",
+            vec![
+                vikram_contracts::ImageSource::url("https://example.test/shot.png"),
+                vikram_contracts::ImageSource::data("image/png", "QUJD"),
+            ],
+        );
+        store
+            .journal()
+            .append(&NewRecord::new(
+                row.id.clone(),
+                RecordKind::Message,
+                serde_json::json!({"message": message}),
+            ))
+            .unwrap();
+
+        let markdown = store
+            .export_session_text(&row.id, ExportFormat::Markdown, 20)
+            .unwrap()
+            .unwrap();
+        assert!(markdown.contains("what is this?"), "{markdown}");
+        assert!(
+            markdown.contains("- image: https://example.test/shot.png · linked image"),
+            "{markdown}"
+        );
+        assert!(markdown.contains("- image: image/png · 3B"), "{markdown}");
+        assert!(
+            !markdown.contains("QUJD"),
+            "base64 payload must not be dumped into the export"
+        );
+    }
+
+    #[test]
+    fn json_export_round_trips_image_blocks_and_markdown_bounds_large_ones() {
+        let store = Store::open_in_memory().unwrap();
+        let row = store
+            .create_session("Session 1", Path::new("/work"), None, 10)
+            .unwrap();
+        // 3 MiB of zero bytes → 4 MiB of base64: big enough that an honest export must still
+        // fit on one readable line instead of inlining the payload.
+        let big = "A".repeat(4 * 1024 * 1024);
+        let message = vikram_contracts::Message::user_with_images(
+            "look",
+            vec![
+                vikram_contracts::ImageSource::data("image/png", big.clone()),
+                vikram_contracts::ImageSource::data("image/png", "!!!not-base64!!!"),
+            ],
+        );
+        store
+            .journal()
+            .append(&NewRecord::new(
+                row.id.clone(),
+                RecordKind::Message,
+                serde_json::json!({"message": message}),
+            ))
+            .unwrap();
+
+        let json = store
+            .export_session_text(&row.id, ExportFormat::Json, 20)
+            .unwrap()
+            .unwrap();
+        let export: SessionExport = serde_json::from_str(&json).unwrap();
+        let record = export.journal.first().expect("one record");
+        let decoded: vikram_contracts::Message =
+            serde_json::from_value(record.payload["message"].clone()).unwrap();
+        assert_eq!(
+            decoded.images().count(),
+            2,
+            "image blocks survive JSON export"
+        );
+
+        let markdown = store
+            .export_session_text(&row.id, ExportFormat::Markdown, 20)
+            .unwrap()
+            .unwrap();
+        assert!(markdown.contains("image/png · 3.0MiB"), "{markdown}");
+        assert!(
+            markdown.contains("image/png · unreadable data"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.len() < big.len() / 2,
+            "markdown names the image; it does not carry the payload"
+        );
+    }
+
+    #[test]
+    fn base64_len_counts_decoded_bytes_or_refuses() {
+        assert_eq!(base64_len("QUJD"), Some(3));
+        assert_eq!(base64_len("TQ=="), Some(1));
+        assert_eq!(base64_len("TWE="), Some(2));
+        assert_eq!(base64_len(""), None);
+        assert_eq!(base64_len("QUJ"), None);
+        assert_eq!(base64_len("QU===JD"), None);
+        assert_eq!(base64_len("QUJD\n"), Some(3));
+        assert_eq!(base64_len("!!!!"), None);
     }
 }
