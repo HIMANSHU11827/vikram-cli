@@ -65,7 +65,7 @@ pub type PluginComponents = BTreeMap<String, Vec<String>>;
 ///
 /// A key outside this list is reported by [`PluginRegistry::validate`] as a warning; it never
 /// blocks installation.
-pub const PLUGIN_COMPONENT_TYPES: [&str; 11] = [
+pub const PLUGIN_COMPONENT_TYPES: [&str; 12] = [
     "tools",
     "skills",
     "agents",
@@ -77,6 +77,7 @@ pub const PLUGIN_COMPONENT_TYPES: [&str; 11] = [
     "channels",
     "services",
     "ui",
+    "wasm",
 ];
 
 pub use crate::plugins::exec::*;
@@ -86,6 +87,7 @@ pub use crate::plugins::permission::*;
 pub use crate::plugins::registry::*;
 pub(crate) use crate::plugins::util::*;
 pub use crate::plugins::version::*;
+pub use crate::plugins::wasm::*;
 
 pub(crate) mod audit;
 pub(crate) mod exec;
@@ -96,6 +98,7 @@ pub(crate) mod permission;
 pub(crate) mod registry;
 pub(crate) mod util;
 pub(crate) mod version;
+pub(crate) mod wasm;
 
 #[cfg(test)]
 mod tests;

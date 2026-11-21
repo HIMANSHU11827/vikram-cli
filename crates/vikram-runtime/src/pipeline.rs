@@ -34,8 +34,8 @@ use vikram_contracts::{
 
 use crate::hooks::{HookContext, HookEffect, HookPoint};
 use crate::plugins::{
-    PluginManifest, PluginPermission, PluginRegistry, ensure_execution_permitted, entry_path,
-    parse_permissions,
+    PluginManifest, PluginPermission, PluginRegistry, WasmPlugin, ensure_execution_permitted,
+    entry_path, parse_permissions,
 };
 use crate::provider::CompletionRequest;
 use crate::runtime::RuntimeInner;
@@ -468,22 +468,27 @@ impl ProcessStageHandler {
     /// The stage dispatch as the plugin receives it: the usual hook context fields, with the
     /// point spelled as the stage name and the whole payload under `details`.
     fn request_payload(&self, ctx: &StageContext) -> String {
-        let mut value = HookContext::new(ctx.point.hook_point())
-            .with_session(ctx.session.id.as_str())
-            .with_turn(ctx.turn.as_str())
-            .with_workspace(ctx.inner.workspace_root.display().to_string())
-            .with_model(ctx.inner.model())
-            .with_text(ctx.request_text.clone())
-            .with_details(stage_payload_details(&ctx.payload))
-            .to_json();
-        if let Value::Object(map) = &mut value {
-            map.insert(
-                "point".to_owned(),
-                Value::String(ctx.point.as_str().to_owned()),
-            );
-        }
-        value.to_string()
+        stage_request_json(ctx).to_string()
     }
+}
+
+/// The hook-context JSON every stage plugin receives, point spelled as the stage name.
+fn stage_request_json(ctx: &StageContext) -> Value {
+    let mut value = HookContext::new(ctx.point.hook_point())
+        .with_session(ctx.session.id.as_str())
+        .with_turn(ctx.turn.as_str())
+        .with_workspace(ctx.inner.workspace_root.display().to_string())
+        .with_model(ctx.inner.model())
+        .with_text(ctx.request_text.clone())
+        .with_details(stage_payload_details(&ctx.payload))
+        .to_json();
+    if let Value::Object(map) = &mut value {
+        map.insert(
+            "point".to_owned(),
+            Value::String(ctx.point.as_str().to_owned()),
+        );
+    }
+    value
 }
 
 impl StageHandler for ProcessStageHandler {
@@ -549,6 +554,62 @@ impl StageHandler for ProcessStageHandler {
             let effect = HookEffect::from_json(&value)
                 .map_err(|reason| StageError::new(ctx.point, self.name(), reason))?;
             apply_stage_effect(ctx, &self.plugin, &effect)
+        })
+    }
+}
+
+/// A wasm module acting as a stage handler: same wrap-the-builtin + effect semantics as
+/// [`ProcessStageHandler`], but the guest runs in wasmi with fuel limits instead of a subprocess.
+pub struct WasmStageHandler {
+    plugin: Arc<WasmPlugin>,
+    label: String,
+}
+
+impl WasmStageHandler {
+    pub fn new(
+        plugin: impl Into<String>,
+        dir: impl Into<PathBuf>,
+        entry: &str,
+        manifest: &PluginManifest,
+    ) -> Result<Self, String> {
+        let plugin: String = plugin.into();
+        let wasm = WasmPlugin::new(plugin.clone(), dir, entry, manifest)?;
+        Ok(Self {
+            plugin: Arc::new(wasm),
+            label: plugin,
+        })
+    }
+}
+
+impl StageHandler for WasmStageHandler {
+    fn name(&self) -> &'static str {
+        "wasm-stage"
+    }
+
+    fn handle<'a>(&'a self, ctx: &'a mut StageContext) -> StageFuture<'a> {
+        Box::pin(async move {
+            if let Some(builtin) = crate::turn::default_stage_handler(ctx.point) {
+                match builtin.handle(ctx).await? {
+                    StageOutcome::Done | StageOutcome::Pass => {}
+                    StageOutcome::Refused(reason) => return Ok(StageOutcome::Refused(reason)),
+                }
+            }
+            let request = stage_request_json(ctx);
+            let plugin = Arc::clone(&self.plugin);
+            let point = ctx.point;
+            let value = tokio::task::spawn_blocking(move || plugin.request(&request))
+                .await
+                .map_err(|err| {
+                    StageError::new(
+                        point,
+                        "wasm-stage",
+                        format!("wasm stage task failed: {err}"),
+                    )
+                })?
+                .map_err(|err| StageError::new(point, "wasm-stage", err.to_string()))?;
+            let effect = HookEffect::from_json(&value)
+                .map_err(|reason| StageError::new(point, "wasm-stage", reason))?;
+            apply_stage_effect(ctx, &self.label, &effect)
         })
     }
 }
@@ -869,13 +930,17 @@ impl StageRegistry {
             });
             return rejected;
         }
-        let Some(entry) = manifest.entry_point() else {
+        let wasm_entries = WasmPlugin::declared_entries(manifest);
+        let process_entry = manifest
+            .entry_point()
+            .filter(|entry| !entry.to_ascii_lowercase().ends_with(".wasm"));
+        if wasm_entries.is_empty() && process_entry.is_none() {
             rejected.push(StageRejection {
                 plugin: id.clone(),
                 reason: "stage points are declared but no entry point is".to_owned(),
             });
             return rejected;
-        };
+        }
         if let Err(reason) = ensure_execution_permitted(&id, manifest) {
             rejected.push(StageRejection {
                 plugin: id.clone(),
@@ -883,6 +948,29 @@ impl StageRegistry {
             });
             return rejected;
         }
+        for entry in &wasm_entries {
+            match WasmStageHandler::new(id.clone(), dir, entry, manifest) {
+                Ok(handler) => {
+                    let handler: Arc<dyn StageHandler> = Arc::new(handler);
+                    for point in points.iter().copied() {
+                        self.push_registration(
+                            point,
+                            format!("plugin:{id}"),
+                            Arc::clone(&handler),
+                            manifest.priority,
+                            true,
+                        );
+                    }
+                }
+                Err(reason) => rejected.push(StageRejection {
+                    plugin: id.clone(),
+                    reason: format!("wasm entry `{entry}`: {reason}"),
+                }),
+            }
+        }
+        let Some(entry) = process_entry else {
+            return rejected;
+        };
         if let Err(reason) = entry_path(dir, entry) {
             rejected.push(StageRejection {
                 plugin: id.clone(),

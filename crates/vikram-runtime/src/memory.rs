@@ -26,6 +26,40 @@
 
 use std::collections::{HashMap, HashSet};
 
+/// Scope name for memory shared by every session of one operator: `user:<id>`.
+///
+/// The scope column is free-form; the `user:`/`project:` prefixes are the convention the
+/// runtime's scope binding ([`MemoryStore::bind_session_scopes`]) and recall expansion rely
+/// on. Returns `None` for an empty segment so a caller can fall back to a narrower scope
+/// rather than write into a malformed shared shelf.
+pub fn user_scope(user: &str) -> Option<String> {
+    scope_segment(user).map(|seg| format!("user:{seg}"))
+}
+
+/// Scope name for memory shared by every session attached to one project or workspace:
+/// `project:<slug>`. Same free-form convention and same `None`-on-empty contract as
+/// [`user_scope`].
+pub fn project_scope(slug: &str) -> Option<String> {
+    scope_segment(slug).map(|seg| format!("project:{seg}"))
+}
+
+/// Scope ids are path/DB-safe by construction: anything outside `[A-Za-z0-9._~-]` folds to
+/// `_`, and an all-empty result is no scope at all.
+fn scope_segment(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
 use crate::error::{Result, RuntimeError};
 use crate::types::now_ms;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -252,6 +286,62 @@ impl MemoryStore {
             .collect())
     }
 
+    /// Record which shared shelves a session may recall: its `user:<id>` and
+    /// `project:<slug>` scopes, or `None` for either dimension the session does not have.
+    ///
+    /// Only host code calls this — never a model-facing tool — so recall expansion can add
+    /// exactly the shelves the runtime vouched for and nothing a caller invented. Passing
+    /// `None` for both clears the binding, so a session that leaves its project stops
+    /// seeing that project's shelf on the next recall.
+    pub fn bind_session_scopes(
+        &self,
+        session: &str,
+        user_scope: Option<&str>,
+        project_scope: Option<&str>,
+    ) -> Result<()> {
+        let session = session.trim();
+        if session.is_empty() {
+            return Ok(());
+        }
+        let user_scope = user_scope.map(str::to_owned);
+        let project_scope = project_scope.map(str::to_owned);
+        let conn = self.lock();
+        let existing = conn
+            .query_row(
+                "SELECT user_scope, project_scope FROM memory_scopes WHERE session = ?1",
+                params![session],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        let next = (user_scope, project_scope);
+        if existing.as_ref() == Some(&next) {
+            return Ok(());
+        }
+        if next.0.is_none() && next.1.is_none() {
+            conn.execute(
+                "DELETE FROM memory_scopes WHERE session = ?1",
+                params![session],
+            )
+            .map_err(|e| RuntimeError::Store(e.to_string()))?;
+            return Ok(());
+        }
+        conn.execute(
+            "INSERT INTO memory_scopes (session, user_scope, project_scope) VALUES (?1, ?2, ?3)
+             ON CONFLICT(session) DO UPDATE SET
+                 user_scope = excluded.user_scope,
+                 project_scope = excluded.project_scope",
+            params![session, next.0, next.1],
+        )
+        .map_err(|e| RuntimeError::Store(e.to_string()))?;
+        Ok(())
+    }
+
     /// Ranked recall for the context builder, restricted to the scopes the caller is allowed to see.
     ///
     /// Delegate to `hybrid_recall` with default weights so the two entry points never drift apart
@@ -290,6 +380,13 @@ impl MemoryStore {
             return Ok(Vec::new());
         }
         let conn = self.lock();
+
+        // A scope that names a session also recalls the shared shelves the host bound to it
+        // (`user:`/`project:`). The binding table is written only by runtime code, so the
+        // expansion can widen recall by exactly what the session was already entitled to —
+        // a caller naming another session's id gains nothing it could not already read by
+        // passing that id's own memories.
+        let scopes = expand_recall_scopes(&conn, scopes)?;
 
         // 1. Gather candidate rows confined to the granted scopes. The raw LIKE sweep mirrors
         //    the historical recall; the FTS5 BM25 signal is computed on top of this same pool
@@ -494,6 +591,48 @@ impl MemoryStore {
         .map(|n| n as usize)
         .map_err(|e| RuntimeError::Store(e.to_string()))
     }
+}
+
+/// The granted scope list plus the shared shelves bound to any session id in it, order
+/// preserved and duplicates collapsed. Scopes with no binding contribute nothing.
+fn expand_recall_scopes(conn: &Connection, scopes: &[String]) -> Result<Vec<String>> {
+    let placeholders = scopes.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT session, user_scope, project_scope FROM memory_scopes WHERE session IN ({placeholders})"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| RuntimeError::Store(e.to_string()))?;
+    let params: Vec<&dyn rusqlite::ToSql> =
+        scopes.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let rows = stmt
+        .query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(|e| RuntimeError::Store(e.to_string()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| RuntimeError::Store(e.to_string()))?;
+    drop(stmt);
+    let mut bound: HashMap<String, Vec<String>> = HashMap::new();
+    for (session, user, project) in rows {
+        let extras: Vec<String> = [user, project].into_iter().flatten().collect();
+        if !extras.is_empty() {
+            bound.insert(session, extras);
+        }
+    }
+    let mut out = scopes.to_vec();
+    for scope in scopes {
+        if let Some(extras) = bound.get(scope) {
+            out.extend(extras.iter().cloned());
+        }
+    }
+    let mut seen = HashSet::new();
+    out.retain(|s| seen.insert(s.clone()));
+    Ok(out)
 }
 
 fn read_pairs<I>(rows: I) -> Result<Vec<(String, String)>>
@@ -722,6 +861,13 @@ fn migrate(conn: &Connection) -> Result<()> {
         );
         -- FTS5 backing for BM25. Best-effort: see fts_or_like_scores fallback.
         CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(id UNINDEXED, key, value, tokenize='porter');
+        -- Session -> shared-scope binding for recall expansion (`user:`/`project:` shelves).
+        -- Written only by host code via `bind_session_scopes`, never by a memory tool.
+        CREATE TABLE IF NOT EXISTS memory_scopes (
+            session       TEXT PRIMARY KEY,
+            user_scope    TEXT,
+            project_scope TEXT
+        );
         "#,
     )
     .map_err(|e| RuntimeError::Store(e.to_string()))?;
@@ -1306,6 +1452,135 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "the replaced value leaves the index"
+        );
+    }
+
+    // ---- shared user:/project: scopes ------------------------------------
+
+    #[test]
+    fn shared_scope_names_are_prefixed_and_sanitized() {
+        assert_eq!(user_scope("user-1").as_deref(), Some("user:user-1"));
+        assert_eq!(
+            project_scope("proj-abc").as_deref(),
+            Some("project:proj-abc")
+        );
+        assert_eq!(
+            project_scope("/tmp/my proj").as_deref(),
+            Some("project:_tmp_my_proj")
+        );
+        assert_eq!(user_scope("   "), None, "no segment, no scope");
+        assert_eq!(project_scope(""), None);
+    }
+
+    #[test]
+    fn a_bound_session_recalls_its_user_and_project_shelves() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store
+            .save("pref", "prefers rustfmt nightly", "user:u1")
+            .unwrap();
+        store
+            .save("conv", "uses tabs in this project", "project:p1")
+            .unwrap();
+        store.save("note", "session only note", "ses-a").unwrap();
+        store
+            .bind_session_scopes("ses-a", Some("user:u1"), Some("project:p1"))
+            .unwrap();
+
+        let hits = store
+            .recall_terms(
+                &["rustfmt".to_string(), "tabs".to_string()],
+                &["global".to_owned(), "ses-a".to_owned()],
+                8,
+            )
+            .unwrap();
+        let scopes: Vec<&str> = hits.iter().map(|(s, _, _)| s.as_str()).collect();
+        assert!(
+            scopes.contains(&"user:u1"),
+            "the bound user shelf recalls: {hits:?}"
+        );
+        assert!(
+            scopes.contains(&"project:p1"),
+            "the bound project shelf recalls: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn unbound_and_other_project_sessions_do_not_see_shared_shelves() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store
+            .save("pref", "prefers rustfmt nightly", "user:u1")
+            .unwrap();
+        store
+            .save("conv", "uses tabs in this project", "project:p1")
+            .unwrap();
+        store
+            .save("conv", "spaces in the other project", "project:p2")
+            .unwrap();
+        store
+            .bind_session_scopes("ses-a", Some("user:u1"), Some("project:p1"))
+            .unwrap();
+        store
+            .bind_session_scopes("ses-b", Some("user:u2"), Some("project:p2"))
+            .unwrap();
+
+        let terms = vec![
+            "prefers".to_string(),
+            "spaces".to_string(),
+            "tabs".to_string(),
+        ];
+        let a = store
+            .recall_terms(&terms, &["global".into(), "ses-a".into()], 8)
+            .unwrap();
+        let a_scopes: Vec<&str> = a.iter().map(|(s, _, _)| s.as_str()).collect();
+        assert!(a_scopes.contains(&"project:p1"));
+        assert!(
+            !a_scopes.contains(&"project:p2"),
+            "project p2's shelf must not leak into p1's session: {a:?}"
+        );
+        assert!(
+            !a_scopes.contains(&"user:u2"),
+            "another user's shelf must not leak: {a:?}"
+        );
+
+        // A session with no binding recalls nothing shared — deny-first.
+        let c = store
+            .recall_terms(&terms, &["global".into(), "ses-c".into()], 8)
+            .unwrap();
+        assert!(
+            c.iter().all(|(s, _, _)| s == "global" || s == "ses-c"),
+            "unbound session sees only its granted scopes: {c:?}"
+        );
+
+        // And granting only `global` never surfaces shared shelves either.
+        let g = store.recall_terms(&terms, &["global".into()], 8).unwrap();
+        assert!(g.iter().all(|(s, _, _)| s == "global"));
+    }
+
+    #[test]
+    fn clearing_a_binding_stops_shared_recall() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store
+            .save("conv", "uses tabs in this project", "project:p1")
+            .unwrap();
+        store
+            .bind_session_scopes("ses-a", None, Some("project:p1"))
+            .unwrap();
+        let terms = vec!["tabs".to_string()];
+        let scopes = ["global".to_owned(), "ses-a".to_owned()];
+        assert!(
+            store
+                .recall_terms(&terms, &scopes, 8)
+                .unwrap()
+                .iter()
+                .any(|(s, _, _)| s == "project:p1")
+        );
+
+        // Leaving the project clears the shelf: the next recall must not see it.
+        store.bind_session_scopes("ses-a", None, None).unwrap();
+        let hits = store.recall_terms(&terms, &scopes, 8).unwrap();
+        assert!(
+            hits.iter().all(|(s, _, _)| s != "project:p1"),
+            "a cleared binding recalls nothing shared: {hits:?}"
         );
     }
 }

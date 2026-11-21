@@ -520,10 +520,10 @@ pub fn proposal_from_evolution(
             return None;
         }
         (
-            if layer == "user" {
-                "user".to_owned()
-            } else {
-                "memory".to_owned()
+            match layer {
+                "user" => "user".to_owned(),
+                "project" => "project".to_owned(),
+                _ => "memory".to_owned(),
             },
             content,
         )
@@ -651,6 +651,10 @@ pub(crate) fn on_turn_end(
     if outcome == TurnState::Cancelled {
         return;
     }
+    // Keep the session's shared-scope binding current so recall sees `user:`/`project:`
+    // shelves even when both learning policies are off — the binding is recall plumbing,
+    // not a learning write.
+    bind_session_memory_scopes(inner, session);
     // Both policies off is the operator's switch for the whole feature, not just its output.
     let policies_enabled = !(inner.learning.surface.policy_memory() == LearningPolicy::Disabled
         && inner.learning.surface.policy_skill() == LearningPolicy::Disabled);
@@ -1244,9 +1248,11 @@ pub(crate) fn apply_or_stage(
         audit(inner, &proposal, "skipped", "policy disabled");
         return;
     }
+    // Resolved once so the dedup read and the eventual write can never disagree about the
+    // shelf: `user`/`project` targets land on the shared scopes recall is bound to read.
+    let scope = memory_write_scope(inner, &proposal);
     if proposal.kind == "memory" {
-        let scope = scope_of(&proposal.target, &proposal.session);
-        let existing = match inner.memory.list(scope) {
+        let existing = match inner.memory.list(&scope) {
             Ok(existing) => existing,
             Err(err) => {
                 audit(
@@ -1281,11 +1287,7 @@ pub(crate) fn apply_or_stage(
     let outcome = if proposal.kind == "memory" {
         inner
             .memory
-            .save(
-                &proposal.key,
-                &proposal.content,
-                scope_of(&proposal.target, &proposal.session),
-            )
+            .save(&proposal.key, &proposal.content, &scope)
             .map(|_| format!("auto-applied{}", tail(&proposal.reason)))
             .unwrap_or_else(|err| format!("could not save memory: {err}"))
     } else {
@@ -1356,9 +1358,103 @@ fn request_skill_approval(inner: &Arc<crate::runtime::RuntimeInner>, proposal: &
 /// Memory writes land in the session's own scope: automatic recall only reads `global` +
 /// the session id, and the shared store has no user dimension — a literal `user`/`memory`
 /// scope would be both invisible to recall and readable by every other session.
+///
+/// Kept for callers that only hold a session id (the CLI approve path, benches). The
+/// runtime's own apply path resolves the wider `user:`/`project:` shelves through
+/// [`memory_write_scope`], which has the session and store context this signature lacks.
 pub fn scope_of(target: &str, session: &SessionId) -> String {
     let _ = target;
     session.as_str().to_owned()
+}
+
+/// FNV-1a over the workspace path: a stable, dependency-free slug for the `project:`
+/// shelf of sessions that share a working directory but have no project row.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// The `project:<slug>` shelf for a session: its project row's id when one is attached
+/// (the store reuses one row per directory, so sessions on the same project share it),
+/// else a hash of the session's working directory so sessions on the same workspace
+/// share a shelf without leaking the absolute path into the scope name.
+fn project_memory_scope(session: &crate::session::SessionRuntime) -> Option<String> {
+    let slug = match session.project_id() {
+        Some(id) => id.as_str().to_owned(),
+        None => {
+            let cwd = session.cwd().to_string_lossy().into_owned();
+            if cwd.trim().is_empty() {
+                return None;
+            }
+            format!("ws-{:016x}", fnv1a(cwd.as_bytes()))
+        }
+    };
+    crate::memory::project_scope(&slug)
+}
+
+/// The shared shelves a session may read and write: `user:<id>` from the runtime's active
+/// identity (the same account `create_session` stamps on new sessions) and
+/// `project:<slug>` from [`project_memory_scope`]. Either is `None` when the session has
+/// no resolvable dimension — never guessed, so a write can only land where recall was
+/// bound to look.
+fn shared_memory_scopes(
+    inner: &Arc<crate::runtime::RuntimeInner>,
+    session: &crate::session::SessionRuntime,
+) -> (Option<String>, Option<String>) {
+    let user = inner
+        .store
+        .get_active_identity()
+        .ok()
+        .and_then(|identity| identity.user)
+        .and_then(|id| crate::memory::user_scope(id.as_str()));
+    (user, project_memory_scope(session))
+}
+
+/// Where a memory proposal's write lands. `user`/`project` targets go to the shared
+/// `user:<id>`/`project:<slug>` shelves when the session resolves them; every other
+/// target — and any shared scope that cannot be resolved — stays in the session's own
+/// scope, the narrowest shelf recall already reads.
+fn memory_write_scope(
+    inner: &Arc<crate::runtime::RuntimeInner>,
+    proposal: &LearningProposal,
+) -> String {
+    let session_scope = proposal.session.as_str().to_owned();
+    if proposal.kind != "memory" {
+        return session_scope;
+    }
+    let Some(session) = inner.session(&proposal.session) else {
+        return session_scope;
+    };
+    let (user_scope, project_scope) = shared_memory_scopes(inner, &session);
+    match proposal.target.as_str() {
+        "user" => user_scope.unwrap_or(session_scope),
+        "project" => project_scope.unwrap_or(session_scope),
+        _ => session_scope,
+    }
+}
+
+/// Tell the memory store which shared shelves this session may recall. Runs every turn so
+/// a project switch or identity change is picked up; the store skips the write when the
+/// binding is unchanged, and a session with neither dimension clears any stale binding.
+fn bind_session_memory_scopes(
+    inner: &Arc<crate::runtime::RuntimeInner>,
+    session: &crate::session::SessionRuntime,
+) {
+    let (user, project) = shared_memory_scopes(inner, session);
+    if let Err(err) =
+        inner
+            .memory
+            .bind_session_scopes(session.id.as_str(), user.as_deref(), project.as_deref())
+    {
+        eprintln!(
+            "vikram: could not bind memory scopes for {}: {err}",
+            session.id
+        );
+    }
 }
 
 /// Applies one staged skill proposal through the skills [`vikram_skills::Manager`], honoring
@@ -2325,5 +2421,118 @@ mod tests {
             .set_policy_skill(LearningPolicy::Auto);
         apply_or_stage(&inner, surface_proposal("skill", "create", "auto-skill"));
         assert!(pending_autonomy_requests(&inner).is_empty());
+    }
+
+    #[test]
+    fn a_project_layer_proposal_maps_to_the_project_target() {
+        let staged = proposal_from_evolution(
+            &evolution_proposal(
+                vikram_evolution::ProposalKind::AddMemory,
+                serde_json::json!({"layer": "project", "content": "crate uses cargo-nextest"}),
+            ),
+            &session(),
+        )
+        .expect("a project-layer memory proposal maps onto the surface");
+        assert_eq!(staged.kind, "memory");
+        assert_eq!(staged.target, "project");
+        assert_eq!(staged.content, "crate uses cargo-nextest");
+    }
+
+    #[tokio::test]
+    async fn an_auto_applied_user_memory_lands_on_the_shared_user_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, _guard) = test_runtime(dir.path()).await;
+        let inner = runtime.handle().inner.clone();
+        inner
+            .learning
+            .surface
+            .set_policy_memory(LearningPolicy::Auto);
+
+        let session = inner.session_list().into_iter().next().unwrap();
+        let mut proposal = surface_proposal("memory", "add", "user");
+        proposal.session = session.id.clone();
+        proposal.key = "pref-1".to_owned();
+        proposal.content = "prefers pnpm over npm".to_owned();
+        apply_or_stage(&inner, proposal);
+
+        let user = inner
+            .store
+            .get_active_identity()
+            .unwrap()
+            .user
+            .expect("bootstrapped identity has a user");
+        let user_scope = crate::memory::user_scope(user.as_str()).unwrap();
+        assert_eq!(
+            inner.memory.get("pref-1", &user_scope).unwrap(),
+            Some("prefers pnpm over npm".to_owned()),
+            "a user-target proposal writes the shared user shelf, not the session's"
+        );
+        assert_eq!(
+            inner.memory.get("pref-1", session.id.as_str()).unwrap(),
+            None,
+            "nothing may be double-written into the session scope"
+        );
+
+        // Once the turn loop binds the session, recall of the session scope surfaces it.
+        bind_session_memory_scopes(&inner, &session);
+        let hits = inner
+            .memory
+            .recall_terms(
+                &["pnpm".to_owned()],
+                &["global".to_owned(), session.id.as_str().to_owned()],
+                5,
+            )
+            .unwrap();
+        assert!(
+            hits.iter().any(|(scope, _, _)| scope == &user_scope),
+            "bound recall must surface the user shelf: {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_project_memory_lands_on_the_project_scope_and_stays_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, _guard) = test_runtime(dir.path()).await;
+        let inner = runtime.handle().inner.clone();
+        inner
+            .learning
+            .surface
+            .set_policy_memory(LearningPolicy::Auto);
+
+        let session = inner.session_list().into_iter().next().unwrap();
+        let mut proposal = surface_proposal("memory", "add", "project");
+        proposal.session = session.id.clone();
+        proposal.key = "conv-1".to_owned();
+        proposal.content = "this workspace uses cargo-nextest".to_owned();
+        apply_or_stage(&inner, proposal);
+
+        let expected = project_memory_scope(&session).expect("session has a workspace");
+        assert_eq!(
+            inner.memory.get("conv-1", &expected).unwrap(),
+            Some("this workspace uses cargo-nextest".to_owned())
+        );
+
+        // A session on a different workspace resolves a different project shelf.
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = crate::session::SessionRuntime::from_row(vikram_store::SessionRow {
+            id: vikram_contracts::SessionId::generate(),
+            title: "other".to_owned(),
+            cwd: other_dir.path().to_path_buf(),
+            model: None,
+            bot: None,
+            created_ms: 0,
+            updated_ms: 0,
+            status: "active".to_owned(),
+            project_id: None,
+            title_source: "generic".to_owned(),
+            title_status: "ready".to_owned(),
+            parent_session: None,
+            forked_from: None,
+        });
+        assert_ne!(
+            project_memory_scope(&other),
+            Some(expected.clone()),
+            "different workspaces must not share a project shelf"
+        );
     }
 }
