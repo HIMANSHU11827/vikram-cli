@@ -197,13 +197,19 @@ impl WavoRecognizer {
         Ok(self.model.as_ref().expect("model loaded"))
     }
 
+    /// The one place the configured language becomes wavo options: `None` leaves the model to
+    /// detect the spoken language itself.
+    fn options(&self) -> wavo::Options {
+        let mut options = wavo::Options::default();
+        options.language = self.language.clone();
+        options
+    }
+
     fn transcribe_impl(&mut self, pcm: &[i16], cancel: &CancelToken) -> Result<Option<String>> {
         cancel.check()?;
-        let language = self.language.clone();
+        let options = self.options();
         let model = self.ensure_loaded()?;
         let audio: Vec<f32> = pcm.iter().map(|sample| *sample as f32 / 32768.0).collect();
-        let mut options = wavo::Options::default();
-        options.language = language;
         let transcript = model
             .transcribe_with(&audio, &options)
             .map_err(wavo_error)?;
@@ -517,6 +523,36 @@ mod tests {
         if VoxtypeRecognizer::detect(&config).is_some() {
             assert!(detail.contains("voxtype fast path"), "{detail}");
         }
+    }
+
+    #[test]
+    fn the_configured_language_reaches_the_wavo_options() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("model.gguf"), b"weights").unwrap();
+        let config = VoiceConfig {
+            asr_model: dir.path().join("model.gguf"),
+            asr_language: Some("en".into()),
+            ..config_with_dir(dir.path())
+        };
+        let engine = AsrEngine::new(&config);
+        let recognizer = engine.wavo.expect("a model file arms the built-in engine");
+        assert_eq!(recognizer.options().language.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn no_configured_language_leaves_wavo_auto_detection_on() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("model.gguf"), b"weights").unwrap();
+        let config = VoiceConfig {
+            asr_model: dir.path().join("model.gguf"),
+            asr_language: None,
+            ..config_with_dir(dir.path())
+        };
+        let recognizer = WavoRecognizer::from_config(&config);
+        assert!(recognizer.options().language.is_none());
+        let engine = AsrEngine::new(&config);
+        let recognizer = engine.wavo.expect("a model file arms the built-in engine");
+        assert!(recognizer.options().language.is_none());
     }
 
     #[test]
