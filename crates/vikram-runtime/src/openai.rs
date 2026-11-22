@@ -1099,16 +1099,25 @@ fn parse_sse_line(line: &str, state: &mut StreamState) -> Option<Vec<ProviderEve
     }
 }
 
-/// The note a `length` finish earns, once. Emitted before `Finished` wherever the finish is
+/// The note a non-clean finish earns, once. Emitted before `Finished` wherever the finish is
 /// assembled — the same surfacing the Anthropic provider gives `stop_reason: max_tokens`.
+/// `length` means the answer was cut off; `content_filter` means the provider withheld it, which
+/// would otherwise look like a short, complete answer.
 fn truncation_note(state: &mut StreamState) -> Option<ProviderEvent> {
-    if state.truncation_noted || state.finish_reason.as_deref() != Some("length") {
+    if state.truncation_noted {
         return None;
     }
+    let note = match state.finish_reason.as_deref() {
+        Some("length") => {
+            "\n[response truncated: the model reached its output-token limit (`length`)]"
+        }
+        Some("content_filter") => {
+            "\n[response withheld: the provider's content filter stopped it (`content_filter`)]"
+        }
+        _ => return None,
+    };
     state.truncation_noted = true;
-    Some(ProviderEvent::TextDelta(
-        "\n[response truncated: the model reached its output-token limit (`length`)]".to_owned(),
-    ))
+    Some(ProviderEvent::TextDelta(note.to_owned()))
 }
 
 /// Flush what the stream holds: assembled tool calls first, then a `Finished` that was waiting
@@ -1330,8 +1339,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_content_filter_finish_is_announced_as_withheld() {
+        let mut state = stream_state();
+        parse_sse_line(
+            r#"data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}"#,
+            &mut state,
+        );
+        let events = parse_sse_line(
+            r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":0}}"#,
+            &mut state,
+        )
+        .expect("usage closes the stream");
+        assert!(
+            matches!(&events[0], ProviderEvent::TextDelta(note) if note.contains("content_filter")),
+            "a withheld answer must be named, not read as a short one: {events:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(ProviderEvent::Finished { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn a_host_that_cannot_be_resolved_is_named_as_dns() {
+        // reqwest panics without a process-wide provider when the rustls-no-provider feature is
+        // in play; production installs it in tls_config, so the test has to install it too or it
+        // only passes when another test happened to run first.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let endpoint = "http://no-such-host-xyz.invalid/v1/chat/completions";
         let err = reqwest::Client::new()
             .get(endpoint)
