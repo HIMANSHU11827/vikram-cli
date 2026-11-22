@@ -105,6 +105,58 @@ fn stop_signal(text: &str) -> Option<StopSignal> {
     }
 }
 
+/// The verdict line `verify` leads with, split into the kind of failure and its reason.
+///
+/// `verify` already puts the verdict on the first line of its result, and the JSON report below it
+/// can be spooled or cut, so this line is the part that always survives. The turn reads it to tell
+/// the operator what a failed run actually failed to prove — a green build that proved nothing is
+/// `expectation_missing`, and that reads very differently from a compile error.
+fn verification_failure(content: &str) -> Option<(String, String)> {
+    let verdict = content.lines().next()?.trim();
+    let rest = verdict.strip_prefix("verify: FAIL")?;
+    let kind = rest
+        .split("kind=")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .to_owned();
+    let reason = rest
+        .split_once('—')
+        .map(|(_, reason)| reason.trim().to_owned())
+        .unwrap_or_default();
+    Some((kind, reason))
+}
+
+/// Tell the operator, in the turn's own words, that a verification did not prove the change.
+/// The model already has the verdict in the tool result; this is the sentence the human needs,
+/// because "verify failed" and "verify passed a build that proves nothing" look the same in a
+/// transcript and are not the same event.
+fn note_verification_failure(inner: &Arc<RuntimeInner>, content: &str) {
+    let Some((kind, reason)) = verification_failure(content) else {
+        return;
+    };
+    let text = match (kind.as_str(), reason.is_empty()) {
+        ("expectation_missing", false) => format!(
+            "verify did not prove the change: {reason}. This is not a pass — make the change the \
+             expectation describes, or declare the expectation that would prove it, and run \
+             verify again."
+        ),
+        ("expectation_missing", true) => "verify did not prove the change: an expectation was \
+                                          declared and nothing showed it. Fix the change, then \
+                                          verify again."
+            .to_owned(),
+        (_, false) => format!("verify failed ({kind}): {reason}"),
+        (_, true) => format!(
+            "verify failed ({kind}) — the failing step's output is in the result. Fix the cause \
+             before claiming the change works."
+        ),
+    };
+    inner.emit(RuntimeEvent::Notice {
+        level: NoticeLevel::Warn,
+        text,
+    });
+}
+
 /// Said to the model on every turn, in its own system message. The transcript prints these lines
 /// between the tool rows as the agent's voice, so they are part of the interface and not decoration:
 /// one or two sentences, present tense, naming the file, command or question in hand.
@@ -1124,6 +1176,9 @@ pub(crate) async fn run_turn(
             growth.record_call(&call.name);
             if call.name == "verify" {
                 growth.record_verification(ok, &content);
+                if !ok {
+                    note_verification_failure(&inner, &content);
+                }
             } else if !ok {
                 growth.record_failure(&call.name, &content);
             }
@@ -6774,5 +6829,139 @@ mod tests {
             .find(|message| message.role == Role::Assistant)
             .expect("the note is committed");
         assert!(answer.text_body().contains(REFUSAL_MARKER), "{answer:?}");
+    }
+
+    // ---- a failed verification is surfaced, not just failed ---------------------------------
+
+    #[test]
+    fn the_verdict_line_names_what_a_failed_run_failed_to_prove() {
+        assert_eq!(
+            verification_failure(
+                "verify: FAIL step=expectations kind=expectation_missing — strict verification \
+                 could not prove the change: `fn handle_poll` not found in src/lib.rs\n{\"ok\":false}"
+            ),
+            Some((
+                "expectation_missing".to_owned(),
+                "strict verification could not prove the change: `fn handle_poll` not found in \
+                 src/lib.rs"
+                    .to_owned()
+            ))
+        );
+        assert_eq!(
+            verification_failure("verify: FAIL step=test kind=test_failed"),
+            Some(("test_failed".to_owned(), String::new()))
+        );
+        assert_eq!(
+            verification_failure("verify: PASS\n{\"ok\":true}"),
+            None,
+            "a pass is not a failure"
+        );
+        assert_eq!(
+            verification_failure("something else entirely"),
+            None,
+            "an unrelated tool result is not a verdict"
+        );
+    }
+
+    /// A tool that answers the way `verify` does under strict mode: a verdict line, then the JSON
+    /// report. Nothing is built, so the test measures the turn's reaction, not cargo's speed.
+    struct StrictVerifyStub;
+
+    impl Tool for StrictVerifyStub {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "verify".into(),
+                description: "reports an unproven change".into(),
+                schema: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+
+        fn permission(&self, _args: &serde_json::Value) -> Result<PermissionRequest, VikramError> {
+            // Read-shaped so the call runs without an approval: this test measures what the turn
+            // does with a verdict, and an approval prompt would only test the approval queue.
+            Ok(PermissionRequest::new(
+                ActionKind::Read,
+                "verify",
+                "cargo",
+                SideEffect::None,
+                Trust::Model,
+            ))
+        }
+
+        fn run(
+            &self,
+            _args: &serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolOutput, VikramError> {
+            Ok(ToolOutput {
+                content: "verify: FAIL step=expectations kind=expectation_missing — strict \
+                          verification could not prove the change: `fn handle_poll` not found in \
+                          src/lib.rs\n{\"ok\":false,\"strict\":true}"
+                    .into(),
+                ok: false,
+            })
+        }
+    }
+
+    /// The operator is told what the run failed to prove. Without this a strict failure and a
+    /// compile error read the same in a transcript.
+    #[tokio::test]
+    async fn a_strict_verification_failure_is_surfaced_with_the_unmet_expectation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let call = ToolCall::new("verify", serde_json::json!({"expect": ["fn handle_poll"]}));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![ProviderEvent::ToolCall(call), finished()],
+            vec![
+                ProviderEvent::TextDelta("the change is not there".into()),
+                finished(),
+            ],
+        ]));
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        handle.inner.tools.register(Box::new(StrictVerifyStub));
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "prove the change".into())
+            .expect("the turn is accepted");
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let mut notices = Vec::new();
+        let mut result = String::new();
+        loop {
+            assert!(Instant::now() < deadline, "the turn never finished");
+            let Ok(Ok(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), events.recv()).await
+            else {
+                continue;
+            };
+            match event {
+                RuntimeEvent::Notice { text, .. } => notices.push(text),
+                RuntimeEvent::MessageCommitted { message, .. } => {
+                    if message.role == Role::Tool {
+                        result = message.text_body();
+                    }
+                }
+                RuntimeEvent::TurnFinished { .. } => break,
+                _ => {}
+            }
+        }
+
+        let surfaced = notices
+            .iter()
+            .find(|notice| notice.contains("did not prove the change"))
+            .unwrap_or_else(|| panic!("the failure was not surfaced: {notices:?}"));
+        assert!(
+            surfaced.contains("fn handle_poll"),
+            "the unmet expectation is named, not summarised away: {surfaced}"
+        );
+        assert!(
+            result.contains("kind=expectation_missing"),
+            "the model still gets the verdict in the tool result: {result}"
+        );
     }
 }
