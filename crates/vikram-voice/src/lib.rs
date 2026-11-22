@@ -22,9 +22,9 @@ pub use asr::{
     resolve_model, resolve_model_in,
 };
 pub use cancel::CancelToken;
-pub use capture::{CpalSource, DeviceSource, probe_capture};
+pub use capture::{CpalSource, DeviceSource, input_devices, probe_capture};
 pub use helpers::{first_available, missing_tool_message, probe, which};
-pub use player::{CpalPlayer, DevicePlayer, probe_playback};
+pub use player::{CpalPlayer, DevicePlayer, output_devices, probe_playback};
 pub use session::{
     AudioSource, HelperPlayer, HelperRecognizer, HelperSource, HelperSynth, Player, Recognizer,
     Synthesizer, VoiceSession,

@@ -6,7 +6,7 @@
 //! and stops within one poll interval of a cancel.
 
 use crate::cancel::CancelToken;
-use crate::capture::{mix_to_mono, resample};
+use crate::capture::{device_name, match_device, mix_to_mono, ordered_names, resample};
 use crate::session::Player;
 use crate::{HelperPlayer, Result, VoiceConfig, VoiceError};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -23,6 +23,39 @@ pub fn probe_playback() -> Option<String> {
     let name = device.description().ok()?.name().to_owned();
     let has_config = device.default_output_config().is_ok();
     has_config.then_some(name)
+}
+
+/// Every output device cpal can see, the default first.
+pub fn output_devices() -> Result<Vec<String>> {
+    let host = cpal::default_host();
+    let default = host
+        .default_output_device()
+        .map(|device| device_name(&device));
+    let devices: Vec<cpal::Device> = host
+        .output_devices()
+        .map_err(|err| VoiceError::NoDevice(format!("enumerate output devices: {err}")))?
+        .collect();
+    Ok(ordered_names(&devices, default.as_deref()))
+}
+
+/// The configured output device, or the host default when none is configured.
+fn open_output(configured: Option<&str>) -> Result<cpal::Device> {
+    let host = cpal::default_host();
+    let Some(requested) = configured.map(str::trim).filter(|name| !name.is_empty()) else {
+        return host
+            .default_output_device()
+            .ok_or_else(|| VoiceError::NoDevice("no default output device".into()));
+    };
+    let devices: Vec<cpal::Device> = host
+        .output_devices()
+        .map_err(|err| VoiceError::NoDevice(format!("enumerate output devices: {err}")))?
+        .collect();
+    let names: Vec<String> = devices.iter().map(device_name).collect();
+    let index = match_device("output", requested, &names).map_err(VoiceError::NoDevice)?;
+    Ok(devices
+        .into_iter()
+        .nth(index)
+        .expect("index came from the same list"))
 }
 
 /// WAV decode, one place: 16-bit PCM only, the format every synthesizer here emits.
@@ -75,7 +108,17 @@ where
 }
 
 /// The linked playback engine. WAV in, speaker out.
-pub struct CpalPlayer;
+pub struct CpalPlayer {
+    device: Option<String>,
+}
+
+impl CpalPlayer {
+    pub fn open(config: &VoiceConfig) -> Self {
+        Self {
+            device: config.output_device.clone(),
+        }
+    }
+}
 
 impl Player for CpalPlayer {
     fn play(&mut self, wav: &[u8]) -> Result<()> {
@@ -86,9 +129,7 @@ impl Player for CpalPlayer {
         cancel.check()?;
         let (samples, rate, channels) = decode_wav(wav)?;
         let mono = mix_to_mono(&samples, channels.max(1) as usize);
-        let device = cpal::default_host()
-            .default_output_device()
-            .ok_or_else(|| VoiceError::NoDevice("no default output device".into()))?;
+        let device = open_output(self.device.as_deref())?;
         let supported = device
             .default_output_config()
             .map_err(|err| VoiceError::NoDevice(format!("output device has no config: {err}")))?;
@@ -183,7 +224,7 @@ pub enum DevicePlayer {
 impl DevicePlayer {
     pub fn new(config: &VoiceConfig) -> Self {
         match probe_playback() {
-            Some(_) => Self::BuiltIn(CpalPlayer),
+            Some(_) => Self::BuiltIn(CpalPlayer::open(config)),
             None => Self::Helper(HelperPlayer::new(config)),
         }
     }
@@ -252,6 +293,15 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "hardware test: enumerates the machine's output devices"]
+    fn output_devices_lists_the_machine_default_first() {
+        let names = output_devices().expect("enumeration must not fail");
+        if let Some(default) = probe_playback() {
+            assert_eq!(names.first().map(String::as_str), Some(default.as_str()));
+        }
+    }
+
+    #[test]
     #[ignore = "hardware test: opens the default output device and plays a short quiet tone"]
     fn the_built_in_player_plays_a_tone() {
         let tone: Vec<i16> = (0..8_000)
@@ -262,7 +312,7 @@ mod tests {
         crate::helpers::write_wav(&path, &tone, 16_000).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let started = Instant::now();
-        CpalPlayer
+        CpalPlayer::open(&VoiceConfig::default())
             .play_cancellable(&bytes, &CancelToken::new())
             .expect("built-in playback must succeed");
         eprintln!("tone played in {:?}", started.elapsed());
