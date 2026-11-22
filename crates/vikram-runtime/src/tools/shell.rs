@@ -84,9 +84,31 @@ fn run_shell_command(command: &str, ctx: &ToolContext, timeout_ms: u64) -> ToolO
     // it over here, so it travels with the output instead of being inferred later.
     body.push_str(&format!("\n[exit {}]", output.status.code().unwrap_or(-1)));
     append_sandbox_note(&mut body, &sandbox_note);
+    if !output.status.success() && !timed_out {
+        // A refusal that the sandbox caused is not the command's failure to own: naming it, and
+        // the grant that would let it through, is the difference between a dead end and a next step.
+        append_denial(
+            &mut body,
+            ctx.sandbox.classify_denial(output.status.code(), &stderr),
+        );
+    }
     ToolOutput {
         content: truncated(body),
         ok: output.status.success() && !timed_out,
+    }
+}
+
+/// Name a sandbox refusal in the command's own output, with the grant that would clear it.
+pub(crate) fn append_denial(body: &mut String, denial: Option<crate::sandbox::SandboxDenial>) {
+    let Some(denial) = denial else {
+        return;
+    };
+    body.push_str(&format!("\n[sandbox] denied: {}", denial.reason));
+    if let Some(grant) = denial.escalation() {
+        body.push_str(&format!(
+            "\n[sandbox] escalation available: {} — ask for it rather than retrying",
+            grant.describe()
+        ));
     }
 }
 
@@ -695,5 +717,52 @@ mod tests {
             }
             other => panic!("expected a command preview, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_sandbox_refusal_is_named_with_the_grant_that_would_clear_it() {
+        let denial = crate::sandbox::SandboxDenial {
+            capability: crate::sandbox::DeniedCapability::Path {
+                path: Some(std::path::PathBuf::from("/usr/bin/cargo")),
+                access: crate::sandbox::Access::Execute,
+            },
+            reason: "executing /usr/bin/cargo is outside the sandbox roots".to_owned(),
+            evidence: crate::sandbox::DenialEvidence::ExitCode { code: 126 },
+            exit_code: Some(126),
+        };
+        let mut body = String::from("[exit 126]");
+        append_denial(&mut body, Some(denial));
+        assert!(
+            body.contains("[sandbox] denied: executing /usr/bin/cargo"),
+            "{body}"
+        );
+        // Execute grants cannot be handed out by a profile, so no escalation is advertised.
+        assert!(!body.contains("escalation available"), "{body}");
+
+        let write = crate::sandbox::SandboxDenial {
+            capability: crate::sandbox::DeniedCapability::Path {
+                path: Some(std::path::PathBuf::from("/etc/hosts")),
+                access: crate::sandbox::Access::Write,
+            },
+            reason: "writing /etc/hosts is outside the sandbox roots".to_owned(),
+            evidence: crate::sandbox::DenialEvidence::Text {
+                message: "Read-only file system".to_owned(),
+            },
+            exit_code: Some(1),
+        };
+        let mut body = String::from("[exit 1]");
+        append_denial(&mut body, Some(write));
+        assert!(
+            body.contains("escalation available: write /etc/hosts"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn a_command_that_failed_for_its_own_reasons_gets_no_sandbox_line() {
+        let mut body = String::from("[exit 1]\n[stderr]\nno such file");
+        let before = body.clone();
+        append_denial(&mut body, None);
+        assert_eq!(body, before);
     }
 }

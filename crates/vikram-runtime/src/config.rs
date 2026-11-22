@@ -127,6 +127,11 @@ pub struct SecurityConfig {
 pub struct SandboxSettings {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Which isolation profile a sandboxed command gets. `build` (the default) also lets the
+    /// toolchain and its caches work, which is what a `cargo` invocation inside a tool call needs;
+    /// `strict` allows only the workspace; `off` runs unsandboxed while `enabled` stays true.
+    #[serde(default)]
+    pub profile: crate::sandbox::SandboxProfile,
     #[serde(default)]
     pub allow_network: bool,
     /// Extra read-only mounts granted to the sandbox (absolute paths).
@@ -138,6 +143,10 @@ impl Default for SandboxSettings {
     fn default() -> Self {
         Self {
             enabled: true,
+            // A coding assistant whose sandbox cannot run `cargo build` is a sandbox that has to
+            // be turned off to work. Build keeps `$HOME` hidden and the workspace writable while
+            // leaving the toolchain reachable; the network stays off until asked for.
+            profile: crate::sandbox::SandboxProfile::Build,
             allow_network: false,
             read_only_paths: Vec::new(),
         }
@@ -1248,5 +1257,28 @@ mod tests {
         assert!(cfg.evolution.auto_cycle);
         assert!(cfg.evolution.auto_benchmark);
         assert_eq!(cfg.evolution.cycle_interval_hours, 6);
+    }
+
+    #[test]
+    fn the_sandbox_profile_defaults_to_build_and_can_be_narrowed() {
+        let defaults = SandboxSettings::default();
+        assert!(defaults.enabled);
+        assert_eq!(
+            defaults.profile,
+            crate::sandbox::SandboxProfile::Build,
+            "the default has to let a build run, or the assistant cannot build"
+        );
+        assert!(!defaults.allow_network, "the network is opt-in");
+
+        let narrowed: SandboxSettings = serde_json::from_str(r#"{"profile": "strict"}"#)
+            .expect("a strict profile is a legal value");
+        assert_eq!(narrowed.profile, crate::sandbox::SandboxProfile::Strict);
+        assert!(narrowed.enabled, "an absent key keeps its default");
+
+        let refused = serde_json::from_str::<SandboxSettings>(r#"{"profile": "wide-open"}"#);
+        assert!(
+            refused.is_err(),
+            "an unknown profile must not be guessed at"
+        );
     }
 }

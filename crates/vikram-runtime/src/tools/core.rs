@@ -80,10 +80,11 @@ impl ToolContext {
     /// The on-by-default context: sandbox resolved from the caller's settings, no spool, no runtime.
     pub fn new(workspace_root: PathBuf, settings: &crate::config::SandboxSettings) -> Self {
         let sandbox = if settings.enabled {
-            crate::sandbox::Sandbox::detect(
-                crate::sandbox::SandboxMode::Full,
+            crate::sandbox::Sandbox::detect_with_profile(
+                settings.profile,
                 settings.allow_network,
                 settings.read_only_paths.clone(),
+                crate::sandbox::ResourceLimits::default(),
             )
         } else {
             crate::sandbox::Sandbox::disabled("disabled in config")
