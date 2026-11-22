@@ -52,7 +52,7 @@ Flags on `listen`/`chat` (`--language`, `--input-device`, `--output-device`,
 run and are written back afterwards, so the next run needs no flags.
 `--asr-model`, `--max-record-ms` and `--voice` apply to that run only.
 
-Config file: `$VIKRAM_HOME/.vikram/voice.json`, else `~/.vikram/voice.json`.
+Config file: `$VIKRAM_HOME/voice.json`, else `~/.vikram/voice.json`.
 Full engine and flag reference: [`voice-plan.md`](voice-plan.md) §3.
 
 ## Files

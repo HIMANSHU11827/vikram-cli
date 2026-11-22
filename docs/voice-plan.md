@@ -173,7 +173,7 @@ stays on screen.
 `vikram voice config path` prints the one file that holds every tunable:
 
 ```
-$VIKRAM_HOME/.vikram/voice.json      # when VIKRAM_HOME is set
+$VIKRAM_HOME/voice.json              # when VIKRAM_HOME is set (it is the home itself)
 ~/.vikram/voice.json                 # otherwise
 ```
 
