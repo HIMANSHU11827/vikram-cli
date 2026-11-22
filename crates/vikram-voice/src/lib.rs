@@ -31,6 +31,7 @@ pub use session::{
 };
 pub use vad::{detect_speech, is_silent, noise_floor, speech_gate, trim_silence};
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -170,18 +171,15 @@ impl VoiceConfig {
 }
 
 impl VoiceConfig {
-    /// `$VIKRAM_HOME/voice.json`, else `~/.vikram/voice.json`.
+    /// `$VIKRAM_HOME/voice.json` when the variable is set, else `~/.vikram/voice.json`. The
+    /// variable *is* the home, exactly as `vikram_runtime::config::vikram_home` treats it.
     pub fn config_path() -> PathBuf {
-        let base = std::env::var_os("VIKRAM_HOME")
-            .filter(|home| !home.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .or_else(|| std::env::var_os("USERPROFILE"))
-                    .map(PathBuf::from)
-            })
-            .unwrap_or_else(|| PathBuf::from("."));
-        base.join(".vikram").join("voice.json")
+        voice_config_path(
+            std::env::var_os("VIKRAM_HOME").as_deref(),
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .as_deref(),
+        )
     }
 
     /// Defaults overlaid with the operator's file. A malformed file is an error, not a silent
@@ -208,6 +206,20 @@ impl VoiceConfig {
         std::fs::write(&path, text)
             .map_err(|err| VoiceError::Config(format!("write {}: {err}", path.display())))?;
         Ok(path)
+    }
+}
+
+/// The one place the `$VIKRAM_HOME` convention is applied to the voice config: a set variable
+/// is already the home, so the file sits directly under it; without it the file sits under
+/// `~/.vikram`.
+fn voice_config_path(home: Option<&OsStr>, user_home: Option<&OsStr>) -> PathBuf {
+    match home.filter(|home| !home.is_empty()) {
+        Some(home) => PathBuf::from(home).join("voice.json"),
+        None => user_home
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".vikram")
+            .join("voice.json"),
     }
 }
 
@@ -368,10 +380,22 @@ mod tests {
     }
 
     #[test]
-    fn the_config_path_sits_in_the_vikram_home() {
-        let path = VoiceConfig::config_path();
-        assert!(path.ends_with("voice.json"), "{}", path.display());
-        assert!(path.to_string_lossy().contains(".vikram"));
+    fn the_config_path_follows_the_vikram_home_convention() {
+        let path = voice_config_path(
+            Some(OsStr::new("/srv/vikram")),
+            Some(OsStr::new("/home/op")),
+        );
+        assert_eq!(path, PathBuf::from("/srv/vikram/voice.json"));
+        assert!(
+            !path.to_string_lossy().contains(".vikram"),
+            "a set VIKRAM_HOME must not be doubled: {}",
+            path.display()
+        );
+        let path = voice_config_path(None, Some(OsStr::new("/home/op")));
+        assert_eq!(path, PathBuf::from("/home/op/.vikram/voice.json"));
+        let path = voice_config_path(Some(OsStr::new("")), Some(OsStr::new("/home/op")));
+        assert_eq!(path, PathBuf::from("/home/op/.vikram/voice.json"));
+        assert!(VoiceConfig::config_path().ends_with("voice.json"));
     }
 
     #[test]

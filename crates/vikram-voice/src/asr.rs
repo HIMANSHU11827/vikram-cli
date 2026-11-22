@@ -12,6 +12,7 @@ use crate::cancel::CancelToken;
 use crate::helpers::{Scratch, run_cancellable, which, write_wav};
 use crate::session::Recognizer;
 use crate::{Result, StageStatus, VoiceConfig, VoiceError};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use wavo::hub::Hub;
@@ -23,21 +24,28 @@ pub const DEFAULT_MODEL: &str = "whisper-base.en";
 /// so a caller can caption from the first frame without an error.
 const MIN_PARTIAL_SAMPLES: usize = 1_600;
 
-/// `$VIKRAM_HOME`, else `~/.vikram`: the same root `vikram_runtime::config::vikram_home` uses.
-/// Mirrored here because `docs/voice-plan.md` §3 keeps this crate off the runtime's dependency
-/// graph; the mirror must track any change to the runtime's convention.
+/// `$VIKRAM_HOME/models`, else `~/.vikram/models`: the same root
+/// `vikram_runtime::config::vikram_home` uses, and the variable *is* that root. Mirrored here
+/// because `docs/voice-plan.md` §3 keeps this crate off the runtime's dependency graph; the
+/// mirror must track any change to the runtime's convention.
 pub fn models_dir() -> PathBuf {
-    let home = std::env::var_os("VIKRAM_HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from);
-    let base = home
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .map(PathBuf::from)
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join(".vikram").join("models")
+    models_dir_in(
+        std::env::var_os("VIKRAM_HOME").as_deref(),
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .as_deref(),
+    )
+}
+
+fn models_dir_in(home: Option<&OsStr>, user_home: Option<&OsStr>) -> PathBuf {
+    match home.filter(|home| !home.is_empty()) {
+        Some(home) => PathBuf::from(home).join("models"),
+        None => user_home
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".vikram")
+            .join("models"),
+    }
 }
 
 /// Where a model comes from: a file on disk, or a hub name the engine may download once.
@@ -448,6 +456,26 @@ impl Recognizer for AsrEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_models_dir_follows_the_vikram_home_convention() {
+        assert_eq!(
+            models_dir_in(
+                Some(OsStr::new("/srv/vikram")),
+                Some(OsStr::new("/home/op"))
+            ),
+            PathBuf::from("/srv/vikram/models"),
+            "a set VIKRAM_HOME must not be doubled"
+        );
+        assert_eq!(
+            models_dir_in(None, Some(OsStr::new("/home/op"))),
+            PathBuf::from("/home/op/.vikram/models")
+        );
+        assert_eq!(
+            models_dir_in(Some(OsStr::new("")), Some(OsStr::new("/home/op"))),
+            PathBuf::from("/home/op/.vikram/models")
+        );
+    }
 
     #[test]
     fn a_hub_name_is_not_a_path() {
