@@ -459,13 +459,18 @@ fn run_step(workspace_root: &Path, step: &PlanStep, sandbox: &Sandbox) -> StepRe
 
     let mut timed_out = false;
     let output = match wait_with_timeout(&mut cmd, step.timeout, None) {
-        Ok(Some(output)) => output,
-        Ok(None) => {
+        Ok(WaitOutcome::Finished(output)) => output,
+        Ok(WaitOutcome::TimedOut(partial)) => {
             timed_out = true;
+            let mut stderr = partial.stderr;
+            if !stderr.is_empty() && !stderr.ends_with(b"\n") {
+                stderr.push(b'\n');
+            }
+            stderr.extend_from_slice(b"verification step timed out");
             std::process::Output {
-                status: exit_status_failure(),
-                stdout: Vec::new(),
-                stderr: b"verification step timed out".to_vec(),
+                status: partial.status,
+                stdout: partial.stdout,
+                stderr,
             }
         }
         Err(e) => {
@@ -521,24 +526,40 @@ pub(crate) fn shell_cmd(command: &str) -> Command {
     }
 }
 
+/// What a waited-on command came to.
+///
+/// `Finished` is a command that exited on its own; `TimedOut` is one killed at the deadline,
+/// carrying whatever its pipes had produced by then. The distinction stays explicit so a caller
+/// never mistakes a killed command for a complete one — and never throws away output it already
+/// paid for waiting on.
+#[derive(Debug)]
+pub(crate) enum WaitOutcome {
+    Finished(std::process::Output),
+    TimedOut(std::process::Output),
+}
+
 /// Run `cmd` under `timeout`, capturing stdout and stderr.
 ///
-/// `Ok(Some)` is a finished command, `Ok(None)` is a timeout, and `Err` is a
-/// spawn or wait failure — the three must stay distinct so a command that never
-/// started is never reported as having timed out. `cancel`, when present, is polled
-/// on the same cadence as the deadline: a cancelled call kills the process tree and
-/// reports `cancelled`, which is how a tool honouring `ToolContext::cancel` actually
-/// stops the command it spawned rather than only abandoning the wait. On Unix the
-/// child leads its own process group, so a timeout or cancel kills the whole group:
-/// a backgrounded grandchild cannot outlive the call. The pipes are drained on
-/// detached threads with a deadline (the `computer.rs` pattern): `wait_with_output`
-/// would block on pipe EOF forever when a surviving grandchild holds stdout open.
+/// `Finished` is a command that exited, `TimedOut` is a deadline kill with the partial output
+/// its pipes had delivered, and `Err` is a spawn or wait failure — the three must stay distinct
+/// so a command that never started is never reported as having timed out. `cancel`, when
+/// present, is polled on the same cadence as the deadline: a cancelled call kills the process
+/// tree and reports `cancelled`, which is how a tool honouring `ToolContext::cancel` actually
+/// stops the command it spawned rather than only abandoning the wait. On Unix the child leads
+/// its own process group, so a timeout or cancel kills the whole group: a backgrounded
+/// grandchild cannot outlive the call.
+///
+/// The pipes are drained from the first moment the child exists, on detached reader threads
+/// that forward bytes as they arrive. A child that has written more than the pipe buffer blocks
+/// on its next write until someone drains — reading only after exit would deadlock exactly the
+/// commands that produce the most output, which are the builds and logs this exists to read.
+/// The readers are never joined: a surviving grandchild holding the write end would wedge the
+/// join exactly as it once wedged the wait, so collection runs under a deadline instead.
 pub(crate) fn wait_with_timeout(
     cmd: &mut Command,
     timeout: Duration,
     cancel: Option<&vikram_contracts::CancellationToken>,
-) -> Result<Option<std::process::Output>, String> {
-    use std::io::Read;
+) -> Result<WaitOutcome, String> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -549,72 +570,123 @@ pub(crate) fn wait_with_timeout(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to start command: {e}"))?;
+
+    let stdout = PipeReader::start(child.stdout.take());
+    let stderr = PipeReader::start(child.stderr.take());
+    let mut out_buffer = Vec::new();
+    let mut err_buffer = Vec::new();
+
     let deadline = Instant::now() + timeout;
     let status = loop {
+        stdout.drain(&mut out_buffer);
+        stderr.drain(&mut err_buffer);
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    kill_tree(&mut child);
-                    return Ok(None);
+                    let status = kill_tree(&mut child);
+                    // SIGKILL closes the group's pipe write ends, so EOF — and with it the rest
+                    // of the stream — arrives quickly; the deadline is for a grandchild that
+                    // escaped the group and still holds the pipe open.
+                    let collect_by = Instant::now() + DRAIN_AFTER_KILL;
+                    stdout.collect(&mut out_buffer, collect_by);
+                    stderr.collect(&mut err_buffer, collect_by);
+                    return Ok(WaitOutcome::TimedOut(std::process::Output {
+                        status: status.unwrap_or_else(|_| exit_status_failure()),
+                        stdout: out_buffer,
+                        stderr: err_buffer,
+                    }));
                 }
                 if cancel.is_some_and(|token| token.is_cancelled()) {
-                    kill_tree(&mut child);
+                    let _ = kill_tree(&mut child);
                     return Err("cancelled".to_owned());
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(e) => {
-                kill_tree(&mut child);
+                let _ = kill_tree(&mut child);
                 return Err(format!("failed while waiting: {e}"));
             }
         }
     };
-    let (out_tx, out_rx) = std::sync::mpsc::channel();
-    let (err_tx, err_rx) = std::sync::mpsc::channel();
-    // Detached readers: they must not be joined, or a grandchild holding the pipe
-    // would block this call exactly like `wait_with_output` did. They exit when
-    // the pipe finally closes.
-    match child.stdout.take() {
-        Some(mut pipe) => {
-            std::thread::spawn(move || {
-                let mut buffer = Vec::new();
-                let _ = pipe.read_to_end(&mut buffer);
-                let _ = out_tx.send(buffer);
-            });
-        }
-        None => {
-            let _ = out_tx.send(Vec::new());
-        }
-    }
-    match child.stderr.take() {
-        Some(mut pipe) => {
-            std::thread::spawn(move || {
-                let mut buffer = Vec::new();
-                let _ = pipe.read_to_end(&mut buffer);
-                let _ = err_tx.send(buffer);
-            });
-        }
-        None => {
-            let _ = err_tx.send(Vec::new());
-        }
-    }
-    let drain_deadline = Instant::now() + Duration::from_secs(1);
-    let collect = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
-        rx.recv_timeout(drain_deadline.saturating_duration_since(Instant::now()))
-            .unwrap_or_default()
-    };
-    Ok(Some(std::process::Output {
+    let collect_by = Instant::now() + DRAIN_AFTER_EXIT;
+    stdout.collect(&mut out_buffer, collect_by);
+    stderr.collect(&mut err_buffer, collect_by);
+    Ok(WaitOutcome::Finished(std::process::Output {
         status,
-        stdout: collect(out_rx),
-        stderr: collect(err_rx),
+        stdout: out_buffer,
+        stderr: err_buffer,
     }))
+}
+
+/// How long a finished or killed child's pipes may take to reach EOF. The common case is
+/// immediate; the cap exists for the one that is not — a grandchild that escaped the process
+/// group and still holds the write end open.
+const DRAIN_AFTER_KILL: Duration = Duration::from_secs(1);
+const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(1);
+
+/// One pipe, read on a detached thread that forwards bytes as they arrive.
+///
+/// The channel closing is the only end-of-output signal a pipe has. The reader is never joined:
+/// it exits when the write end closes, whenever that is, and the caller collects under a
+/// deadline instead of waiting for that to happen.
+struct PipeReader {
+    chunks: std::sync::mpsc::Receiver<Vec<u8>>,
+}
+
+impl PipeReader {
+    fn start<T: std::io::Read + Send + 'static>(pipe: Option<T>) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        match pipe {
+            Some(mut pipe) => {
+                std::thread::spawn(move || {
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        match pipe.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => {
+                                // A dropped receiver means nobody is collecting; stop reading
+                                // rather than fill a pipe nobody will drain.
+                                if sender.send(chunk[..read].to_vec()).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            // No pipe: a closed channel reads as immediate EOF.
+            None => drop(sender),
+        }
+        Self { chunks: receiver }
+    }
+
+    fn drain(&self, buffer: &mut Vec<u8>) {
+        while let Ok(chunk) = self.chunks.try_recv() {
+            buffer.extend_from_slice(&chunk);
+        }
+    }
+
+    fn collect(&self, buffer: &mut Vec<u8>, deadline: Instant) {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            match self.chunks.recv_timeout(remaining) {
+                Ok(chunk) => buffer.extend_from_slice(&chunk),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
 }
 
 /// Kill the child and, on Unix, its whole process group. The child was spawned
 /// with `process_group(0)`, so its pid is also the pgid and a negative pid
 /// addresses the group — `child.kill()` alone would leave grandchildren running.
-fn kill_tree(child: &mut std::process::Child) {
+/// The wait is what harvests the exit status a `TimedOut` outcome reports.
+fn kill_tree(child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
     #[cfg(unix)]
     {
         let pid = child.id();
@@ -626,7 +698,7 @@ fn kill_tree(child: &mut std::process::Child) {
         }
     }
     let _ = child.kill();
-    let _ = child.wait();
+    child.wait()
 }
 
 #[cfg(not(windows))]
@@ -941,6 +1013,55 @@ mod tests {
         assert!(
             !marker.exists(),
             "the cancelled command's process tree was killed"
+        );
+    }
+
+    #[test]
+    fn a_command_emitting_more_than_the_pipe_buffer_completes() {
+        let mut cmd = shell_cmd("yes x | head -c 70000");
+        let started = Instant::now();
+        let result = wait_with_timeout(&mut cmd, Duration::from_secs(10), None);
+        let Ok(WaitOutcome::Finished(output)) = result else {
+            panic!("70000 bytes is one pipe buffer over; it must complete, not deadlock");
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the command itself runs in milliseconds"
+        );
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            output.stdout.len(),
+            70_000,
+            "the whole output is delivered, not just what fit the pipe"
+        );
+    }
+
+    #[test]
+    fn a_command_emitting_200k_completes() {
+        let mut cmd = shell_cmd("yes x | head -c 200000");
+        let result = wait_with_timeout(&mut cmd, Duration::from_secs(10), None);
+        let Ok(WaitOutcome::Finished(output)) = result else {
+            panic!("200000 bytes must complete, not deadlock the wait");
+        };
+        assert_eq!(output.stdout.len(), 200_000);
+    }
+
+    #[test]
+    fn a_genuinely_hung_command_times_out_with_its_partial_output() {
+        let mut cmd = shell_cmd("echo started; sleep 5");
+        let started = Instant::now();
+        let result = wait_with_timeout(&mut cmd, Duration::from_millis(250), None);
+        let Ok(WaitOutcome::TimedOut(partial)) = result else {
+            panic!("a sleeping command must be reported as a timeout");
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline is honored"
+        );
+        let text = String::from_utf8_lossy(&partial.stdout);
+        assert!(
+            text.contains("started"),
+            "output produced before the deadline survives the kill: {text:?}"
         );
     }
 

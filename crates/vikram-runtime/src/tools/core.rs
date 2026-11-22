@@ -8,8 +8,12 @@ use crate::config::resolve_within;
 
 use crate::tools::*;
 
-/// Output larger than this is truncated with an explicit marker rather than silently cut.
+/// Output larger than this is elided with an explicit marker rather than silently cut. The head
+/// and the tail both survive — the head for ordering context, the tail because a build or a test
+/// run puts its reason for existing at the end.
 pub const MAX_TOOL_OUTPUT: usize = 20_000;
+const TRUNCATION_HEAD: usize = 15_000;
+const TRUNCATION_TAIL: usize = 4_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolOutput {
@@ -381,18 +385,38 @@ impl Default for ToolRegistry {
     }
 }
 
-pub(crate) fn truncated(mut text: String) -> String {
-    if text.len() > MAX_TOOL_OUTPUT {
-        let cut = text
-            .char_indices()
-            .take_while(|(i, _)| *i < MAX_TOOL_OUTPUT)
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
-        text.truncate(cut);
-        text.push_str("\n… [output truncated]");
+pub(crate) fn truncated(text: String) -> String {
+    if text.len() <= MAX_TOOL_OUTPUT {
+        return text;
     }
-    text
+    let head_cut = floor_boundary(&text, TRUNCATION_HEAD);
+    let tail_start = ceil_boundary(&text, text.len() - TRUNCATION_TAIL);
+    let dropped = tail_start - head_cut;
+    let mut out = String::with_capacity(head_cut + (text.len() - tail_start) + 96);
+    out.push_str(&text[..head_cut]);
+    out.push_str(&format!(
+        "\n… [{dropped} bytes elided — the middle was dropped; the tail follows]\n"
+    ));
+    out.push_str(&text[tail_start..]);
+    out
+}
+
+/// The largest char boundary at or below `target`, so a slice cut never splits a character.
+fn floor_boundary(text: &str, target: usize) -> usize {
+    let mut cut = target.min(text.len());
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    cut
+}
+
+/// The smallest char boundary at or above `target`.
+fn ceil_boundary(text: &str, target: usize) -> usize {
+    let mut cut = target.min(text.len());
+    while cut < text.len() && !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    cut
 }
 
 pub(crate) fn arg_str(args: &Value, key: &str) -> Result<String, VikramError> {

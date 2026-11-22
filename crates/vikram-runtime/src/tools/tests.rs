@@ -1823,3 +1823,36 @@ fn list_dir_handles_non_utf8_filenames() {
         out.content
     );
 }
+
+#[test]
+fn truncation_keeps_the_tail_and_names_what_was_dropped() {
+    let mut text = String::new();
+    for index in 0..1_500 {
+        text.push_str(&format!("filler line {index:04}\n"));
+    }
+    text.push_str("error[E0308]: mismatched types in the last line\n");
+    let cut = truncated(text.clone());
+    assert!(
+        cut.contains("error[E0308]: mismatched types in the last line"),
+        "the tail — the reason the command ran — must survive: {}",
+        &cut[cut.len().saturating_sub(200)..]
+    );
+    assert!(
+        cut.contains("filler line 0000"),
+        "the head survives too, so ordering context is not lost"
+    );
+    assert!(
+        cut.contains("bytes elided"),
+        "truncation is marked and names the elided span, never silent"
+    );
+    let marker_line = cut
+        .lines()
+        .find(|line| line.contains("bytes elided"))
+        .expect("the marker is on its own line");
+    let named: usize = marker_line
+        .split(|c: char| !c.is_ascii_digit())
+        .find(|token| !token.is_empty())
+        .and_then(|digits| digits.parse().ok())
+        .expect("the marker carries a byte count");
+    assert!(named > 0, "the elided span is nonzero");
+}

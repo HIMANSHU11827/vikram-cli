@@ -38,18 +38,13 @@ fn run_shell_command(command: &str, ctx: &ToolContext, timeout_ms: u64) -> ToolO
     let sandbox_note = ctx.sandbox.enforcement_notice();
     cmd.current_dir(&ctx.workspace_root);
 
-    let output = match crate::verification::wait_with_timeout(
+    let (output, timed_out) = match crate::verification::wait_with_timeout(
         &mut cmd,
         Duration::from_millis(timeout_ms),
         ctx.cancel.as_ref(),
     ) {
-        Ok(Some(output)) => output,
-        Ok(None) => {
-            return ToolOutput {
-                content: format!("command timed out after {timeout_ms} ms"),
-                ok: false,
-            };
-        }
+        Ok(crate::verification::WaitOutcome::Finished(output)) => (output, false),
+        Ok(crate::verification::WaitOutcome::TimedOut(partial)) => (partial, true),
         Err(e) => {
             return ToolOutput {
                 content: e,
@@ -67,6 +62,16 @@ fn run_shell_command(command: &str, ctx: &ToolContext, timeout_ms: u64) -> ToolO
         body.push_str("[stderr]\n");
         body.push_str(&stderr);
     }
+    if timed_out {
+        // The marker rides with the partial output instead of replacing it: what the command
+        // produced before the deadline is the whole reason anyone ran it.
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(&format!(
+            "[command timed out after {timeout_ms} ms — output above is partial]"
+        ));
+    }
     if body.trim().is_empty() {
         body = format!("(no output, exit {:?})", output.status.code());
     }
@@ -76,7 +81,7 @@ fn run_shell_command(command: &str, ctx: &ToolContext, timeout_ms: u64) -> ToolO
     append_sandbox_note(&mut body, &sandbox_note);
     ToolOutput {
         content: truncated(body),
-        ok: output.status.success(),
+        ok: output.status.success() && !timed_out,
     }
 }
 

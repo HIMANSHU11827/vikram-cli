@@ -29,7 +29,7 @@ fn run_git(argv: &[String], ctx: &ToolContext) -> ToolOutput {
         cmd.env("GIT_COMMITTER_EMAIL", "vikram@local");
     }
     match crate::verification::wait_with_timeout(&mut cmd, GIT_TIMEOUT, ctx.cancel.as_ref()) {
-        Ok(Some(output)) => {
+        Ok(crate::verification::WaitOutcome::Finished(output)) => {
             let mut body = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr);
             if !stderr.trim().is_empty() {
@@ -48,10 +48,29 @@ fn run_git(argv: &[String], ctx: &ToolContext) -> ToolOutput {
                 ok: output.status.success(),
             }
         }
-        Ok(None) => ToolOutput {
-            content: format!("git timed out after {}s", GIT_TIMEOUT.as_secs()),
-            ok: false,
-        },
+        Ok(crate::verification::WaitOutcome::TimedOut(partial)) => {
+            let mut body = String::from_utf8_lossy(&partial.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&partial.stderr);
+            if !stderr.trim().is_empty() {
+                if !body.is_empty() && !body.ends_with('\n') {
+                    body.push('\n');
+                }
+                body.push_str("[stderr]\n");
+                body.push_str(&stderr);
+            }
+            if !body.is_empty() && !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push_str(&format!(
+                "[git timed out after {}s — output above is partial]",
+                GIT_TIMEOUT.as_secs()
+            ));
+            body.push_str(&format!("\n[exit {}]", partial.status.code().unwrap_or(-1)));
+            ToolOutput {
+                content: truncated(body),
+                ok: false,
+            }
+        }
         Err(error) => ToolOutput {
             content: format!("failed to start git: {error}"),
             ok: false,

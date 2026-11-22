@@ -213,18 +213,13 @@ macro_rules! cmd_check_tool {
                 cmd.current_dir(&ctx.workspace_root);
                 let sandbox_note = ctx.sandbox.enforcement_notice();
 
-                let output = match crate::verification::wait_with_timeout(
+                let (output, timed_out) = match crate::verification::wait_with_timeout(
                     &mut cmd,
                     Duration::from_millis(timeout_ms),
                     ctx.cancel.as_ref(),
                 ) {
-                    Ok(Some(output)) => output,
-                    Ok(None) => {
-                        return Ok(ToolOutput {
-                            content: format!("command timed out after {timeout_ms} ms"),
-                            ok: false,
-                        });
-                    }
+                    Ok(crate::verification::WaitOutcome::Finished(output)) => (output, false),
+                    Ok(crate::verification::WaitOutcome::TimedOut(partial)) => (partial, true),
                     Err(e) => {
                         return Ok(ToolOutput {
                             content: e,
@@ -242,6 +237,14 @@ macro_rules! cmd_check_tool {
                     body.push_str("[stderr]\n");
                     body.push_str(&stderr);
                 }
+                if timed_out {
+                    if !body.is_empty() && !body.ends_with('\n') {
+                        body.push('\n');
+                    }
+                    body.push_str(&format!(
+                        "[command timed out after {timeout_ms} ms — output above is partial]"
+                    ));
+                }
                 if body.trim().is_empty() {
                     body = format!("(no output, exit {:?})", output.status.code());
                 }
@@ -249,7 +252,7 @@ macro_rules! cmd_check_tool {
                 append_sandbox_note(&mut body, &sandbox_note);
                 Ok(ToolOutput {
                     content: truncated(body),
-                    ok: output.status.success(),
+                    ok: output.status.success() && !timed_out,
                 })
             }
         }
