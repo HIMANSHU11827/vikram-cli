@@ -2328,6 +2328,7 @@ mod tests {
             resource: "/etc/hosts".to_owned(),
             reason: "outside the workspace".to_owned(),
             amendment: Some("allow fs write resource=/etc/**".to_owned()),
+            preview: None,
         });
         app.overlay = Some(Overlay::Approvals);
         let rendered = draw(80, 24, |frame| {

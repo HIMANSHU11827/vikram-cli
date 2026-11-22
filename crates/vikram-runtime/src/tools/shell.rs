@@ -1,8 +1,32 @@
 use serde_json::{Value, json};
 use std::time::Duration;
-use vikram_contracts::{ActionKind, PermissionRequest, SideEffect, Trust, VikramError};
+use vikram_contracts::{ActionKind, PermissionRequest, SideEffect, ToolCall, Trust, VikramError};
 
 use crate::tools::*;
+use crate::types::ApprovalPreview;
+
+/// The shell that runs a command and the arguments that carry it. One definition, so the approval
+/// preview shows the invocation that will actually run instead of a re-parsed guess.
+fn shell_invocation(command: &str) -> (String, Vec<String>) {
+    #[cfg(windows)]
+    {
+        let comspec = std::env::var("COMSPEC")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "cmd".to_owned());
+        (comspec, vec!["/C".to_owned(), command.to_owned()])
+    }
+    #[cfg(not(windows))]
+    {
+        let shell = std::env::var("SHELL")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "sh".to_owned());
+        (shell, vec!["-c".to_owned(), command.to_owned()])
+    }
+}
 /// Shared implementation of the RunShell execution pattern: spawn a shell command in
 /// `ctx.workspace_root`, capture stdout+stderr, enforce a timeout, truncate output.
 ///
@@ -12,28 +36,9 @@ use crate::tools::*;
 /// the running process can do. When the sandbox is not enforced, a one-line notice
 /// is appended so the model never mistakes host execution for isolation.
 fn run_shell_command(command: &str, ctx: &ToolContext, timeout_ms: u64) -> ToolOutput {
-    #[cfg(windows)]
-    let mut cmd = {
-        let comspec = std::env::var("COMSPEC")
-            .ok()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "cmd".to_owned());
-        let mut c = std::process::Command::new(&comspec);
-        c.args(["/C", command]);
-        c
-    };
-    #[cfg(not(windows))]
-    let mut cmd = {
-        let shell = std::env::var("SHELL")
-            .ok()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "sh".to_owned());
-        let mut c = std::process::Command::new(&shell);
-        c.args(["-c", command]);
-        c
-    };
+    let (program, args) = shell_invocation(command);
+    let mut cmd = std::process::Command::new(&program);
+    cmd.args(&args);
     ctx.sandbox.wrap_command(&mut cmd, &ctx.workspace_root);
     let sandbox_note = ctx.sandbox.enforcement_notice();
     cmd.current_dir(&ctx.workspace_root);
@@ -132,6 +137,16 @@ impl Tool for RunShell {
             side_effect,
             Trust::Model,
         ))
+    }
+
+    fn preview(&self, call: &ToolCall, ctx: &ToolContext) -> Option<ApprovalPreview> {
+        let command = call.arguments.get("command")?.as_str()?;
+        let (program, args) = shell_invocation(command);
+        Some(ApprovalPreview::Command {
+            program,
+            args,
+            cwd: ctx.workspace_root.display().to_string(),
+        })
     }
 
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
@@ -656,5 +671,29 @@ mod tests {
         assert_eq!(open.side_effect, SideEffect::ExternalChange);
         let list = tool.permission(&json!({"action": "list"})).unwrap();
         assert_eq!(list.side_effect, SideEffect::LocalMutation);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn shell_run_previews_the_program_arguments_and_working_directory() {
+        use crate::types::ApprovalPreview;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext {
+            workspace_root: dir.path().to_path_buf(),
+            ..ToolContext::default()
+        };
+        let call = vikram_contracts::ToolCall::new("shell.run", json!({"command": "cargo test"}));
+        match RunShell.preview(&call, &ctx) {
+            Some(ApprovalPreview::Command { program, args, cwd }) => {
+                assert!(!program.is_empty(), "the program that runs is named");
+                assert_eq!(args, vec!["-c".to_owned(), "cargo test".to_owned()]);
+                assert_eq!(
+                    cwd,
+                    dir.path().display().to_string(),
+                    "the directory the command runs in is resolved, not guessed"
+                );
+            }
+            other => panic!("expected a command preview, got {other:?}"),
+        }
     }
 }

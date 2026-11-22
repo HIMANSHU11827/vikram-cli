@@ -162,6 +162,16 @@ pub trait Tool: Send + Sync {
     /// How the host should describe this call to policy.
     fn permission(&self, args: &Value) -> Result<PermissionRequest, VikramError>;
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError>;
+    /// What the operator will see change if this call is approved. The default is no preview: a
+    /// tool that cannot describe its effect opts out instead of showing a guess. The context is the
+    /// same one `run` gets, because a preview of a path needs the workspace root to resolve it.
+    fn preview(
+        &self,
+        _call: &vikram_contracts::ToolCall,
+        _ctx: &ToolContext,
+    ) -> Option<crate::types::ApprovalPreview> {
+        None
+    }
 }
 
 /// Extra tool families that the host installs at startup.

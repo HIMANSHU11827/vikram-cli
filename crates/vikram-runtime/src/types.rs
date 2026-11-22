@@ -269,6 +269,28 @@ pub struct SessionSummary {
     pub updated_ms: u64,
 }
 
+/// What approving a call will actually change, so the operator judges the effect instead of the
+/// tool's name. A tool opts in through [`crate::tools::Tool::preview`]; a call that cannot describe
+/// its effect carries no preview at all rather than a guess.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ApprovalPreview {
+    /// A file's content before and after the call. Either side is capped; a cut names how many
+    /// lines it dropped, so a shortened preview is never mistaken for a small change.
+    Diff {
+        path: String,
+        before: String,
+        after: String,
+    },
+    /// A command about to run: the program, its arguments, and the directory it runs in.
+    Command {
+        program: String,
+        args: Vec<String>,
+        cwd: String,
+    },
+    /// Free text the operator should read before deciding (a message body, a payload).
+    Body { title: String, text: String },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApprovalPrompt {
     pub approval: ApprovalId,
@@ -277,6 +299,9 @@ pub struct ApprovalPrompt {
     pub resource: String,
     pub reason: String,
     pub amendment: Option<String>,
+    /// The effect of the call, when the tool can describe it. `None` means "this tool shows no
+    /// preview", never "nothing will change".
+    pub preview: Option<ApprovalPreview>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

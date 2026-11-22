@@ -1,11 +1,88 @@
 use serde_json::{Value, json};
-use vikram_contracts::{ActionKind, PermissionRequest, SideEffect, Trust, VikramError};
+use vikram_contracts::{ActionKind, PermissionRequest, SideEffect, ToolCall, Trust, VikramError};
 
 use crate::tools::*;
+use crate::types::ApprovalPreview;
 
 /// Largest payload `fs.write`/`fs.edit` will put on disk in one call. Bigger content is refused
 /// before anything is touched — a tool call is not a file-transfer channel.
 const MAX_WRITE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Lines of each side of an approval preview. The cut is announced with its size, so a shortened
+/// preview can never be mistaken for a small change.
+const PREVIEW_LINES: usize = 200;
+
+/// Unchanged lines kept around an edit's hunk. The point of the preview is the change, so a
+/// whole-file before/after would show the head of a large file and hide the line being edited.
+const PREVIEW_CONTEXT: usize = 3;
+
+/// Changed lines an edit reports back to the model before eliding the rest.
+const RESULT_CHANGED_LINES: usize = 10;
+
+/// One side of a preview, capped at [`PREVIEW_LINES`] with the remainder counted out loud.
+fn capped(side: &str) -> String {
+    let total = side.lines().count();
+    if total <= PREVIEW_LINES {
+        return side.to_owned();
+    }
+    let mut out: String = side
+        .lines()
+        .take(PREVIEW_LINES)
+        .map(|line| format!("{line}\n"))
+        .collect();
+    out.push_str(&format!(
+        "… [{PREVIEW_LINES} of {total} lines shown, {} cut]",
+        total - PREVIEW_LINES
+    ));
+    out
+}
+
+/// Join unchanged context around the replaced text into one side of a diff.
+fn hunk_side(head: &[&str], middle: &str, tail: &[&str]) -> String {
+    let mut out = String::new();
+    for line in head {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(middle);
+    if !middle.is_empty() && !middle.ends_with('\n') && !tail.is_empty() {
+        out.push('\n');
+    }
+    for line in tail {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// The window one edit changes: the matched text plus a few unchanged lines either side.
+fn edit_hunk(content: &str, old: &str, new: &str) -> Option<(String, String)> {
+    let start = content.find(old)?;
+    let end = start + old.len();
+    let prefix: Vec<&str> = content[..start].lines().collect();
+    let head = &prefix[prefix.len().saturating_sub(PREVIEW_CONTEXT)..];
+    let suffix = content[end..].strip_prefix('\n').unwrap_or(&content[end..]);
+    let tail: Vec<&str> = suffix.lines().take(PREVIEW_CONTEXT).collect();
+    Some((hunk_side(head, old, &tail), hunk_side(head, new, &tail)))
+}
+
+/// The first `limit` changed lines, removals then additions, with the rest counted.
+fn changed_lines(old: &str, new: &str, limit: usize) -> String {
+    let mut lines: Vec<String> = old
+        .lines()
+        .map(|line| format!("- {line}"))
+        .chain(new.lines().map(|line| format!("+ {line}")))
+        .collect();
+    let total = lines.len();
+    let mut out = lines
+        .drain(..limit.min(total))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if total > limit {
+        out.push_str(&format!("\n… [{} more changed lines]", total - limit));
+    }
+    out
+}
 
 pub(crate) struct ReadFile;
 
@@ -153,6 +230,24 @@ impl Tool for WriteFile {
         ))
     }
 
+    fn preview(&self, call: &ToolCall, ctx: &ToolContext) -> Option<ApprovalPreview> {
+        let raw = call.arguments.get("path")?.as_str()?;
+        let content = call.arguments.get("content")?.as_str()?;
+        let (path, _) = canonical_resource(&ctx.workspace_root, raw).ok()?;
+        let before = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            // A file that is not there yet is a create: its before side is genuinely empty.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            // Exists but is not readable text — a text diff would be a guess, so show none.
+            Err(_) => return None,
+        };
+        Some(ApprovalPreview::Diff {
+            path: raw.to_owned(),
+            before: capped(&before),
+            after: capped(content),
+        })
+    }
+
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let raw = arg_str(args, "path")?;
         let content = arg_str(args, "content")?;
@@ -232,6 +327,24 @@ impl Tool for EditFile {
         ))
     }
 
+    fn preview(&self, call: &ToolCall, ctx: &ToolContext) -> Option<ApprovalPreview> {
+        let raw = call.arguments.get("path")?.as_str()?;
+        let old_string = call.arguments.get("old_string")?.as_str()?;
+        let new_string = call.arguments.get("new_string")?.as_str()?;
+        // Nothing changes, so there is no diff to show — an empty one would be a lie about effect.
+        if old_string == new_string {
+            return None;
+        }
+        let (path, _) = canonical_resource(&ctx.workspace_root, raw).ok()?;
+        let content = std::fs::read_to_string(&path).ok()?;
+        let (before, after) = edit_hunk(&content, old_string, new_string)?;
+        Some(ApprovalPreview::Diff {
+            path: raw.to_owned(),
+            before: capped(&before),
+            after: capped(&after),
+        })
+    }
+
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let raw = arg_str(args, "path")?;
         let old_string = arg_str(args, "old_string")?;
@@ -260,6 +373,14 @@ impl Tool for EditFile {
             });
         }
         let new_content = content.replace(&old_string, &new_string);
+        // The requested state already holds. Reporting "edited ... bytes" here would claim a change
+        // that did not happen, and an empty diff would read as one.
+        if new_content == content {
+            return Ok(ToolOutput {
+                content: format!("no change: {raw} already holds the requested text"),
+                ok: true,
+            });
+        }
         if new_content.len() > MAX_WRITE_BYTES {
             return Ok(ToolOutput {
                 content: format!(
@@ -282,10 +403,10 @@ impl Tool for EditFile {
                 checkpoint(ctx, &path, "modify", Some(content.as_bytes()));
                 Ok(ToolOutput {
                     content: truncated(format!(
-                        "edited {}: {} -> {} bytes",
-                        raw,
-                        content.len(),
-                        new_content.len()
+                        "edited {raw}: {} -> {} lines\n{}",
+                        old_string.lines().count(),
+                        new_string.lines().count(),
+                        changed_lines(&old_string, &new_string, RESULT_CHANGED_LINES)
                     )),
                     ok: true,
                 })
@@ -326,6 +447,18 @@ impl Tool for DeleteFile {
         ))
     }
 
+    fn preview(&self, call: &ToolCall, ctx: &ToolContext) -> Option<ApprovalPreview> {
+        let raw = call.arguments.get("path")?.as_str()?;
+        let (path, _) = canonical_resource(&ctx.workspace_root, raw).ok()?;
+        // Bytes, not text: a binary file has no readable diff, so it gets no preview.
+        let before = std::fs::read_to_string(&path).ok()?;
+        Some(ApprovalPreview::Diff {
+            path: raw.to_owned(),
+            before: capped(&before),
+            after: String::new(),
+        })
+    }
+
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
         let raw = arg_str(args, "path")?;
         let (path, _) = canonical_resource(&ctx.workspace_root, &raw)?;
@@ -363,11 +496,27 @@ impl Tool for DeleteFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ApprovalPreview;
 
     fn workspace_ctx(dir: &std::path::Path) -> ToolContext {
         ToolContext {
             workspace_root: dir.to_path_buf(),
             ..ToolContext::default()
+        }
+    }
+
+    fn call(name: &str, arguments: Value) -> vikram_contracts::ToolCall {
+        vikram_contracts::ToolCall::new(name, arguments)
+    }
+
+    fn diff(preview: Option<ApprovalPreview>) -> (String, String, String) {
+        match preview {
+            Some(ApprovalPreview::Diff {
+                path,
+                before,
+                after,
+            }) => (path, before, after),
+            other => panic!("expected a diff preview, got {other:?}"),
         }
     }
 
@@ -409,5 +558,170 @@ mod tests {
             .unwrap();
         assert!(!out.ok, "{}", out.content);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "small");
+    }
+
+    #[test]
+    fn write_preview_shows_the_file_before_and_after() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "old line\n").unwrap();
+        let ctx = workspace_ctx(dir.path());
+        let preview = WriteFile.preview(
+            &call(
+                "fs.write",
+                json!({"path": "a.txt", "content": "new line\n"}),
+            ),
+            &ctx,
+        );
+        let (path, before, after) = diff(preview);
+        assert_eq!(path, "a.txt");
+        assert_eq!(before, "old line\n");
+        assert_eq!(after, "new line\n");
+    }
+
+    #[test]
+    fn write_preview_of_a_new_file_shows_nothing_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = workspace_ctx(dir.path());
+        let preview = WriteFile.preview(
+            &call("fs.write", json!({"path": "new.txt", "content": "hello\n"})),
+            &ctx,
+        );
+        let (_, before, after) = diff(preview);
+        assert_eq!(
+            before, "",
+            "a file that does not exist yet has no before side"
+        );
+        assert_eq!(after, "hello\n");
+    }
+
+    #[test]
+    fn edit_preview_is_a_diff_of_the_changed_hunk() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "one\ntwo\nthree\n").unwrap();
+        let ctx = workspace_ctx(dir.path());
+        let preview = EditFile.preview(
+            &call(
+                "fs.edit",
+                json!({"path": "f.txt", "old_string": "two", "new_string": "TWO"}),
+            ),
+            &ctx,
+        );
+        let (path, before, after) = diff(preview);
+        assert_eq!(path, "f.txt");
+        assert_eq!(before, "one\ntwo\nthree\n");
+        assert_eq!(after, "one\nTWO\nthree\n");
+    }
+
+    #[test]
+    fn edit_preview_keeps_the_change_visible_in_a_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=400).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(dir.path().join("big.txt"), &body).unwrap();
+        let ctx = workspace_ctx(dir.path());
+        let preview = EditFile.preview(
+            &call(
+                "fs.edit",
+                json!({"path": "big.txt", "old_string": "line 399", "new_string": "line 399 edited"}),
+            ),
+            &ctx,
+        );
+        let (_, before, after) = diff(preview);
+        assert!(
+            before.contains("line 399\n") && after.contains("line 399 edited\n"),
+            "the changed line is the point of the preview:\nbefore={before}\nafter={after}"
+        );
+        assert!(
+            !before.contains("line 1\n"),
+            "the preview is the hunk, not the first 200 lines of the file"
+        );
+    }
+
+    #[test]
+    fn a_preview_longer_than_the_line_cap_is_cut_and_says_how_much() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=300).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(dir.path().join("big.txt"), &body).unwrap();
+        let ctx = workspace_ctx(dir.path());
+        let preview = WriteFile.preview(
+            &call(
+                "fs.write",
+                json!({"path": "big.txt", "content": "replaced\n"}),
+            ),
+            &ctx,
+        );
+        let (_, before, _) = diff(preview);
+        assert_eq!(
+            before.lines().count(),
+            PREVIEW_LINES + 1,
+            "the cap keeps exactly {PREVIEW_LINES} lines plus one announcement line: {before}"
+        );
+        assert!(
+            before.contains("200 of 300") && before.contains("100 cut"),
+            "the cut is announced with its size: {before}"
+        );
+    }
+
+    #[test]
+    fn delete_preview_shows_the_content_that_will_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gone.txt"), "bye\n").unwrap();
+        let ctx = workspace_ctx(dir.path());
+        let preview = DeleteFile.preview(&call("fs.delete", json!({"path": "gone.txt"})), &ctx);
+        let (path, before, after) = diff(preview);
+        assert_eq!(path, "gone.txt");
+        assert_eq!(before, "bye\n");
+        assert_eq!(after, "", "a delete leaves nothing behind");
+    }
+
+    #[test]
+    fn an_edit_that_changes_nothing_reports_no_change_instead_of_an_empty_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "same\n").unwrap();
+        let ctx = workspace_ctx(dir.path());
+        let args = json!({"path": "f.txt", "old_string": "same", "new_string": "same"});
+        let out = EditFile.run(&args, &ctx).unwrap();
+        assert!(out.ok, "{}", out.content);
+        assert!(
+            out.content.contains("no change"),
+            "the result says the file already holds the requested text: {}",
+            out.content
+        );
+        assert!(
+            EditFile.preview(&call("fs.edit", args), &ctx).is_none(),
+            "an empty diff is not a preview"
+        );
+    }
+
+    #[test]
+    fn edit_result_names_the_first_changed_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        let ctx = workspace_ctx(dir.path());
+        let out = EditFile
+            .run(
+                &json!({"path": "f.txt", "old_string": "beta", "new_string": "BETA"}),
+                &ctx,
+            )
+            .unwrap();
+        assert!(out.ok, "{}", out.content);
+        assert!(
+            out.content.contains("- beta") && out.content.contains("+ BETA"),
+            "the changed line is shown, not just byte counts: {}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn a_tool_that_does_not_opt_in_carries_no_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "text\n").unwrap();
+        let ctx = workspace_ctx(dir.path());
+        assert!(
+            ReadFile
+                .preview(&call("fs.read", json!({"path": "f.txt"})), &ctx)
+                .is_none(),
+            "reading has no effect to preview, and the default is no preview"
+        );
     }
 }

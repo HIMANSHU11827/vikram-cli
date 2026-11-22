@@ -2157,6 +2157,7 @@ async fn run_tool_once(
                 resource: request.resource.clone(),
                 reason: reason.clone(),
                 amendment,
+                preview: tool.preview(&call, &inner.tool_context()),
             };
             let (tx, rx) = oneshot::channel();
             inner.approvals.lock().expect("approvals lock").insert(

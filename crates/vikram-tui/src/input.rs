@@ -2991,6 +2991,7 @@ mod tests {
                 resource: format!("/etc/hosts{n}"),
                 reason: "outside the workspace".to_owned(),
                 amendment: None,
+                preview: None,
             });
         }
         app.overlay = Some(Overlay::Approvals);
