@@ -212,8 +212,8 @@ impl WavoRecognizer {
                 },
             };
             // wavo's own choice: the GPU when the adapter it picks is a real one, the CPU when it
-            // is a software device. Forcing `Backend::Gpu` here deadlocked the first decode on
-            // this Intel UHD, which is worse than a slower backend that works.
+            // would pick a software device. Leaving the choice here means the adapter wavo proves
+            // at load time is the one used, and the print below says which it was.
             let model = wavo::Model::load(&path).map_err(wavo_error)?;
             let device = model.device();
             let label = format!("{} ({:?})", device.name, device.api);

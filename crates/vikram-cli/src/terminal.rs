@@ -620,8 +620,14 @@ fn drain_voice_mode(app: &mut App, rx: &Receiver<VoiceEvent>, mode: &mut VoiceMo
                     text: heard,
                 });
             }
-            // Silence between utterances is the normal state of a room, not news.
-            VoiceEvent::Empty => {}
+            // Silence between utterances is the normal state of a room, not news — but a take the
+            // gate rejected must not look like a dead feature, so it says so once per turn.
+            VoiceEvent::Empty => {
+                app.push_notice(
+                    NoticeLevel::Info,
+                    "voice: nothing heard that turn — check the input level or speak closer",
+                );
+            }
             VoiceEvent::Partial(text) => {
                 let text = text.trim();
                 if !text.is_empty() {
