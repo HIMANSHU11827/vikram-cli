@@ -69,6 +69,42 @@ impl Origin {
     }
 }
 
+/// What a provider said about *why* the answer stopped, as it appears in the stream.
+///
+/// Both providers translate the wire's stop reason into a note they append to the answer
+/// (`anthropic.rs` `stop_note` for `stop_reason`, `openai.rs` `truncation_note` for
+/// `finish_reason`), because the note is the part the model and the operator both read. The turn
+/// branches on the same markers: an answer that was cut off, or declined, must not be handed to
+/// the caller as a finished one. The markers live here so the note the provider writes and the
+/// note the turn recognises cannot drift apart.
+pub(crate) const TRUNCATION_MARKER: &str = "[response truncated:";
+pub(crate) const REFUSAL_MARKER: &str = "[the model declined";
+
+/// The note the turn itself writes when a step was cut off and the provider's own note is not in
+/// the committed text (it was discarded with a step that got retried for size). It carries the
+/// same marker, so a reader — and the next step's classifier — cannot mistake it for prose.
+const TRUNCATION_NOTE: &str = "\n[response truncated: the answer is incomplete]";
+
+/// How an answer ended, when it did not end normally. `end_turn` and `tool_use` need no handling:
+/// the first breaks the loop because there is nothing left to do, the second continues it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopSignal {
+    /// The output-token limit was reached: the answer is incomplete by construction.
+    Truncated,
+    /// The model declined to answer (`refusal`, `content_filter`). Surfaced, never retried.
+    Refused,
+}
+
+fn stop_signal(text: &str) -> Option<StopSignal> {
+    if text.contains(TRUNCATION_MARKER) {
+        Some(StopSignal::Truncated)
+    } else if text.contains(REFUSAL_MARKER) {
+        Some(StopSignal::Refused)
+    } else {
+        None
+    }
+}
+
 /// Said to the model on every turn, in its own system message. The transcript prints these lines
 /// between the tool rows as the agent's voice, so they are part of the interface and not decoration:
 /// one or two sentences, present tense, naming the file, command or question in hand.
@@ -670,6 +706,10 @@ pub(crate) async fn run_turn(
         let mut reasoning_buffer = String::new();
         let mut calls: Vec<ToolCall> = Vec::new();
         let mut stream_failed = false;
+        // Set once per step when the provider says the answer did not end normally. It is not an
+        // error: the text that did arrive is real and is kept, but it is incomplete and the turn
+        // says so instead of letting a cut-off answer read as a finished one.
+        let mut stop: Option<StopSignal> = None;
         // Silence is measured from the last *event that produced something visible*, not from a
         // one-shot "did anything ever arrive" flag. A model can emit one token and then go quiet
         // while it streams a long tool-call argument block (which the provider buffers without
@@ -757,6 +797,9 @@ pub(crate) async fn run_turn(
                     if !delta.is_empty() {
                         last_progress = Instant::now();
                         output_tokens += vikram_contracts::TokenMeter::estimate(&delta);
+                        if stop.is_none() {
+                            stop = stop_signal(&delta);
+                        }
                         text_buffer.push_str(&delta);
                         inner.emit(RuntimeEvent::StreamDelta {
                             session: session.id.clone(),
@@ -828,6 +871,50 @@ pub(crate) async fn run_turn(
             }
         }
 
+        if let Some(signal) = stop {
+            // A step that ended early is not an error — the text that arrived is real and is kept —
+            // but it must not reach the caller as a normal finish. Nothing is retried here: a
+            // truncated request truncates again, and re-asking after a refusal would silently
+            // overrule the model's own decision. The operator is told, the journal records it, and
+            // the transcript carries the note.
+            let (level, text) = match signal {
+                StopSignal::Truncated => (
+                    NoticeLevel::Warn,
+                    format!(
+                        "the model reached its output-token limit after {output_tokens} tokens: \
+                         this answer is cut off, not finished. Ask it to continue, or raise \
+                         `max_output_tokens`."
+                    ),
+                ),
+                StopSignal::Refused => (
+                    NoticeLevel::Warn,
+                    "the model declined to answer. It was not asked again: a refusal is an answer, \
+                     and repeating the request would be a silent override of it."
+                        .to_owned(),
+                ),
+            };
+            inner.emit(RuntimeEvent::Notice { level, text });
+            inner.journal(
+                &session.id,
+                RecordKind::Status,
+                match signal {
+                    StopSignal::Truncated => serde_json::json!({
+                        "turn": turn.as_str(),
+                        "stop_reason": "max_tokens",
+                        "truncated": true,
+                        "output_tokens": output_tokens,
+                    }),
+                    StopSignal::Refused => serde_json::json!({
+                        "turn": turn.as_str(),
+                        "stop_reason": "refusal",
+                        "refused": true,
+                    }),
+                },
+            );
+            if signal == StopSignal::Truncated && !text_buffer.contains(TRUNCATION_MARKER) {
+                text_buffer.push_str(TRUNCATION_NOTE);
+            }
+        }
         if dropped_for_limit {
             // The rejected stream may have produced partial text, reasoning or call fragments
             // before the error arrived. Spend them now so the retried request cannot commit
@@ -6553,5 +6640,139 @@ mod tests {
         ] {
             assert!(WORK_CONTRACT.contains(rule), "the contract states `{rule}`");
         }
+    }
+
+    /// Run one scripted turn and hand back what the operator saw, what was committed, and the
+    /// status records the journal kept.
+    async fn run_for_stop(
+        script: Vec<Vec<ProviderEvent>>,
+    ) -> (
+        Vec<String>,
+        Vec<Message>,
+        Vec<serde_json::Value>,
+        Arc<ScriptedProvider>,
+    ) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let provider = Arc::new(ScriptedProvider::new(script));
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "explain the parser".into())
+            .expect("the turn is accepted");
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let mut notices = Vec::new();
+        loop {
+            assert!(Instant::now() < deadline, "the turn never finished");
+            let Ok(Ok(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), events.recv()).await
+            else {
+                continue;
+            };
+            match event {
+                RuntimeEvent::Notice { text, .. } => notices.push(text),
+                RuntimeEvent::TurnFinished { .. } => break,
+                _ => {}
+            }
+        }
+        let messages = handle
+            .inner
+            .session(&session)
+            .expect("the session survives the turn")
+            .messages();
+        let statuses = handle
+            .inner
+            .store
+            .replay_messages(&session)
+            .expect("the journal reads back")
+            .into_iter()
+            .filter(|record| record.kind == RecordKind::Status)
+            .map(|record| record.payload)
+            .collect();
+        (notices, messages, statuses, provider)
+    }
+
+    /// `max_tokens` means the answer was cut off. It is kept — the words that arrived are real —
+    /// but it is marked incomplete everywhere the caller can look, and it is not retried.
+    #[tokio::test]
+    async fn a_truncated_answer_is_marked_incomplete_rather_than_completed() {
+        let (notices, messages, statuses, provider) = run_for_stop(vec![vec![
+            ProviderEvent::TextDelta("half an ans".into()),
+            ProviderEvent::TextDelta(format!(
+                "\n{TRUNCATION_MARKER} the model reached its output-token limit (`max_tokens`)]"
+            )),
+            finished(),
+        ]])
+        .await;
+
+        let answer = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::Assistant)
+            .expect("the partial answer is committed");
+        assert!(
+            answer.text_body().contains(TRUNCATION_MARKER),
+            "the transcript says the answer is cut off: {answer:?}"
+        );
+        assert!(
+            notices.iter().any(|notice| notice.contains("cut off")),
+            "the operator is told, not left to notice: {notices:?}"
+        );
+        assert!(
+            statuses.iter().any(|payload| {
+                payload
+                    .get("truncated")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                    && payload
+                        .get("stop_reason")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("max_tokens")
+            }),
+            "the journal keeps the truncation, so it survives a fold: {statuses:?}"
+        );
+        assert_eq!(
+            provider.taken().len(),
+            1,
+            "a truncated answer is not re-asked: it would truncate again"
+        );
+    }
+
+    /// A refusal is an answer, not a transport failure: it is surfaced once and never retried
+    /// behind the operator's back.
+    #[tokio::test]
+    async fn a_refusal_is_surfaced_and_not_retried() {
+        let (notices, messages, statuses, provider) = run_for_stop(vec![vec![
+            ProviderEvent::TextDelta(format!("\n{REFUSAL_MARKER} to answer (`refusal`)]")),
+            finished(),
+        ]])
+        .await;
+
+        assert_eq!(
+            provider.taken().len(),
+            1,
+            "the model declined once; asking again would overrule it silently"
+        );
+        assert!(
+            notices.iter().any(|notice| notice.contains("declined")),
+            "{notices:?}"
+        );
+        assert!(
+            statuses.iter().any(|payload| {
+                payload.get("refused").and_then(serde_json::Value::as_bool) == Some(true)
+            }),
+            "{statuses:?}"
+        );
+        let answer = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::Assistant)
+            .expect("the note is committed");
+        assert!(answer.text_body().contains(REFUSAL_MARKER), "{answer:?}");
     }
 }
