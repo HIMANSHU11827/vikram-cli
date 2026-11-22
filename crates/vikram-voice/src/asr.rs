@@ -297,18 +297,33 @@ impl Recognizer for WavoRecognizer {
 /// already on PATH, never as a requirement.
 pub const VOXTYPE: &str = "voxtype";
 
-/// The transcript is the stdout paragraph after the last blank line: `voxtype -q transcribe`
-/// prints its progress first and the text last, which is the observed CLI contract this
-/// parses against.
+/// The transcript is the last paragraph of stdout that is not progress output: `voxtype -q
+/// transcribe` prints VAD and whisper.cpp diagnostics around the text, and the order is not
+/// fixed — a run that ended with `VAD: 2.56s speech (79.5% of audio)` used to return that line
+/// as the transcript. So paragraphs are scanned from the end and the first one that does not
+/// look like a log line wins.
 fn last_paragraph(stdout: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(stdout);
-    let text = text.trim();
-    let tail = text
-        .rsplit_once("\n\n")
-        .map(|(_, tail)| tail)
-        .unwrap_or(text);
-    let tail = tail.trim();
-    (!tail.is_empty()).then(|| tail.to_owned())
+    let paragraphs: Vec<&str> = text.split("\n\n").map(str::trim).collect();
+    paragraphs
+        .into_iter()
+        .rev()
+        .find(|paragraph| !paragraph.is_empty() && !is_progress_output(paragraph))
+        .map(str::to_owned)
+}
+
+/// Progress lines voxtype prints around the transcript: VAD summaries, whisper.cpp diagnostics
+/// (`whisper_model_load:`, `whisper_backend_init_gpu:`, …), and bracketed status lines.
+fn is_progress_output(paragraph: &str) -> bool {
+    paragraph.lines().all(|line| {
+        let line = line.trim_start();
+        line.starts_with("VAD")
+            || line.starts_with("whisper_")
+            || line.starts_with("ggml_")
+            || line.starts_with("main:")
+            || line.starts_with("system_info")
+            || line.starts_with('[')
+    })
 }
 
 /// The optional fast path: voxtype's own engine stack (GPU-accelerated where available) over
@@ -714,6 +729,20 @@ mod tests {
         );
         assert_eq!(last_paragraph(b"\n\n\n"), None);
         assert_eq!(last_paragraph(b""), None);
+    }
+
+    #[test]
+    fn voxtype_progress_after_the_transcript_is_not_the_transcript() {
+        let observed = "Hello Vikram, this is a voice test.\n\n\
+                        VAD: 2.10s speech (100.0% of audio)\n";
+        assert_eq!(
+            last_paragraph(observed.as_bytes()).as_deref(),
+            Some("Hello Vikram, this is a voice test.")
+        );
+        let logs = "whisper_model_load: n_mels = 80\n\n\
+                    whisper_backend_init_gpu: using Vulkan0 backend\n\n\
+                    VAD backend: Energy\n";
+        assert_eq!(last_paragraph(logs.as_bytes()), None);
     }
 
     #[test]
