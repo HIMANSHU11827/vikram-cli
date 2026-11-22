@@ -1585,24 +1585,44 @@ impl RuntimeInner {
     /// Two moves, in this order: fold the older conversation into a summary, then digest oversized
     /// tool results in the tail if folding alone left us over. Both are journaled and both are
     /// announced, because a context that quietly changed shape is a context nobody can reason about.
-    pub fn prepare_context(
+    /// The inputs every context decision needs: the session's estimator, the budget for this
+    /// request, and the compaction policy from config.
+    fn context_plan(
         &self,
         session: &Arc<SessionRuntime>,
         prefix: &[Message],
-    ) -> (Vec<Message>, crate::context_engine::ContextBudget) {
-        use crate::compaction::{CompactionPolicy, prune_transcript, should_compact};
-
+    ) -> (
+        crate::context_engine::TokenEstimator,
+        crate::context_engine::ContextBudget,
+        crate::compaction::CompactionPolicy,
+    ) {
         let estimator = session.estimator();
         let budget = self.context_budget(session, prefix);
-        let policy = CompactionPolicy::from_config(
+        let policy = crate::compaction::CompactionPolicy::from_config(
             &self
                 .config
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .context,
         );
+        (estimator, budget, policy)
+    }
+
+    /// Build the transcript to send, folding the old span with the model as its author.
+    ///
+    /// A fold is the one place the runtime rewrites its own history, so a keyword classifier is a
+    /// poor author when a model is available: it loses the reasons behind a decision. This asks the
+    /// model under an explicit retention instruction and falls back to the deterministic fold —
+    /// announcing which path ran — when the answer is unusable.
+    pub async fn prepare_context_with_model(
+        &self,
+        session: &Arc<SessionRuntime>,
+        prefix: &[Message],
+    ) -> (Vec<Message>, crate::context_engine::ContextBudget) {
+        use crate::compaction::should_compact;
+
+        let (estimator, budget, policy) = self.context_plan(session, prefix);
         let mut transcript = session.messages();
-        let usable = budget.usable_input();
 
         if self
             .config
@@ -1611,15 +1631,44 @@ impl RuntimeInner {
             .context
             .auto_compact
             && should_compact(&estimator, &transcript, &budget, &policy)
-            && let Some((folded, _)) =
-                self.fold_once(&session.id, &transcript, &estimator, &budget, &policy)
         {
-            transcript = folded;
+            let folded = self
+                .fold_once_with_model(&session.id, &transcript, &estimator, &budget, &policy)
+                .await
+                .map(|(folded, _)| folded);
+            match folded {
+                Some(folded) => transcript = folded,
+                None => {
+                    if let Some((folded, _)) =
+                        self.fold_once(&session.id, &transcript, &estimator, &budget, &policy)
+                    {
+                        transcript = folded;
+                    }
+                }
+            }
         }
+
+        let transcript = self.prune_tail(session, transcript, &estimator, &budget, &policy);
+        (transcript, budget)
+    }
+
+    /// Digest oversized tool results in the tail, and complain loudly when compaction is off and
+    /// the transcript is over budget. Folding happens before this: this is the cheaper second move.
+    fn prune_tail(
+        &self,
+        session: &Arc<SessionRuntime>,
+        mut transcript: Vec<Message>,
+        estimator: &crate::context_engine::TokenEstimator,
+        budget: &crate::context_engine::ContextBudget,
+        policy: &crate::compaction::CompactionPolicy,
+    ) -> Vec<Message> {
+        use crate::compaction::prune_transcript;
+
+        let usable = budget.usable_input();
 
         if transcript.len() > policy.keep_recent
             && let Some((pruned, replaced)) =
-                prune_transcript(&estimator, &budget, &transcript, policy.tool_output_ceiling)
+                prune_transcript(estimator, budget, &transcript, policy.tool_output_ceiling)
         {
             let saved = estimator
                 .estimate_messages(&transcript)
@@ -1641,7 +1690,7 @@ impl RuntimeInner {
             .auto_compact
             && usable > 0
         {
-            let used = crate::compaction::active_context_tokens(&estimator, &transcript, &budget);
+            let used = crate::compaction::active_context_tokens(estimator, &transcript, budget);
             if used > usable {
                 // Compaction is off, so the only honest move left is to say so rather than send a
                 // request the provider will reject.
@@ -1653,7 +1702,7 @@ impl RuntimeInner {
             }
         }
 
-        (transcript, budget)
+        transcript
     }
 
     /// `/compact`: fold now, whether or not the meter has reached the trigger.
@@ -1697,13 +1746,97 @@ impl RuntimeInner {
         let length_before = transcript.len();
         let (folded, report) =
             crate::compaction::compact(estimator, transcript, budget, policy, through_seq)?;
+        let folded = self.apply_fold(session, &folded, &report, length_before)?;
+        Some((folded, report))
+    }
+
+    /// Fold with the model writing the summary body.
+    ///
+    /// `None` means no fold happened at all (no provider, no journal, or the session refused a
+    /// second fold) — not that the model's answer was unusable. An unusable answer still folds,
+    /// deterministically, and says so.
+    async fn fold_once_with_model(
+        &self,
+        session: &SessionId,
+        transcript: &[Message],
+        estimator: &crate::context_engine::TokenEstimator,
+        budget: &crate::context_engine::ContextBudget,
+        policy: &crate::compaction::CompactionPolicy,
+    ) -> Option<(Vec<Message>, crate::compaction::CompactionReport)> {
+        use crate::compaction::{FoldSource, compact_with_summarizer};
+
+        let provider = self
+            .provider
+            .read()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: runtime provider lock rwlock poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()?;
+        let through_seq = self
+            .store
+            .journal()
+            .last_seq(session)
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        let length_before = transcript.len();
+        let model = provider.model().to_owned();
+
+        let outcome = compact_with_summarizer(
+            estimator,
+            transcript,
+            budget,
+            policy,
+            through_seq,
+            |request| {
+                let provider = Arc::clone(&provider);
+                let model = model.clone();
+                async move {
+                    let prompt = format!("{}\n\n{}", request.instruction, request.transcript);
+                    let completion = crate::provider::CompletionRequest {
+                        model,
+                        messages: vec![Message::user(prompt)],
+                        tools: Vec::new(),
+                        max_output_tokens: Some(
+                            u32::try_from(request.max_tokens).unwrap_or(u32::MAX),
+                        ),
+                    };
+                    collect_completion(&provider, completion, SUMMARY_TIMEOUT).await
+                }
+            },
+        )
+        .await?;
+
+        if outcome.source == FoldSource::Deterministic
+            && let Some(reason) = &outcome.fallback_reason
+        {
+            self.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!(
+                    "compaction: the model summary was unusable ({reason}); folded deterministically"
+                ),
+            });
+        }
+        let folded = self.apply_fold(session, &outcome.messages, &outcome.report, length_before)?;
+        Some((folded, outcome.report))
+    }
+
+    /// Journal a fold, swap the live transcript, announce it. `None` refuses a duplicate fold.
+    fn apply_fold(
+        &self,
+        session: &SessionId,
+        folded: &[Message],
+        report: &crate::compaction::CompactionReport,
+        length_before: usize,
+    ) -> Option<Vec<Message>> {
         let live = self.session(session)?;
         if !live.note_compaction(length_before) {
             return None;
         }
-        let summary = folded[0].clone();
-        self.journal_compaction(session, &summary, &report);
-        live.replace_messages(folded.clone(), now_ms());
+        let summary = folded.first()?.clone();
+        self.journal_compaction(session, &summary, report);
+        live.replace_messages(folded.to_vec(), now_ms());
         self.emit(RuntimeEvent::ContextCompacted {
             session: session.clone(),
             folded: report.folded,
@@ -1712,7 +1845,7 @@ impl RuntimeInner {
             after_tokens: report.after_tokens,
             through_seq: report.through_seq,
         });
-        Some((folded, report))
+        Some(folded.to_vec())
     }
 
     /// Append the compaction marker. The summary is stored with the number of messages it folded,
@@ -6107,6 +6240,39 @@ impl RuntimeHandle {
     }
 }
 
+/// How long a fold may wait on the model before the deterministic fold takes over.
+const SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Drain a non-tool completion to text, bounded by `timeout`, reporting why it failed.
+///
+/// Unlike the title collector, a failure here must be distinguishable from an empty answer: the
+/// fold needs to know when to fall back, and the operator needs to know it happened.
+async fn collect_completion(
+    provider: &Arc<dyn Provider>,
+    request: crate::provider::CompletionRequest,
+    timeout: std::time::Duration,
+) -> std::result::Result<String, String> {
+    use futures_util::StreamExt;
+
+    let drain = async {
+        let mut stream = provider.stream(request);
+        let mut collected = String::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(crate::provider::ProviderEvent::TextDelta(t)) => collected.push_str(&t),
+                Ok(crate::provider::ProviderEvent::Finished { .. }) => break,
+                Ok(_) => {}
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+        Ok(collected)
+    };
+    match tokio::time::timeout(timeout, drain).await {
+        Ok(result) => result,
+        Err(_) => Err(format!("no answer within {}s", timeout.as_secs())),
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::await_holding_lock,
@@ -8800,6 +8966,60 @@ mod tests {
             handle.inner.store.list_file_changes(&id).unwrap().len(),
             1,
             "the source keeps its own change log"
+        );
+    }
+    /// The fold is the runtime rewriting its own history, so which author wrote it has to be
+    /// observable: a model that answers becomes the summary body, and the live transcript is what
+    /// the next request sees.
+    #[tokio::test]
+    async fn the_model_writes_the_fold_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let (runtime, provider) = named_runtime(dir.path(), "SUMMARY-AUTHORED-BY-THE-MODEL").await;
+        let handle = runtime.handle();
+        let id = handle.create_session(None).unwrap();
+        let live = handle.inner.session(&id).expect("the session exists");
+        let estimator = live.estimator();
+        let budget = handle.inner.context_budget(&live, &[]);
+        let policy = crate::compaction::CompactionPolicy::from_config(
+            &handle
+                .inner
+                .config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .context,
+        );
+        let transcript: Vec<Message> = (0..40)
+            .map(|i| {
+                Message::user(format!(
+                    "step {i}: read crates/vikram-runtime/src/turn.rs and note how the loop \
+                     assembles context before every provider call, because the fold has to keep \
+                     the reason this mattered to the session that is still running"
+                ))
+            })
+            .collect();
+
+        let (folded, report) = handle
+            .inner
+            .fold_once_with_model(&id, &transcript, &estimator, &budget, &policy)
+            .await
+            .expect("the model answered, so the fold happened");
+        let summary = folded.first().expect("a fold starts with its summary");
+        assert!(
+            summary
+                .text_body()
+                .contains("SUMMARY-AUTHORED-BY-THE-MODEL"),
+            "the model wrote the body, got {:?}",
+            summary.text_body()
+        );
+        assert!(
+            !provider.asked().is_empty(),
+            "the summarizer was actually asked"
+        );
+        assert_eq!(report.folded, transcript.len() - report.kept);
+        assert!(
+            handle.inner.session(&id).unwrap().messages().len() < transcript.len(),
+            "the live transcript was replaced by the fold"
         );
     }
 }

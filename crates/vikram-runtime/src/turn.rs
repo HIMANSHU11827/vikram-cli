@@ -621,7 +621,7 @@ pub(crate) async fn run_turn(
             StagePayload::ContextBuild(payload) => (payload.prefix, payload.labels),
             _ => (Vec::new(), Vec::new()),
         };
-        let (transcript, budget) = inner.prepare_context(&session, &prefix);
+        let (transcript, budget) = inner.prepare_context_with_model(&session, &prefix).await;
         let estimator = session.estimator();
         let mut parts: Vec<ContextPart> = labels
             .iter()
@@ -4952,10 +4952,24 @@ mod tests {
     async fn an_over_budget_transcript_folds_before_the_request_leaves() {
         let dir = tempfile::tempdir().expect("temp dir");
         let _home = isolated_home(dir.path());
-        let provider = Arc::new(ScriptedProvider::new(vec![vec![ProviderEvent::Finished {
-            input_tokens: Some(1_200),
-            output_tokens: Some(20),
-        }]]));
+        // Two calls: the model writes the fold, then the turn itself runs against the folded
+        // transcript. The first answer has to be real text or the fold falls back deterministically
+        // and this test would stop proving the model-authored path.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::TextDelta(
+                    "Folded: each item reads a file and returns its first line.".into(),
+                ),
+                ProviderEvent::Finished {
+                    input_tokens: Some(400),
+                    output_tokens: Some(20),
+                },
+            ],
+            vec![ProviderEvent::Finished {
+                input_tokens: Some(1_200),
+                output_tokens: Some(20),
+            }],
+        ]));
         let config = Config {
             model: "test-model".into(),
             workspace_root: Some(dir.path().to_path_buf()),
@@ -5006,8 +5020,8 @@ mod tests {
         );
 
         let requests = provider.taken();
-        assert_eq!(requests.len(), 1, "one request went out");
-        let sent = &requests[0];
+        assert_eq!(requests.len(), 2, "the summarizer, then the turn");
+        let sent = requests.last().expect("the turn's request went out");
         assert!(
             sent.iter().any(crate::compaction::is_compaction_summary),
             "the summary travels with the request"
