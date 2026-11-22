@@ -223,9 +223,17 @@ pub enum DevicePlayer {
 
 impl DevicePlayer {
     pub fn new(config: &VoiceConfig) -> Self {
-        match probe_playback() {
-            Some(_) => Self::BuiltIn(CpalPlayer::open(config)),
-            None => Self::Helper(HelperPlayer::new(config)),
+        // A configured name means the built-in engine even when the host has no default output:
+        // `open_output` resolves the name, so an unknown one is an honest error at play time
+        // instead of a silent switch to the helper's own default device.
+        let built_in = match config.output_device.as_deref() {
+            Some(name) if !name.trim().is_empty() => true,
+            _ => probe_playback().is_some(),
+        };
+        if built_in {
+            Self::BuiltIn(CpalPlayer::open(config))
+        } else {
+            Self::Helper(HelperPlayer::new(config))
         }
     }
 }
@@ -290,6 +298,46 @@ mod tests {
                 assert!(probe_playback().is_none());
             }
         }
+    }
+
+    #[test]
+    fn a_configured_device_keeps_the_built_in_engine() {
+        let config = VoiceConfig {
+            output_device: Some("Studio Monitors".into()),
+            ..Default::default()
+        };
+        assert!(
+            matches!(DevicePlayer::new(&config), DevicePlayer::BuiltIn(_)),
+            "the named device must be resolved, never replaced by the helper"
+        );
+    }
+
+    #[test]
+    fn the_configured_device_is_carried_into_the_player() {
+        let config = VoiceConfig {
+            output_device: Some("Studio Monitors".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            CpalPlayer::open(&config).device.as_deref(),
+            Some("Studio Monitors")
+        );
+        let config = VoiceConfig::default();
+        assert!(CpalPlayer::open(&config).device.is_none());
+    }
+
+    #[test]
+    #[ignore = "hardware test: opens the machine's output devices by name"]
+    fn a_named_output_device_opens_and_an_unknown_one_lists_the_alternatives() {
+        let Some(default) = probe_playback() else {
+            return;
+        };
+        assert!(open_output(Some(&default)).is_ok());
+        let err = open_output(Some("No Such Speaker"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("No Such Speaker"), "{err}");
+        assert!(err.contains(&default), "{err}");
     }
 
     #[test]

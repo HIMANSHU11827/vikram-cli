@@ -332,9 +332,17 @@ pub enum DeviceSource {
 
 impl DeviceSource {
     pub fn new(config: &VoiceConfig) -> Self {
-        match probe_capture() {
-            Some(_) => Self::BuiltIn(CpalSource::start(config)),
-            None => Self::Helper(HelperSource::new(config)),
+        // A configured name means the built-in engine even when the host has no default input:
+        // `open_input` resolves the name, so an unknown one is an honest error at record time
+        // instead of a silent switch to the helper's own default device.
+        let built_in = match config.input_device.as_deref() {
+            Some(name) if !name.trim().is_empty() => true,
+            _ => probe_capture().is_some(),
+        };
+        if built_in {
+            Self::BuiltIn(CpalSource::start(config))
+        } else {
+            Self::Helper(HelperSource::new(config))
         }
     }
 }
@@ -537,6 +545,46 @@ mod tests {
             &quiet[..],
             "pre-roll: every frame before the gate opened"
         );
+    }
+
+    #[test]
+    fn a_configured_device_keeps_the_built_in_engine() {
+        let config = VoiceConfig {
+            input_device: Some("Studio Mic".into()),
+            ..Default::default()
+        };
+        assert!(
+            matches!(DeviceSource::new(&config), DeviceSource::BuiltIn(_)),
+            "the named device must be resolved, never replaced by the helper"
+        );
+    }
+
+    #[test]
+    fn the_configured_device_is_carried_into_the_source() {
+        let config = VoiceConfig {
+            input_device: Some("Studio Mic".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            CpalSource::start(&config).device.as_deref(),
+            Some("Studio Mic")
+        );
+        let config = VoiceConfig::default();
+        assert!(CpalSource::start(&config).device.is_none());
+    }
+
+    #[test]
+    #[ignore = "hardware test: opens the machine's input devices by name"]
+    fn a_named_input_device_opens_and_an_unknown_one_lists_the_alternatives() {
+        let Some(default) = probe_capture() else {
+            return;
+        };
+        assert!(open_input(Some(&default)).is_ok());
+        let err = open_input(Some("No Such Microphone"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("No Such Microphone"), "{err}");
+        assert!(err.contains(&default), "{err}");
     }
 
     #[test]
