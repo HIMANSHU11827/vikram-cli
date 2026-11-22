@@ -2684,6 +2684,11 @@ async fn build_completion_request(
     request_text: &str,
     mut messages: Vec<Message>,
 ) -> Result<CompletionRequest, String> {
+    let model = if inner.workers.by_session(&session.id).is_some() {
+        session.model().unwrap_or_else(|| inner.model())
+    } else {
+        inner.model()
+    };
     let model_hook = run_hook(
         inner,
         session,
@@ -2691,7 +2696,7 @@ async fn build_completion_request(
             .with_session(session.id.as_str())
             .with_turn(turn.as_str())
             .with_workspace(inner.workspace_root.display().to_string())
-            .with_model(inner.model())
+            .with_model(model.clone())
             .with_text(request_text),
     )
     .await;
@@ -2707,8 +2712,11 @@ async fn build_completion_request(
     for text in &model_hook.effect.append {
         messages.push(Message::text(Role::System, text.clone(), Trust::External));
     }
+    // A worker's brief may name its own model; that choice is stamped on its session at spawn
+    // and is the one its requests carry. Ordinary sessions keep the runtime's live choice. The
+    // decision is made once, above, so the hook and the request can never disagree about it.
     Ok(CompletionRequest {
-        model: inner.model(),
+        model: model.clone(),
         messages,
         tools: inner.tools.specs(),
         max_output_tokens: model_hook
@@ -2724,7 +2732,7 @@ async fn build_completion_request(
             // Nothing explicit: the registry's per-model figure, so Anthropic stops
             // hard-capping every turn at its 4096 default. Unknown models send no cap —
             // the assumed floor is a budgeting guess, not a provider limit.
-            .or_else(|| crate::context_engine::ModelLimits::declared_output_cap(&inner.model())),
+            .or_else(|| crate::context_engine::ModelLimits::declared_output_cap(&model)),
     })
 }
 

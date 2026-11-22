@@ -770,6 +770,7 @@ mod tests {
         script: std::sync::Mutex<
             std::collections::VecDeque<Vec<std::result::Result<ProviderEvent, VikramError>>>,
         >,
+        models: std::sync::Mutex<Vec<String>>,
     }
 
     impl ScriptedProvider {
@@ -781,13 +782,20 @@ mod tests {
                         .map(|batch| batch.into_iter().map(Ok).collect())
                         .collect(),
                 ),
+                models: std::sync::Mutex::new(Vec::new()),
             })
+        }
+
+        /// The model each request actually carried, in request order.
+        fn models(&self) -> Vec<String> {
+            self.models.lock().expect("models lock").clone()
         }
 
         /// A script of raw results, for turns that must fail mid-stream.
         fn raw(batches: Vec<Vec<std::result::Result<ProviderEvent, VikramError>>>) -> Arc<Self> {
             Arc::new(Self {
                 script: std::sync::Mutex::new(batches.into()),
+                models: std::sync::Mutex::new(Vec::new()),
             })
         }
     }
@@ -805,7 +813,11 @@ mod tests {
             Some(32_768)
         }
 
-        fn stream(&self, _request: CompletionRequest) -> ProviderStream {
+        fn stream(&self, request: CompletionRequest) -> ProviderStream {
+            self.models
+                .lock()
+                .expect("models lock")
+                .push(request.model.clone());
             let batch = self
                 .script
                 .lock()
@@ -1501,5 +1513,71 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(handle.inner.session(&parent).is_some());
+    }
+
+    #[tokio::test]
+    async fn role_model_routing_overrides_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::TextDelta("routed to my own model".into()),
+                ProviderEvent::Finished {
+                    input_tokens: Some(4),
+                    output_tokens: Some(4),
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("ran on the default".into()),
+                ProviderEvent::Finished {
+                    input_tokens: Some(4),
+                    output_tokens: Some(4),
+                },
+            ],
+        ]);
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::clone(&provider) as Arc<dyn Provider>,
+        )
+        .await
+        .expect("runtime boots with the scripted provider");
+        let handle = runtime.handle();
+        let parent = handle.snapshot().sessions[0].id.clone();
+        let mut events = handle.events();
+
+        // A brief that names its model and effort: both are stamped on the child, and the
+        // request the child's turn sends actually carries the choice.
+        let mut routed = plain_brief(dir.path());
+        routed.model = Some("big-model".into());
+        routed.effort = Some("high".into());
+        let routed_id = handle
+            .spawn_worker(parent.clone(), routed, None)
+            .expect("the routed worker spawns");
+        let routed_record = handle.inner.workers.by_id(&routed_id).unwrap();
+        let routed_session = handle
+            .inner
+            .session(&routed_record.session)
+            .expect("the child is live before its turn ends");
+        assert_eq!(routed_session.model().as_deref(), Some("big-model"));
+        assert_eq!(routed_session.effort().as_deref(), Some("high"));
+        let store = vikram_store::Store::open(&crate::config::database_path()).unwrap();
+        let row = store.get_session(&routed_record.session).unwrap().unwrap();
+        assert_eq!(row.model.as_deref(), Some("big-model"));
+        let _ = settle_worker(&handle, &mut events, &routed_id).await;
+        assert_eq!(provider.models()[0], "big-model");
+
+        // A brief with absent fields: the worker inherits the orchestrator's live choices.
+        let inherited_id = handle
+            .spawn_worker(parent, plain_brief(dir.path()), None)
+            .expect("the inheriting worker spawns");
+        let inherited_record = handle.inner.workers.by_id(&inherited_id).unwrap();
+        let inherited_session = handle
+            .inner
+            .session(&inherited_record.session)
+            .expect("the child is live before its turn ends");
+        assert_eq!(inherited_session.model().as_deref(), Some("test-model"));
+        assert_eq!(inherited_session.effort(), None);
+        let _ = settle_worker(&handle, &mut events, &inherited_id).await;
+        assert_eq!(provider.models()[1], "test-model");
     }
 }
