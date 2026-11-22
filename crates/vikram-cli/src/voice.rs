@@ -845,8 +845,8 @@ mod tests {
         assert_eq!(loaded.asr_language.as_deref(), Some("en"));
         assert_eq!(
             path,
-            home.path().join(".vikram").join("voice.json"),
-            "the config lands under VIKRAM_HOME"
+            home.path().join("voice.json"),
+            "the config lands at the root of VIKRAM_HOME"
         );
         assert!(path.is_file());
 
