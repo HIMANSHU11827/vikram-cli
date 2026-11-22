@@ -8,7 +8,7 @@
 //! note for `VoiceStatus`.
 
 use crate::cancel::CancelToken;
-use crate::helpers::{Scratch, run, which, write_wav};
+use crate::helpers::{Scratch, run_cancellable, which, write_wav};
 use crate::session::Recognizer;
 use crate::{Result, StageStatus, VoiceConfig, VoiceError};
 use std::path::{Path, PathBuf};
@@ -238,15 +238,25 @@ impl VoxtypeRecognizer {
 
 impl Recognizer for VoxtypeRecognizer {
     fn transcribe(&mut self, pcm: &[i16]) -> Result<Option<String>> {
+        self.transcribe_cancellable(pcm, &CancelToken::new())
+    }
+
+    fn transcribe_cancellable(
+        &mut self,
+        pcm: &[i16],
+        cancel: &CancelToken,
+    ) -> Result<Option<String>> {
+        cancel.check()?;
         let scratch = Scratch::new()?;
         let wav = scratch.path().join("utterance.wav");
         write_wav(&wav, pcm, self.sample_rate)?;
         let wav = wav.to_string_lossy().into_owned();
-        let stdout = run(
+        let stdout = run_cancellable(
             VOXTYPE,
             &["-q", "transcribe", &wav],
             None,
             self.timeout_secs,
+            cancel,
         )?;
         Ok(last_paragraph(&stdout))
     }

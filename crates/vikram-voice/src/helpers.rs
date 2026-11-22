@@ -115,6 +115,28 @@ pub(crate) fn run(
     input: Option<&[u8]>,
     timeout_secs: u64,
 ) -> Result<Vec<u8>, VoiceError> {
+    run_with(program, args, input, timeout_secs, None)
+}
+
+/// Like [`run`], but a cancel observed mid-run kills the helper and returns
+/// [`VoiceError::Cancelled`] instead of waiting the helper out.
+pub(crate) fn run_cancellable(
+    program: &str,
+    args: &[&str],
+    input: Option<&[u8]>,
+    timeout_secs: u64,
+    cancel: &crate::CancelToken,
+) -> Result<Vec<u8>, VoiceError> {
+    run_with(program, args, input, timeout_secs, Some(cancel))
+}
+
+fn run_with(
+    program: &str,
+    args: &[&str],
+    input: Option<&[u8]>,
+    timeout_secs: u64,
+    cancel: Option<&crate::CancelToken>,
+) -> Result<Vec<u8>, VoiceError> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(if input.is_some() {
@@ -144,6 +166,13 @@ pub(crate) fn run(
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
+        if let Some(cancel) = cancel
+            && cancel.is_cancelled()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(VoiceError::Cancelled);
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
                 let output = child

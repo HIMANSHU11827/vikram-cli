@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use clap::Subcommand;
-use vikram_voice::{VoiceConfig, VoiceSession, probe};
+use vikram_voice::{VoiceConfig, VoiceError, VoiceSession, probe};
 
 #[derive(Debug, Subcommand)]
 pub enum VoiceAction {
@@ -66,6 +66,68 @@ fn config(
     config
 }
 
+/// SIGINT during a voice turn cancels the session instead of killing the process; when the turn
+/// ends, the previous handler is restored. The handler itself only flips an atomic flag — the
+/// watcher thread does the token flip, so nothing unsafe happens under the signal.
+#[cfg(unix)]
+mod interrupt {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use vikram_voice::CancelToken;
+
+    static TRIGGERED: AtomicBool = AtomicBool::new(false);
+    static STOP: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "C" fn on_sigint(_: libc::c_int) {
+        TRIGGERED.store(true, Ordering::SeqCst);
+    }
+
+    pub struct Guard {
+        previous: libc::sighandler_t,
+        watcher: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Guard {
+        pub fn install(token: CancelToken) -> Self {
+            let previous =
+                unsafe { libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t) };
+            TRIGGERED.store(false, Ordering::SeqCst);
+            STOP.store(false, Ordering::SeqCst);
+            let watcher = std::thread::spawn(move || {
+                loop {
+                    if STOP.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if TRIGGERED.swap(false, Ordering::SeqCst) {
+                        token.cancel();
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            });
+            Self {
+                previous,
+                watcher: Some(watcher),
+            }
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            unsafe { libc::signal(libc::SIGINT, self.previous) };
+            STOP.store(true, Ordering::SeqCst);
+            if let Some(watcher) = self.watcher.take() {
+                let _ = watcher.join();
+            }
+        }
+    }
+}
+
+fn report_notes(session: &mut VoiceSession) {
+    for note in session.status().notes {
+        eprintln!("voice: {note}");
+    }
+}
+
 pub fn run(action: VoiceAction) -> Result<(), String> {
     match action {
         VoiceAction::Status { model } => {
@@ -90,15 +152,27 @@ pub fn run(action: VoiceAction) -> Result<(), String> {
             let config = config(enable, model, None, max_record_ms);
             config.validate().map_err(|err| err.to_string())?;
             let mut session = VoiceSession::start(config).map_err(|err| err.to_string())?;
-            match session.listen_once().map_err(|err| err.to_string())? {
-                Some(text) => {
+            #[cfg(unix)]
+            let guard = interrupt::Guard::install(session.cancel_token());
+            let result = session.listen_once();
+            #[cfg(unix)]
+            drop(guard);
+            match result {
+                Ok(Some(text)) => {
+                    report_notes(&mut session);
                     println!("{text}");
                     Ok(())
                 }
-                None => {
+                Ok(None) => {
+                    report_notes(&mut session);
                     println!("no speech detected");
                     Ok(())
                 }
+                Err(VoiceError::Cancelled) => {
+                    println!("voice: cancelled");
+                    Ok(())
+                }
+                Err(err) => Err(err.to_string()),
             }
         }
         VoiceAction::Say {
@@ -113,7 +187,17 @@ pub fn run(action: VoiceAction) -> Result<(), String> {
             let config = config(enable, None, voice, None);
             config.validate().map_err(|err| err.to_string())?;
             let mut session = VoiceSession::start(config).map_err(|err| err.to_string())?;
-            session.speak(&text).map_err(|err| err.to_string())
+            #[cfg(unix)]
+            let guard = interrupt::Guard::install(session.cancel_token());
+            let result = session.speak(&text);
+            #[cfg(unix)]
+            drop(guard);
+            if let Err(VoiceError::Cancelled) = result {
+                println!("voice: cancelled");
+                return Ok(());
+            }
+            report_notes(&mut session);
+            result.map_err(|err| err.to_string())
         }
     }
 }
