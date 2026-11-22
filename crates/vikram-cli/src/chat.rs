@@ -9,7 +9,7 @@ use vikram_contracts::{ImageSource, Message, PermissionMode, SessionId};
 use vikram_runtime::Runtime;
 use vikram_runtime::RuntimeHandle;
 use vikram_runtime::config::Config;
-use vikram_runtime::types::{RuntimeEvent, TurnState};
+use vikram_runtime::types::{ApprovalPrompt, RuntimeEvent, TurnState};
 
 pub async fn run(config: Config, message: String, fresh: bool) -> Result<(), String> {
     run_with_images(config, message, fresh, Vec::new()).await
@@ -299,11 +299,12 @@ async fn stream_turn(
             }
             Ok(RuntimeEvent::ApprovalRequested(prompt)) if prompt.session == *session => {
                 // Only reachable when the operator chose a prompting posture for a headless run.
-                // Nothing is reading this, so the honest answer is no, never a silent yes.
-                eprintln!(
-                    "\n[denied: nobody to ask] {} {} — {}",
-                    prompt.verb, prompt.resource, prompt.reason
-                );
+                // Nothing is reading this, so the honest answer is no, never a silent yes. What the
+                // call would have done is printed under the refusal: a log read afterwards should
+                // say more than the name of a tool that was never allowed to run.
+                for line in refusal_lines(&prompt) {
+                    eprintln!("{line}");
+                }
                 let _ = handle.answer_approval(&prompt.approval, false, false);
             }
             Ok(RuntimeEvent::Error { text }) => {
@@ -389,11 +390,79 @@ fn session_title(message: &str) -> String {
     }
 }
 
+/// What a headless run prints when a call asks for permission. The refusal comes first and in the
+/// words it always used; what the call would have done follows it, so a log read after the fact
+/// says more than the name of a tool that was never allowed to run.
+fn refusal_lines(prompt: &ApprovalPrompt) -> Vec<String> {
+    let mut lines = vec![format!(
+        "\n[denied: nobody to ask] {} {} — {}",
+        prompt.verb, prompt.resource, prompt.reason
+    )];
+    if let Some(preview) = &prompt.preview {
+        lines.extend(
+            vikram_tui::widgets::preview_text(preview, vikram_tui::widgets::PREVIEW_LINES)
+                .into_iter()
+                .map(|line| format!("  {line}")),
+        );
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::session_title;
-    use super::{MAX_IMAGE_BYTES, Slash, base64, load_image, media_type, parse_slash};
-    use vikram_contracts::ImageSource;
+    use super::{
+        MAX_IMAGE_BYTES, Slash, base64, load_image, media_type, parse_slash, refusal_lines,
+    };
+    use vikram_contracts::{ApprovalId, ImageSource, SessionId};
+    use vikram_runtime::types::{ApprovalPreview, ApprovalPrompt};
+
+    fn approval(preview: Option<ApprovalPreview>) -> ApprovalPrompt {
+        ApprovalPrompt {
+            approval: ApprovalId::generate(),
+            session: SessionId::generate(),
+            verb: "shell.run".to_owned(),
+            resource: "cargo test".to_owned(),
+            reason: "runs a process".to_owned(),
+            amendment: None,
+            preview,
+        }
+    }
+
+    #[test]
+    fn a_refused_call_prints_what_it_would_have_done() {
+        let lines = refusal_lines(&approval(Some(ApprovalPreview::Command {
+            program: "cargo".to_owned(),
+            args: vec!["test".to_owned()],
+            cwd: "/work".to_owned(),
+        })));
+        assert_eq!(
+            lines[0],
+            "\n[denied: nobody to ask] shell.run cargo test — runs a process"
+        );
+        assert_eq!(lines[1], "  $ /work");
+        assert_eq!(lines[2], "  cargo test");
+    }
+
+    #[test]
+    fn a_refusal_without_a_preview_is_the_line_it_always_was() {
+        assert_eq!(
+            refusal_lines(&approval(None)),
+            vec!["\n[denied: nobody to ask] shell.run cargo test — runs a process"]
+        );
+    }
+
+    #[test]
+    fn a_refused_diff_prints_both_sides() {
+        let lines = refusal_lines(&approval(Some(ApprovalPreview::Diff {
+            path: "src/main.rs".to_owned(),
+            before: "let a = 1;\n".to_owned(),
+            after: "let a = 2;\n".to_owned(),
+        })));
+        assert_eq!(lines[1], "  src/main.rs");
+        assert_eq!(lines[2], "  -let a = 1;");
+        assert_eq!(lines[3], "  +let a = 2;");
+    }
 
     #[test]
     fn base64_is_standard_and_pads_the_tail() {
