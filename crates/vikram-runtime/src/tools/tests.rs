@@ -135,6 +135,7 @@ fn every_builtin_declares_a_permission_shape() {
             "browser.sessions" => json!({}),
             "code.review" => json!({}),
             "codeindex" => json!({"action": "search", "query": "x"}),
+            "spawn_worker" => json!({"objective": "do the thing"}),
             "session.search" => json!({"query": "x"}),
             "plugin.execute" => json!({"plugin": "p", "args": "x"}),
             "plugin.list" => json!({}),

@@ -38,6 +38,7 @@ pub mod memory;
 pub mod memory_files;
 pub mod memory_provider;
 pub mod openai;
+pub mod orchestrator;
 pub mod pipeline;
 pub mod plugins;
 pub mod provider;
@@ -82,6 +83,9 @@ pub use lsp::{LspClient, LspError, LspPool, ServerCommand};
 pub use mcp::McpRegistry;
 pub use memory::{HybridOptions, HybridWeights, MemoryStore, ScoredMemory};
 pub use memory_provider::{BuiltInMemoryProvider, MemoryProvider, MemoryProviderManager};
+pub use orchestrator::{
+    AttemptOutcome, WorkerBrief, WorkerId, WorkerRecord, WorkerRegistry, WorkerStatus,
+};
 pub use plugins::PluginRegistry;
 pub use provider::{CompletionRequest, Provider, ProviderEvent, ProviderStream, ToolSpec};
 pub use rules::RuleBook;

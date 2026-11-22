@@ -650,6 +650,9 @@ pub(crate) struct RuntimeInner {
     pub bots: BotManager,
     pub tasks: TaskManager,
     pub rosters: HiveRosterManager,
+    /// Spawned workers: the orchestrator's team registry. Every worker session is looked up
+    /// here at turn end, so the handoff and retry decisions live with the records.
+    pub workers: crate::orchestrator::WorkerRegistry,
     // `tickets` field lives above (grouped with hive/learning extraction);
     // removed duplicate declaration here.
     pub mcp: std::sync::Arc<std::sync::Mutex<McpRegistry>>,
@@ -2915,6 +2918,7 @@ impl Runtime {
             bots,
             tasks: TaskManager::new(),
             rosters: HiveRosterManager::load(),
+            workers: crate::orchestrator::WorkerRegistry::new(),
             mcp: Arc::new(Mutex::new(mcp)),
             mcp_visibility: std::sync::Arc::new(Mutex::new(mcp_visibility)),
             plugins: Mutex::new(plugins),

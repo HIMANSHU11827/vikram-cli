@@ -245,6 +245,7 @@ impl ToolRegistry {
         registry.register(Box::new(HiveShow));
         registry.register(Box::new(HiveDelegate));
         registry.register(Box::new(HiveDelete));
+        registry.register(Box::new(crate::orchestrator::SpawnWorker));
         registry.register(Box::new(BotList));
         registry.register(Box::new(BotShow));
         registry.register(Box::new(BotCreate));

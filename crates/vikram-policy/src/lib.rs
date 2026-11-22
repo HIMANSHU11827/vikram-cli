@@ -97,6 +97,86 @@ impl<'de> serde::Deserialize<'de> for ResourcePattern {
     }
 }
 
+/// The capability envelope one session's calls are evaluated under.
+///
+/// A worker's scope is computed at spawn from the intersection of its parent's envelope and the
+/// brief's asks, and that intersection is the whole security story: a child can never hold more
+/// than its parent, so a denial the parent earned is a denial every descendant inherits. `None`
+/// fields are the operator's own posture — unrestricted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CapabilityScope {
+    /// Tool verbs this session may call, as exact verbs or family heads (`fs` covers `fs.write`).
+    /// `None` means every registered tool.
+    pub tools: Option<Vec<String>>,
+    /// Absolute subtrees file actions may land in. `None` means the whole workspace.
+    pub file_scope: Option<Vec<String>>,
+}
+
+impl CapabilityScope {
+    pub fn unrestricted() -> Self {
+        Self::default()
+    }
+
+    pub fn is_unrestricted(&self) -> bool {
+        self.tools.is_none() && self.file_scope.is_none()
+    }
+
+    /// The scope a child receives for one brief. `None` on the parent means the operator's own
+    /// posture, so the child gets exactly what the brief asked for; a scoped parent narrows every
+    /// ask to what the parent already held — subtree-aware, so a brief naming a subdirectory of a
+    /// granted tree keeps it, while a brief naming a parent of a granted tree gets nothing.
+    pub fn narrowed(parent: &Self, brief_tools: &[String], brief_files: &[String]) -> Self {
+        let tools = Some(match &parent.tools {
+            None => brief_tools.to_vec(),
+            Some(parent_tools) => brief_tools
+                .iter()
+                .filter(|tool| parent_tools.contains(tool))
+                .cloned()
+                .collect(),
+        });
+        let file_scope = Some(match &parent.file_scope {
+            None => brief_files.to_vec(),
+            Some(parent_files) => brief_files
+                .iter()
+                .filter(|file| parent_files.iter().any(|root| subtree_holds(root, file)))
+                .cloned()
+                .collect(),
+        });
+        Self { tools, file_scope }
+    }
+
+    /// Whether a verb survives the tool allowlist. An entry matches the exact verb or its dotted
+    /// descendants — `fs.read` covers `fs.read.x`, never `fs.readx` — mirroring how rule verb
+    /// prefixes are matched, so a family head (`fs`) and a full verb grant behave alike.
+    pub fn allows_verb(&self, verb: &str) -> bool {
+        self.tools.as_ref().is_none_or(|list| {
+            list.iter().any(|allowed| {
+                allowed == verb
+                    || verb
+                        .strip_prefix(allowed.as_str())
+                        .is_some_and(|rest| rest.starts_with('.'))
+            })
+        })
+    }
+
+    /// Whether a path stays inside the file scope. Unresolved or absolute-elsewhere paths are
+    /// outside by construction — the scope only ever narrows.
+    pub fn contains_path(&self, path: &str) -> bool {
+        self.file_scope
+            .as_ref()
+            .is_none_or(|roots| roots.iter().any(|root| subtree_holds(root, path)))
+    }
+}
+
+/// Whether `path` sits inside the subtree rooted at `root`: the root itself, or anything strictly
+/// beneath it. A lookalike prefix (`/ws/proj-evil` under `/ws/proj`) never qualifies.
+fn subtree_holds(root: &str, path: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Rule {
     pub actions: Vec<ActionKind>,
@@ -1572,6 +1652,107 @@ mod tests {
                 assert!(reason.contains("tool or web-sourced content"), "{reason}")
             }
             other => panic!("external content must never widen policy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unrestricted_parent_grants_exactly_what_the_brief_asks() {
+        let brief_tools = vec!["fs.read".to_owned(), "fs.write".to_owned()];
+        let brief_files = vec!["/ws/a".to_owned()];
+        let scope =
+            CapabilityScope::narrowed(&CapabilityScope::unrestricted(), &brief_tools, &brief_files);
+        assert_eq!(scope.tools.as_deref(), Some(&brief_tools[..]));
+        assert_eq!(scope.file_scope.as_deref(), Some(&brief_files[..]));
+        assert!(!scope.is_unrestricted());
+    }
+
+    #[test]
+    fn a_scoped_parent_narrows_the_brief_to_what_it_already_held() {
+        let parent = CapabilityScope {
+            tools: Some(vec!["fs.read".to_owned(), "fs.write".to_owned()]),
+            file_scope: Some(vec!["/ws/a".to_owned()]),
+        };
+        let brief_tools = vec!["fs.write".to_owned(), "shell.run".to_owned()];
+        let brief_files = vec![
+            "/ws/a".to_owned(),
+            "/ws/a/sub".to_owned(),
+            // A parent of the granted tree, and an unrelated tree, get nothing.
+            "/ws".to_owned(),
+            "/ws/b".to_owned(),
+        ];
+        let child = CapabilityScope::narrowed(&parent, &brief_tools, &brief_files);
+        assert_eq!(
+            child.tools.as_deref(),
+            Some(&["fs.write".to_owned()][..]),
+            "`shell.run` was never the parent's to grant"
+        );
+        assert_eq!(
+            child.file_scope.as_deref(),
+            Some(&["/ws/a".to_owned(), "/ws/a/sub".to_owned()][..])
+        );
+        // The child never exceeds the parent, whatever the brief claimed.
+        for file in child.file_scope.unwrap() {
+            assert!(parent.contains_path(&file), "child gained `{file}`");
+        }
+    }
+
+    #[test]
+    fn a_verb_the_allowlist_never_named_is_refused() {
+        let scope = CapabilityScope {
+            tools: Some(vec!["fs.read".to_owned()]),
+            file_scope: None,
+        };
+        assert!(scope.allows_verb("fs.read"));
+        assert!(scope.allows_verb("fs.read.x"));
+        assert!(!scope.allows_verb("fs.write"));
+        assert!(!scope.allows_verb("fs.readx"));
+    }
+
+    #[test]
+    fn a_family_head_entry_covers_every_tool_in_that_family() {
+        let scope = CapabilityScope {
+            tools: Some(vec!["fs".to_owned()]),
+            file_scope: None,
+        };
+        assert!(scope.allows_verb("fs.read"));
+        assert!(scope.allows_verb("fs.write"));
+        assert!(!scope.allows_verb("shell.run"));
+    }
+
+    #[test]
+    fn the_file_scope_admits_subtrees_and_refuses_lookalikes() {
+        let scope = CapabilityScope {
+            tools: None,
+            file_scope: Some(vec!["/ws/a".to_owned()]),
+        };
+        assert!(scope.contains_path("/ws/a"));
+        assert!(scope.contains_path("/ws/a/x/y.txt"));
+        assert!(!scope.contains_path("/ws/a-evil/x"));
+        assert!(!scope.contains_path("/ws/b"));
+    }
+
+    #[test]
+    fn narrowing_survives_any_number_of_generations() {
+        let mut scope = CapabilityScope::narrowed(
+            &CapabilityScope::unrestricted(),
+            &["fs.read".to_owned(), "fs.write".to_owned()],
+            &["/ws/a".to_owned(), "/ws/b".to_owned()],
+        );
+        for _ in 0..8 {
+            scope = CapabilityScope::narrowed(
+                &scope,
+                &[
+                    "fs.read".to_owned(),
+                    "fs.write".to_owned(),
+                    "shell.run".to_owned(),
+                ],
+                &["/ws/a/x".to_owned(), "/ws/b".to_owned()],
+            );
+            assert!(scope.allows_verb("fs.read"));
+            assert!(!scope.allows_verb("shell.run"));
+            assert!(scope.contains_path("/ws/a/x"));
+            assert!(scope.contains_path("/ws/b/y"));
+            assert!(!scope.contains_path("/ws/a/y"));
         }
     }
 }

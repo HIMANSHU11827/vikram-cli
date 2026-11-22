@@ -78,6 +78,13 @@ pub struct SessionRuntime {
     /// How far from the operator's own session this one sits. Checked against
     /// `max_delegation_depth` before a child is allowed to spawn another child.
     pub depth: AtomicU32,
+    /// The capability envelope this session's calls are evaluated under. `None` is the operator's
+    /// own posture — unrestricted. A worker session carries the narrowed scope its brief earned.
+    pub capability_scope: Mutex<Option<vikram_policy::CapabilityScope>>,
+    /// Turns a worker session may run before it is marked partial. `0` means no worker budget.
+    pub worker_max_turns: AtomicU64,
+    /// The reasoning effort the orchestrator routed this session to, when it chose one.
+    pub effort: Mutex<Option<String>>,
     /// Who named this session: `generic`, `auto` or `manual`. A `manual` title is never overwritten
     /// by derivation, and this is the in-memory half of that rule.
     pub title_source: Mutex<String>,
@@ -121,6 +128,9 @@ impl SessionRuntime {
             parent: Mutex::new(None),
             forked_from: Mutex::new(forked_from),
             depth: AtomicU32::new(0),
+            capability_scope: Mutex::new(None),
+            worker_max_turns: AtomicU64::new(0),
+            effort: Mutex::new(None),
             title_source: Mutex::new(row.title_source),
             title_status: Mutex::new(row.title_status),
             titling_started: AtomicBool::new(false),
@@ -246,6 +256,50 @@ impl SessionRuntime {
 
     pub fn set_depth(&self, depth: u32) {
         self.depth.store(depth, Ordering::Relaxed);
+    }
+
+    /// The envelope policy evaluates this session's calls under. Unrestricted when unset.
+    pub fn capability_scope(&self) -> vikram_policy::CapabilityScope {
+        self.capability_scope
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session scope lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()
+            .unwrap_or_default()
+    }
+
+    pub fn set_capability_scope(&self, scope: Option<vikram_policy::CapabilityScope>) {
+        *self.capability_scope.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session scope lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = scope;
+    }
+
+    pub fn worker_max_turns(&self) -> u64 {
+        self.worker_max_turns.load(Ordering::Relaxed)
+    }
+
+    pub fn set_worker_max_turns(&self, max: u64) {
+        self.worker_max_turns.store(max, Ordering::Relaxed);
+    }
+
+    pub fn effort(&self) -> Option<String> {
+        self.effort
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session effort lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .clone()
+    }
+
+    pub fn set_effort(&self, effort: Option<String>) {
+        *self.effort.lock().unwrap_or_else(|e| {
+            eprintln!("vikram: session effort lock mutex poisoned; recovering");
+            e.into_inner()
+        }) = effort;
     }
 
     pub fn project_id(&self) -> Option<ProjectId> {

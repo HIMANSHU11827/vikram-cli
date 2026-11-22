@@ -4747,7 +4747,7 @@ mod tests {
         let config = Config {
             model: "test-model".into(),
             workspace_root: Some(dir.path().to_path_buf()),
-            context_window: Some(12_000),
+            context_window: Some(14_000),
             max_output_tokens: Some(200),
             context: ContextConfig {
                 trigger_percent: 10,
