@@ -18,7 +18,7 @@ use vikram_contracts::{
     ActionKind, ApprovalId, BotId, Decision, Message, PermissionMode, PermissionRequest, Posture,
     RecordKind, SessionId,
 };
-use vikram_policy::{MandatoryFloor, Policy, ResourcePattern, Rule};
+use vikram_policy::{CapabilityScope, MandatoryFloor, Policy, ResourcePattern, Rule};
 use vikram_store::Store;
 
 use crate::bots::{BotManager, ManagedBot, TaskManager};
@@ -1068,8 +1068,20 @@ impl RuntimeInner {
     /// `max_delegation_depth` veto only exists in the depth-aware path, so a session that is
     /// already deep must be judged here — `judge` alone would let it keep delegating.
     pub fn judge_at_depth(&self, request: &PermissionRequest, depth: u32) -> Decision {
+        self.judge_scoped(request, &CapabilityScope::unrestricted(), depth)
+    }
+
+    /// The whole decision under one session's capability envelope. `Deny` is final in
+    /// `PermissionMode::resolve`, so no posture — not even `yolo` — can widen a scope denial,
+    /// and both gate entry points come through here, so a view cannot invent its own answer.
+    pub fn judge_scoped(
+        &self,
+        request: &PermissionRequest,
+        scope: &CapabilityScope,
+        depth: u32,
+    ) -> Decision {
         let policy = self.policy();
-        let raw = policy.evaluate_at_depth(request, depth);
+        let raw = policy.evaluate_scoped(request, scope, depth);
         let listed = policy.has_allow(request);
         let root = self.workspace_root.to_string_lossy().into_owned();
         self.mode().resolve(

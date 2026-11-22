@@ -2091,10 +2091,13 @@ async fn run_tool_once(
 
     // A delegated session is one step further from the operator, and `max_delegation_depth` is only
     // real if the gate can see that: a child may not keep spawning children. The decision must be
-    // the depth-aware one — judging at depth 0 computed the veto and then ignored it.
+    // the depth-aware one — judging at depth 0 computed the veto and then ignored it. A worker
+    // session also carries the capability envelope its brief earned, and the scope-aware decision
+    // is the only one that refuses to let a worker out of it.
     let depth = session.depth();
-    let raw = inner.policy().evaluate_at_depth(&request, depth);
-    let decision = inner.judge_at_depth(&request, depth);
+    let scope = session.capability_scope();
+    let raw = inner.policy().evaluate_scoped(&request, &scope, depth);
+    let decision = inner.judge_scoped(&request, &scope, depth);
     let auto = PermissionMode::auto_resolved(&raw, &decision);
     inner.journal(
         &session.id,

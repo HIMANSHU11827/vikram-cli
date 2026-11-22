@@ -582,6 +582,35 @@ impl Policy {
     }
 
     pub fn evaluate_at_depth(&self, req: &PermissionRequest, depth: u32) -> Decision {
+        self.evaluate_scoped(req, &CapabilityScope::unrestricted(), depth)
+    }
+
+    /// Evaluate a request under one session's capability envelope. Scope denials come before the
+    /// rule tiers, so neither an operator allow rule nor a posture can widen what a worker was
+    /// granted; the floor and the tiers then rule exactly as they would for the operator's own
+    /// session. An unrestricted scope is exactly `evaluate_at_depth`.
+    pub fn evaluate_scoped(
+        &self,
+        req: &PermissionRequest,
+        scope: &CapabilityScope,
+        depth: u32,
+    ) -> Decision {
+        if !scope.allows_verb(&req.verb) {
+            return Decision::Deny {
+                reason: format!("`{}` is outside this session's tool allowlist", req.verb),
+            };
+        }
+        if matches!(req.action, ActionKind::Read | ActionKind::Write)
+            && !scope.contains_path(&req.resource)
+        {
+            return Decision::Deny {
+                reason: format!("`{}` is outside this session's file scope", req.resource),
+            };
+        }
+        self.evaluate_at_depth_unscoped(req, depth)
+    }
+
+    fn evaluate_at_depth_unscoped(&self, req: &PermissionRequest, depth: u32) -> Decision {
         // Normalise a workspace-relative resource against the floor's root so callers that report a
         // relative path are evaluated against the same scope as absolute ones.
         let req = self.normalize_request(req);
@@ -1753,6 +1782,101 @@ mod tests {
             assert!(scope.contains_path("/ws/a/x"));
             assert!(scope.contains_path("/ws/b/y"));
             assert!(!scope.contains_path("/ws/a/y"));
+        }
+    }
+
+    #[test]
+    fn a_scoped_write_outside_the_file_scope_is_denied_by_the_machine() {
+        let policy = Policy::new(
+            vec![Rule::allow(ActionKind::Write, ResourcePattern::Any)],
+            MandatoryFloor::default(),
+        );
+        let scope = CapabilityScope {
+            tools: None,
+            file_scope: Some(vec!["/ws/allowed".to_owned()]),
+        };
+        let inside = fs_write("/ws/allowed/out.txt", Trust::Model);
+        let outside = fs_write("/ws/other/out.txt", Trust::Model);
+        assert!(policy.evaluate_scoped(&inside, &scope, 0).is_allowed());
+        match policy.evaluate_scoped(&outside, &scope, 0) {
+            Decision::Deny { reason } => assert!(reason.contains("file scope"), "{reason}"),
+            other => panic!("outside the scope must be a policy denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_scope_denial_survives_an_operator_allow_rule() {
+        let policy = Policy::new(
+            vec![Rule::allow(ActionKind::Write, ResourcePattern::Any)],
+            MandatoryFloor::default(),
+        );
+        let scope = CapabilityScope {
+            tools: None,
+            file_scope: Some(vec!["/ws/allowed".to_owned()]),
+        };
+        // The exact request an unrestricted session would run quietly.
+        assert!(
+            policy
+                .evaluate_at_depth(&fs_write("/ws/other/out.txt", Trust::Model), 0)
+                .is_allowed()
+        );
+        // The same request, scoped, is refused — no rule can outvote the envelope.
+        assert!(
+            matches!(
+                policy.evaluate_scoped(&fs_write("/ws/other/out.txt", Trust::Model), &scope, 0),
+                Decision::Deny { .. }
+            ),
+            "an operator allow rule must not widen a worker's scope"
+        );
+    }
+
+    #[test]
+    fn a_verb_outside_the_tool_allowlist_is_denied_by_the_machine() {
+        let policy = Policy::new(
+            vec![
+                Rule::allow(ActionKind::Read, ResourcePattern::Any),
+                Rule::allow(ActionKind::Execute, ResourcePattern::Any),
+            ],
+            MandatoryFloor::default(),
+        );
+        let scope = CapabilityScope {
+            tools: Some(vec!["fs.read".to_owned()]),
+            file_scope: None,
+        };
+        let allowed = PermissionRequest::new(
+            ActionKind::Read,
+            "fs.read",
+            "/x",
+            SideEffect::None,
+            Trust::Model,
+        );
+        let refused = PermissionRequest::new(
+            ActionKind::Execute,
+            "shell.run",
+            "cargo test",
+            SideEffect::LocalMutation,
+            Trust::Model,
+        );
+        assert!(policy.evaluate_scoped(&allowed, &scope, 0).is_allowed());
+        match policy.evaluate_scoped(&refused, &scope, 0) {
+            Decision::Deny { reason } => {
+                assert!(reason.contains("tool allowlist"), "{reason}")
+            }
+            other => panic!("an unlisted tool must be a policy denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unrestricted_scope_evaluates_exactly_as_the_depth_aware_path() {
+        let policy = allowlist_policy();
+        let unrestricted = CapabilityScope::unrestricted();
+        for command in ["cargo test -p x", "cargo publish"] {
+            let req = shell(command);
+            assert_eq!(
+                policy.evaluate_scoped(&req, &unrestricted, 0),
+                policy.evaluate_at_depth(&req, 0),
+                "`{command}` must not change meaning under an unrestricted scope"
+            );
         }
     }
 }

@@ -486,8 +486,13 @@ mod tests {
     }
 
     /// Wait until the worker's turn has genuinely finished, so assertions read settled state
-    /// instead of racing a turn that is still streaming.
-    async fn settle_worker(handle: &RuntimeHandle, id: &WorkerId) -> WorkerRecord {
+    /// instead of racing a turn that has not started or is still streaming. The receiver must be
+    /// subscribed before the spawn: a broadcast channel does not replay events for late joiners.
+    async fn settle_worker(
+        handle: &RuntimeHandle,
+        events: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+        id: &WorkerId,
+    ) -> WorkerRecord {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let record = handle
@@ -495,13 +500,16 @@ mod tests {
                 .workers
                 .by_id(id)
                 .expect("worker is registered");
-            let done = record.status != WorkerStatus::Running
-                || handle
-                    .inner
-                    .session(&record.session)
-                    .is_none_or(|session| !session.is_busy());
-            if done {
-                return record;
+            match events.try_recv() {
+                Ok(RuntimeEvent::TurnFinished { session, .. }) if session == record.session => {
+                    return record;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    return record;
+                }
             }
             if tokio::time::Instant::now() >= deadline {
                 panic!("worker {id} never settled");
@@ -541,6 +549,7 @@ mod tests {
         .expect("runtime boots with the scripted provider");
         let handle = runtime.handle();
         let parent = handle.snapshot().sessions[0].id.clone();
+        let mut events = handle.events();
 
         let brief = plain_brief(dir.path());
         let id = handle
@@ -596,6 +605,75 @@ mod tests {
                 .all(|m| !m.text_body().contains("Output format"))
         );
 
-        let _ = settle_worker(&handle, &id).await;
+        let _ = settle_worker(&handle, &mut events, &id).await;
+    }
+
+    #[tokio::test]
+    async fn worker_cannot_write_outside_file_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::ToolCall(vikram_contracts::ToolCall::new(
+                "fs.write",
+                serde_json::json!({"path": "elsewhere/out.txt", "content": "nope"}),
+            )),
+            ProviderEvent::Finished {
+                input_tokens: Some(4),
+                output_tokens: Some(4),
+            },
+        ]]);
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::clone(&provider) as Arc<dyn Provider>,
+        )
+        .await
+        .expect("runtime boots with the scripted provider");
+        let handle = runtime.handle();
+        let parent = handle.snapshot().sessions[0].id.clone();
+        let mut events = handle.events();
+
+        let mut brief = plain_brief(dir.path());
+        brief.tool_allowlist = vec!["fs.read".into(), "fs.write".into()];
+        brief.file_scope = vec![dir.path().join("scope").to_string_lossy().into_owned()];
+        let id = handle
+            .spawn_worker(parent, brief, None)
+            .expect("the orchestrator spawns a worker");
+        let worker = handle.inner.workers.by_id(&id).expect("worker record");
+        let _ = settle_worker(&handle, &mut events, &id).await;
+
+        // The denial is audit-logged in the worker's own journal, as a policy decision.
+        let store = vikram_store::Store::open(&crate::config::database_path()).unwrap();
+        let records = store.replay_messages(&worker.session).unwrap();
+        let denial = records
+            .iter()
+            .find(|record| {
+                record.kind == vikram_contracts::RecordKind::Policy
+                    && record
+                        .payload
+                        .get("verb")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("fs.write")
+            })
+            .expect("the out-of-scope write is journaled as a policy decision");
+        assert_eq!(
+            denial
+                .payload
+                .get("evaluated")
+                .and_then(serde_json::Value::as_str),
+            Some("deny"),
+            "the policy machine, not a prompt, refused it"
+        );
+        let reason = denial
+            .payload
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(reason.contains("file scope"), "{reason}");
+
+        // Refused before execution: the file was never created.
+        assert!(
+            !dir.path().join("elsewhere").join("out.txt").exists(),
+            "a denied write must leave no effect behind"
+        );
     }
 }
