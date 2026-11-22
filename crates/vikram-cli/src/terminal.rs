@@ -431,6 +431,8 @@ enum VoiceEvent {
     Heard(String),
     Empty,
     Failed(String),
+    /// Worth telling the operator, but the mode keeps running.
+    Note(String),
 }
 
 /// The host's half of voice mode: how to reach the worker, and which turn the operator is still
@@ -455,10 +457,31 @@ fn toggle_voice_mode(app: &mut App, events: &Sender<VoiceEvent>, mode: &mut Voic
     let (job_tx, job_rx) = std::sync::mpsc::channel::<VoiceJob>();
     let events = events.clone();
     app.voice_mode = true;
-    app.push_notice(
-        NoticeLevel::Info,
-        "voice mode on — speak; /voice again stops it",
-    );
+    // Turning the mode on is also the operator saying voice should stay on, so write it down:
+    // otherwise the next start, and every `vikram voice …` command, still reads enabled=false and
+    // the setting looks like it did not change.
+    let mut config = match VoiceConfig::load() {
+        Ok(config) => config,
+        Err(err) => {
+            app.push_notice(NoticeLevel::Warn, format!("voice: {err}; ran on defaults"));
+            VoiceConfig::default()
+        }
+    };
+    config.enabled = true;
+    let notice = match config.save() {
+        Ok(path) => format!(
+            "voice mode on — speak; /voice stops it · enabled saved to {}",
+            path.display()
+        ),
+        Err(err) => {
+            app.push_notice(
+                NoticeLevel::Warn,
+                format!("voice: enabled=true not saved: {err}"),
+            );
+            "voice mode on — speak; /voice again stops it".to_owned()
+        }
+    };
+    app.push_notice(NoticeLevel::Info, notice);
     mode.jobs = Some(job_tx);
     std::thread::spawn(move || voice_worker(job_rx, events));
 }
@@ -467,9 +490,20 @@ fn toggle_voice_mode(app: &mut App, events: &Sender<VoiceEvent>, mode: &mut Voic
 /// never listens while it speaks — the reply comes out of the same room, and a microphone left open
 /// would transcribe the assistant's own voice as the operator's next turn.
 fn voice_worker(jobs: Receiver<VoiceJob>, events: Sender<VoiceEvent>) {
+    // The mode runs on the operator's saved settings — language, devices, gate, voice — not on
+    // defaults, or `/voice` would quietly undo everything `voice config set` recorded.
+    let config = match VoiceConfig::load() {
+        Ok(config) => config,
+        Err(err) => {
+            let _ = events.send(VoiceEvent::Note(format!(
+                "{err}; voice mode ran on defaults"
+            )));
+            VoiceConfig::default()
+        }
+    };
     let config = VoiceConfig {
         enabled: true,
-        ..Default::default()
+        ..config
     };
     let mut session = match VoiceSession::start(config) {
         Ok(session) => session,
@@ -534,6 +568,9 @@ fn drain_voice_mode(app: &mut App, rx: &Receiver<VoiceEvent>, mode: &mut VoiceMo
             }
             // Silence between utterances is the normal state of a room, not news.
             VoiceEvent::Empty => {}
+            VoiceEvent::Note(text) => {
+                app.push_notice(NoticeLevel::Warn, format!("voice: {text}"));
+            }
             VoiceEvent::Failed(err) => {
                 mode.jobs = None;
                 mode.awaiting = None;

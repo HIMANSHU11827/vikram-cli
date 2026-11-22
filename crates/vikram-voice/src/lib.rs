@@ -197,15 +197,21 @@ impl VoiceConfig {
 
     pub fn save(&self) -> Result<PathBuf> {
         let path = Self::config_path();
+        self.save_to(&path)?;
+        Ok(path)
+    }
+
+    /// Write to an explicit path. `save` is this against `config_path`, and the split exists so the
+    /// writing can be tested without touching the operator's real file.
+    pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|err| VoiceError::Config(format!("create {}: {err}", parent.display())))?;
         }
         let text = serde_json::to_string_pretty(self)
             .map_err(|err| VoiceError::Config(format!("serialize voice config: {err}")))?;
-        std::fs::write(&path, text)
-            .map_err(|err| VoiceError::Config(format!("write {}: {err}", path.display())))?;
-        Ok(path)
+        std::fs::write(path, text)
+            .map_err(|err| VoiceError::Config(format!("write {}: {err}", path.display())))
     }
 }
 
@@ -420,5 +426,22 @@ mod tests {
             ..Default::default()
         };
         assert!(no_minimum.validate().is_err());
+    }
+
+    #[test]
+    fn saving_to_a_path_creates_it_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("voice.json");
+        let config = VoiceConfig {
+            enabled: true,
+            floor_ratio: 3.0,
+            ..Default::default()
+        };
+        config.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"enabled\": true"), "{text}");
+        let parsed: VoiceConfig = serde_json::from_str(&text).unwrap();
+        assert!(parsed.enabled);
+        assert_eq!(parsed.floor_ratio, 3.0);
     }
 }
