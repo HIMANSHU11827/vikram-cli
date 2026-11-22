@@ -8,7 +8,7 @@
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::time::Duration;
-use vikram_contracts::{Block, Role, ToolCall, VikramError};
+use vikram_contracts::{Block, Role, ToolCall, Trust, VikramError};
 
 use crate::config::Config;
 use crate::error::Result;
@@ -470,13 +470,20 @@ fn parse_sse_line(line: &str, pending: &mut StreamState) -> Option<Vec<ProviderE
 
 /// A `stop_reason` that is not a clean end, in words. `max_tokens` means the answer was cut off
 /// mid-thought and `refusal` means the model declined; neither may read as an ordinary finish.
+///
+/// The note carries the marker the turn loop classifies on ([`crate::turn::TRUNCATION_MARKER`],
+/// [`crate::turn::REFUSAL_MARKER`]), so the sentence the model reads and the branch the runtime
+/// takes are the same fact rather than two copies of it.
 fn stop_note(stop_reason: Option<&str>) -> Option<String> {
     match stop_reason {
-        Some("max_tokens") => Some(
-            "\n[response truncated: the model reached its output-token limit (`max_tokens`)]"
-                .to_owned(),
-        ),
-        Some("refusal") => Some("\n[the model declined to answer (`refusal`)]".to_owned()),
+        Some("max_tokens") => Some(format!(
+            "\n{} the model reached its output-token limit (`max_tokens`)]",
+            crate::turn::TRUNCATION_MARKER
+        )),
+        Some("refusal") => Some(format!(
+            "\n{} to answer (`refusal`)]",
+            crate::turn::REFUSAL_MARKER
+        )),
         _ => None,
     }
 }
@@ -533,21 +540,32 @@ fn rejection(status: reqwest::StatusCode, body: &str, endpoint: &str) -> VikramE
     }
 }
 
+/// The cache breakpoint marker: Anthropic keeps the prefix up to this block for five minutes, so
+/// the next request that shares it pays a tenth of the input price for those tokens.
+fn cache_control() -> Value {
+    json!({"type": "ephemeral"})
+}
+
 fn build_request_body(request: &CompletionRequest) -> Value {
-    let mut system = String::new();
+    // System text is sent as blocks, not one string, because a cache breakpoint attaches to a
+    // block and the breakpoint has to sit at the end of the stable prefix rather than at the end
+    // of everything. `host_end` is the index of the last host-authored block: project
+    // instructions, the voice and the work contract are stable within a workspace, while
+    // retrieved memory, the dialectic supplement and code-index context change every turn.
+    let mut system: Vec<Value> = Vec::new();
+    let mut host_end: Option<usize> = None;
     let mut messages: Vec<Value> = Vec::new();
 
     // Merge consecutive same-role messages (Anthropic requires alternation).
     for message in &request.messages {
         let role_str = match message.role {
             Role::System => {
-                // Accumulate system text.
                 for block in &message.blocks {
-                    if let Block::Text { text, .. } = block {
-                        if !system.is_empty() {
-                            system.push('\n');
+                    if let Block::Text { text, trust } = block {
+                        system.push(json!({"type": "text", "text": text}));
+                        if *trust == Trust::Host {
+                            host_end = Some(system.len() - 1);
                         }
-                        system.push_str(text);
                     }
                 }
                 continue;
@@ -627,11 +645,19 @@ fn build_request_body(request: &CompletionRequest) -> Value {
         "max_tokens": request.max_output_tokens.unwrap_or(4096),
         "stream": true,
     });
+    // Two breakpoints, never more: the last tool definition and the last host-authored system
+    // block. Anthropic allows four; two is what this request shape can use, because the second
+    // breakpoint already covers the tools that precede it in the cache order (tools -> system ->
+    // messages), and a breakpoint anywhere past the host block would be invalidated by the
+    // per-turn context that follows it.
     if !system.is_empty() {
+        if let Some(index) = host_end {
+            system[index]["cache_control"] = cache_control();
+        }
         body["system"] = json!(system);
     }
     if !request.tools.is_empty() {
-        let tools: Vec<Value> = request
+        let mut tools: Vec<Value> = request
             .tools
             .iter()
             .map(|tool| {
@@ -642,6 +668,9 @@ fn build_request_body(request: &CompletionRequest) -> Value {
                 })
             })
             .collect();
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = cache_control();
+        }
         body["tools"] = json!(tools);
     }
     body
@@ -690,7 +719,16 @@ mod tests {
         let body = build_request_body(&request);
 
         assert_eq!(body["model"], json!(MODEL));
-        assert_eq!(body["system"], json!("be brief"));
+        assert_eq!(
+            body["system"],
+            json!([{
+                "type": "text",
+                "text": "be brief",
+                "cache_control": {"type": "ephemeral"},
+            }]),
+            "the system prompt travels as blocks so a cache breakpoint can sit on the last one: \
+             {body}"
+        );
         assert_eq!(body["max_tokens"], json!(1024));
         assert_eq!(body["stream"], json!(true));
         assert_eq!(
@@ -780,20 +818,38 @@ mod tests {
     #[test]
     fn tool_definitions_use_input_schema_and_endpoint_legal_names() {
         let mut request = request(vec![Message::user("hi")]);
-        request.tools = vec![tool_spec("fs.read")];
+        request.tools = vec![tool_spec("fs.read"), tool_spec("shell.run")];
 
         let body = build_request_body(&request);
+        let tools = body["tools"].as_array().expect("the tool list");
 
+        // The definition itself is untouched by caching: same name, description and schema.
         assert_eq!(
-            body["tools"],
-            json!([{
-                "name": "fs-_read",
-                "description": "read a file",
-                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
-            }]),
+            tools[0]["name"],
+            json!("fs-_read"),
+            "a dot is not legal in a tool name: {tools:?}"
+        );
+        assert_eq!(tools[0]["description"], json!("read a file"));
+        assert_eq!(
+            tools[0]["input_schema"],
+            json!({"type": "object", "properties": {"path": {"type": "string"}}}),
             "the Messages API puts the schema under `input_schema`, with no `function` wrapper"
         );
-        assert!(body["tools"][0].get("function").is_none(), "{body}");
+        assert!(tools[0].get("function").is_none(), "{body}");
+        assert!(
+            tools[0].get("cache_control").is_none(),
+            "only the last definition carries the breakpoint: {tools:?}"
+        );
+        assert_eq!(
+            tools[1]["cache_control"],
+            json!({"type": "ephemeral"}),
+            "the last definition is where the prefix ends: {tools:?}"
+        );
+        assert_eq!(tools[1]["name"], json!("shell-_run"));
+        assert_eq!(
+            tools[1]["input_schema"],
+            json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        );
     }
 
     #[test]
@@ -801,6 +857,72 @@ mod tests {
         let body = build_request_body(&request(vec![Message::user("hi")]));
 
         assert!(body.get("tools").is_none(), "{body}");
+    }
+
+    /// Two breakpoints, in the two places that pay: the last tool definition and the last
+    /// host-authored system block. Anything after the host block is per-turn context, so a
+    /// breakpoint there would be invalidated by the next request and cost 1.25x for nothing.
+    #[test]
+    fn anthropic_requests_mark_the_stable_prefix_as_cacheable() {
+        let mut request = request(vec![
+            Message::system("project instructions"),
+            Message::text(Role::System, "the voice", Trust::Host),
+            Message::text(Role::System, "the work contract", Trust::Host),
+            Message::text(Role::System, "retrieved memory", Trust::External),
+            Message::text(Role::System, "code index", Trust::External),
+            Message::user("hi"),
+        ]);
+        request.tools = vec![tool_spec("fs.read"), tool_spec("shell.run")];
+
+        let body = build_request_body(&request);
+        let system = body["system"].as_array().expect("system blocks");
+        let tools = body["tools"].as_array().expect("tool definitions");
+
+        let marked: Vec<usize> = system
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| block.get("cache_control").is_some())
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            marked,
+            vec![2],
+            "exactly one system block is marked, and it is the last host-authored one: {system:?}"
+        );
+        assert_eq!(
+            system[2]["cache_control"],
+            json!({"type": "ephemeral"}),
+            "{system:?}"
+        );
+        assert!(
+            tools[1].get("cache_control").is_some() && tools[0].get("cache_control").is_none(),
+            "the last tool definition carries the breakpoint, the ones before it do not: {tools:?}"
+        );
+
+        let breakpoints = serde_json::to_string(&body)
+            .expect("the body serializes")
+            .matches("cache_control")
+            .count();
+        assert_eq!(
+            breakpoints, 2,
+            "never more than two breakpoints: {breakpoints}"
+        );
+    }
+
+    /// A request with no host-authored system block has nothing stable to cache, so it must not
+    /// claim a breakpoint it cannot honour.
+    #[test]
+    fn a_request_with_only_external_system_text_marks_no_system_block() {
+        let body = build_request_body(&request(vec![
+            Message::text(Role::System, "a scraped page", Trust::External),
+            Message::user("hi"),
+        ]));
+
+        assert!(
+            body["system"][0].get("cache_control").is_none(),
+            "external context is per-turn and is not a cache boundary: {}",
+            body["system"]
+        );
     }
 
     #[test]
