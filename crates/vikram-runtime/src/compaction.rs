@@ -246,54 +246,66 @@ fn made_progress(before: u64, after: u64) -> bool {
     before == 0 || after <= before.saturating_sub(before / 10)
 }
 
-/// Fold the transcript to `policy.target` of the usable window, keeping the tail verbatim.
-///
-/// The fold walks the old prefix once and classifies each message into the things a resumed agent
-/// needs: the live objective, decisions taken, work completed, work still pending, files touched,
-/// and errors that were never resolved. Everything else is counted, not transcribed.
-pub fn compact(
+/// The fixed opening sentence of a fold. `is_fold_header` parses it and replay identifies a
+/// summary by it, so the deterministic fold and a model-written one both emit exactly this; only
+/// the body below it differs.
+fn fold_header(folded: usize, kept: usize, through_seq: u64) -> String {
+    format!(
+        "{SUMMARY_HEADER} {folded} earlier messages folded; the {kept} most recent are verbatim \
+         below. Originals are durable in the journal through seq {through_seq} and can be re-read.\n"
+    )
+}
+
+/// Where a fold cuts: the old span that becomes a summary, and the tail kept verbatim.
+#[derive(Clone, Copy)]
+struct FoldPlan<'a> {
+    old: &'a [Message],
+    recent: &'a [Message],
+    before_tokens: u64,
+    through_seq: u64,
+}
+
+fn plan_fold<'a>(
     estimator: &TokenEstimator,
-    messages: &[Message],
-    budget: &ContextBudget,
+    messages: &'a [Message],
     policy: &CompactionPolicy,
     through_seq: u64,
-) -> Option<(Vec<Message>, CompactionReport)> {
+) -> Option<FoldPlan<'a>> {
     if messages.len() < policy.keep_recent + policy.min_fold {
         return None;
     }
-
-    let before_tokens = estimator.estimate_messages(messages);
-    let existing_summary = is_compaction_summary(&messages[0]);
-    let body = if existing_summary {
+    let body = if is_compaction_summary(&messages[0]) {
         &messages[1..]
     } else {
         messages
     };
-
     let proposed = body.len().saturating_sub(policy.keep_recent);
     let split = safe_split(body, proposed);
     if split < policy.min_fold {
         return None;
     }
     let (old, recent) = body.split_at(split);
+    Some(FoldPlan {
+        old,
+        recent,
+        before_tokens: estimator.estimate_messages(messages),
+        through_seq,
+    })
+}
 
-    let goal = summary_ceiling(budget);
-    let mut note = FoldNote::default();
-    note.collect(old, estimator);
-    let mut summary = note.render(old.len(), recent.len(), through_seq);
-
-    // The summary has to fit too. If a long session produced more sections than the ceiling can
-    // carry, drop the least load-bearing ones before the transcript does.
-    while estimator.estimate_text(&summary) > goal && note.trim_least_important() {
-        summary = note.render(old.len(), recent.len(), through_seq);
-    }
-
-    let mut out = Vec::with_capacity(recent.len() + 1);
+/// Put a summary in front of the kept tail and judge the result: the same guards for every path,
+/// so a model-written fold cannot slip past a check the keyword fold has to pass.
+fn finish_fold(
+    estimator: &TokenEstimator,
+    plan: &FoldPlan,
+    summary: String,
+) -> Option<(Vec<Message>, CompactionReport)> {
+    let mut out = Vec::with_capacity(plan.recent.len() + 1);
     out.push(Message::text(Role::System, summary, Trust::Host));
-    out.extend_from_slice(recent);
+    out.extend_from_slice(plan.recent);
 
     let after_tokens = estimator.estimate_messages(&out);
-    if !made_progress(before_tokens, after_tokens) {
+    if !made_progress(plan.before_tokens, after_tokens) {
         // A fold that frees less than a tenth of the context is not worth the information it
         // spends, and re-running it every step is how compaction thrashes.
         return None;
@@ -302,14 +314,210 @@ pub fn compact(
         return None;
     }
     let report = CompactionReport {
-        folded: old.len(),
-        kept: recent.len(),
-        before_tokens,
+        folded: plan.old.len(),
+        kept: plan.recent.len(),
+        before_tokens: plan.before_tokens,
         after_tokens,
-        through_seq,
+        through_seq: plan.through_seq,
         summary_tokens: estimator.estimate_text(&out[0].text_body()),
     };
     Some((out, report))
+}
+
+/// Fold the transcript to `policy.target` of the usable window, keeping the tail verbatim.
+///
+/// The fold walks the old prefix once and classifies each message into the things a resumed agent
+/// needs: the live objective, decisions taken, work completed, work still pending, files touched,
+/// and errors that were never resolved. Everything else is counted, not transcribed. This is the
+/// deterministic path; `compact_with_summarizer` asks a model to write the same span instead and
+/// falls back to this when it cannot.
+pub fn compact(
+    estimator: &TokenEstimator,
+    messages: &[Message],
+    budget: &ContextBudget,
+    policy: &CompactionPolicy,
+    through_seq: u64,
+) -> Option<(Vec<Message>, CompactionReport)> {
+    let plan = plan_fold(estimator, messages, policy, through_seq)?;
+    let goal = summary_ceiling(budget);
+    let mut note = FoldNote::default();
+    note.collect(plan.old, estimator);
+    let mut summary = note.render(plan.old.len(), plan.recent.len(), through_seq);
+
+    // The summary has to fit too. If a long session produced more sections than the ceiling can
+    // carry, drop the least load-bearing ones before the transcript does.
+    while estimator.estimate_text(&summary) > goal && note.trim_least_important() {
+        summary = note.render(plan.old.len(), plan.recent.len(), through_seq);
+    }
+    finish_fold(estimator, &plan, summary)
+}
+
+/// Which path wrote a fold's summary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FoldSource {
+    /// The caller's summarizer wrote the body; this module wrote only the fold header.
+    Model,
+    /// `FoldNote`'s keyword classification, because no summarizer was available or it failed.
+    Deterministic,
+}
+
+impl FoldSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FoldSource::Model => "model",
+            FoldSource::Deterministic => "deterministic",
+        }
+    }
+}
+
+/// A fold, and how it was made.
+///
+/// `fallback_reason` is `Some` exactly when a summarizer was offered and the deterministic fold
+/// wrote instead, so a caller can report which path ran and why without guessing.
+#[derive(Clone, Debug)]
+pub struct FoldOutcome {
+    pub messages: Vec<Message>,
+    pub report: CompactionReport,
+    pub source: FoldSource,
+    pub fallback_reason: Option<String>,
+}
+
+/// What a summarizer is asked to do: the instruction, the span being folded, and the ceiling the
+/// answer has to fit.
+#[derive(Clone, Debug)]
+pub struct SummaryRequest {
+    pub instruction: &'static str,
+    pub transcript: String,
+    pub max_tokens: u64,
+}
+
+impl SummaryRequest {
+    /// The whole prompt, for a caller that only wants text to send to a provider.
+    pub fn prompt(&self) -> String {
+        format!(
+            "{}\n\n--- transcript of the span being folded ---\n\n{}\n",
+            self.instruction, self.transcript
+        )
+    }
+}
+
+/// What survives a fold and what does not, stated to the model instead of inferred from keywords.
+pub const SUMMARY_INSTRUCTION: &str = "\
+Summarise the conversation below so another agent can continue this work without re-reading it. \
+Keep: decisions taken and the reason for them; every file path and symbol touched; problems that \
+are still open; the next step. Drop: pleasantries, acknowledgements, restated plans that were \
+superseded, and tool output that has already been acted on. Write terse markdown under these \
+headings, omitting any heading with nothing under it: Live objective, Decisions, Work completed, \
+Relevant files, Errors and blocked, Next steps. No preamble, no closing remark.";
+
+/// The span being folded, as text a model can read. Each block is clipped so one enormous tool
+/// result cannot crowd out the decisions that follow it.
+fn render_span(old: &[Message]) -> String {
+    const PER_BLOCK: usize = 1_500;
+    let mut out = String::new();
+    for message in old {
+        let role = match message.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        };
+        for block in &message.blocks {
+            let text = match block {
+                Block::Text { text, .. } => text.clone(),
+                Block::Reasoning { text, .. } => format!("(reasoning) {text}"),
+                Block::ToolCall { call } => format!("(call {} {})", call.name, call.arguments),
+                Block::ToolResult { content, ok, .. } => format!("(result ok={ok}) {content}"),
+                Block::Image { .. } => "(image)".to_owned(),
+            };
+            out.push_str(&format!("[{role}] {}\n", condense(&text, PER_BLOCK)));
+        }
+    }
+    out
+}
+
+/// The deterministic fold, labelled. What a caller uses when it has no summarizer to offer.
+pub fn compact_deterministic(
+    estimator: &TokenEstimator,
+    messages: &[Message],
+    budget: &ContextBudget,
+    policy: &CompactionPolicy,
+    through_seq: u64,
+) -> Option<FoldOutcome> {
+    let (messages, report) = compact(estimator, messages, budget, policy, through_seq)?;
+    Some(FoldOutcome {
+        messages,
+        report,
+        source: FoldSource::Deterministic,
+        fallback_reason: None,
+    })
+}
+
+/// Fold with a model in the loop, and fall back to the keyword fold when it cannot deliver.
+///
+/// `summarize` is handed the pre-fold transcript under an explicit retention instruction and must
+/// return the summary body within `SummaryRequest::max_tokens`. Anything that does not qualify —
+/// an error, an empty answer, an answer over the ceiling, or one that frees too little context —
+/// is replaced by `compact`, and `FoldOutcome::source`/`fallback_reason` say which path ran. The
+/// fold header stays this module's: replay identifies a summary by its opening sentence.
+pub async fn compact_with_summarizer<F, Fut>(
+    estimator: &TokenEstimator,
+    messages: &[Message],
+    budget: &ContextBudget,
+    policy: &CompactionPolicy,
+    through_seq: u64,
+    summarize: F,
+) -> Option<FoldOutcome>
+where
+    F: FnOnce(SummaryRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    let plan = plan_fold(estimator, messages, policy, through_seq)?;
+    let goal = summary_ceiling(budget);
+    let request = SummaryRequest {
+        instruction: SUMMARY_INSTRUCTION,
+        transcript: render_span(plan.old),
+        max_tokens: goal,
+    };
+
+    let fallback = match summarize(request).await {
+        Err(error) => Some(format!("summarizer failed: {error}")),
+        Ok(body) => {
+            let body = body.trim();
+            let tokens = estimator.estimate_text(body);
+            if body.is_empty() {
+                Some("summarizer returned an empty summary".to_owned())
+            } else if tokens > goal {
+                Some(format!(
+                    "summarizer returned {tokens} tokens against a {goal}-token ceiling"
+                ))
+            } else {
+                let summary = format!(
+                    "{}{body}\n",
+                    fold_header(plan.old.len(), plan.recent.len(), through_seq)
+                );
+                match finish_fold(estimator, &plan, summary) {
+                    Some((messages, report)) => {
+                        return Some(FoldOutcome {
+                            messages,
+                            report,
+                            source: FoldSource::Model,
+                            fallback_reason: None,
+                        });
+                    }
+                    None => Some("the model summary freed too little context".to_owned()),
+                }
+            }
+        }
+    };
+
+    let (messages, report) = compact(estimator, messages, budget, policy, through_seq)?;
+    Some(FoldOutcome {
+        messages,
+        report,
+        source: FoldSource::Deterministic,
+        fallback_reason: fallback,
+    })
 }
 
 /// How large a summary may be: one twelfth of the usable window, bounded so it is never trivial on
@@ -615,13 +823,7 @@ impl FoldNote {
     }
 
     fn render(&self, folded: usize, kept: usize, through_seq: u64) -> String {
-        let mut out = String::new();
-        out.push_str(SUMMARY_HEADER);
-        out.push_str(&format!(
-            " {} earlier messages folded; the {} most recent are verbatim below. Originals are \
-             durable in the journal through seq {through_seq} and can be re-read.\n",
-            folded, kept
-        ));
+        let mut out = fold_header(folded, kept, through_seq);
         out.push_str(&self.sections());
         out
     }
@@ -1083,6 +1285,162 @@ mod tests {
         let e = TokenEstimator::default();
         let msgs: Vec<Message> = (0..4).map(|i| Message::user(format!("m{i}"))).collect();
         assert!(compact(&e, &msgs, &budget(), &policy(), 10).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_supplied_summarizer_writes_the_fold() {
+        let e = TokenEstimator::default();
+        let msgs = long_transcript();
+        let seen = std::sync::Mutex::new(None::<SummaryRequest>);
+        let outcome = compact_with_summarizer(&e, &msgs, &budget(), &policy(), 90, |request| {
+            *seen.lock().unwrap() = Some(request);
+            std::future::ready(Ok::<String, String>(
+                "### Decisions\n- keep the store as the source of truth so the TUI and the daemon agree"
+                    .to_owned(),
+            ))
+        })
+        .await
+        .expect("the transcript folds");
+        assert_eq!(outcome.source, FoldSource::Model);
+        assert!(outcome.fallback_reason.is_none(), "{outcome:?}");
+        let text = outcome.messages[0].text_body();
+        assert!(
+            text.contains("keep the store as the source of truth"),
+            "the model's text is what lands: {text}"
+        );
+        assert!(
+            !text.contains("### Live objective"),
+            "the keyword fold did not run: {text}"
+        );
+        assert!(
+            is_compaction_summary(&outcome.messages[0]),
+            "the marker shape stays ours so replay recognises it: {text}"
+        );
+        assert!(text.contains("through seq 90"), "{text}");
+        assert!(pairing_is_consistent(&outcome.messages));
+        assert_eq!(
+            outcome.messages.last().unwrap().text_body(),
+            "continue and finish the tests",
+            "the tail is still verbatim"
+        );
+
+        let request = seen
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the summarizer was called");
+        assert!(
+            request
+                .transcript
+                .contains("Build the complete context engine"),
+            "the summarizer reads the pre-fold span: {}",
+            request.transcript
+        );
+        assert!(
+            !request.transcript.contains("continue and finish the tests"),
+            "the kept tail is not part of the span being folded"
+        );
+        assert_eq!(request.max_tokens, summary_ceiling(&budget()));
+        assert!(
+            request.prompt().contains("Keep: decisions taken"),
+            "the retention instruction travels with the transcript"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_model_summary_falls_back_to_the_keyword_fold() {
+        let e = TokenEstimator::default();
+        let outcome =
+            compact_with_summarizer(&e, &long_transcript(), &budget(), &policy(), 90, |_| {
+                std::future::ready(Ok::<String, String>("   \n".to_owned()))
+            })
+            .await
+            .expect("the fallback still folds");
+        assert_eq!(outcome.source, FoldSource::Deterministic);
+        assert!(
+            outcome
+                .fallback_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("empty")),
+            "{outcome:?}"
+        );
+        let text = outcome.messages[0].text_body();
+        assert!(text.contains("### Live objective"), "{text}");
+        assert!(is_compaction_summary(&outcome.messages[0]), "{text}");
+        assert!(pairing_is_consistent(&outcome.messages));
+    }
+
+    #[tokio::test]
+    async fn a_failed_summarizer_falls_back_and_says_why() {
+        let e = TokenEstimator::default();
+        let outcome =
+            compact_with_summarizer(&e, &long_transcript(), &budget(), &policy(), 90, |_| {
+                std::future::ready(Err::<String, String>("provider returned 503".to_owned()))
+            })
+            .await
+            .expect("a provider error still folds");
+        assert_eq!(outcome.source, FoldSource::Deterministic);
+        assert!(
+            outcome
+                .fallback_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("provider returned 503")),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_model_summary_is_refused_not_truncated() {
+        let e = TokenEstimator::default();
+        let ceiling = summary_ceiling(&budget());
+        let outcome =
+            compact_with_summarizer(&e, &long_transcript(), &budget(), &policy(), 90, |_| {
+                std::future::ready(Ok::<String, String>("x".repeat(20_000)))
+            })
+            .await
+            .expect("the fallback still folds");
+        assert_eq!(outcome.source, FoldSource::Deterministic);
+        assert!(
+            outcome
+                .fallback_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("ceiling")),
+            "{outcome:?}"
+        );
+        assert!(
+            outcome.report.summary_tokens <= ceiling,
+            "the fold that ran respects the budget: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_summary_stays_inside_the_budget() {
+        let e = TokenEstimator::default();
+        let ceiling = summary_ceiling(&budget());
+        let outcome =
+            compact_with_summarizer(&e, &long_transcript(), &budget(), &policy(), 90, |_| {
+                std::future::ready(Ok::<String, String>(
+                    "### Next steps\n- run the narrowest check that proves the change".to_owned(),
+                ))
+            })
+            .await
+            .expect("the transcript folds");
+        assert_eq!(outcome.source, FoldSource::Model);
+        assert!(outcome.report.summary_tokens <= ceiling, "{outcome:?}");
+        assert!(outcome.report.after_tokens < outcome.report.before_tokens);
+        assert!(pairing_is_consistent(&outcome.messages));
+    }
+
+    #[test]
+    fn the_deterministic_path_is_labelled_too() {
+        let e = TokenEstimator::default();
+        let outcome = compact_deterministic(&e, &long_transcript(), &budget(), &policy(), 90)
+            .expect("the transcript folds");
+        assert_eq!(outcome.source, FoldSource::Deterministic);
+        assert_eq!(outcome.source.as_str(), "deterministic");
+        assert_eq!(FoldSource::Model.as_str(), "model");
+        assert!(outcome.fallback_reason.is_none());
+        assert!(outcome.messages[0].text_body().contains("### Decisions"));
     }
 
     #[test]
