@@ -18,8 +18,8 @@ mod session;
 mod vad;
 
 pub use asr::{
-    AsrEngine, BASE_TIER, TINY_TIER, VoxtypeRecognizer, WhisperRecognizer, gpu_preferred,
-    models_dir, probe_asr, resolve_model, resolve_model_in,
+    AsrEngine, DEFAULT_MODEL, VoxtypeRecognizer, WavoRecognizer, models_dir, probe_asr,
+    resolve_model, resolve_model_in,
 };
 pub use cancel::CancelToken;
 pub use capture::{CpalSource, DeviceSource, probe_capture};

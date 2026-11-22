@@ -1,29 +1,23 @@
-//! Built-in ASR: whisper.cpp linked through whisper-rs.
+//! Built-in ASR: wavo, a pure-Rust Whisper/Parakeet/Moonshine engine on wgpu.
 //!
-//! Model resolution follows the repo's durable-home convention (`$VIKRAM_HOME`, else `~/.vikram`):
-//! an explicit `asr_model` wins if it exists, otherwise the `base` (default) and `tiny` (speed)
-//! tiers are looked up under `<home>/models`. A missing model is a real error naming the exact
-//! expected path and its download URL — never a silent pass. The whisper-cli helper stays as a
-//! last-resort fallback tier, and a whisper failure that reaches it is recorded as a degrade
-//! note for `VoiceStatus`.
+//! Models are GGUF files from wavo's hub (`handy-computer/*-gguf`). The repo's durable-home
+//! convention (`$VIKRAM_HOME`, else `~/.vikram`) holds them under `<home>/models`, so a fresh
+//! machine downloads the default model on the first utterance, not at `status` time. An explicit
+//! `asr_model` may be a downloaded `.gguf` path or any wavo hub name. A missing model is a real
+//! error naming what to fetch — never a silent pass. The whisper-cli helper stays as a last-resort
+//! fallback tier, and a wavo failure that reaches it is recorded as a degrade note for
+//! `VoiceStatus`.
 
 use crate::cancel::CancelToken;
 use crate::helpers::{Scratch, run_cancellable, which, write_wav};
 use crate::session::Recognizer;
 use crate::{Result, StageStatus, VoiceConfig, VoiceError};
 use std::path::{Path, PathBuf};
-use whisper_rs::{
-    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
-};
+use std::sync::mpsc;
+use wavo::hub::Hub;
 
-pub const BASE_TIER: (&str, &str) = (
-    "ggml-base.bin",
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
-);
-pub const TINY_TIER: (&str, &str) = (
-    "ggml-tiny.bin",
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
-);
+/// The hub name of the default tier: 80 MB, English, 7× faster than whisper-turbo.
+pub const DEFAULT_MODEL: &str = "whisper-base.en";
 
 /// `$VIKRAM_HOME`, else `~/.vikram`: the same root `vikram_runtime::config::vikram_home` uses.
 /// Mirrored here because `docs/voice-plan.md` §3 keeps this crate off the runtime's dependency
@@ -42,35 +36,62 @@ pub fn models_dir() -> PathBuf {
     base.join(".vikram").join("models")
 }
 
-/// Resolution order: explicit `asr_model` if it is a file; then `base`, then `tiny`, under
-/// `dir`. The error names the exact expected path and where to download it.
+/// Where a model comes from: a file on disk, or a hub name the engine may download once.
+#[derive(Clone, Debug, PartialEq)]
+enum ModelSource {
+    File(PathBuf),
+    Hub(String),
+}
+
+/// A hub name has no path separator and no extension; anything else is a path.
+fn is_hub_name(arg: &str) -> bool {
+    !arg.contains(['/', '\\']) && !arg.ends_with(".gguf")
+}
+
+fn source_of(config: &VoiceConfig) -> ModelSource {
+    let arg = config.asr_model.to_string_lossy();
+    if arg.trim().is_empty() {
+        ModelSource::Hub(DEFAULT_MODEL.to_owned())
+    } else if is_hub_name(&arg) {
+        ModelSource::Hub(arg.into_owned())
+    } else {
+        ModelSource::File(config.asr_model.clone())
+    }
+}
+
+fn hub(dir: &Path) -> Hub {
+    Hub::at(dir)
+}
+
+/// Resolution: an explicit source wins (a file must exist; a hub name must be known);
+/// otherwise the default tier is looked up offline under `dir`. A model that is known but not
+/// downloaded yet is an honest error here — `probe` says it downloads on the first utterance.
 pub fn resolve_model_in(dir: &Path, config: &VoiceConfig) -> Result<PathBuf> {
-    if !config.asr_model.as_os_str().is_empty() {
-        let explicit = &config.asr_model;
-        if explicit.is_file() {
-            return Ok(explicit.clone());
+    match source_of(config) {
+        ModelSource::File(model) => {
+            if model.is_file() {
+                Ok(model)
+            } else {
+                Err(VoiceError::ModelMissing(format!(
+                    "asr_model {} is not a file; point it at a downloaded .gguf, or clear it to \
+                     use {}",
+                    model.display(),
+                    DEFAULT_MODEL
+                )))
+            }
         }
-        return Err(VoiceError::ModelMissing(format!(
-            "asr_model {} is not a file; point it at a downloaded ggml model, or clear it to \
-             use {}",
-            explicit.display(),
-            dir.join(BASE_TIER.0).display()
-        )));
-    }
-    for (file, _) in [BASE_TIER, TINY_TIER] {
-        let candidate = dir.join(file);
-        if candidate.is_file() {
-            return Ok(candidate);
+        ModelSource::Hub(name) => {
+            wavo::hub::lookup(&name).map_err(|err| VoiceError::ModelMissing(err.to_string()))?;
+            match hub(dir).find(&name) {
+                Some(path) if path.is_file() => Ok(path),
+                _ => Err(VoiceError::ModelMissing(format!(
+                    "{name} is not downloaded under {}; it downloads on the first utterance, or \
+                     run `wavo pull {name}`",
+                    dir.display()
+                ))),
+            }
         }
     }
-    Err(VoiceError::ModelMissing(format!(
-        "expected {} (default tier) or {} under {}; download one, e.g. curl -L -o '{}' {}",
-        BASE_TIER.0,
-        TINY_TIER.0,
-        dir.display(),
-        dir.join(BASE_TIER.0).display(),
-        BASE_TIER.1
-    )))
 }
 
 pub fn resolve_model(config: &VoiceConfig) -> Result<PathBuf> {
@@ -80,153 +101,122 @@ pub fn resolve_model(config: &VoiceConfig) -> Result<PathBuf> {
 
 pub fn probe_asr(config: &VoiceConfig) -> StageStatus {
     let fast_path = config.voxtype_fast_path && which(VOXTYPE).is_some();
-    let backend = if gpu_preferred() {
-        "vulkan gpu, cpu fallback"
-    } else {
-        "cpu only"
-    };
-    match resolve_model(config) {
-        Ok(model) => StageStatus::Ready(if fast_path {
-            format!(
-                "voxtype fast path; built-in whisper.cpp ({}, {backend})",
-                model.display()
-            )
-        } else {
-            format!("built-in whisper.cpp ({}, {backend})", model.display())
-        }),
+    let detail = match resolve_model(config) {
+        Ok(model) => format!("built-in wavo ({})", model.display()),
         Err(err) => {
             if fast_path {
-                StageStatus::Degraded(format!(
-                    "voxtype fast path only; built-in whisper model missing: {err}"
-                ))
-            } else {
-                StageStatus::Missing(err.to_string())
+                return StageStatus::Degraded(format!(
+                    "voxtype fast path only; built-in wavo model missing: {err}"
+                ));
             }
+            return StageStatus::Missing(err.to_string());
         }
-    }
-}
-
-fn whisper_error(err: whisper_rs::WhisperError) -> VoiceError {
-    VoiceError::Helper(format!("whisper.cpp: {err:?}"))
-}
-
-/// Whether this build asks whisper.cpp for the GPU. With the `gpu` feature the answer is yes and
-/// the CPU is only a retry path; a `--no-default-features` build never opens a GPU device.
-pub fn gpu_preferred() -> bool {
-    cfg!(feature = "gpu")
-}
-
-/// Device preference order for context creation: the GPU where the build supports it, then the
-/// CPU, so a missing Vulkan driver degrades instead of failing.
-fn device_order() -> Vec<bool> {
-    if gpu_preferred() {
-        vec![true, false]
+    };
+    StageStatus::Ready(if fast_path {
+        format!("voxtype fast path; {detail}")
     } else {
-        vec![false]
-    }
+        detail
+    })
 }
 
-fn create_context(model: &PathBuf, use_gpu: bool) -> Result<WhisperContext> {
-    let mut params = WhisperContextParameters::default();
-    params.use_gpu(use_gpu);
-    WhisperContext::new_with_params(model, params).map_err(whisper_error)
+fn wavo_error(err: wavo::Error) -> VoiceError {
+    VoiceError::Helper(format!("wavo: {err}"))
 }
 
 /// The linked-in recognizer. Model load happens lazily on the first utterance so `status`
-/// never costs a multi-second model read.
-pub struct WhisperRecognizer {
-    model: PathBuf,
+/// never costs a model read; a missing hub model is downloaded once, with a printed note.
+pub struct WavoRecognizer {
+    source: ModelSource,
+    dir: PathBuf,
     language: Option<String>,
-    state: Option<WhisperState>,
-    context: Option<WhisperContext>,
+    model: Option<wavo::Model>,
 }
 
-impl WhisperRecognizer {
-    pub fn new(model: PathBuf, language: Option<String>) -> Self {
+impl WavoRecognizer {
+    pub(crate) fn new(source: ModelSource, dir: PathBuf, language: Option<String>) -> Self {
         Self {
-            model,
+            source,
+            dir,
             language,
-            state: None,
-            context: None,
+            model: None,
         }
     }
 
-    fn ensure_loaded(&mut self) -> Result<&mut WhisperState> {
-        if self.context.is_none() {
-            if !self.model.is_file() {
-                return Err(VoiceError::ModelMissing(format!(
-                    "model file {} disappeared since startup; re-download from {}",
-                    self.model.display(),
-                    BASE_TIER.1
-                )));
+    /// Build from a resolved config: the same source rules the rest of the module uses.
+    pub fn from_config(config: &VoiceConfig) -> Self {
+        Self::new(
+            source_of(config),
+            config.models_dir.clone().unwrap_or_else(models_dir),
+            config.asr_language.clone(),
+        )
+    }
+
+    fn download(&self, name: &str) -> Result<PathBuf> {
+        let (tx, rx) = mpsc::channel();
+        let dir = self.dir.clone();
+        let owned = name.to_owned();
+        eprintln!("voice: downloading wavo model {name} (one time)");
+        std::thread::spawn(move || {
+            let result = hub(&dir).pull(&owned, |_| std::ops::ControlFlow::Continue(()));
+            let _ = tx.send(result.map_err(|err| err.to_string()));
+        });
+        let outcome = rx
+            .recv()
+            .unwrap_or_else(|_| Err("download thread died".into()));
+        match outcome {
+            Ok(path) => {
+                eprintln!("voice: {name} ready at {}", path.display());
+                Ok(path)
             }
-            whisper_rs::install_logging_hooks();
-            let mut failure = None;
-            for use_gpu in device_order() {
-                match create_context(&self.model, use_gpu) {
-                    Ok(context) => {
-                        self.context = Some(context);
-                        break;
+            Err(err) => Err(VoiceError::ModelMissing(format!(
+                "could not download {name}: {err}"
+            ))),
+        }
+    }
+
+    fn ensure_loaded(&mut self) -> Result<&wavo::Model> {
+        if self.model.is_none() {
+            let path = match &self.source {
+                ModelSource::File(model) => {
+                    if !model.is_file() {
+                        return Err(VoiceError::ModelMissing(format!(
+                            "model file {} disappeared since startup",
+                            model.display()
+                        )));
                     }
-                    Err(err) => {
-                        if use_gpu {
-                            eprintln!("voice: whisper gpu unavailable ({err}); using cpu");
-                        }
-                        failure = Some(err);
-                    }
+                    model.clone()
                 }
-            }
-            if self.context.is_none() {
-                return Err(failure.unwrap_or_else(|| {
-                    VoiceError::Helper("whisper.cpp: no device could be opened".into())
-                }));
-            }
+                ModelSource::Hub(name) => match hub(&self.dir).find(name) {
+                    Some(path) if path.is_file() => path,
+                    _ => self.download(name)?,
+                },
+            };
+            let model = wavo::Model::load(&path).map_err(wavo_error)?;
+            self.model = Some(model);
         }
-        if self.state.is_none() {
-            let state = self
-                .context
-                .as_ref()
-                .expect("context exists")
-                .create_state()
-                .map_err(whisper_error)?;
-            self.state = Some(state);
-        }
-        Ok(self.state.as_mut().expect("state exists"))
+        Ok(self.model.as_ref().expect("model loaded"))
     }
 
     fn transcribe_impl(&mut self, pcm: &[i16], cancel: &CancelToken) -> Result<Option<String>> {
         cancel.check()?;
         let language = self.language.clone();
-        let state = self.ensure_loaded()?;
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_language(language.as_deref());
-        params.set_print_progress(false);
-        params.set_print_timestamps(false);
-        params.set_suppress_nst(true);
-        let mut audio = vec![0f32; pcm.len()];
-        whisper_rs::convert_integer_to_float_audio(pcm, &mut audio).map_err(whisper_error)?;
-        // Mid-inference abort exists upstream (`set_abort_callback_safe`), but whisper-rs
-        // 0.16.0 miswires its trampoline — the double-boxed closure is cast back to the wrong
-        // type, so the callback reads garbage and aborts every encode. Until that is fixed
-        // upstream, cancellation lands here: before inference and on its completion.
-        state.full(params, &audio).map_err(whisper_error)?;
+        let model = self.ensure_loaded()?;
+        let audio: Vec<f32> = pcm.iter().map(|sample| *sample as f32 / 32768.0).collect();
+        let mut options = wavo::Options::default();
+        options.language = language;
+        let transcript = model
+            .transcribe_with(&audio, &options)
+            .map_err(wavo_error)?;
+        // wavo has no abort hook; cancellation lands before inference and on its completion.
         if cancel.is_cancelled() {
             return Err(VoiceError::Cancelled);
         }
-        let mut text = String::new();
-        for index in 0..state.full_n_segments() {
-            if let Some(segment) = state.get_segment(index)
-                && let Ok(line) = segment.to_str_lossy()
-            {
-                text.push_str(&line);
-            }
-        }
-        let text = text.trim();
+        let text = transcript.text.trim();
         Ok((!text.is_empty()).then(|| text.to_owned()))
     }
 }
 
-impl Recognizer for WhisperRecognizer {
+impl Recognizer for WavoRecognizer {
     fn transcribe(&mut self, pcm: &[i16]) -> Result<Option<String>> {
         self.transcribe_impl(pcm, &crate::CancelToken::new())
     }
@@ -305,13 +295,13 @@ impl Recognizer for VoxtypeRecognizer {
     }
 }
 
-/// The ASR chain: the detected voxtype fast path first, built-in whisper second, the
+/// The ASR chain: the detected voxtype fast path first, built-in wavo second, the
 /// whisper-cli helper only as a runtime fallback. Every handoff is recorded as a degrade
 /// note for `VoiceStatus`, and a missing model is reported as the model's own error —
 /// whisper-cli needs the same model file, so a missing model is never rescued by the helper.
 pub struct AsrEngine {
     voxtype: Option<VoxtypeRecognizer>,
-    whisper: Option<WhisperRecognizer>,
+    wavo: Option<WavoRecognizer>,
     helper: crate::HelperRecognizer,
     helper_name: String,
     model_error: Option<String>,
@@ -320,16 +310,22 @@ pub struct AsrEngine {
 
 impl AsrEngine {
     pub fn new(config: &VoiceConfig) -> Self {
-        let (whisper, model_error) = match resolve_model(config) {
-            Ok(model) => (
-                Some(WhisperRecognizer::new(model, config.asr_language.clone())),
-                None,
-            ),
-            Err(err) => (None, Some(err.to_string())),
+        let (wavo, model_error) = match resolve_model(config) {
+            Ok(_) => (Some(WavoRecognizer::from_config(config)), None),
+            Err(err) => {
+                // A hub model that is known but not downloaded is armed: the first
+                // utterance downloads it. Only an unknown or missing file is an error.
+                match source_of(config) {
+                    ModelSource::Hub(name) if wavo::hub::lookup(&name).is_ok() => {
+                        (Some(WavoRecognizer::from_config(config)), None)
+                    }
+                    _ => (None, Some(err.to_string())),
+                }
+            }
         };
         Self {
             voxtype: VoxtypeRecognizer::detect(config),
-            whisper,
+            wavo,
             helper: crate::HelperRecognizer::new(config),
             helper_name: config.asr_helper.clone(),
             model_error,
@@ -354,16 +350,16 @@ impl Recognizer for AsrEngine {
                 Ok(text) => return Ok(text),
                 Err(VoiceError::Cancelled) => return Err(VoiceError::Cancelled),
                 Err(err) => self.notes.push(format!(
-                    "voxtype fast path failed: {err}; trying built-in whisper"
+                    "voxtype fast path failed: {err}; trying built-in wavo"
                 )),
             }
         }
-        if let Some(whisper) = self.whisper.as_mut() {
-            match whisper.transcribe_cancellable(pcm, cancel) {
+        if let Some(wavo) = self.wavo.as_mut() {
+            match wavo.transcribe_cancellable(pcm, cancel) {
                 Ok(text) => return Ok(text),
                 Err(VoiceError::Cancelled) => return Err(VoiceError::Cancelled),
                 Err(err) => self.notes.push(format!(
-                    "built-in whisper failed: {err}; falling back to {helper_name}",
+                    "built-in wavo failed: {err}; falling back to {helper_name}",
                     helper_name = self.helper_name
                 )),
             }
@@ -384,18 +380,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_gpu_build_tries_the_device_before_the_cpu() {
-        let order = device_order();
-        assert_eq!(
-            order.last(),
-            Some(&false),
-            "the cpu is always the last resort"
-        );
-        if gpu_preferred() {
-            assert_eq!(order.first(), Some(&true));
-        } else {
-            assert_eq!(order, vec![false]);
-        }
+    fn a_hub_name_is_not_a_path() {
+        assert!(is_hub_name("whisper-base.en"));
+        assert!(!is_hub_name("weights.gguf"));
+        assert!(!is_hub_name("/tmp/weights.gguf"));
+        assert!(!is_hub_name("models/weights"));
     }
 
     fn config_with_dir(dir: &Path) -> VoiceConfig {
@@ -408,7 +397,7 @@ mod tests {
     #[test]
     fn an_explicit_model_that_exists_wins() {
         let dir = tempfile::tempdir().unwrap();
-        let model = dir.path().join("my-model.bin");
+        let model = dir.path().join("my-model.gguf");
         std::fs::write(&model, b"weights").unwrap();
         let config = VoiceConfig {
             asr_model: model.clone(),
@@ -421,67 +410,48 @@ mod tests {
     fn an_explicit_model_that_is_missing_names_it() {
         let dir = tempfile::tempdir().unwrap();
         let config = VoiceConfig {
-            asr_model: dir.path().join("gone.bin"),
+            asr_model: dir.path().join("gone.gguf"),
             ..config_with_dir(dir.path())
         };
         let err = resolve_model(&config).unwrap_err().to_string();
-        assert!(err.contains("gone.bin"), "error names the path: {err}");
+        assert!(err.contains("gone.gguf"), "error names the path: {err}");
     }
 
     #[test]
-    fn base_is_the_default_tier_and_tiny_is_second() {
+    fn an_unknown_hub_name_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("ggml-base.bin");
-        std::fs::write(&base, b"weights").unwrap();
-        let config = config_with_dir(dir.path());
-        assert_eq!(resolve_model(&config).unwrap(), base);
-
-        let tiny_dir = tempfile::tempdir().unwrap();
-        let tiny = tiny_dir.path().join("ggml-tiny.bin");
-        std::fs::write(&tiny, b"weights").unwrap();
-        assert_eq!(
-            resolve_model(&config_with_dir(tiny_dir.path())).unwrap(),
-            tiny
-        );
+        let config = VoiceConfig {
+            asr_model: dir.path().join("not-a-model").to_path_buf(),
+            ..config_with_dir(dir.path())
+        };
+        let err = resolve_model(&config).unwrap_err().to_string();
+        assert!(err.contains("not-a-model"), "{err}");
     }
 
     #[test]
-    fn a_missing_model_names_the_exact_path_and_download_url() {
+    fn a_missing_default_model_says_it_downloads_on_first_utterance() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_dir(dir.path());
         let err = resolve_model(&config).unwrap_err().to_string();
-        assert!(err.contains("ggml-base.bin"), "{err}");
+        assert!(err.contains(DEFAULT_MODEL), "{err}");
         assert!(
             err.contains(dir.path().display().to_string().as_str()),
             "{err}"
         );
-        assert!(err.contains(BASE_TIER.1), "download URL: {err}");
-        assert!(err.contains("curl"), "{err}");
+        assert!(
+            err.contains("first utterance") || err.contains("wavo pull"),
+            "{err}"
+        );
     }
 
     #[test]
-    fn probe_reports_whisper_ready_only_when_a_model_resolves() {
-        let dir = tempfile::tempdir().unwrap();
-        let ready_dir = tempfile::tempdir().unwrap();
-        std::fs::write(ready_dir.path().join("ggml-base.bin"), b"weights").unwrap();
-
-        let missing = probe_asr(&config_with_dir(dir.path()));
-        match missing {
-            StageStatus::Degraded(reason) => {
-                assert!(reason.contains("voxtype fast path only"));
-                assert!(reason.contains(BASE_TIER.1));
-            }
-            StageStatus::Missing(reason) => {
-                assert!(reason.contains(BASE_TIER.1), "{reason}");
-            }
+    fn probe_reports_wavo_ready_only_when_the_model_is_on_disk() {
+        let missing_dir = tempfile::tempdir().unwrap();
+        match probe_asr(&config_with_dir(missing_dir.path())) {
+            StageStatus::Degraded(reason) => assert!(reason.contains("voxtype fast path only")),
+            StageStatus::Missing(reason) => assert!(reason.contains(DEFAULT_MODEL), "{reason}"),
             other => panic!("a missing model must not look ready: {other:?}"),
         }
-
-        let ready = probe_asr(&config_with_dir(ready_dir.path()));
-        let StageStatus::Ready(detail) = ready else {
-            panic!("expected ready, got {ready:?}")
-        };
-        assert!(detail.contains("built-in whisper.cpp"), "{detail}");
     }
 
     #[test]
@@ -489,12 +459,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = VoiceConfig {
             voxtype_fast_path: false,
+            asr_model: dir.path().join("missing.gguf"),
             ..config_with_dir(dir.path())
         };
         let mut engine = AsrEngine::new(&config);
         let err = engine.transcribe(&[0i16; 160]).unwrap_err();
         assert!(matches!(err, VoiceError::ModelMissing(_)));
-        assert!(err.to_string().contains(BASE_TIER.1));
+        assert!(err.to_string().contains("missing.gguf"));
         assert!(
             engine.notes().is_empty(),
             "no degrade note: nothing was tried and silently failed"
@@ -502,20 +473,24 @@ mod tests {
     }
 
     #[test]
-    fn a_chain_with_a_model_arms_the_built_in_engine() {
+    fn a_known_model_that_is_not_downloaded_still_arms_the_engine() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("ggml-tiny.bin"), b"weights").unwrap();
-        let engine = AsrEngine::new(&config_with_dir(dir.path()));
-        assert!(engine.whisper.is_some());
+        let config = config_with_dir(dir.path());
+        let engine = AsrEngine::new(&config);
+        assert!(
+            engine.wavo.is_some(),
+            "the first utterance downloads the default model"
+        );
         assert!(engine.model_error.is_none());
     }
 
     #[test]
     fn the_voxtype_fast_path_can_be_switched_off_entirely() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("ggml-base.bin"), b"weights").unwrap();
+        std::fs::write(dir.path().join("model.gguf"), b"weights").unwrap();
         let config = VoiceConfig {
             voxtype_fast_path: false,
+            asr_model: dir.path().join("model.gguf"),
             ..config_with_dir(dir.path())
         };
         assert!(VoxtypeRecognizer::detect(&config).is_none());
@@ -524,34 +499,23 @@ mod tests {
             engine.voxtype.is_none(),
             "disabled fast path must not be armed"
         );
-        let _ = engine.whisper.expect("built-in engine must still arm");
+        let _ = engine.wavo.expect("built-in engine must still arm");
     }
 
     #[test]
     fn probe_names_the_engines_the_machine_actually_has() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("ggml-base.bin"), b"weights").unwrap();
-        let config = config_with_dir(dir.path());
+        std::fs::write(dir.path().join("model.gguf"), b"weights").unwrap();
+        let config = VoiceConfig {
+            asr_model: dir.path().join("model.gguf"),
+            ..config_with_dir(dir.path())
+        };
         let StageStatus::Ready(detail) = probe_asr(&config) else {
             panic!("model resolves, so ASR must be ready")
         };
+        assert!(detail.contains("built-in wavo"), "{detail}");
         if VoxtypeRecognizer::detect(&config).is_some() {
             assert!(detail.contains("voxtype fast path"), "{detail}");
-        } else {
-            assert!(detail.contains("built-in whisper.cpp"), "{detail}");
-        }
-
-        let bare_dir = tempfile::tempdir().unwrap();
-        let bare = config_with_dir(bare_dir.path());
-        match probe_asr(&bare) {
-            StageStatus::Degraded(reason) if VoxtypeRecognizer::detect(&bare).is_some() => {
-                assert!(reason.contains("voxtype fast path only"), "{reason}");
-                assert!(reason.contains(BASE_TIER.1), "{reason}");
-            }
-            StageStatus::Missing(reason) => {
-                assert!(reason.contains(BASE_TIER.1), "{reason}");
-            }
-            other => panic!("a machine with no model and no voxtype must miss honestly: {other:?}"),
         }
     }
 
@@ -570,13 +534,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "hardware/model test: needs a model under ~/.vikram/models and VIKRAM_VOICE_TEST_WAV"]
+    #[ignore = "hardware/model test: needs a downloaded wavo model and VIKRAM_VOICE_TEST_WAV"]
     fn transcribes_real_speech_with_a_downloaded_model() {
         let Ok(wav) = std::env::var("VIKRAM_VOICE_TEST_WAV") else {
             return;
         };
         let config = VoiceConfig::default();
-        let model = resolve_model(&config).expect("a model must resolve");
+        resolve_model(&config).expect("a model must be downloaded");
         let mut reader = hound::WavReader::open(&wav).expect("fixture wav must decode");
         let pcm: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap()).collect();
         assert!(
@@ -584,10 +548,10 @@ mod tests {
             "fixture must hold at least one second of audio"
         );
         let started = std::time::Instant::now();
-        let mut recognizer = WhisperRecognizer::new(model, None);
+        let mut recognizer = WavoRecognizer::from_config(&config);
         let text = recognizer
             .transcribe(&pcm)
-            .expect("whisper must run")
+            .expect("wavo must run")
             .expect("real speech must produce a transcript");
         eprintln!("transcript ({:?}): {text}", started.elapsed());
         assert!(text.split_whitespace().count() >= 3);

@@ -7,18 +7,13 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
-[features]
-default = ["gpu"]
-# Vulkan is the one backend that covers Intel, AMD and NVIDIA GPUs on the platforms VIKRAM runs
-# on, so it is the default: whisper.cpp loads it at runtime and falls back to CPU by itself when
-# no Vulkan device exists. Build with --no-default-features for a CPU-only binary.
-gpu = ["whisper-rs/vulkan"]
-
 [dependencies]
 thiserror.workspace = true
 cpal = { version = "0.18", features = ["pipewire"] }
 hound = "3.5"
-whisper-rs = { version = "0.16", default-features = false }
+# Pure Rust on wgpu: Vulkan on this machine, and it falls back to CPU by itself when no GPU
+# device exists. `hub` adds model downloads; the CLI features of the crate stay off.
+wavo = { version = "0.6", default-features = false, features = ["hub"] }
 
 [dev-dependencies]
 tempfile.workspace = true
