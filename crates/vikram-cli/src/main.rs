@@ -506,6 +506,9 @@ struct JobArgs {
     /// Create it switched off.
     #[arg(long)]
     disabled: bool,
+    /// Let a trigger fire this job's agent turn without an approval step.
+    #[arg(long)]
+    auto_approve: bool,
 }
 
 /// The same fields, all optional, for editing an existing job.
@@ -554,6 +557,12 @@ struct JobChanges {
     /// Switch it off.
     #[arg(long)]
     disable: bool,
+    /// Let a trigger fire this job's agent turn without an approval step.
+    #[arg(long)]
+    auto_approve: bool,
+    /// Require the approval step again.
+    #[arg(long = "no-auto-approve")]
+    no_auto_approve: bool,
 }
 
 impl JobArgs {
@@ -573,6 +582,8 @@ impl JobArgs {
             order: self.order.clone(),
             enable: false,
             disable: self.disabled,
+            auto_approve: self.auto_approve,
+            no_auto_approve: false,
         }
     }
 }
@@ -3256,6 +3267,9 @@ fn edit_job(id: &str, changes: &JobChanges) -> Result<String, String> {
     if changes.enable && changes.disable {
         return Err("--enable and --disable cannot be used together".to_owned());
     }
+    if changes.auto_approve && changes.no_auto_approve {
+        return Err("--auto-approve and --no-auto-approve cannot be used together".to_owned());
+    }
     let draft = draft_of(changes, None, None);
     vikram_daemon::cli::cron_edit(id, &draft)
 }
@@ -3268,6 +3282,11 @@ fn draft_of(
     schedule: Option<String>,
 ) -> vikram_daemon::cli::Draft {
     let enabled = match (changes.enable, changes.disable) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    };
+    let auto_approve = match (changes.auto_approve, changes.no_auto_approve) {
         (true, false) => Some(true),
         (false, true) => Some(false),
         _ => None,
@@ -3290,6 +3309,7 @@ fn draft_of(
         priority: changes.priority,
         order: changes.order.clone(),
         enabled,
+        auto_approve,
     }
 }
 
