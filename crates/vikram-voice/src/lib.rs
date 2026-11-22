@@ -60,7 +60,8 @@ pub enum VoiceError {
 
 /// The knob set an operator can set without recompiling. Defaults describe what is probed, not
 /// what is claimed to work: `enabled` is false until the operator opts in.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct VoiceConfig {
     pub enabled: bool,
     pub capture_helper: String,
@@ -84,6 +85,14 @@ pub struct VoiceConfig {
     pub sample_rate: u16,
     pub rms_threshold: f32,
     pub hangover_ms: u64,
+    /// A run shorter than this is a click, not a word.
+    pub min_speech_ms: u64,
+    /// How far above the measured noise floor a frame must sit to count as voiced.
+    pub floor_ratio: f32,
+    /// Input device name, matched case-insensitively against cpal's list. None = default.
+    pub input_device: Option<String>,
+    /// Output device name. None = default.
+    pub output_device: Option<String>,
 }
 
 impl Default for VoiceConfig {
@@ -107,6 +116,10 @@ impl Default for VoiceConfig {
             sample_rate: 16_000,
             rms_threshold: 0.01,
             hangover_ms: 200,
+            min_speech_ms: 250,
+            floor_ratio: 2.5,
+            input_device: None,
+            output_device: None,
         }
     }
 }
@@ -129,7 +142,57 @@ impl VoiceConfig {
         if self.sample_rate == 0 {
             return Err(VoiceError::Config("sample_rate must be positive".into()));
         }
+        if !(1.0..=20.0).contains(&self.floor_ratio) {
+            return Err(VoiceError::Config(
+                "floor_ratio must be between 1 and 20".into(),
+            ));
+        }
+        if self.min_speech_ms == 0 {
+            return Err(VoiceError::Config("min_speech_ms must be positive".into()));
+        }
         Ok(())
+    }
+}
+
+impl VoiceConfig {
+    /// `$VIKRAM_HOME/voice.json`, else `~/.vikram/voice.json`.
+    pub fn config_path() -> PathBuf {
+        let base = std::env::var_os("VIKRAM_HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .map(PathBuf::from)
+            })
+            .unwrap_or_else(|| PathBuf::from("."));
+        base.join(".vikram").join("voice.json")
+    }
+
+    /// Defaults overlaid with the operator's file. A malformed file is an error, not a silent
+    /// reset: an operator who edited the wrong key should hear about it.
+    pub fn load() -> Result<Self> {
+        let path = Self::config_path();
+        if !path.is_file() {
+            return Ok(Self::default());
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|err| VoiceError::Config(format!("read {}: {err}", path.display())))?;
+        serde_json::from_str(&text)
+            .map_err(|err| VoiceError::Config(format!("parse {}: {err}", path.display())))
+    }
+
+    pub fn save(&self) -> Result<PathBuf> {
+        let path = Self::config_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| VoiceError::Config(format!("create {}: {err}", parent.display())))?;
+        }
+        let text = serde_json::to_string_pretty(self)
+            .map_err(|err| VoiceError::Config(format!("serialize voice config: {err}")))?;
+        std::fs::write(&path, text)
+            .map_err(|err| VoiceError::Config(format!("write {}: {err}", path.display())))?;
+        Ok(path)
     }
 }
 
@@ -277,5 +340,33 @@ mod tests {
         let text = missing_tool_message("parecord");
         assert!(text.contains("parecord"));
         assert!(text.contains("install"));
+    }
+
+    #[test]
+    fn a_partial_config_file_keeps_the_defaults() {
+        let config: VoiceConfig =
+            serde_json::from_str(r#"{"max_record_ms": 5000, "asr_language": "en"}"#)
+                .expect("partial json parses");
+        assert_eq!(config.max_record_ms, 5_000);
+        assert_eq!(config.asr_language.as_deref(), Some("en"));
+        assert_eq!(config.floor_ratio, 2.5);
+        assert!(!config.enabled);
+    }
+
+    #[test]
+    fn the_config_path_sits_in_the_vikram_home() {
+        let path = VoiceConfig::config_path();
+        assert!(path.ends_with("voice.json"), "{}", path.display());
+        assert!(path.to_string_lossy().contains(".vikram"));
+    }
+
+    #[test]
+    fn a_ratio_at_or_below_one_is_refused() {
+        let mut config = VoiceConfig::default();
+        config.floor_ratio = 0.5;
+        assert!(config.validate().is_err());
+        config.floor_ratio = 2.5;
+        config.min_speech_ms = 0;
+        assert!(config.validate().is_err());
     }
 }

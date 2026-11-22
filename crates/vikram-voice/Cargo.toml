@@ -9,6 +9,8 @@ publish = false
 
 [dependencies]
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 cpal = { version = "0.18", features = ["pipewire"] }
 hound = "3.5"
 # Pure Rust on wgpu: Vulkan on this machine, and it falls back to CPU by itself when no GPU

@@ -350,6 +350,8 @@ where
         let Some((start, end)) = detect_speech(
             &pcm,
             self.config.rms_threshold,
+            self.config.floor_ratio,
+            self.config.min_speech_ms,
             self.config.hangover_ms,
             self.config.sample_rate,
         ) else {

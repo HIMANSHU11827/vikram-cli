@@ -6,10 +6,6 @@
 //! (a door slam, music), which is why `docs/voice-plan.md` schedules a model-based VAD later.
 
 const FRAME_MS: u64 = 10;
-/// Sustained voiced audio required before a segment counts as speech.
-const MIN_SPEECH_MS: u64 = 250;
-/// How far above the measured noise floor a frame must sit to count as voiced.
-const FLOOR_RATIO: f32 = 2.5;
 
 fn frame_rms(pcm: &[i16], frame: usize) -> Vec<f32> {
     pcm.chunks(frame)
@@ -40,8 +36,8 @@ pub fn noise_floor(frames: &[f32]) -> f32 {
 
 /// The level a frame must reach to be called voiced: above the noise floor by `FLOOR_RATIO`,
 /// never below `absolute`.
-pub fn speech_gate(frames: &[f32], absolute: f32) -> f32 {
-    (noise_floor(frames) * FLOOR_RATIO).max(absolute)
+pub fn speech_gate(frames: &[f32], absolute: f32, ratio: f32) -> f32 {
+    (noise_floor(frames) * ratio).max(absolute)
 }
 
 /// Sample range of the first sustained speech run, extended by the hangover.
@@ -53,6 +49,8 @@ pub fn speech_gate(frames: &[f32], absolute: f32) -> f32 {
 pub fn detect_speech(
     pcm: &[i16],
     absolute: f32,
+    ratio: f32,
+    min_speech_ms: u64,
     hangover_ms: u64,
     sample_rate: u16,
 ) -> Option<(usize, usize)> {
@@ -64,9 +62,9 @@ pub fn detect_speech(
         return None;
     }
     let frames = frame_rms(pcm, frame);
-    let gate = speech_gate(&frames, absolute);
+    let gate = speech_gate(&frames, absolute, ratio);
     let voiced: Vec<bool> = frames.iter().map(|rms| *rms >= gate).collect();
-    let min_frames = (((MIN_SPEECH_MS * sample_rate as u64) / 1000) as usize / frame).max(1);
+    let min_frames = (((min_speech_ms * sample_rate as u64) / 1000) as usize / frame).max(1);
     let hangover_frames = ((hangover_ms * sample_rate as u64) / 1000) as usize / frame;
 
     let mut start_frame = None;
@@ -190,7 +188,7 @@ mod tests {
     #[test]
     fn a_steady_fan_is_not_speech() {
         let pcm = steady(0.2, 16_000);
-        assert_eq!(detect_speech(&pcm, 0.01, 200, 16_000), None);
+        assert_eq!(detect_speech(&pcm, 0.01, 2.5, 250, 200, 16_000), None);
     }
 
     #[test]
@@ -198,7 +196,7 @@ mod tests {
         let mut pcm = vec![0i16; 4_000];
         pcm.extend_from_slice(&steady(0.4, 800));
         pcm.extend_from_slice(&vec![0i16; 4_000]);
-        assert_eq!(detect_speech(&pcm, 0.01, 200, 16_000), None);
+        assert_eq!(detect_speech(&pcm, 0.01, 2.5, 250, 200, 16_000), None);
     }
 
     #[test]
@@ -206,7 +204,8 @@ mod tests {
         let mut pcm = steady(0.002, 4_800);
         pcm.extend_from_slice(&steady(0.15, 8_000));
         pcm.extend_from_slice(&steady(0.002, 4_800));
-        let (start, end) = detect_speech(&pcm, 0.01, 200, 16_000).expect("speech expected");
+        let (start, end) =
+            detect_speech(&pcm, 0.01, 2.5, 250, 200, 16_000).expect("speech expected");
         assert!(start >= 4_000, "leading noise should be trimmed: {start}");
         assert!(start <= 5_000, "speech starts around 4800 samples: {start}");
         assert!(end >= 12_800, "the word must be inside the range: {end}");
@@ -216,9 +215,9 @@ mod tests {
     fn the_gate_follows_a_loud_room() {
         let quiet = vec![0.001f32; 100];
         let loud = vec![0.05f32; 100];
-        assert!(speech_gate(&loud, 0.01) > speech_gate(&quiet, 0.01));
+        assert!(speech_gate(&loud, 0.01, 2.5) > speech_gate(&quiet, 0.01, 2.5));
         assert!(
-            speech_gate(&quiet, 0.01) >= 0.01,
+            speech_gate(&quiet, 0.01, 2.5) >= 0.01,
             "absolute floor still applies"
         );
     }

@@ -66,13 +66,15 @@ Honest position: **no reliable open wake-word engine exists for Rust**. Options:
 
 | Option | Mechanism | Verdict |
 |---|---|---|
-| whisper.cpp via `whisper-rs` | Local, real | Primary. Needs ggml model file (~75 MB–1.5 GB); we ship a downloader + checksum, never bundle weights. |
-| `whisper-cli` binary | Same engine, shelled out | Fallback/helper path if the crate binding fails on a platform. |
+| wavo 0.6 (pure Rust) | Local, wgpu/Vulkan, GGUF weights | **Chosen engine.** No C/C++, no ONNX runtime; ~85 MB `whisper-base.en-Q8_0.gguf` pulled once into the hub cache. Accuracy on our test clip: exact, versus whisper.cpp base mishearing the name. |
+| Voxtype (if installed) | External CLI fast path | Optional accelerator, never required — Vikram works without it. |
+| `whisper-cli` binary | Same whisper.cpp engine, shelled out | Last-resort helper when both built-in paths fail. |
 | Cloud ASR (provider APIs) | Network | Optional provider seam — but voice must work offline; never the only path. |
 
-Model tiers (operator chooses, stored as config): `tiny`/`base` for speed,
-`small`/`medium` for accuracy. Default `base` — honest speed/accuracy point
-on CPU.
+Model tiers (operator chooses, stored as config): `whisper-base.en` (default,
+8-bit, ~85 MB), `whisper-small.en` (~270 MB) when accuracy matters more than
+latency. GGML `.bin` files from whisper.cpp cannot be loaded by wavo; the old
+tier constants are gone.
 
 ### 2.5 NLU
 
@@ -98,14 +100,18 @@ identity the text persona uses, not a second personality.
 
 ## 3. Crate layout
 
-> **Status (2026-11-22): superseded by implementation.** `crates/vikram-voice`
-> landed at `5a12d42` as a transport-only scaffold — actual files are
-> `lib.rs`, `helpers.rs`, `session.rs`, `vad.rs`
-> (`VoiceSession::{start,listen_once,speak,status}`, energy-gate VAD, helper
-> discovery), and the only dependency is `thiserror`. The layout below was the
-> plan; the capture/asr/tts/player stages remain helper-driven shells and
-> `cpal`/`whisper-rs`/`piper` are still not dependencies. No new contract
-> types were added, as planned.
+> **Status (2026-11-22, current): implemented and shipped.** `crates/vikram-voice`
+> now holds `asr.rs`, `capture.rs`, `player.rs`, `session.rs`, `vad.rs`,
+> `helpers.rs`, `cancel.rs`. Capture and playback are built-in `cpal` 0.18 with
+> the `pipewire` feature; ASR is **wavo 0.6** (pure Rust, wgpu/Vulkan, GGUF
+> models, downloaded once through the hub cache on the first utterance) with the
+> Voxtype fast path and a `whisper-cli` helper behind it; TTS is `piper` when an
+> ONNX voice is supplied, otherwise `espeak-ng`. The energy VAD now gates on a
+> measured noise floor instead of a fixed level. `whisper-rs`, whisper.cpp and
+> the `gpu`/vulkan feature were removed at `6a56df9`. Interfaces: CLI
+> `vikram voice status|listen|say|chat`, TUI `/voice` (hands-free loop) and
+> `Ctrl+G` (one dictation). The layout below is the original plan, kept for
+> history.
 
 New crate `crates/vikram-voice`, depending only on `vikram-contracts` for shared
 types (audio frames stay `Vec<i16>`/`Vec<f32>` primitives; no new contract types
