@@ -2905,7 +2905,7 @@ async fn build_completion_request(
     Ok(CompletionRequest {
         model: model.clone(),
         messages,
-        tools: inner.tools.specs(),
+        tools: inner.tools.specs_for_mode(inner.mode()),
         max_output_tokens: model_hook
             .effect
             .max_output_tokens
