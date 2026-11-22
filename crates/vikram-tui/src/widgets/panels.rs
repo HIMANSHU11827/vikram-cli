@@ -17,10 +17,16 @@ use vikram_runtime::types::{BotState, NoticeLevel, TaskState};
 use crate::app::{ActivityKind, App, BotClick, Focus, InspectorKind, Overlay, Selection, TabHit};
 use crate::theme::{StatusSegment, Theme};
 
+use super::preview;
+
 /// A tab is a reminder of what exists, not a synopsis of the session.
 const TAB_TITLE_CAP: usize = 22;
 const AGENT_NAME_CAP: usize = 14;
 const DIALOG_WIDTH: u16 = 62;
+/// Rows the docked approvals panel may take: a full preview, the question, and its answers.
+const APPROVAL_PANEL_MAX: u16 = 32;
+/// The column a request's body starts at, so a preview reads as part of the question above it.
+const APPROVAL_INDENT: &str = "   ";
 
 const HELP_ROWS: [(&str, &str); 19] = [
     ("Enter", "send the message"),
@@ -1357,10 +1363,12 @@ fn chip_row(
 /// How many rows the approvals panel needs when it is docked under the transcript.
 ///
 /// The caller reserves exactly this many rows so the question never covers the rows it is asking
-/// about: the transcript is laid out above the reserved strip and stays readable behind it.
+/// about: the transcript is laid out above the reserved strip and stays readable behind it. The
+/// ceiling leaves room for a full preview plus the answers; the caller still halves it against the
+/// transcript, so a preview cannot take the screen.
 pub fn approval_panel_height(app: &App, theme: &Theme) -> u16 {
     let (_, lines, _, _) = approval_lines(app, theme);
-    (lines.len() as u16 + 2).clamp(3, 16)
+    (lines.len() as u16 + 2).clamp(3, APPROVAL_PANEL_MAX)
 }
 
 /// The panel body plus the line each request header and answer button sits on, so a press can
@@ -1398,6 +1406,14 @@ fn approval_lines(app: &App, theme: &Theme) -> ApprovalBody {
                     format!("   proposed: {}", clip(amendment, 48, theme.ascii)),
                     Style::default().fg(theme.ok),
                 ));
+            }
+            // What the call will change, under the question it belongs to. A tool that cannot
+            // describe its effect carries no preview, and then the panel says exactly what it said
+            // before previews existed.
+            if let Some(preview) = &approval.preview {
+                for line in preview::preview_lines(preview, theme, preview::PREVIEW_LINES) {
+                    lines.push(indent(line, APPROVAL_INDENT));
+                }
             }
         }
     }
@@ -1817,6 +1833,12 @@ fn duration(ms: u64) -> String {
     }
 }
 
+fn indent(line: Line<'static>, prefix: &str) -> Line<'static> {
+    let mut spans = line.spans;
+    spans.insert(0, Span::raw(prefix.to_owned()));
+    Line::from(spans)
+}
+
 fn clip(text: &str, width: usize, ascii: bool) -> String {
     if width == 0 {
         return String::new();
@@ -1914,8 +1936,8 @@ mod tests {
     use ratatui::backend::TestBackend;
     use vikram_contracts::{ApprovalId, BotId, Message, SessionId};
     use vikram_runtime::types::{
-        ApprovalPrompt, BackgroundTask, BotProfile, BotSnapshot, BotState, ContextMeter,
-        ContextPart, Metrics, NoticeLevel, RuntimeStatus, SessionSnapshot, TurnState,
+        ApprovalPreview, ApprovalPrompt, BackgroundTask, BotProfile, BotSnapshot, BotState,
+        ContextMeter, ContextPart, Metrics, NoticeLevel, RuntimeStatus, SessionSnapshot, TurnState,
     };
 
     fn draw(width: u16, height: u16, render: impl FnOnce(&mut Frame)) -> String {
@@ -2315,6 +2337,102 @@ mod tests {
         assert!(
             rendered.contains("reverse-search input history"),
             "got {rendered}"
+        );
+    }
+
+    fn prompt(preview: Option<ApprovalPreview>) -> ApprovalPrompt {
+        ApprovalPrompt {
+            approval: ApprovalId::generate(),
+            session: SessionId::generate(),
+            verb: "fs.write".to_owned(),
+            resource: "/etc/hosts".to_owned(),
+            reason: "outside the workspace".to_owned(),
+            amendment: None,
+            preview,
+        }
+    }
+
+    fn approval_text(app: &App, theme: &Theme) -> Vec<String> {
+        approval_lines(app, theme)
+            .1
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_approval_without_a_preview_renders_exactly_as_before() {
+        let mut app = app_with_default_bots();
+        app.approvals.push(prompt(None));
+        // Byte-for-byte what the panel drew before previews existed: the header, the reason, the
+        // blank row, the four answers, and the key hint. Nothing is added for a tool that cannot
+        // describe its effect.
+        assert_eq!(
+            approval_text(&app, &Theme::new(true)),
+            vec![
+                "> * fs.write /etc/hosts",
+                "   outside the workspace",
+                "",
+                ">  Approve ",
+                "   Deny ",
+                "   Add to the allow list ",
+                "   Approve and add to the allow list ",
+                "  ↑↓ choose · enter confirm · a approve · d deny · p add",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_diff_preview_is_drawn_under_the_request() {
+        let mut app = app_with_default_bots();
+        app.approvals.push(prompt(Some(ApprovalPreview::Diff {
+            path: "src/main.rs".to_owned(),
+            before: "let a = 1;\n".to_owned(),
+            after: "let a = 2;\n".to_owned(),
+        })));
+        let lines = approval_text(&app, &Theme::new(false));
+        assert_eq!(lines[2], "   src/main.rs", "{lines:#?}");
+        assert_eq!(lines[3], "   -let a = 1;", "{lines:#?}");
+        assert_eq!(lines[4], "   +let a = 2;", "{lines:#?}");
+        // The question still comes last, so the answers are never pushed off by the preview.
+        assert!(lines.iter().any(|line| line.contains("Deny")), "{lines:#?}");
+    }
+
+    #[test]
+    fn a_command_preview_shows_the_directory_and_the_command() {
+        let mut app = app_with_default_bots();
+        app.approvals.push(prompt(Some(ApprovalPreview::Command {
+            program: "cargo".to_owned(),
+            args: vec!["test".to_owned(), "-p".to_owned(), "vikram-tui".to_owned()],
+            cwd: "/work".to_owned(),
+        })));
+        let lines = approval_text(&app, &Theme::new(false));
+        assert_eq!(lines[2], "   $ /work", "{lines:#?}");
+        assert_eq!(lines[3], "   cargo test -p vikram-tui", "{lines:#?}");
+    }
+
+    #[test]
+    fn a_preview_never_takes_more_than_its_row_budget() {
+        let mut app = app_with_default_bots();
+        let side: String = (0..300).map(|line| format!("line {line}\n")).collect();
+        app.approvals.push(prompt(Some(ApprovalPreview::Diff {
+            path: "big.txt".to_owned(),
+            before: side.clone(),
+            after: side,
+        })));
+        let lines = approval_text(&app, &Theme::new(false));
+        let preview_rows = lines
+            .iter()
+            .filter(|line| line.starts_with("   -") || line.starts_with("   +"))
+            .count();
+        assert!(
+            preview_rows <= crate::widgets::PREVIEW_LINES,
+            "{preview_rows} diff rows: {lines:#?}"
         );
     }
 

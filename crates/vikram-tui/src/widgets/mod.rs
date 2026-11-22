@@ -8,6 +8,7 @@ pub mod markdown;
 pub mod panels;
 pub mod payload;
 pub mod picker;
+pub mod preview;
 
 pub use conversation::{conversation, conversation_lines, extract_file_path};
 pub use panels::{
@@ -19,3 +20,4 @@ pub use picker::{
     Picker, PickerBody, PickerItem, PickerKind, Verb, picker_body, picker_lines, picker_title,
     wanted_width,
 };
+pub use preview::{PREVIEW_LINES, preview_lines, preview_text};
