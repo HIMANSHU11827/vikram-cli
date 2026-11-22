@@ -80,14 +80,19 @@ pub fn resolve_model(config: &VoiceConfig) -> Result<PathBuf> {
 
 pub fn probe_asr(config: &VoiceConfig) -> StageStatus {
     let fast_path = config.voxtype_fast_path && which(VOXTYPE).is_some();
+    let backend = if gpu_preferred() {
+        "vulkan gpu, cpu fallback"
+    } else {
+        "cpu only"
+    };
     match resolve_model(config) {
         Ok(model) => StageStatus::Ready(if fast_path {
             format!(
-                "voxtype fast path; built-in whisper.cpp ({})",
+                "voxtype fast path; built-in whisper.cpp ({}, {backend})",
                 model.display()
             )
         } else {
-            format!("built-in whisper.cpp ({})", model.display())
+            format!("built-in whisper.cpp ({}, {backend})", model.display())
         }),
         Err(err) => {
             if fast_path {
@@ -103,6 +108,28 @@ pub fn probe_asr(config: &VoiceConfig) -> StageStatus {
 
 fn whisper_error(err: whisper_rs::WhisperError) -> VoiceError {
     VoiceError::Helper(format!("whisper.cpp: {err:?}"))
+}
+
+/// Whether this build asks whisper.cpp for the GPU. With the `gpu` feature the answer is yes and
+/// the CPU is only a retry path; a `--no-default-features` build never opens a GPU device.
+pub fn gpu_preferred() -> bool {
+    cfg!(feature = "gpu")
+}
+
+/// Device preference order for context creation: the GPU where the build supports it, then the
+/// CPU, so a missing Vulkan driver degrades instead of failing.
+fn device_order() -> Vec<bool> {
+    if gpu_preferred() {
+        vec![true, false]
+    } else {
+        vec![false]
+    }
+}
+
+fn create_context(model: &PathBuf, use_gpu: bool) -> Result<WhisperContext> {
+    let mut params = WhisperContextParameters::default();
+    params.use_gpu(use_gpu);
+    WhisperContext::new_with_params(model, params).map_err(whisper_error)
 }
 
 /// The linked-in recognizer. Model load happens lazily on the first utterance so `status`
@@ -134,10 +161,26 @@ impl WhisperRecognizer {
                 )));
             }
             whisper_rs::install_logging_hooks();
-            let context =
-                WhisperContext::new_with_params(&self.model, WhisperContextParameters::default())
-                    .map_err(whisper_error)?;
-            self.context = Some(context);
+            let mut failure = None;
+            for use_gpu in device_order() {
+                match create_context(&self.model, use_gpu) {
+                    Ok(context) => {
+                        self.context = Some(context);
+                        break;
+                    }
+                    Err(err) => {
+                        if use_gpu {
+                            eprintln!("voice: whisper gpu unavailable ({err}); using cpu");
+                        }
+                        failure = Some(err);
+                    }
+                }
+            }
+            if self.context.is_none() {
+                return Err(failure.unwrap_or_else(|| {
+                    VoiceError::Helper("whisper.cpp: no device could be opened".into())
+                }));
+            }
         }
         if self.state.is_none() {
             let state = self
@@ -339,6 +382,21 @@ impl Recognizer for AsrEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gpu_build_tries_the_device_before_the_cpu() {
+        let order = device_order();
+        assert_eq!(
+            order.last(),
+            Some(&false),
+            "the cpu is always the last resort"
+        );
+        if gpu_preferred() {
+            assert_eq!(order.first(), Some(&true));
+        } else {
+            assert_eq!(order, vec![false]);
+        }
+    }
 
     fn config_with_dir(dir: &Path) -> VoiceConfig {
         VoiceConfig {
