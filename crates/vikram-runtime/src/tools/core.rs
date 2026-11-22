@@ -273,6 +273,7 @@ impl ToolRegistry {
         registry.register(Box::new(Diagnostics));
         registry.register(Box::new(Process));
         registry.register(Box::new(Task));
+        registry.register(Box::new(UpdatePlan));
         registry.register(Box::new(AskUser));
         registry.register(Box::new(MessagePoll));
         registry.register(Box::new(MessageCard));

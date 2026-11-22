@@ -340,3 +340,357 @@ impl Tool for Task {
         }
     }
 }
+
+/// One step of a session's plan, as the model wrote it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanStep {
+    pub text: String,
+    pub status: PlanStatus,
+}
+
+/// Where a step stands. Three states, because a checklist with more is a project tracker and this
+/// is what the agent is doing right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanStatus {
+    Pending,
+    InProgress,
+    Done,
+}
+
+impl PlanStatus {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "pending" => Some(Self::Pending),
+            "in_progress" => Some(Self::InProgress),
+            "done" => Some(Self::Done),
+            _ => None,
+        }
+    }
+
+    fn mark(self) -> &'static str {
+        match self {
+            Self::Pending => "[ ]",
+            Self::InProgress => "[>]",
+            Self::Done => "[x]",
+        }
+    }
+}
+
+/// The live plan for one session. It replaces the previous plan wholesale on every write: a plan
+/// that could only be appended to would grow a second copy of itself every time the agent changed
+/// its mind, which is the failure mode of a task list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Plan {
+    pub steps: Vec<PlanStep>,
+    /// 1 for the first write, then one per replacement. A UI can use it to tell a re-render from a
+    /// real change.
+    pub revision: u64,
+}
+
+impl Plan {
+    /// The checklist as text: what the model is handed back, and what an interface draws.
+    pub fn render(&self) -> String {
+        let done = self
+            .steps
+            .iter()
+            .filter(|step| step.status == PlanStatus::Done)
+            .count();
+        let mut out = format!("plan: {} steps ({done} done)\n", self.steps.len());
+        for step in &self.steps {
+            out.push_str(step.status.mark());
+            out.push(' ');
+            out.push_str(&step.text);
+            out.push('\n');
+        }
+        out.pop();
+        out
+    }
+}
+
+/// Plans are per session and live for the life of the process. They are deliberately not the
+/// global `tasks.json`: a task is something the operator keeps, a plan is what the agent is doing
+/// in this conversation, and merging the two would make every session's checklist one list.
+fn plans() -> &'static std::sync::Mutex<std::collections::HashMap<String, Plan>> {
+    static PLANS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Plan>>> =
+        std::sync::OnceLock::new();
+    PLANS.get_or_init(Default::default)
+}
+
+/// The plan the model last wrote for `session`, if it wrote one. This is the accessor an interface
+/// renders: the checklist is state, not a message, so it does not have to be re-read from the
+/// transcript.
+pub fn plan_for(session: &vikram_contracts::SessionId) -> Option<Plan> {
+    plans()
+        .lock()
+        .expect("plans lock")
+        .get(session.as_str())
+        .cloned()
+}
+
+/// Every live plan, in session order, for an interface that lists more than one session.
+pub fn all_plans() -> Vec<(String, Plan)> {
+    let mut out: Vec<(String, Plan)> = plans()
+        .lock()
+        .expect("plans lock")
+        .iter()
+        .map(|(session, plan)| (session.clone(), plan.clone()))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// A step count beyond this is a tracker, not a plan, and would spend the context it is meant to
+/// save. Refused rather than silently clipped: a clipped plan lies about what is left.
+const MAX_PLAN_STEPS: usize = 50;
+
+/// `update_plan` — the checklist the operator can watch. It replaces the session's plan and hands
+/// the rendered result back, so the model sees the same list the human does.
+pub(crate) struct UpdatePlan;
+
+impl Tool for UpdatePlan {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "update_plan".into(),
+            description: "Replace this session's plan with an ordered checklist. Send every step \
+                          each time: the list you send is the whole plan, and the previous one is \
+                          dropped. Use it for work that takes more than a step, and mark steps \
+                          done as you finish them."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "description": "the whole plan, in order",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": {"type": "string", "description": "one step, in the imperative"},
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "done"]
+                                }
+                            },
+                            "required": ["text", "status"]
+                        }
+                    }
+                },
+                "required": ["steps"]
+            }),
+        }
+    }
+
+    fn permission(&self, _args: &Value) -> Result<PermissionRequest, VikramError> {
+        // Session state, not a file or a process: `SideEffect::None` is what keeps a plan update
+        // from stopping a turn for an approval nobody needs to give.
+        Ok(PermissionRequest::new(
+            ActionKind::Write,
+            "session.plan",
+            "plan",
+            SideEffect::None,
+            Trust::Model,
+        ))
+    }
+
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+        let raw = args
+            .get("steps")
+            .ok_or_else(|| VikramError::ProviderRejected("missing array argument `steps`".into()))?
+            .as_array()
+            .ok_or_else(|| {
+                VikramError::ProviderRejected("argument `steps` must be an array of steps".into())
+            })?;
+        if raw.len() > MAX_PLAN_STEPS {
+            return Err(VikramError::ProviderRejected(format!(
+                "a plan of {} steps is too long; the limit is {MAX_PLAN_STEPS}. Send the next few \
+                 steps, not the whole project.",
+                raw.len()
+            )));
+        }
+        let mut steps = Vec::with_capacity(raw.len());
+        for (index, item) in raw.iter().enumerate() {
+            let text = item
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .ok_or_else(|| {
+                    VikramError::ProviderRejected(format!(
+                        "step {index} has no `text`: every step needs one imperative line"
+                    ))
+                })?;
+            let status = item.get("status").and_then(Value::as_str).ok_or_else(|| {
+                VikramError::ProviderRejected(format!("step {index} has no `status`"))
+            })?;
+            let status = PlanStatus::parse(status).ok_or_else(|| {
+                VikramError::ProviderRejected(format!(
+                    "step {index} has status `{status}`; the only statuses are `pending`, \
+                     `in_progress` and `done`"
+                ))
+            })?;
+            steps.push(PlanStep {
+                text: text.to_owned(),
+                status,
+            });
+        }
+        let key = ctx
+            .session
+            .as_ref()
+            .map(|session| session.as_str().to_owned())
+            .unwrap_or_default();
+        let plan = {
+            let mut plans = plans().lock().expect("plans lock");
+            let revision = plans.get(&key).map_or(1, |plan| plan.revision + 1);
+            let plan = Plan { steps, revision };
+            plans.insert(key, plan.clone());
+            plan
+        };
+        Ok(ToolOutput {
+            content: plan.render(),
+            ok: true,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vikram_contracts::SessionId;
+
+    fn ctx(session: &SessionId) -> ToolContext {
+        ToolContext {
+            session: Some(session.clone()),
+            ..ToolContext::default()
+        }
+    }
+
+    fn steps(value: Value) -> Value {
+        json!({ "steps": value })
+    }
+
+    #[test]
+    fn update_plan_replaces_the_plan_rather_than_appending_to_it() {
+        let session = SessionId::generate();
+        let first = UpdatePlan
+            .run(
+                &steps(json!([
+                    {"text": "read the failing test", "status": "in_progress"},
+                    {"text": "fix it", "status": "pending"},
+                    {"text": "run the suite", "status": "pending"},
+                ])),
+                &ctx(&session),
+            )
+            .expect("the first plan is accepted");
+        assert!(first.ok, "{}", first.content);
+        assert_eq!(plan_for(&session).expect("the plan is kept").steps.len(), 3);
+
+        let second = UpdatePlan
+            .run(
+                &steps(json!([
+                    {"text": "read the failing test", "status": "done"},
+                    {"text": "fix it", "status": "in_progress"},
+                ])),
+                &ctx(&session),
+            )
+            .expect("the second plan is accepted");
+        assert!(second.ok, "{}", second.content);
+
+        let plan = plan_for(&session).expect("the plan is kept");
+        assert_eq!(
+            plan.steps.len(),
+            2,
+            "the second plan is the whole plan: {plan:?}"
+        );
+        assert_eq!(plan.steps[1].text, "fix it");
+        assert_eq!(plan.steps[1].status, PlanStatus::InProgress);
+        assert_eq!(plan.revision, 2, "a replacement is a new revision");
+        assert!(
+            second.content.contains("[>] fix it"),
+            "the model is handed the same checklist the operator sees: {}",
+            second.content
+        );
+        assert!(
+            !second.content.contains("run the suite"),
+            "a dropped step does not linger in the rendered plan: {}",
+            second.content
+        );
+    }
+
+    #[test]
+    fn update_plan_validates_every_status() {
+        let session = SessionId::generate();
+        let out = UpdatePlan
+            .run(
+                &steps(json!([
+                    {"text": "a", "status": "pending"},
+                    {"text": "b", "status": "in_progress"},
+                    {"text": "c", "status": "done"},
+                ])),
+                &ctx(&session),
+            )
+            .expect("all three statuses are legal");
+        let plan = plan_for(&session).expect("the plan is kept");
+        assert_eq!(
+            plan.steps.iter().map(|s| s.status).collect::<Vec<_>>(),
+            vec![
+                PlanStatus::Pending,
+                PlanStatus::InProgress,
+                PlanStatus::Done
+            ]
+        );
+        assert!(out.content.contains("(1 done)"), "{}", out.content);
+    }
+
+    #[test]
+    fn update_plan_rejects_an_unknown_status() {
+        let session = SessionId::generate();
+        let err = UpdatePlan
+            .run(
+                &steps(json!([{"text": "fix it", "status": "doing"}])),
+                &ctx(&session),
+            )
+            .expect_err("an unknown status is refused, not defaulted");
+        let text = err.to_string();
+        assert!(text.contains("doing"), "{text}");
+        assert!(text.contains("in_progress"), "{text}");
+        assert!(
+            plan_for(&session).is_none(),
+            "a refused plan does not replace the last good one"
+        );
+    }
+
+    #[test]
+    fn update_plan_rejects_a_step_without_text_and_an_oversized_plan() {
+        let session = SessionId::generate();
+        assert!(
+            UpdatePlan
+                .run(
+                    &steps(json!([{"text": "  ", "status": "pending"}])),
+                    &ctx(&session)
+                )
+                .is_err(),
+            "an empty step is not a step"
+        );
+        let too_many: Vec<Value> = (0..MAX_PLAN_STEPS + 1)
+            .map(|n| json!({"text": format!("step {n}"), "status": "pending"}))
+            .collect();
+        assert!(
+            UpdatePlan
+                .run(&steps(Value::Array(too_many)), &ctx(&session))
+                .is_err(),
+            "a plan longer than the limit is refused, never clipped"
+        );
+    }
+
+    #[test]
+    fn a_plan_update_never_needs_an_approval() {
+        let request = UpdatePlan
+            .permission(&steps(json!([])))
+            .expect("the permission shape is valid");
+        assert_eq!(
+            request.side_effect,
+            SideEffect::None,
+            "session state, so no posture has to stop for it"
+        );
+    }
+}

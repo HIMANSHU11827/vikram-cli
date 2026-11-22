@@ -54,3 +54,7 @@ pub(crate) mod web;
 
 #[cfg(test)]
 mod tests;
+
+// The live plan is session state an interface draws beside the transcript, not a message, so the
+// accessor is exported from the crate rather than living only inside the tool that writes it.
+pub use crate::tools::process::{Plan, PlanStatus, PlanStep, all_plans, plan_for};
