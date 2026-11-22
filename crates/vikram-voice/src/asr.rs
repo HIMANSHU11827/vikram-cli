@@ -19,6 +19,10 @@ use wavo::hub::Hub;
 /// The hub name of the default tier: 80 MB, English, 7× faster than whisper-turbo.
 pub const DEFAULT_MODEL: &str = "whisper-base.en";
 
+/// A caption needs at least 100 ms of 16 kHz audio; below that the answer is an empty string,
+/// so a caller can caption from the first frame without an error.
+const MIN_PARTIAL_SAMPLES: usize = 1_600;
+
 /// `$VIKRAM_HOME`, else `~/.vikram`: the same root `vikram_runtime::config::vikram_home` uses.
 /// Mirrored here because `docs/voice-plan.md` §3 keeps this crate off the runtime's dependency
 /// graph; the mirror must track any change to the runtime's convention.
@@ -220,6 +224,51 @@ impl WavoRecognizer {
         let text = transcript.text.trim();
         Ok((!text.is_empty()).then(|| text.to_owned()))
     }
+
+    /// Load the model only if it is already on disk: a caption never starts a download.
+    fn ensure_resolved(&mut self) -> Result<&wavo::Model> {
+        if self.model.is_none() {
+            let path = match &self.source {
+                ModelSource::File(model) => {
+                    if !model.is_file() {
+                        return Err(VoiceError::ModelMissing(format!(
+                            "model file {} disappeared since startup",
+                            model.display()
+                        )));
+                    }
+                    model.clone()
+                }
+                ModelSource::Hub(name) => match hub(&self.dir).find(name) {
+                    Some(path) if path.is_file() => path,
+                    _ => {
+                        return Err(VoiceError::ModelMissing(format!(
+                            "{name} is not downloaded under {}; live captions never download \
+                             mid-stream — run `wavo pull {name}`",
+                            self.dir.display()
+                        )));
+                    }
+                },
+            };
+            self.model = Some(wavo::Model::load(&path).map_err(wavo_error)?);
+        }
+        Ok(self.model.as_ref().expect("model loaded"))
+    }
+
+    /// The transcript of the buffer so far, for captioning while the operator is still speaking.
+    /// A buffer under 100 ms is an empty caption, not an error, and the model must already be on
+    /// disk: a caption must never stall on a download or a model that is still missing.
+    pub fn transcribe_partial(&mut self, pcm: &[i16]) -> Result<String> {
+        if pcm.len() < MIN_PARTIAL_SAMPLES {
+            return Ok(String::new());
+        }
+        let options = self.options();
+        let model = self.ensure_resolved()?;
+        let audio: Vec<f32> = pcm.iter().map(|sample| *sample as f32 / 32768.0).collect();
+        let transcript = model
+            .transcribe_with(&audio, &options)
+            .map_err(wavo_error)?;
+        Ok(transcript.text.trim().to_owned())
+    }
 }
 
 impl Recognizer for WavoRecognizer {
@@ -336,6 +385,21 @@ impl AsrEngine {
             helper_name: config.asr_helper.clone(),
             model_error,
             notes: Vec::new(),
+        }
+    }
+
+    /// A caption for the audio so far: the built-in wavo engine only, never the voxtype CLI
+    /// (it transcribes whole utterances) and never a mid-stream model download.
+    pub fn transcribe_partial(&mut self, pcm: &[i16]) -> Result<String> {
+        if pcm.len() < MIN_PARTIAL_SAMPLES {
+            return Ok(String::new());
+        }
+        match self.wavo.as_mut() {
+            Some(wavo) => wavo.transcribe_partial(pcm),
+            None => match self.model_error.clone() {
+                Some(err) => Err(VoiceError::ModelMissing(err)),
+                None => Ok(String::new()),
+            },
         }
     }
 }
@@ -553,6 +617,61 @@ mod tests {
         let engine = AsrEngine::new(&config);
         let recognizer = engine.wavo.expect("a model file arms the built-in engine");
         assert!(recognizer.options().language.is_none());
+    }
+
+    #[test]
+    fn a_short_buffer_is_an_empty_caption_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_dir(dir.path());
+        let mut recognizer = WavoRecognizer::from_config(&config);
+        assert_eq!(recognizer.transcribe_partial(&[]).unwrap(), "");
+        assert_eq!(
+            recognizer
+                .transcribe_partial(&vec![0i16; MIN_PARTIAL_SAMPLES - 1])
+                .unwrap(),
+            ""
+        );
+        let mut engine = AsrEngine::new(&config);
+        assert_eq!(engine.transcribe_partial(&[0i16; 10]).unwrap(), "");
+    }
+
+    #[test]
+    fn an_unresolved_hub_model_is_an_error_that_names_it_and_downloads_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_dir(dir.path());
+        let mut recognizer = WavoRecognizer::from_config(&config);
+        let err = recognizer
+            .transcribe_partial(&vec![0i16; MIN_PARTIAL_SAMPLES])
+            .unwrap_err();
+        assert!(err.to_string().contains(DEFAULT_MODEL), "{err}");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "a caption must never download mid-stream"
+        );
+        let mut engine = AsrEngine::new(&config);
+        let err = engine
+            .transcribe_partial(&vec![0i16; MIN_PARTIAL_SAMPLES])
+            .unwrap_err();
+        assert!(err.to_string().contains(DEFAULT_MODEL), "{err}");
+    }
+
+    #[test]
+    #[ignore = "hardware/model test: needs a downloaded wavo model and VIKRAM_VOICE_TEST_WAV"]
+    fn a_partial_transcript_captions_a_resolved_model() {
+        let Ok(wav) = std::env::var("VIKRAM_VOICE_TEST_WAV") else {
+            return;
+        };
+        let config = VoiceConfig::default();
+        resolve_model(&config).expect("a model must be downloaded");
+        let mut reader = hound::WavReader::open(&wav).expect("fixture wav must decode");
+        let pcm: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap()).collect();
+        let mut recognizer = WavoRecognizer::from_config(&config);
+        let text = recognizer
+            .transcribe_partial(&pcm)
+            .expect("partial inference must run on a resolved model");
+        eprintln!("partial: {text}");
+        assert!(!text.is_empty(), "a full utterance must caption something");
     }
 
     #[test]
