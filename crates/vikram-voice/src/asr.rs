@@ -38,7 +38,7 @@ pub fn models_dir() -> PathBuf {
 
 /// Where a model comes from: a file on disk, or a hub name the engine may download once.
 #[derive(Clone, Debug, PartialEq)]
-enum ModelSource {
+pub(crate) enum ModelSource {
     File(PathBuf),
     Hub(String),
 }

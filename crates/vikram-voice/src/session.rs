@@ -5,7 +5,7 @@ use crate::helpers::{
     write_wav,
 };
 use crate::player::DevicePlayer;
-use crate::vad::{is_silent, trim_silence};
+use crate::vad::detect_speech;
 use crate::{AsrEngine, Result, StageStatus, VoiceConfig, VoiceError, VoiceStatus, probe};
 use std::fs;
 use std::path::PathBuf;
@@ -347,20 +347,15 @@ where
             self.phase = VoicePhase::Idle;
             return Ok(None);
         }
-        if is_silent(&pcm, self.config.rms_threshold) {
-            self.phase = VoicePhase::Idle;
-            return Ok(None);
-        }
-        let (start, end) = trim_silence(
+        let Some((start, end)) = detect_speech(
             &pcm,
             self.config.rms_threshold,
             self.config.hangover_ms,
             self.config.sample_rate,
-        );
-        if start == end {
+        ) else {
             self.phase = VoicePhase::Idle;
             return Ok(None);
-        }
+        };
         self.phase = VoicePhase::Transcribing;
         let turn = self
             .recognizer
@@ -465,10 +460,13 @@ mod tests {
         (session, calls, heard)
     }
 
+    /// A word inside a quiet room: the gate needs a floor to measure against and a burst long
+    /// enough to count as speech, so a bare tone is not a valid fixture any more.
     fn speech() -> Vec<i16> {
-        (0..3_200)
-            .map(|i| ((i as f64 * 0.08).sin() * 16_000.0) as i16)
-            .collect()
+        let mut pcm = vec![0i16; 1_600];
+        pcm.extend((0..4_800).map(|i| ((i as f64 * 0.08).sin() * 16_000.0) as i16));
+        pcm.extend(vec![0i16; 1_600]);
+        pcm
     }
 
     #[test]

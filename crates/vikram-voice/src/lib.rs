@@ -29,7 +29,7 @@ pub use session::{
     AudioSource, HelperPlayer, HelperRecognizer, HelperSource, HelperSynth, Player, Recognizer,
     Synthesizer, VoiceSession,
 };
-pub use vad::{is_silent, trim_silence};
+pub use vad::{detect_speech, is_silent, noise_floor, speech_gate, trim_silence};
 
 use std::path::PathBuf;
 use thiserror::Error;
