@@ -125,6 +125,7 @@ impl WhisperRecognizer {
                     BASE_TIER.1
                 )));
             }
+            whisper_rs::install_logging_hooks();
             let context =
                 WhisperContext::new_with_params(&self.model, WhisperContextParameters::default())
                     .map_err(whisper_error)?;
@@ -146,15 +147,17 @@ impl WhisperRecognizer {
         cancel.check()?;
         let language = self.language.clone();
         let state = self.ensure_loaded()?;
-        let abort = cancel.clone();
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_language(language.as_deref());
         params.set_print_progress(false);
         params.set_print_timestamps(false);
         params.set_suppress_nst(true);
-        params.set_abort_callback_safe(move || abort.is_cancelled());
         let mut audio = vec![0f32; pcm.len()];
         whisper_rs::convert_integer_to_float_audio(pcm, &mut audio).map_err(whisper_error)?;
+        // Mid-inference abort exists upstream (`set_abort_callback_safe`), but whisper-rs
+        // 0.16.0 miswires its trampoline — the double-boxed closure is cast back to the wrong
+        // type, so the callback reads garbage and aborts every encode. Until that is fixed
+        // upstream, cancellation lands here: before inference and on its completion.
         state.full(params, &audio).map_err(whisper_error)?;
         if cancel.is_cancelled() {
             return Err(VoiceError::Cancelled);
@@ -352,5 +355,29 @@ mod tests {
         let engine = AsrEngine::new(&config_with_dir(dir.path()));
         assert!(engine.whisper.is_some());
         assert!(engine.model_error.is_none());
+    }
+
+    #[test]
+    #[ignore = "hardware/model test: needs a model under ~/.vikram/models and VIKRAM_VOICE_TEST_WAV"]
+    fn transcribes_real_speech_with_a_downloaded_model() {
+        let Ok(wav) = std::env::var("VIKRAM_VOICE_TEST_WAV") else {
+            return;
+        };
+        let config = VoiceConfig::default();
+        let model = resolve_model(&config).expect("a model must resolve");
+        let mut reader = hound::WavReader::open(&wav).expect("fixture wav must decode");
+        let pcm: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap()).collect();
+        assert!(
+            pcm.len() > 16_000,
+            "fixture must hold at least one second of audio"
+        );
+        let started = std::time::Instant::now();
+        let mut recognizer = WhisperRecognizer::new(model, None);
+        let text = recognizer
+            .transcribe(&pcm)
+            .expect("whisper must run")
+            .expect("real speech must produce a transcript");
+        eprintln!("transcript ({:?}): {text}", started.elapsed());
+        assert!(text.split_whitespace().count() >= 3);
     }
 }
