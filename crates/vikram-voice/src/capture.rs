@@ -11,10 +11,17 @@ use crate::session::AudioSource;
 use crate::vad::detect_speech;
 use crate::{HelperSource, Result, VoiceConfig, VoiceError};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const POLL: Duration = Duration::from_millis(50);
+
+/// How long the consumer waits past the take's own cap before it stops waiting for the capture
+/// thread. The thread stops itself at `max_ms`; this is the margin for dropping the stream and
+/// resampling, after which a missing take is an error instead of a wait with no end.
+const TAKE_SLACK: Duration = Duration::from_secs(2);
 
 /// When a take is over. The gate is the VAD's own (`vad::detect_speech`, the same noise floor
 /// and ratio the session applies afterwards), fed the samples as they arrive, so capture stops
@@ -338,6 +345,47 @@ fn stream_capture(
     Ok(resample(&pcm, rate, u32::from(config_rate)))
 }
 
+/// The consumer half of the live path: hand each chunk over until the take arrives, and stop on
+/// the deadline instead of waiting for a message that may never come. The capture thread owns the
+/// device and can wedge inside a backend call with no way to signal; a turn that waits on it
+/// forever is a hang the operator cannot tell from a slow model, so the wait is bounded here as
+/// well as in the thread.
+fn wait_for_take(
+    rx: &mpsc::Receiver<LiveMsg>,
+    deadline: Instant,
+    over: &AtomicBool,
+    on_chunk: &mut dyn FnMut(&[i16]),
+    cancel: &CancelToken,
+) -> Result<Vec<i16>> {
+    loop {
+        if cancel.is_cancelled() {
+            return Err(VoiceError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(VoiceError::NoDevice(
+                "input capture did not finish in time".into(),
+            ));
+        }
+        match rx.recv_timeout(POLL) {
+            Ok(LiveMsg::Chunk(chunk)) => {
+                // Chunks still queued after the take ended are history, not something the
+                // speaker is saying: draining them keeps a slow captioner out of the way.
+                if !over.load(Ordering::SeqCst) {
+                    on_chunk(&chunk);
+                }
+            }
+            Ok(LiveMsg::Done(pcm)) => return Ok(pcm),
+            Ok(LiveMsg::Failed(err)) => return Err(VoiceError::NoDevice(err)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(VoiceError::NoDevice(
+                    "input capture thread stopped without a take".into(),
+                ));
+            }
+        }
+    }
+}
+
 /// One capture from the configured input device (the host default when unset), converted to
 /// config-rate mono i16.
 pub struct CpalSource {
@@ -428,6 +476,11 @@ impl AudioSource for CpalSource {
         let config_rate = self.sample_rate;
         let stop = self.stop;
         let thread_cancel = cancel.clone();
+        // Set the moment the take is over, before the take itself is sent: from then on the
+        // chunks still queued are history, not something the speaker is saying, so they are
+        // drained instead of handed to the captioner.
+        let over = Arc::new(AtomicBool::new(false));
+        let thread_over = over.clone();
         let capture = std::thread::spawn(move || {
             let result = stream_capture(
                 device.as_deref(),
@@ -437,6 +490,7 @@ impl AudioSource for CpalSource {
                 &thread_cancel,
                 &tx,
             );
+            thread_over.store(true, Ordering::SeqCst);
             match result {
                 Ok(pcm) => {
                     let _ = tx.send(LiveMsg::Done(pcm));
@@ -448,22 +502,8 @@ impl AudioSource for CpalSource {
                 }
             }
         });
-        let outcome = loop {
-            if cancel.is_cancelled() {
-                break Err(VoiceError::Cancelled);
-            }
-            match rx.recv_timeout(POLL) {
-                Ok(LiveMsg::Chunk(chunk)) => on_chunk(&chunk),
-                Ok(LiveMsg::Done(pcm)) => break Ok(pcm),
-                Ok(LiveMsg::Failed(err)) => break Err(VoiceError::NoDevice(err)),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    break Err(VoiceError::NoDevice(
-                        "input capture thread stopped without a take".into(),
-                    ));
-                }
-            }
-        };
+        let deadline = Instant::now() + Duration::from_millis(max_ms.max(1)) + TAKE_SLACK;
+        let outcome = wait_for_take(&rx, deadline, &over, on_chunk, cancel);
         // Joining on every path is what guarantees no stream outlives the call: the thread drops
         // the cpal stream when its loop ends, and its loop polls the token every 50 ms.
         let _ = capture.join();
@@ -744,6 +784,102 @@ mod tests {
             .to_string();
         assert!(err.contains("No Such Microphone"), "{err}");
         assert!(err.contains(&default), "{err}");
+    }
+
+    fn live() -> (mpsc::Sender<LiveMsg>, mpsc::Receiver<LiveMsg>) {
+        mpsc::channel()
+    }
+
+    fn soon() -> Instant {
+        Instant::now() + Duration::from_millis(60)
+    }
+
+    #[test]
+    fn a_take_that_never_arrives_is_an_error_not_a_wait() {
+        let (tx, rx) = live();
+        let over = AtomicBool::new(false);
+        let mut tapped = 0usize;
+        let started = Instant::now();
+        let result = wait_for_take(
+            &rx,
+            soon(),
+            &over,
+            &mut |_| tapped += 1,
+            &CancelToken::new(),
+        );
+        assert!(
+            matches!(result, Err(VoiceError::NoDevice(_))),
+            "a silent capture thread must not become an endless wait: {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "it must give up promptly"
+        );
+        assert_eq!(tapped, 0);
+        drop(tx);
+    }
+
+    #[test]
+    fn the_take_is_returned_and_the_chunks_before_it_are_tapped() {
+        let (tx, rx) = live();
+        let over = AtomicBool::new(false);
+        let mut tapped: Vec<i16> = Vec::new();
+        tx.send(LiveMsg::Chunk(vec![1, 2])).unwrap();
+        tx.send(LiveMsg::Chunk(vec![3])).unwrap();
+        tx.send(LiveMsg::Done(vec![1, 2, 3, 4])).unwrap();
+        let take = wait_for_take(
+            &rx,
+            soon(),
+            &over,
+            &mut |chunk| tapped.extend_from_slice(chunk),
+            &CancelToken::new(),
+        )
+        .expect("the take was sent");
+        assert_eq!(take, vec![1, 2, 3, 4]);
+        assert_eq!(tapped, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn chunks_still_queued_after_the_take_ended_are_drained_not_captioned() {
+        let (tx, rx) = live();
+        // The thread marks the take over before sending it, exactly as `record_streaming` does.
+        let over = AtomicBool::new(true);
+        let mut tapped = 0usize;
+        tx.send(LiveMsg::Chunk(vec![1, 2])).unwrap();
+        tx.send(LiveMsg::Done(vec![1, 2])).unwrap();
+        let take = wait_for_take(
+            &rx,
+            soon(),
+            &over,
+            &mut |_| tapped += 1,
+            &CancelToken::new(),
+        )
+        .expect("the take was sent");
+        assert_eq!(take, vec![1, 2]);
+        assert_eq!(tapped, 0, "the backlog is history, not speech");
+    }
+
+    #[test]
+    fn a_cancelled_consumer_stops_waiting() {
+        let (_tx, rx) = live();
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let result = wait_for_take(&rx, soon(), &AtomicBool::new(false), &mut |_| {}, &cancel);
+        assert!(matches!(result, Err(VoiceError::Cancelled)), "{result:?}");
+    }
+
+    #[test]
+    fn an_input_device_that_cannot_open_is_named_in_the_error() {
+        let config = VoiceConfig {
+            input_device: Some("No Such Microphone".into()),
+            ..Default::default()
+        };
+        let mut source = CpalSource::start(&config);
+        let err = source
+            .record_streaming(200, &CancelToken::new(), &mut |_| {})
+            .expect_err("a device that is not there cannot record");
+        let text = err.to_string();
+        assert!(text.contains("No Such Microphone"), "{text}");
     }
 
     #[test]
