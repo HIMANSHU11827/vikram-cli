@@ -33,6 +33,9 @@ pub const EVENT_DEDUP_MS: Millis = 60_000;
 pub enum TriggerKind {
     /// Something was posted into a conversation through the postbox.
     Postbox,
+    /// A path a job subscribes to changed on disk. The daemon polls the paths its jobs name,
+    /// so the watch is declared by the subscription itself: `on file.changed:<path>`.
+    FileChanged,
     /// A job's run settled — succeeded, failed, was cancelled or skipped.
     JobSettled,
     /// A notification was delivered (or attempted) for a finished run.
@@ -43,6 +46,7 @@ impl TriggerKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Postbox => "postbox",
+            Self::FileChanged => "file.changed",
             Self::JobSettled => "job.settled",
             Self::Notify => "notify",
         }
@@ -53,6 +57,7 @@ impl TriggerKind {
     pub fn parse(text: &str) -> Result<Self, TriggerError> {
         match text.trim().to_ascii_lowercase().as_str() {
             "postbox" => Ok(Self::Postbox),
+            "file.changed" => Ok(Self::FileChanged),
             "job.settled" => Ok(Self::JobSettled),
             "notify" => Ok(Self::Notify),
             other => Err(TriggerError::UnknownTrigger(other.to_string())),
@@ -106,7 +111,9 @@ impl Trigger {
 
 #[derive(Debug, thiserror::Error)]
 pub enum TriggerError {
-    #[error("unknown trigger `{0}`: use `on postbox`, `on job.settled` or `on notify`")]
+    #[error(
+        "unknown trigger `{0}`: use `on postbox`, `on file.changed`, `on job.settled` or `on notify`"
+    )]
     UnknownTrigger(String),
     #[error("trigger `{0}` names a kind but no subject; write `kind:subject` or just `kind`")]
     EmptySubject(String),
@@ -387,6 +394,19 @@ mod tests {
             trail.iter().any(|row| row.kind == "quiet.set"),
             "a quiet-hours change must be audited: {trail:?}"
         );
+    }
+
+    #[test]
+    fn a_file_changed_trigger_parses_and_keeps_the_paths_case() {
+        let trigger = Trigger::parse("file.changed:/tmp/Notes.TXT").unwrap();
+        assert_eq!(trigger.kind, TriggerKind::FileChanged);
+        assert_eq!(trigger.subject.as_deref(), Some("/tmp/Notes.TXT"));
+        assert!(trigger.matches(TriggerKind::FileChanged, "/tmp/Notes.TXT"));
+        assert!(
+            !trigger.matches(TriggerKind::FileChanged, "/tmp/notes.txt"),
+            "a path is not a name: case is part of it"
+        );
+        assert_eq!(trigger.describe(), "file.changed:/tmp/Notes.TXT");
     }
 
     #[test]

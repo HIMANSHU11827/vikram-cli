@@ -128,7 +128,11 @@ impl Schedule {
 
         // `on <trigger>` subscribes to an internal event instead of a clock. The trigger is
         // validated here so a job can never be created for a signal the daemon cannot produce.
-        if let Some(rest) = lower.strip_prefix("on ") {
+        // The subject is read from the text as typed rather than the lowercased copy: a subject
+        // can be a file path, and a path's case is part of the path. (The slice is safe because
+        // `lower` differs from `spec` only by ASCII case, so the first three bytes match.)
+        if lower.starts_with("on ") {
+            let rest = spec[3..].trim();
             let trigger =
                 Trigger::parse(rest).map_err(|err| ScheduleError::BadTrigger(err.to_string()))?;
             return Ok(Schedule::Event { trigger });
@@ -821,5 +825,23 @@ mod tests {
     fn a_trigger_the_daemon_does_not_produce_is_refused() {
         let err = Schedule::parse("on smoke-signal", Zone::Utc, at(2026, 11, 3, 0, 0)).unwrap_err();
         assert!(err.to_string().contains("smoke-signal"), "{err}");
+    }
+
+    #[test]
+    fn a_trigger_subject_keeps_its_case() {
+        let schedule = Schedule::parse(
+            "on file.changed:/tmp/Notes.TXT",
+            Zone::Utc,
+            at(2026, 11, 3, 0, 0),
+        )
+        .unwrap();
+        let Schedule::Event { trigger } = schedule else {
+            panic!("an `on` schedule is a subscription, not a clock");
+        };
+        assert_eq!(
+            trigger.subject.as_deref(),
+            Some("/tmp/Notes.TXT"),
+            "a subject can be a path, and a path's case is part of the path"
+        );
     }
 }

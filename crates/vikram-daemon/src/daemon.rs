@@ -406,6 +406,8 @@ impl Daemon {
         }
 
         // Events land before the due scan so a job armed by one is claimed in this same pass.
+        // The watch scan goes first of all so a change observed this pass is drained this pass.
+        self.scan_watches(now)?;
         self.drain_events(now, &mut report)?;
 
         let quiet = QuietHours::load(&self.store)?;
@@ -587,6 +589,67 @@ impl Daemon {
         }
         if latest != seen {
             self.store.set_state_ms(SEEN_KEY, latest)?;
+        }
+        Ok(())
+    }
+
+    /// Poll the paths the jobs themselves declare through `on file.changed:<path>`. A first
+    /// sighting is a baseline, not a change: the watch starts when the subscription is first
+    /// seen, so creating it does not fire the job. From then on any difference in the path's
+    /// stamp is a signal, emitted through the same bus every other trigger uses. Snapshots live
+    /// in `daemon_state`, so a restart re-baselines instead of replaying a change it missed.
+    fn scan_watches(&self, now: Millis) -> Result<(), StoreError> {
+        let mut paths: Vec<String> = Vec::new();
+        for job in self.store.list_jobs()? {
+            if !job.enabled {
+                continue;
+            }
+            let Some(trigger) = self.jobs.trigger_of(&job) else {
+                continue;
+            };
+            if trigger.kind == TriggerKind::FileChanged
+                && let Some(path) = trigger.subject
+                && !paths.contains(&path)
+            {
+                paths.push(path);
+            }
+        }
+        for path in &paths {
+            let key = format!("watch.{path}");
+            let seen = self.store.state(&key)?;
+            match std::fs::metadata(path) {
+                Ok(meta) => {
+                    let stamp = file_stamp(&meta);
+                    match seen.as_deref() {
+                        None => {
+                            self.store.set_state(&key, &stamp)?;
+                        }
+                        Some(prev) if prev != stamp => {
+                            self.store.set_state(&key, &stamp)?;
+                            self.emit(TriggerKind::FileChanged, path, "modified", now)?;
+                        }
+                        Some(_) => {}
+                    }
+                }
+                // A watched path disappearing is a change too — the last one it will report.
+                Err(err) if err.kind() == ErrorKind::NotFound => {
+                    if seen.is_some() {
+                        let _ = self.store.delete_state(&key);
+                        self.emit(TriggerKind::FileChanged, path, "removed", now)?;
+                    }
+                }
+                // Unreadable is not removed: keep the snapshot and say nothing, rather than
+                // firing on a permission problem that is not the operator's change.
+                Err(_) => {}
+            }
+        }
+        // A watch nobody subscribes to anymore is litter, not history.
+        for key in self.store.state_keys("watch.")? {
+            if let Some(path) = key.strip_prefix("watch.")
+                && !paths.iter().any(|live| live == path)
+            {
+                let _ = self.store.delete_state(&key);
+            }
         }
         Ok(())
     }
@@ -982,6 +1045,19 @@ fn class_of(mode: JobMode) -> TaskClass {
         JobMode::Agent | JobMode::Delegate => TaskClass::Agent,
         JobMode::Workflow => TaskClass::Workflow,
     }
+}
+
+/// The comparison key for a watched path: modification time to the millisecond, plus size. Two
+/// writes inside one millisecond that also agree on size are one change — the polling trade for
+/// observing a file with no platform watcher of our own.
+fn file_stamp(meta: &std::fs::Metadata) -> String {
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|span| span.as_millis() as i64)
+        .unwrap_or_default();
+    format!("{modified}:{}", meta.len())
 }
 
 /// A job and its run, for callers that want to show both without a second lookup.
@@ -1687,5 +1763,47 @@ mod tests {
         assert!(refused.to_string().contains("smoke-signal"));
         let trail = store.audit_trail(20).unwrap();
         assert!(trail.iter().any(|row| row.kind == "trigger.refused"));
+    }
+
+    #[tokio::test]
+    async fn file_change_trigger_fires_end_to_end() {
+        let store = store();
+        let manager = JobManager::new(store.clone());
+        let now = time::now_ms();
+        let dir = home();
+        let watched = dir.path().join("Notes.TXT");
+        std::fs::write(&watched, "first draft").unwrap();
+        let job = manager
+            .create(
+                NewJob::new("on notes", format!("on file.changed:{}", watched.display()))
+                    .mode(JobMode::Script)
+                    .payload("echo saw the change")
+                    .target("none"),
+                now,
+            )
+            .unwrap();
+
+        let mut daemon = Daemon::new(store.clone(), dir.path()).with_tick_ms(50);
+        // The first pass records what the file looks like now; nothing has changed yet.
+        let baseline = daemon.tick(now).await.unwrap();
+        assert!(baseline.triggered.is_empty(), "{:?}", baseline.triggered);
+        assert!(store.runs_for(&job.id, 5).unwrap().is_empty());
+
+        std::fs::write(&watched, "second draft, longer").unwrap();
+        let woke = daemon.tick(time::now_ms()).await.unwrap();
+        assert_eq!(woke.triggered, vec![job.id.clone()]);
+        assert_eq!(woke.dispatched, vec![job.id.clone()]);
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        daemon.tick(time::now_ms()).await.unwrap();
+        let runs = store.runs_for(&job.id, 5).unwrap();
+        assert_eq!(runs.len(), 1, "one change is one fire");
+        assert_eq!(runs[0].status, RunStatus::Ok);
+        assert!(runs[0].output.contains("saw the change"));
+
+        // A pass with no further change fires nothing more.
+        let idle = daemon.tick(time::now_ms()).await.unwrap();
+        assert!(idle.triggered.is_empty(), "{:?}", idle.triggered);
+        assert_eq!(store.runs_for(&job.id, 5).unwrap().len(), 1);
     }
 }
