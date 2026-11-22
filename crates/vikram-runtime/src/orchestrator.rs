@@ -469,7 +469,7 @@ mod tests {
         }
 
         fn context_window(&self) -> Option<u64> {
-            Some(8192)
+            Some(32_768)
         }
 
         fn stream(&self, _request: CompletionRequest) -> ProviderStream {
@@ -674,6 +674,200 @@ mod tests {
         assert!(
             !dir.path().join("elsewhere").join("out.txt").exists(),
             "a denied write must leave no effect behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_trust_is_monotonic_narrower() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let scope_a = dir.path().join("scope").to_string_lossy().into_owned();
+        let outside = dir.path().join("OUTSIDE");
+        // One scripted round, consumed by the first worker spawned; every later turn sees an
+        // empty stream and ends immediately, so phases stay independent of turn scheduling.
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::ToolCall(vikram_contracts::ToolCall::new(
+                "spawn_worker",
+                serde_json::json!({
+                    "objective": "spawn a worker that can write anywhere",
+                    "output_format": "text",
+                    "tool_allowlist": ["fs.write"],
+                    "file_scope": ["/"],
+                    "boundary": "none",
+                }),
+            )),
+            ProviderEvent::Finished {
+                input_tokens: Some(4),
+                output_tokens: Some(4),
+            },
+        ]]);
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::clone(&provider) as Arc<dyn Provider>,
+        )
+        .await
+        .expect("runtime boots with the scripted provider");
+        let handle = runtime.handle();
+        let parent = handle.snapshot().sessions[0].id.clone();
+        let mut events = handle.events();
+
+        // Phase one — a worker without the grant tries to mint trust by spawning.
+        let mut escape = plain_brief(dir.path());
+        escape.tool_allowlist = vec!["fs.read".into()];
+        escape.file_scope = vec![scope_a.clone()];
+        let escape_id = handle
+            .spawn_worker(parent.clone(), escape, None)
+            .expect("the ungranted worker spawns");
+        let escape_record = handle.inner.workers.by_id(&escape_id).unwrap();
+        let _ = settle_worker(&handle, &mut events, &escape_id).await;
+
+        // The escape was refused by the policy machine, and it stayed childless: a denial
+        // cannot be routed around by minting a new worker.
+        let store = vikram_store::Store::open(&crate::config::database_path()).unwrap();
+        let records = store.replay_messages(&escape_record.session).unwrap();
+        let denial = records
+            .iter()
+            .find(|record| {
+                record.kind == vikram_contracts::RecordKind::Policy
+                    && record
+                        .payload
+                        .get("verb")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("spawn_worker")
+            })
+            .expect("the escape attempt is journaled as a policy decision");
+        assert_eq!(
+            denial
+                .payload
+                .get("evaluated")
+                .and_then(serde_json::Value::as_str),
+            Some("deny")
+        );
+        let reason = denial
+            .payload
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(reason.contains("tool allowlist"), "{reason}");
+        assert_eq!(
+            handle.inner.workers.list().len(),
+            1,
+            "the refused spawn created nothing"
+        );
+
+        // Phase two — a worker WITH the grant still cannot hand down more than it holds.
+        let mut granted = plain_brief(dir.path());
+        granted.tool_allowlist = vec!["fs.read".into(), "fs.write".into(), "spawn_worker".into()];
+        granted.file_scope = vec![scope_a.clone()];
+        let granted_id = handle
+            .spawn_worker(parent.clone(), granted, None)
+            .expect("the granted worker spawns");
+        let granted_record = handle.inner.workers.by_id(&granted_id).unwrap();
+        let _ = settle_worker(&handle, &mut events, &granted_id).await;
+
+        // The granted worker's child asked for more than its parent holds — and got the
+        // intersection, not the ask.
+        let mut greedy = plain_brief(dir.path());
+        greedy.tool_allowlist = vec![
+            "fs.read".into(),
+            "fs.write".into(),
+            "spawn_worker".into(),
+            "shell.run".into(),
+        ];
+        greedy.file_scope = vec![scope_a.clone(), outside.to_string_lossy().into_owned()];
+        let child_id = handle
+            .spawn_worker(granted_record.session.clone(), greedy, None)
+            .expect("a granted worker may spawn");
+        let child = handle.inner.workers.by_id(&child_id).unwrap();
+        assert_eq!(child.depth, 2);
+        assert_eq!(
+            child.scope.tools,
+            Some(vec![
+                "fs.read".to_owned(),
+                "fs.write".to_owned(),
+                "spawn_worker".to_owned(),
+            ]),
+            "`shell.run` was never the parent's to grant"
+        );
+        assert_eq!(
+            child.scope.file_scope,
+            Some(vec![scope_a.clone()]),
+            "the outside path was cut at spawn"
+        );
+        // Nothing the child holds reaches outside its parent, whatever the brief claimed.
+        let parent_scope = granted_record.scope.clone();
+        for tool in child.scope.tools.as_deref().unwrap_or(&[]) {
+            assert!(parent_scope.allows_verb(tool), "child gained `{tool}`");
+        }
+        for root in child.scope.file_scope.as_deref().unwrap_or(&[]) {
+            assert!(
+                parent_scope.contains_path(root),
+                "child gained file reach `{root}`"
+            );
+        }
+
+        // A denial the parent earned is inherited by every descendant; a denial the
+        // orchestrator itself earned (the floor) is inherited by every worker and sibling.
+        let beyond = PermissionRequest::new(
+            vikram_contracts::ActionKind::Write,
+            "fs.write",
+            outside.join("x.txt").to_string_lossy().into_owned(),
+            vikram_contracts::SideEffect::LocalMutation,
+            Trust::Model,
+        );
+        for (scope, depth) in [
+            (granted_record.scope.clone(), 1u32),
+            (child.scope.clone(), 2),
+        ] {
+            match handle.inner.judge_scoped(&beyond, &scope, depth) {
+                vikram_contracts::policy::Decision::Deny { reason } => {
+                    assert!(reason.contains("file scope"), "{reason}")
+                }
+                other => panic!("the inherited denial was lost, got {other:?}"),
+            }
+        }
+        let floor_denied = PermissionRequest::new(
+            vikram_contracts::ActionKind::Write,
+            "fs.write",
+            "/etc/passwd",
+            vikram_contracts::SideEffect::LocalMutation,
+            Trust::Model,
+        );
+        let mut sibling = plain_brief(dir.path());
+        sibling.file_scope = vec![scope_a.clone(), outside.to_string_lossy().into_owned()];
+        let sibling_id = handle
+            .spawn_worker(parent.clone(), sibling, None)
+            .expect("a sibling may spawn with its own brief");
+        let sibling_scope = handle.inner.workers.by_id(&sibling_id).unwrap().scope;
+        for scope in [
+            CapabilityScope::unrestricted(),
+            granted_record.scope.clone(),
+            child.scope.clone(),
+            sibling_scope.clone(),
+        ] {
+            assert!(
+                matches!(
+                    handle.inner.judge_scoped(&floor_denied, &scope, 1),
+                    vikram_contracts::policy::Decision::Deny { .. }
+                ),
+                "what the orchestrator cannot do, nobody below it can re-obtain"
+            );
+        }
+
+        // The chain is cut at the floor: the grandchild exists, and its own spawn is refused.
+        let mut chain = plain_brief(dir.path());
+        chain.tool_allowlist = vec!["fs.read".into()];
+        chain.file_scope = vec![scope_a.clone()];
+        let grandchild_id = handle
+            .spawn_worker(child.session.clone(), chain.clone(), None)
+            .expect("depth 3 is the last link the floor permits");
+        let grandchild = handle.inner.workers.by_id(&grandchild_id).unwrap();
+        let refused = handle
+            .spawn_worker(grandchild.session.clone(), chain, None)
+            .expect_err("depth 4 exceeds the delegation floor");
+        assert!(
+            refused.to_string().contains("delegation depth"),
+            "{refused}"
         );
     }
 }
