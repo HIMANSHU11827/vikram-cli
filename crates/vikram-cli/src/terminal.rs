@@ -489,6 +489,22 @@ fn toggle_voice_mode(app: &mut App, events: &Sender<VoiceEvent>, mode: &mut Voic
 /// The worker's whole life: listen, report, wait to be told what to say, speak, listen again. It
 /// never listens while it speaks — the reply comes out of the same room, and a microphone left open
 /// would transcribe the assistant's own voice as the operator's next turn.
+/// Trace one line about the voice worker when `VIKRAM_VOICE_DEBUG` is set. A worker that stops
+/// listening leaves no trace on screen, so the only way to see where it stopped is a log.
+fn vdebug(message: &str) {
+    if std::env::var_os("VIKRAM_VOICE_DEBUG").is_none() {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/vikram-voice-debug.log")
+    {
+        let _ = writeln!(file, "{message}");
+    }
+}
+
 fn voice_worker(jobs: Receiver<VoiceJob>, events: Sender<VoiceEvent>) {
     // The mode runs on the operator's saved settings — language, devices, gate, voice — not on
     // defaults, or `/voice` would quietly undo everything `voice config set` recorded.
@@ -513,28 +529,38 @@ fn voice_worker(jobs: Receiver<VoiceJob>, events: Sender<VoiceEvent>) {
         }
     };
     loop {
+        vdebug("worker: listening");
         match session.listen_once() {
             Ok(Some(text)) if !text.trim().is_empty() => {
+                vdebug(&format!("worker: heard {} chars", text.len()));
                 if events.send(VoiceEvent::Heard(text)).is_err() {
+                    vdebug("worker: host gone while sending Heard");
                     return;
                 }
             }
             Ok(_) => {
                 if events.send(VoiceEvent::Empty).is_err() {
+                    vdebug("worker: host gone while sending Empty");
                     return;
                 }
             }
             Err(err) => {
+                vdebug(&format!("worker: listen failed: {err}"));
                 let _ = events.send(VoiceEvent::Failed(err.to_string()));
                 return;
             }
         }
         match jobs.recv() {
             Ok(VoiceJob::Speak(text)) => {
-                let _ = session.speak(&text);
+                vdebug(&format!("worker: speaking {} bytes", text.len()));
+                let spoken = session.speak(&text);
+                vdebug(&format!("worker: spoke {spoken:?}"));
             }
-            Ok(VoiceJob::Skip) => {}
-            Ok(VoiceJob::Stop) | Err(_) => return,
+            Ok(VoiceJob::Skip) => vdebug("worker: skip"),
+            Ok(VoiceJob::Stop) | Err(_) => {
+                vdebug("worker: stop");
+                return;
+            }
         }
     }
 }
