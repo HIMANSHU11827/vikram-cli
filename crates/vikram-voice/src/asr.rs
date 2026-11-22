@@ -336,9 +336,18 @@ fn last_paragraph(stdout: &[u8]) -> Option<String> {
 /// Progress lines voxtype prints around the transcript: VAD summaries, whisper.cpp diagnostics
 /// (`whisper_model_load:`, `whisper_backend_init_gpu:`, …), and bracketed status lines.
 fn is_progress_output(paragraph: &str) -> bool {
-    paragraph.lines().all(|line| {
+    // A transcript paragraph never carries engine chatter. `any` rather than `all` because
+    // voxtype prints its diagnostics in one block: "Loading audio file: …" followed by
+    // "Audio format: …" and "Processing N samples" is a paragraph whose first line is a log
+    // line and whose rest are too, and the old `all` test let it through as a transcript.
+    paragraph.lines().any(|line| {
         let line = line.trim_start();
         line.starts_with("VAD")
+            || line.starts_with("Loading audio file")
+            || line.starts_with("Audio format:")
+            || line.starts_with("Processing ")
+            || line.starts_with("Detected language")
+            || line.starts_with("Transcrib")
             || line.starts_with("whisper_")
             || line.starts_with("ggml_")
             || line.starts_with("main:")
