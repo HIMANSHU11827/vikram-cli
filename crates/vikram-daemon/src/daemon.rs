@@ -577,6 +577,26 @@ impl Daemon {
                 if kind == TriggerKind::JobSettled && row.subject == job.id {
                     continue;
                 }
+                // And a trigger may not start a model turn on its own say-so. An operator
+                // arming a slot is approval; a signal arming one is not, so the job's config
+                // has to say yes explicitly, and a refusal is a recorded decision, not a skip.
+                if spawns_agent_turn(job.mode) && !job.auto_approve {
+                    self.store.audit(
+                        "trigger.approval",
+                        &job.id,
+                        &format!(
+                            "{}:{} would start a {} turn; --auto-approve allows it",
+                            kind.as_str(),
+                            row.subject,
+                            job.mode.as_str()
+                        ),
+                        now,
+                    )?;
+                    report
+                        .refused
+                        .push(format!("{}: trigger needs --auto-approve", job.id));
+                    continue;
+                }
                 if self.store.set_next_run(&job.id, Some(now), now)? {
                     armed.push(job.id.clone());
                 }
@@ -1066,6 +1086,13 @@ fn class_of(mode: JobMode) -> TaskClass {
         JobMode::Agent | JobMode::Delegate => TaskClass::Agent,
         JobMode::Workflow => TaskClass::Workflow,
     }
+}
+
+/// The modes that start a model turn, and are therefore behind the approval boundary when a
+/// trigger — not an operator — is doing the waking. A script runs a command the operator wrote;
+/// an agent, delegate or workflow turn spends the operator's model on the trigger's behalf.
+fn spawns_agent_turn(mode: JobMode) -> bool {
+    matches!(mode, JobMode::Agent | JobMode::Delegate | JobMode::Workflow)
 }
 
 /// The comparison key for a watched path: modification time to the millisecond, plus size. Two
@@ -1654,6 +1681,77 @@ mod tests {
             .collect();
         assert_eq!(lines.len(), 1, "one notification for one fire: {log}");
         assert!(lines[0].contains("trigger"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn trigger_respects_approval_boundary() {
+        let store = store();
+        let manager = JobManager::new(store.clone());
+        let now = time::now_ms();
+        // A delegate turn is a model turn: a trigger may not start one unless the job opts in.
+        let held = manager
+            .create(
+                NewJob::new("held agent", "on postbox")
+                    .mode(JobMode::Delegate)
+                    .payload("summarise the mail")
+                    .target("none"),
+                now,
+            )
+            .unwrap();
+        let allowed = manager
+            .create(
+                NewJob::new("approved agent", "on postbox")
+                    .mode(JobMode::Delegate)
+                    .payload("summarise the mail")
+                    .target("none")
+                    .auto_approve(true),
+                now,
+            )
+            .unwrap();
+        let dir = home();
+        let mut daemon = Daemon::new(store.clone(), dir.path()).with_tick_ms(50);
+
+        daemon
+            .bus()
+            .emit("postbox", "note-1", "mail landed", now)
+            .unwrap();
+        let woke = daemon.tick(time::now_ms()).await.unwrap();
+        assert!(
+            !woke.dispatched.contains(&held.id),
+            "no agent turn unless the job opts in: {:?}",
+            woke.dispatched
+        );
+        assert!(
+            woke.dispatched.contains(&allowed.id),
+            "the opted-in job is dispatched: {:?}",
+            woke.dispatched
+        );
+        assert!(store.runs_for(&held.id, 5).unwrap().is_empty());
+
+        // The held job stays armed, and the refusal is on the record naming the rule.
+        let held_job = store.get_job(&held.id).unwrap().unwrap();
+        assert!(held_job.enabled, "the subscription survives the refusal");
+        assert!(held_job.next_run_ms.is_none(), "the trigger never armed it");
+        let trail = store.audit_trail(50).unwrap();
+        assert!(
+            trail
+                .iter()
+                .any(|row| row.kind == "trigger.approval" && row.subject == held.id),
+            "the boundary decision is audited: {trail:?}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        daemon.tick(time::now_ms()).await.unwrap();
+        assert_eq!(
+            store.runs_for(&held.id, 5).unwrap().len(),
+            0,
+            "still no turn for the held job"
+        );
+        assert_eq!(
+            store.runs_for(&allowed.id, 5).unwrap().len(),
+            1,
+            "the opted-in job did get its turn"
+        );
     }
 
     #[tokio::test]

@@ -167,6 +167,10 @@ pub struct Job {
     pub last_run_ms: Option<Millis>,
     pub next_run_ms: Option<Millis>,
     pub last_status: String,
+    /// Whether a trigger — as opposed to an operator — may start this job's agent turn without
+    /// an approval step. Deny by default: `on postbox` waking a script is automation, but
+    /// `on postbox` waking a model turn is a decision, and the job's config has to say yes.
+    pub auto_approve: bool,
 }
 
 impl Job {
@@ -198,6 +202,7 @@ impl Job {
             last_run_ms: None,
             next_run_ms: None,
             last_status: "never".into(),
+            auto_approve: false,
         }
     }
 }
@@ -349,6 +354,7 @@ impl ScheduleStore {
             "TEXT NOT NULL DEFAULT 'parallel'",
         )?;
         self.add_column("daemon_runs", "delivery_note", "TEXT NOT NULL DEFAULT ''")?;
+        self.add_column("daemon_jobs", "auto_approve", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(())
     }
 
@@ -376,9 +382,9 @@ impl ScheduleStore {
         conn.execute(
             "INSERT INTO daemon_jobs (id, name, description, schedule, timezone, mode, payload,
                  target, agent, bot, timeout_ms, retries, priority, order_mode, enabled,
-                 created_ms, updated_ms, last_run_ms, next_run_ms, last_status)
+                 created_ms, updated_ms, last_run_ms, next_run_ms, last_status, auto_approve)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                 ?17, ?18, ?19, ?20)",
+                 ?17, ?18, ?19, ?20, ?21)",
             params![
                 job.id,
                 job.name,
@@ -400,6 +406,7 @@ impl ScheduleStore {
                 job.last_run_ms,
                 job.next_run_ms,
                 job.last_status,
+                i64::from(job.auto_approve),
             ],
         )?;
         Ok(())
@@ -412,7 +419,7 @@ impl ScheduleStore {
             "UPDATE daemon_jobs SET name = ?2, description = ?3, schedule = ?4, timezone = ?5,
                  mode = ?6, payload = ?7, target = ?8, agent = ?9, bot = ?10, timeout_ms = ?11,
                  retries = ?12, priority = ?13, order_mode = ?14, enabled = ?15, updated_ms = ?16,
-                 last_run_ms = ?17, next_run_ms = ?18, last_status = ?19
+                 last_run_ms = ?17, next_run_ms = ?18, last_status = ?19, auto_approve = ?20
              WHERE id = ?1",
             params![
                 job.id,
@@ -434,6 +441,7 @@ impl ScheduleStore {
                 job.last_run_ms,
                 job.next_run_ms,
                 job.last_status,
+                i64::from(job.auto_approve),
             ],
         )?;
         if changed == 0 {
@@ -1108,7 +1116,7 @@ impl ScheduleStore {
 
 const JOB_COLUMNS: &str = "id, name, description, schedule, timezone, mode, payload, target, agent,
     bot, timeout_ms, retries, priority, enabled, created_ms, updated_ms, last_run_ms, next_run_ms,
-    last_status, order_mode";
+    last_status, order_mode, auto_approve";
 
 /// Newest first, with the slot and the attempt as tiebreakers. Runs started in the same
 /// millisecond — which is normal in a test and possible in a burst — must still come back in a
@@ -1228,6 +1236,7 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         // Kept exactly as written; the runner reads it with a fallback, so a word from a newer
         // build cannot stop the job from running.
         order: row.get(19)?,
+        auto_approve: row.get::<_, i64>(20)? != 0,
     })
 }
 

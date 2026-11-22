@@ -35,6 +35,8 @@ pub struct NewJob {
     /// How a team job runs its members: `parallel` or `sequential`.
     pub order: String,
     pub enabled: bool,
+    /// Whether a trigger may start this job's agent turn without an approval step.
+    pub auto_approve: bool,
 }
 
 impl NewJob {
@@ -108,6 +110,13 @@ impl NewJob {
 
     pub fn order(mut self, order: impl Into<String>) -> Self {
         self.order = order.into();
+        self
+    }
+
+    /// Say yes on the job's behalf where the approval boundary is concerned: a trigger may
+    /// start this job's agent turn. Anything else — the default — keeps the boundary shut.
+    pub fn auto_approve(mut self, auto_approve: bool) -> Self {
+        self.auto_approve = auto_approve;
         self
     }
 }
@@ -210,6 +219,7 @@ impl JobManager {
             draft.order
         };
         job.enabled = draft.enabled;
+        job.auto_approve = draft.auto_approve;
         job.created_ms = now;
         job.updated_ms = now;
 

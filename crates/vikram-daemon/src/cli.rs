@@ -406,6 +406,8 @@ pub struct Draft {
     /// How a hive job runs its members: `parallel` or `sequential`.
     pub order: Option<String>,
     pub enabled: Option<bool>,
+    /// Let a trigger start this job's agent turn without an approval step (`--auto-approve`).
+    pub auto_approve: Option<bool>,
 }
 
 impl Draft {
@@ -458,6 +460,9 @@ impl Draft {
         }
         if let Some(enabled) = self.enabled {
             job = job.enabled(enabled);
+        }
+        if let Some(auto_approve) = self.auto_approve {
+            job = job.auto_approve(auto_approve);
         }
         // A job that names nobody to run it fails on its first slot, hours after the typo and
         // possibly overnight. Refuse it while the operator is still looking at the command.
@@ -532,6 +537,9 @@ pub fn cron_show(needle: &str) -> Result<String, String> {
     );
     if !job.description.is_empty() {
         text.push_str(&format!("description: {}\n", job.description));
+    }
+    if job.auto_approve {
+        text.push_str("auto-approve: a trigger may start this agent turn\n");
     }
     if let Some(timeout) = job.timeout_ms {
         text.push_str(&format!("timeout: {}\n", humanize_ms(timeout)));
@@ -613,6 +621,9 @@ pub fn cron_edit(needle: &str, draft: &Draft) -> Result<String, String> {
         } else if job.next_run_ms.is_none() {
             job.next_run_ms = manager.next_slot(&job, now_ms());
         }
+    }
+    if let Some(auto_approve) = draft.auto_approve {
+        job.auto_approve = auto_approve;
     }
     job.updated_ms = now_ms();
     // Same rule as creation: an edited job that names nobody would only fail at its next slot.
