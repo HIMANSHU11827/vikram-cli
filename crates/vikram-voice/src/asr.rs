@@ -142,6 +142,8 @@ pub struct WavoRecognizer {
     dir: PathBuf,
     language: Option<String>,
     model: Option<wavo::Model>,
+    /// Where the model actually runs, once it has loaded: adapter name and graphics API.
+    backend: Option<String>,
 }
 
 impl WavoRecognizer {
@@ -151,7 +153,13 @@ impl WavoRecognizer {
             dir,
             language,
             model: None,
+            backend: None,
         }
+    }
+
+    /// The adapter the model is running on, or `None` before the first utterance.
+    pub fn backend(&self) -> Option<&str> {
+        self.backend.as_deref()
     }
 
     /// Build from a resolved config: the same source rules the rest of the module uses.
@@ -203,7 +211,20 @@ impl WavoRecognizer {
                     _ => self.download(name)?,
                 },
             };
-            let model = wavo::Model::load(&path).map_err(wavo_error)?;
+            // Vulkan first, on purpose: the operator asked for the GPU, and an integrated Intel
+            // part is still several times faster than the CPU on these kernels. A driver that
+            // cannot provide it falls back to whatever wavo would have picked, and says so.
+            let model = match wavo::Model::load_with(&path, wavo::Backend::Gpu) {
+                Ok(model) => model,
+                Err(err) => {
+                    eprintln!("voice: no gpu backend ({err}); transcribing on the cpu");
+                    wavo::Model::load(&path).map_err(wavo_error)?
+                }
+            };
+            let device = model.device();
+            let label = format!("{} ({:?})", device.name, device.api);
+            eprintln!("voice: asr on {label}");
+            self.backend = Some(label);
             self.model = Some(model);
         }
         Ok(self.model.as_ref().expect("model loaded"))
