@@ -3524,4 +3524,144 @@ mod tests {
             other => panic!("unexpected command: {other:?}"),
         }
     }
+
+    #[test]
+    fn voice_listen_parses_every_override_flag() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "vikram",
+            "voice",
+            "listen",
+            "--enable",
+            "--language",
+            "en",
+            "--input-device",
+            "USB Mic",
+            "--output-device",
+            "Speakers",
+            "--threshold",
+            "0.02",
+            "--min-speech",
+            "300",
+            "--floor-ratio",
+            "4.5",
+        ])
+        .expect("every override flag parses");
+        match cli.command {
+            Some(Command::Voice {
+                action:
+                    voice::VoiceAction::Listen {
+                        enable, overrides, ..
+                    },
+            }) => {
+                assert!(enable);
+                assert_eq!(overrides.language.as_deref(), Some("en"));
+                assert_eq!(overrides.input_device.as_deref(), Some("USB Mic"));
+                assert_eq!(overrides.output_device.as_deref(), Some("Speakers"));
+                assert_eq!(overrides.threshold, Some(0.02));
+                assert_eq!(overrides.min_speech_ms, Some(300));
+                assert_eq!(overrides.floor_ratio, Some(4.5));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn voice_chat_parses_every_override_flag() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "vikram",
+            "voice",
+            "chat",
+            "--enable",
+            "--asr-model",
+            "/tmp/ggml-base.en.bin",
+            "--language",
+            "de",
+            "--input-device",
+            "USB Mic",
+            "--output-device",
+            "Speakers",
+            "--threshold",
+            "0.03",
+            "--min-speech",
+            "150",
+            "--floor-ratio",
+            "3.5",
+            "--fresh",
+        ])
+        .expect("every override flag parses on chat too");
+        match cli.command {
+            Some(Command::Voice {
+                action:
+                    voice::VoiceAction::Chat {
+                        asr_model,
+                        fresh,
+                        overrides,
+                        ..
+                    },
+            }) => {
+                assert_eq!(
+                    asr_model.as_deref(),
+                    Some(std::path::Path::new("/tmp/ggml-base.en.bin"))
+                );
+                assert!(fresh);
+                assert_eq!(overrides.language.as_deref(), Some("de"));
+                assert_eq!(overrides.input_device.as_deref(), Some("USB Mic"));
+                assert_eq!(overrides.output_device.as_deref(), Some("Speakers"));
+                assert_eq!(overrides.threshold, Some(0.03));
+                assert_eq!(overrides.min_speech_ms, Some(150));
+                assert_eq!(overrides.floor_ratio, Some(3.5));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn voice_overrides_default_to_none_so_the_saved_config_wins() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["vikram", "voice", "listen", "--enable"])
+            .expect("no override flags is a valid invocation");
+        match cli.command {
+            Some(Command::Voice {
+                action: voice::VoiceAction::Listen { overrides, .. },
+            }) => assert_eq!(overrides, voice::OverrideArgs::default()),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn voice_config_set_parses_a_key_and_a_value() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "vikram",
+            "voice",
+            "config",
+            "set",
+            "input_device",
+            "USB Mic",
+        ])
+        .expect("config set takes two positionals");
+        match cli.command {
+            Some(Command::Voice {
+                action:
+                    voice::VoiceAction::Config {
+                        action: voice::VoiceConfigAction::Set { key, value },
+                    },
+            }) => {
+                assert_eq!(key, "input_device");
+                assert_eq!(value, "USB Mic");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["vikram", "voice", "config", "path"]).expect("path parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Voice {
+                action: voice::VoiceAction::Config {
+                    action: voice::VoiceConfigAction::Path
+                }
+            })
+        ));
+    }
 }
