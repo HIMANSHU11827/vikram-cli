@@ -69,6 +69,9 @@ pub struct VoiceConfig {
     pub models_dir: Option<PathBuf>,
     /// None lets whisper auto-detect the spoken language.
     pub asr_language: Option<String>,
+    /// Use the detected voxtype CLI as the ASR fast path. Absence changes nothing: the
+    /// built-in whisper engine is the primary path either way.
+    pub voxtype_fast_path: bool,
     pub asr_timeout_secs: u64,
     pub tts_helper: String,
     pub tts_fallback: String,
@@ -91,6 +94,7 @@ impl Default for VoiceConfig {
             asr_model: PathBuf::new(),
             models_dir: None,
             asr_language: None,
+            voxtype_fast_path: true,
             asr_timeout_secs: 120,
             tts_helper: "piper".into(),
             tts_fallback: "espeak-ng".into(),

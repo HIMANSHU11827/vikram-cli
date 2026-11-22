@@ -8,7 +8,7 @@
 //! note for `VoiceStatus`.
 
 use crate::cancel::CancelToken;
-use crate::helpers::which;
+use crate::helpers::{Scratch, run, which, write_wav};
 use crate::session::Recognizer;
 use crate::{Result, StageStatus, VoiceConfig, VoiceError};
 use std::path::{Path, PathBuf};
@@ -79,17 +79,25 @@ pub fn resolve_model(config: &VoiceConfig) -> Result<PathBuf> {
 }
 
 pub fn probe_asr(config: &VoiceConfig) -> StageStatus {
+    let fast_path = config.voxtype_fast_path && which(VOXTYPE).is_some();
     match resolve_model(config) {
-        Ok(model) => {
-            let fallback = which(&config.asr_helper)
-                .map(|_| format!("; runtime fallback: {}", config.asr_helper))
-                .unwrap_or_default();
-            StageStatus::Ready(format!(
-                "built-in whisper.cpp ({}){fallback}",
+        Ok(model) => StageStatus::Ready(if fast_path {
+            format!(
+                "voxtype fast path; built-in whisper.cpp ({})",
                 model.display()
-            ))
+            )
+        } else {
+            format!("built-in whisper.cpp ({})", model.display())
+        }),
+        Err(err) => {
+            if fast_path {
+                StageStatus::Degraded(format!(
+                    "voxtype fast path only; built-in whisper model missing: {err}"
+                ))
+            } else {
+                StageStatus::Missing(err.to_string())
+            }
         }
-        Err(err) => StageStatus::Missing(err.to_string()),
     }
 }
 
@@ -189,11 +197,67 @@ impl Recognizer for WhisperRecognizer {
     }
 }
 
-/// The ASR chain: built-in whisper first, whisper-cli helper only as a runtime fallback.
-/// A whisper failure that reaches the helper is recorded as a degrade note, and a missing
-/// model is reported as the model's own error — whisper-cli needs the same model file, so
-/// a missing model is never rescued by the helper.
+/// The voxtype CLI's name, the one external binary this crate may call — only when it is
+/// already on PATH, never as a requirement.
+pub const VOXTYPE: &str = "voxtype";
+
+/// The transcript is the stdout paragraph after the last blank line: `voxtype -q transcribe`
+/// prints its progress first and the text last, which is the observed CLI contract this
+/// parses against.
+fn last_paragraph(stdout: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stdout);
+    let text = text.trim();
+    let tail = text
+        .rsplit_once("\n\n")
+        .map(|(_, tail)| tail)
+        .unwrap_or(text);
+    let tail = tail.trim();
+    (!tail.is_empty()).then(|| tail.to_owned())
+}
+
+/// The optional fast path: voxtype's own engine stack (GPU-accelerated where available) over
+/// the same 16 kHz mono WAV. Present only when the binary is detected; absence never affects
+/// the built-in path.
+pub struct VoxtypeRecognizer {
+    timeout_secs: u64,
+    sample_rate: u16,
+}
+
+impl VoxtypeRecognizer {
+    /// `None` when the operator disabled the fast path or the binary is not on PATH.
+    pub fn detect(config: &VoiceConfig) -> Option<Self> {
+        if !config.voxtype_fast_path || which(VOXTYPE).is_none() {
+            return None;
+        }
+        Some(Self {
+            timeout_secs: config.asr_timeout_secs,
+            sample_rate: config.sample_rate,
+        })
+    }
+}
+
+impl Recognizer for VoxtypeRecognizer {
+    fn transcribe(&mut self, pcm: &[i16]) -> Result<Option<String>> {
+        let scratch = Scratch::new()?;
+        let wav = scratch.path().join("utterance.wav");
+        write_wav(&wav, pcm, self.sample_rate)?;
+        let wav = wav.to_string_lossy().into_owned();
+        let stdout = run(
+            VOXTYPE,
+            &["-q", "transcribe", &wav],
+            None,
+            self.timeout_secs,
+        )?;
+        Ok(last_paragraph(&stdout))
+    }
+}
+
+/// The ASR chain: the detected voxtype fast path first, built-in whisper second, the
+/// whisper-cli helper only as a runtime fallback. Every handoff is recorded as a degrade
+/// note for `VoiceStatus`, and a missing model is reported as the model's own error —
+/// whisper-cli needs the same model file, so a missing model is never rescued by the helper.
 pub struct AsrEngine {
+    voxtype: Option<VoxtypeRecognizer>,
     whisper: Option<WhisperRecognizer>,
     helper: crate::HelperRecognizer,
     helper_name: String,
@@ -211,6 +275,7 @@ impl AsrEngine {
             Err(err) => (None, Some(err.to_string())),
         };
         Self {
+            voxtype: VoxtypeRecognizer::detect(config),
             whisper,
             helper: crate::HelperRecognizer::new(config),
             helper_name: config.asr_helper.clone(),
@@ -231,6 +296,15 @@ impl Recognizer for AsrEngine {
         cancel: &CancelToken,
     ) -> Result<Option<String>> {
         cancel.check()?;
+        if let Some(voxtype) = self.voxtype.as_mut() {
+            match voxtype.transcribe_cancellable(pcm, cancel) {
+                Ok(text) => return Ok(text),
+                Err(VoiceError::Cancelled) => return Err(VoiceError::Cancelled),
+                Err(err) => self.notes.push(format!(
+                    "voxtype fast path failed: {err}; trying built-in whisper"
+                )),
+            }
+        }
         if let Some(whisper) = self.whisper.as_mut() {
             match whisper.transcribe_cancellable(pcm, cancel) {
                 Ok(text) => return Ok(text),
@@ -240,7 +314,8 @@ impl Recognizer for AsrEngine {
                     helper_name = self.helper_name
                 )),
             }
-        } else if let Some(err) = self.model_error.clone() {
+        }
+        if let Some(err) = self.model_error.clone() {
             return Err(VoiceError::ModelMissing(err));
         }
         self.helper.transcribe(pcm)
@@ -323,10 +398,16 @@ mod tests {
         std::fs::write(ready_dir.path().join("ggml-base.bin"), b"weights").unwrap();
 
         let missing = probe_asr(&config_with_dir(dir.path()));
-        let StageStatus::Missing(reason) = missing else {
-            panic!("expected missing, got {missing:?}")
-        };
-        assert!(reason.contains(BASE_TIER.1));
+        match missing {
+            StageStatus::Degraded(reason) => {
+                assert!(reason.contains("voxtype fast path only"));
+                assert!(reason.contains(BASE_TIER.1));
+            }
+            StageStatus::Missing(reason) => {
+                assert!(reason.contains(BASE_TIER.1), "{reason}");
+            }
+            other => panic!("a missing model must not look ready: {other:?}"),
+        }
 
         let ready = probe_asr(&config_with_dir(ready_dir.path()));
         let StageStatus::Ready(detail) = ready else {
@@ -338,7 +419,11 @@ mod tests {
     #[test]
     fn a_chain_without_a_model_fails_with_the_model_error_not_the_helper() {
         let dir = tempfile::tempdir().unwrap();
-        let mut engine = AsrEngine::new(&config_with_dir(dir.path()));
+        let config = VoiceConfig {
+            voxtype_fast_path: false,
+            ..config_with_dir(dir.path())
+        };
+        let mut engine = AsrEngine::new(&config);
         let err = engine.transcribe(&[0i16; 160]).unwrap_err();
         assert!(matches!(err, VoiceError::ModelMissing(_)));
         assert!(err.to_string().contains(BASE_TIER.1));
@@ -355,6 +440,65 @@ mod tests {
         let engine = AsrEngine::new(&config_with_dir(dir.path()));
         assert!(engine.whisper.is_some());
         assert!(engine.model_error.is_none());
+    }
+
+    #[test]
+    fn the_voxtype_fast_path_can_be_switched_off_entirely() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ggml-base.bin"), b"weights").unwrap();
+        let config = VoiceConfig {
+            voxtype_fast_path: false,
+            ..config_with_dir(dir.path())
+        };
+        assert!(VoxtypeRecognizer::detect(&config).is_none());
+        let engine = AsrEngine::new(&config);
+        assert!(
+            engine.voxtype.is_none(),
+            "disabled fast path must not be armed"
+        );
+        let _ = engine.whisper.expect("built-in engine must still arm");
+    }
+
+    #[test]
+    fn probe_names_the_engines_the_machine_actually_has() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ggml-base.bin"), b"weights").unwrap();
+        let config = config_with_dir(dir.path());
+        let StageStatus::Ready(detail) = probe_asr(&config) else {
+            panic!("model resolves, so ASR must be ready")
+        };
+        if VoxtypeRecognizer::detect(&config).is_some() {
+            assert!(detail.contains("voxtype fast path"), "{detail}");
+        } else {
+            assert!(detail.contains("built-in whisper.cpp"), "{detail}");
+        }
+
+        let bare_dir = tempfile::tempdir().unwrap();
+        let bare = config_with_dir(bare_dir.path());
+        match probe_asr(&bare) {
+            StageStatus::Degraded(reason) if VoxtypeRecognizer::detect(&bare).is_some() => {
+                assert!(reason.contains("voxtype fast path only"), "{reason}");
+                assert!(reason.contains(BASE_TIER.1), "{reason}");
+            }
+            StageStatus::Missing(reason) => {
+                assert!(reason.contains(BASE_TIER.1), "{reason}");
+            }
+            other => panic!("a machine with no model and no voxtype must miss honestly: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn voxtype_stdout_parses_to_the_last_paragraph() {
+        let observed = "Loading audio file: \"/tmp/x.wav\"\n\
+                        Processing 176000 samples (11.00s)...\n\
+                        VAD: 8.22s speech (74.7% of audio)\n\n\
+                        And so my fellow Americans, ask not what your country can do for you.\n";
+        assert_eq!(
+            last_paragraph(observed.as_bytes()).as_deref(),
+            Some("And so my fellow Americans, ask not what your country can do for you.")
+        );
+        assert_eq!(last_paragraph(b"\n\n\n"), None);
+        assert_eq!(last_paragraph(b""), None);
     }
 
     #[test]
@@ -379,5 +523,31 @@ mod tests {
             .expect("real speech must produce a transcript");
         eprintln!("transcript ({:?}): {text}", started.elapsed());
         assert!(text.split_whitespace().count() >= 3);
+    }
+
+    #[test]
+    #[ignore = "hardware/model test: needs VIKRAM_VOICE_TEST_WAV; exercises the detected voxtype fast path"]
+    fn the_voxtype_fast_path_transcribes_real_speech() {
+        let Ok(wav) = std::env::var("VIKRAM_VOICE_TEST_WAV") else {
+            return;
+        };
+        let config = VoiceConfig::default();
+        let mut engine = AsrEngine::new(&config);
+        if engine.voxtype.is_none() {
+            return;
+        }
+        let mut reader = hound::WavReader::open(&wav).expect("fixture wav must decode");
+        let pcm: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap()).collect();
+        let started = std::time::Instant::now();
+        let text = engine
+            .transcribe(&pcm)
+            .expect("voxtype must run")
+            .expect("real speech must produce a transcript");
+        eprintln!("fast path ({:?}): {text}", started.elapsed());
+        assert!(text.split_whitespace().count() >= 3);
+        assert!(
+            engine.notes().is_empty(),
+            "a healthy fast path leaves no degrade notes"
+        );
     }
 }
