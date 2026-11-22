@@ -1787,6 +1787,10 @@ mod tests {
         }
     }
 
+    /// A PTY on a loaded machine can take seconds to produce its first byte, so the wait is
+    /// measured on the clock rather than counted in polls.
+    const TERMINAL_OUTPUT_DEADLINE: Duration = Duration::from_secs(10);
+
     fn terminal_handler() -> (ScratchDir, WorkspaceAgentRequestHandler) {
         let (dir, handler) = workspace_handler();
         (dir, handler.with_terminal_support())
@@ -1821,7 +1825,8 @@ mod tests {
 
         let mut output = String::new();
         let mut exit_status = None;
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + TERMINAL_OUTPUT_DEADLINE;
+        while std::time::Instant::now() < deadline {
             let resp = terminal_request(
                 &handler,
                 2,
@@ -1837,7 +1842,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(output.contains("vikram-acp-term"), "output was {output:?}");
+        assert!(
+            output.contains("vikram-acp-term"),
+            "no output within {TERMINAL_OUTPUT_DEADLINE:?}: {output:?}"
+        );
         assert_eq!(exit_status.unwrap()["exitCode"], serde_json::json!(0));
 
         let resp = terminal_request(
@@ -1910,7 +1918,8 @@ mod tests {
         needle: &str,
     ) -> String {
         let mut output = String::new();
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + TERMINAL_OUTPUT_DEADLINE;
+        while std::time::Instant::now() < deadline {
             let resp = terminal_request(
                 handler,
                 2,
