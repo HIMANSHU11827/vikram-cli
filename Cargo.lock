@@ -4267,6 +4267,8 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "hound",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "wavo",
