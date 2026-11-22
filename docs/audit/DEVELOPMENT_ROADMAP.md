@@ -1,5 +1,14 @@
 # Development Roadmap (P0–P3)
 
+> **Superseded (2026-11-22):** historical roadmap from the 2026-11-03 audit.
+> Much of P0–P2 has since landed or was refuted: sandbox (`vikram-sandbox`),
+> MCP serve + stdio, the verification loop (`verification.rs`), code indexing
+> (`vikram-codeindex`), ACP (`vikram-acp`), scheduling/event triggers
+> (`vikram-daemon`), memory/`connect_all` error propagation, and the kernel
+> items are moot (the `vikram-kernel` crate was deleted in `fd929d9`). Live
+> priorities: [`../../CONTINUE.md`](../../CONTINUE.md) and
+> [`../roadmap.md`](../roadmap.md). Kept as a historical record.
+
 Detailed, prioritized roadmap. For the contributor-focused cross-platform roadmap see
 `docs/roadmap.md`.
 

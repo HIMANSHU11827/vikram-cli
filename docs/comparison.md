@@ -47,16 +47,16 @@ dimension are therefore `unverified` rather than "no".
 | Dimension | VIKRAM | Hermes | Claude Code | Codex CLI | OpenCode | Goose | Antigravity | Agent Zero |
 |---|---|---|---|---|---|---|---|---|
 | **Platforms (chat gateways)** | ✓ 28 adapter modules in `crates/vikram-gateway/src/platforms/` + registry, pairing, access control, routing, delivery ledger | ✓ 27 platform dirs, each with `adapter.py` + `plugin.yaml` | unverified | absent (checked): no messaging-adapter crate among the 125; `slack`/`notion` appear only as plugin ids and MCP server names in tests | unverified | unverified | unverified | unverified |
-| **Media (in/out)** | ✓ 19 of 28 gateway modules implement `send_media` for attachments/media; `Block::Image` + `ImageSource::{Url,Data}` in contracts; per-adapter media types and filenames | ✓ 26 of 27 adapters reference media/attachments | unverified | ✓ `attachment-store` crate; image handling present | unverified | unverified | unverified | unverified |
+| **Media (in/out)** | ✓ 20 of 28 gateway modules implement `send_media` for attachments/media; `Block::Image` + `ImageSource::{Url,Data}` in contracts; per-adapter media types and filenames | ✓ 26 of 27 adapters reference media/attachments | unverified | ✓ `attachment-store` crate; image handling present | unverified | unverified | unverified | unverified |
 | **MCP** | ✓ client + server + discovery + visibility (`crates/vikram-mcp`, 5 modules; JSON-RPC 2.0 over stdio) | unverified (one `mcp` mention in `discord/adapter.py`; no MCP client/server in the subset) | ◐ plugins may ship MCP | ✓ `rmcp-client` crate + `rmcp` workspace pin | ◐ client, oauth, stdio, socket | ◐ MCP-first: `ExtensionConfig::{Stdio,Builtin,StreamableHttp}` | unverified | unverified |
 | **Skills / plugins** | ✓ `vikram-skills` (15 modules: `SKILL.md` + frontmatter, progressive load, bundles, install, history, trust) and 9 plugin tools in the runtime | ✓ `plugin.yaml` manifest per platform adapter (27); no agent-skill system in the subset | ◐ skills, plugins, hooks | ✓ `skills`, `plugin`, `plugin-host`, `hooks` crates | ◐ `PluginHooks` namespaced events | ◐ extensions + recipes | unverified | unverified |
 | **Sandboxing** | ✓ `vikram-sandbox`: bubblewrap (`bwrap`), macOS `sandbox-exec`/Seatbelt profile, Windows Job objects; policy floor independent of the mechanism | unverified | ◐ `--restricted`, sandbox refs marked public/ASSUMPTION | ✓ `sandboxing`, `bwrap`, `linux-sandbox`, `windows-sandbox-rs`, `mxc-sandbox` crates | ◐ none (permission rules only) | ◐ none (approvals + policy) | unverified | unverified |
-| **Subagents / teams** | ✓ `agents.rs`, `teams.rs`, `hive_chat.rs`; tools `team.create/list/delegate`, `hive.create/delegate`; delegation and hive token budgets in `ContextConfig` | unverified | ◐ `agent.register/spawn`, `teammate`, subagent types | ✓ subagent references in 417 files; `agent-roles`, `runtime-agent-instance` | ◐ child session, background jobs | ◐ `SubagentOperation`, concurrency cap | unverified | unverified |
+| **Subagents / teams** | ✓ `bots.rs`, `hive_roster.rs`, `hive_chat.rs`; tools `hive.create/list/delegate` (rosters) + `bot.*` (profiles); sub-agent delegation and hive token budgets in `ContextConfig` (teams were renamed to hive rosters — `docs/RENAME-TEAM-HIVE-AGENT-BOT.md`) | unverified | ◐ `agent.register/spawn`, `teammate`, subagent types | ✓ subagent references in 417 files; `agent-roles`, `runtime-agent-instance` | ◐ child session, background jobs | ◐ `SubagentOperation`, concurrency cap | unverified | unverified |
 | **Persistence / memory** | ✓ SQLite journal (`vikram-store`, WAL, fork/duplicate/export, interrupted-session recovery) + `memory.rs` FTS5 hybrid recall with MMR rerank + `memory_files` | unverified (sqlite mentioned in 5 adapter files; no store crate in the subset) | ◐ resume/plan restore | ✓ `rollout`, `thread-store`, `memories`, `message-history` crates | ◐ SQLite event-sourced | ◐ SQLite session manager + migrations | unverified | unverified |
 | **Browser / computer** | ✓ 12 browser tools over CDP (`browser/{cdp,dom,capture,discovery}.rs`) + Linux computer use via `xdotool`/`scrot`/`wmctrl` (`computer.rs`) | unverified | unverified | ◐ config surface only (`app-server-protocol` `browser_use_config`); no driver crate found | unverified | unverified | unverified | unverified |
 | **TUI / CLI** | ✓ ratatui + crossterm TUI (`vikram-tui`), clap CLI (`vikram-cli`), background daemon (`vikram-daemon`) | unverified (gateway adapters only) | ◐ CLI/TUI product, closed source | ✓ `tui`, `cli`, `exec` crates | ◐ TUI | ◐ CLI | unverified | unverified |
 | **ACP** | ✓ client **and** server, JSON-RPC 2.0 on stdio (`AcpClient`, `AcpServer` in `vikram-acp`) | unverified | unverified | absent (checked): no `agent-client-protocol`/`acp` match in `codex-rs` | ◐ ACP server | ◐ exposes ACP | unverified | unverified |
-| **Providers** | ✓ one OpenAI-compatible `/chat/completions` seam; `base_url` + `model` + `api_key_env` from config. No per-vendor adapters — any compatible endpoint works, none is special-cased | unverified | ◐ Anthropic-first + Bedrock/Vertex/gateway | ✓ `model-provider` with Amazon Bedrock, GCP, Ollama, LM Studio alongside OpenAI | ◐ provider-agnostic catalog + variants | ◐ 11 engines + 53 declarative providers | unverified | unverified |
+| **Providers** | ✓ OpenAI-compatible `/chat/completions` seam (`openai.rs`) **plus a native Anthropic Messages provider** (`anthropic.rs` — SSE streaming, tool use, thinking blocks; landed `a1fecc9`); `base_url` + `model` + `api_key_env` from config | unverified | ◐ Anthropic-first + Bedrock/Vertex/gateway | ✓ `model-provider` with Amazon Bedrock, GCP, Ollama, LM Studio alongside OpenAI | ◐ provider-agnostic catalog + variants | ◐ 11 engines + 53 declarative providers | unverified | unverified |
 | **Licensing** | ✓ `MIT OR Apache-2.0` (`Cargo.toml` `[workspace.package] license`, `LICENSE-MIT`, `LICENSE-APACHE`) | unverified (no LICENSE in the vendored subset; `plugin.yaml` says `author: NousResearch`) | unverified | ✓ Apache-2.0 (`codex/LICENSE`) | unverified | unverified | unverified | unverified |
 
 Reading the table: VIKRAM's row is dense because this is VIKRAM's repository. **A dense VIKRAM row
@@ -166,21 +166,21 @@ build profile and warns when it is not release.
 Run from the repository root. Each command prints the value quoted above.
 
 ```bash
-# 16 workspace crates (includes vikram-bench)
-ls -d crates/*/ | wc -l                                   # 16
+# 17 workspace crates (includes vikram-bench, vikram-voice)
+ls -d crates/*/ | wc -l                                   # 17
 
-# 222 Rust files, 171886 lines (this tree is edited concurrently — re-run for today's count)
-find crates -name '*.rs' | wc -l                          # 222
-find crates -name '*.rs' -exec cat {} + | wc -l           # 171886
+# 256 Rust files, 246781 lines (this tree is edited concurrently — re-run for today's count)
+find crates -name '*.rs' | wc -l                          # 256
+find crates -name '*.rs' -exec cat {} + | wc -l           # 246781
 
-# 2357 unit/integration test annotations across the workspace
-grep -r "#\[test\]\|#\[tokio::test\]" crates/ --include=*.rs | wc -l   # 2357
+# 3395 unit/integration test annotations across the workspace
+grep -r "#\[test\]\|#\[tokio::test\]" crates/ --include=*.rs | wc -l   # 3395
 
-# 28 gateway platform modules; 26 implement PlatformAdapter, 19 implement send_media
+# 28 gateway platform modules; 26 implement PlatformAdapter, 20 implement send_media
 ls crates/vikram-gateway/src/platforms/*.rs | grep -v mod.rs | wc -l   # 28
 grep -l "impl PlatformAdapter for" crates/vikram-gateway/src/platforms/*.rs | wc -l  # 26
 grep -l "fn supports_media(&self) -> bool {" crates/vikram-gateway/src/platforms/*.rs \
-  | xargs grep -l "true" | wc -l                                      # 19
+  | xargs grep -l "true" | wc -l                                      # 20
 
 # 71 built-in tool registrations
 grep -c "registry.register(Box::new(" crates/vikram-runtime/src/tools/core.rs       # 71
@@ -197,8 +197,9 @@ grep -n "bwrap\|sandbox-exec\|JobObjects" crates/vikram-sandbox/src/lib.rs
 # ACP: client and server
 grep -n "pub struct AcpClient\|pub struct AcpServer" crates/vikram-acp/src/lib.rs
 
-# Provider seam: one OpenAI-compatible endpoint builder, no per-vendor adapters
+# Provider seams: OpenAI-compatible endpoint builder + native Anthropic Messages provider
 grep -rn "chat/completions" crates/vikram-runtime/src/openai.rs
+ls crates/vikram-runtime/src/anthropic.rs
 
 # Licence
 grep -n "license" Cargo.toml                            # line 24: MIT OR Apache-2.0
@@ -239,10 +240,11 @@ cargo run -p vikram-bench --release
   not claimed, not estimated, and not implied by the ordering of the table.
 * **`unverified` ≠ absent.** Five of the seven other frameworks have no vendored source here, so this
   document can only say "no evidence", which is a statement about this repository.
-* VIKRAM's own thin spots, recorded rather than hidden: one provider family (OpenAI-compatible
-  only, no vendor SDKs), a young ACP implementation (2 tests), and eight gateway modules without
-  outbound media (A2A artifacts, Buzz/Buzz CLI, Google Chat user OAuth, SimpleX XFTP, and
-  IRC/ntfy/raft/SMS, which have no media path in the reference).
+* VIKRAM's own thin spots, recorded rather than hidden: two provider families (OpenAI-compatible
+  + native Anthropic; no other vendor SDKs, no local inference), a young ACP implementation
+  (2 tests), and eight gateway modules without outbound media (A2A artifacts, Buzz/Buzz CLI,
+  Google Chat user OAuth, SimpleX XFTP, and IRC/ntfy/raft/SMS, which have no media path in
+  the reference).
 
 
 ## 7. Where the remaining work is tracked

@@ -57,7 +57,8 @@ file behind it is refused when you type it, rather than silently treated as UTC.
 - **delegate** – the job runs on one bot's own identity: `--bot arun` spawns a child session owned by that agent through the runtime's own delegation path, and the bot's answer is what the run records. Without `--bot` the job is refused when it is created, not on its first slot.
 - **workflow** – the job runs a team: `--agent <team>` fans the prompt out to every member of that team in its own session, then reports one line per member (`arun: port 80 is up` / `mira: failed — timed out`). The run fails when any member failed, and names them. Teams are capped at 8 members for an unattended run. Without `--agent` the job is refused when it is created. `--order sequential` runs one member at a time, each one starting only after the previous turn finished — for a team that shares a rate limit, one test database or a deploy lock; the run output is still one line per member. Cancelling the run stops whichever members are still working; `vikram jobs cancel <run> --agent mira` stops one member and lets the rest finish — the request travels through the scheduler database, so it lands whether or not the daemon was started before the CLI ran.
 
-Bots and teams come from the runtime's own `agents` and `teams` stores (`vikram agents`, `vikram config`), not from a second registry inside the daemon.
+Bots and hive rosters come from the runtime's own `bots` and `hive_rosters` stores
+(`vikram bots`, `vikram config`), not from a second registry inside the daemon.
 
 ## Lifecycle
 

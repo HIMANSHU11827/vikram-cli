@@ -175,13 +175,13 @@ this repository. The nine above are the acceptance criteria.
 | JARVIS property | VIKRAM component | State |
 |---|---|---|
 | Memory | `crates/vikram-store` — SQLite, per user/profile/entity isolation, hybrid recall | **built** |
-| Personality continuity | `SOUL.md` / `INSTRUCTIONS.md` context files (`crates/vikram-runtime/src/context.rs`, `config.rs`) | **built (files), unmeasured (consistency)** |
+| Personality continuity | `SOUL.md` / `INSTRUCTIONS.md` context files (`crates/vikram-runtime/src/context.rs`, `config.rs`) | **built (files); measured (`vikram bench personality`, deterministic local consistency scoring — `crates/vikram-bench/src/personality.rs`, landed `196f731`)** |
 | Hands | `crates/vikram-skills`, `crates/vikram-mcp`, runtime tool exec, browser + computer use | **built** |
 | Safety | `crates/vikram-policy` — deny-first, non-widenable floor; sandbox crate | **built (stronger than film)** |
-| Presence | `crates/vikram-gateway` — ~27 messaging platforms | **built** |
-| Proactivity | `crates/vikram-daemon` — cron jobs, retries, heartbeats | **partial: scheduled, not event-driven** |
+| Presence | `crates/vikram-gateway` — 28 platform modules | **built** |
+| Proactivity | `crates/vikram-daemon` — cron jobs **+ event triggers** (`on <trigger>` schedules, EventBus, quiet hours, audit) | **built (scheduled + event-driven, landed `196f731`)** |
 | Self-evaluation / improvement | `crates/vikram-evolution` — experience → reflection → gated proposals → verify | **partial: operator-gated, no semantic verification** |
-| Voice | none | **missing** |
+| Voice | `crates/vikram-voice` transport scaffold — `vikram voice status\|listen\|say`, helper-driven, no `cpal`/`whisper-rs` yet | **transport committed (`5a12d42`), audio engines missing** |
 | Always-on / wake-free | none | **missing** |
 | Speaker identification | none | **missing** |
 | Environment awareness (screen, apps, time, place) | computer-use + code index, on demand only | **partial** |
@@ -197,12 +197,16 @@ relationship model.
 
 1. **Voice I/O.** ASR in, TTS out, interruptible. Without it this is a CLI, not a presence.
    New crate: `vikram-voice`. No existing dependency in the workspace.
+   *(Update 2026-11-22: the crate now exists — transport scaffold landed at `5a12d42`;
+   the audio engines beneath it are still missing, see §5.)*
 2. **Relationship model.** People, projects, preferences, mood — first-class rows, not free-text
    memories. Feeds context assembly before every turn.
 3. **Event-driven proactivity.** Extend `vikram-daemon` from cron to triggers (file change, calendar
    proximity, inbox arrival, long-job completion) with a silence policy: when *not* to speak.
+   *(Built — `on <trigger>` schedules, EventBus, quiet hours, audit trail landed in `196f731`.)*
 4. **Personality consistency measurement.** A test harness that scores the same persona prompts
    across sessions and models, so "same person every day" is verified, not hoped for.
+   *(Built — `vikram bench personality`, deterministic local scoring, `196f731`.)*
 5. **Semantic verification** (already P0 in `CONTINUE.md`) — the difference between "tests pass" and
    "the feature exists".
 6. **Always-on session** — a resident process that keeps working memory warm instead of paying cold

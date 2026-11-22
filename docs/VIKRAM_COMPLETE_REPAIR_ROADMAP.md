@@ -15,12 +15,12 @@ audit itself.
 
 | Audit P0 claim | Verdict | Evidence |
 |---|---|---|
-| W-001 kernel hardcodes `Trust::Model` | **REFUTED** | `Effect::RequestTool` carries `originating_trust` ([effects.rs:25](file:///home/himanshu/Desktop/VIKRAM-CLI/crates/vikram-kernel/src/effects.rs#L25)), forwarded at :54-72; evaluated at [machine.rs:218-221](file:///home/himanshu/Desktop/VIKRAM-CLI/crates/vikram-kernel/src/machine.rs#L218); regression test exists at effects.rs:135-147 |
-| W-002 `mcp serve` is a stub | **REFUTED** | Real JSON-RPC stdio loop at [server.rs:522-562](file:///home/himanshu/Desktop/VIKRAM-CLI/crates/vikram-mcp/src/server.rs#L522); `initialize`/`tools/list`/`tools/call` at :212-313; wired to real local tools at [main.rs:1542-1594](file:///home/himanshu/Desktop/VIKRAM-CLI/crates/vikram-cli/src/main.rs#L1542) |
-| W-003 MCP runtime has null stdio | **REFUTED** | stdin/stdout piped and used at [runtime.rs(mcp):66-140](file:///home/himanshu/Desktop/VIKRAM-CLI/crates/vikram-mcp/src/runtime.rs#L66); only stderr is `Stdio::null()` at [mcp.rs:457](file:///home/himanshu/Desktop/VIKRAM-CLI/crates/vikram-runtime/src/mcp.rs#L457), which is correct |
-| W-125 no OS sandbox | **PARTIALLY IMPLEMENTED** | bwrap + Seatbelt + documented pass-through in [sandbox.rs](file:///home/himanshu/Desktop/VIKRAM-CLI/crates/vikram-runtime/src/sandbox.rs) (305 LOC); Windows/Termux have no isolation |
-| W-129 no verification loop | **REFUTED** | `verify()` with repair callback + attempt budget + workspace isolation in [verification.rs](file:///home/himanshu/Desktop/VIKRAM-CLI/crates/vikram-runtime/src/verification.rs) (466 LOC); exposed as the `verify` tool, wired at [tools.rs:4337-4340](file:///home/himanshu/Desktop/VIKRAM-CLI/crates/vikram-runtime/src/tools.rs#L4337) |
-| W-124 no durable mid-turn resume | **CONFIRMED MISSING** | checkpoint/resume appear only in `types.rs`/`workspace.rs`/`runtime.rs` for file-change snapshots; no execution-state resume across a crash mid-turn |
+| W-001 kernel hardcodes `Trust::Model` | **REFUTED** | The kernel crate was later deleted wholesale by its own follow-up commit (`fd929d9`). Today every tool request is stamped with per-origin trust before evaluation — `Origin::trust()` at [turn.rs:57-65](file:///home/himanshu/Desktop/VIKRAM-CLI/crates/vikram-runtime/src/turn.rs#L57) and the `originating_trust` re-stamp at [turn.rs:2061](file:///home/himanshu/Desktop/VIKRAM-CLI/crates/vikram-runtime/src/turn.rs#L2061) |
+| W-002 `mcp serve` is a stub | **REFUTED** | Real JSON-RPC stdio loop in [server.rs:285-639](file:///home/himanshu/Desktop/VIKRAM-CLI/crates/vikram-mcp/src/server.rs#L285); wired via `async fn mcp_serve` at [main.rs:2595](file:///home/himanshu/Desktop/VIKRAM-CLI/crates/vikram-cli/src/main.rs#L2595) behind a deny-first approved-tools gate (refuses to expose anything with no approved tools configured) |
+| W-003 MCP runtime has null stdio | **REFUTED** | stdin/stdout piped and used at [client.rs:483-485](file:///home/himanshu/Desktop/VIKRAM-CLI/crates/vikram-mcp/src/client.rs#L483) (`Stdio::piped()` + `kill_on_drop`); only stderr is inherited so server logs stay visible |
+| W-125 no OS sandbox | **PARTIALLY IMPLEMENTED** | Dedicated `vikram-sandbox` crate — `SandboxMechanism` enum: Bubblewrap, Seatbelt, Landlock, JobObjects (Windows stub, honestly documented), PassThrough ([lib.rs:21-28](file:///home/himanshu/Desktop/VIKRAM-CLI/crates/vikram-sandbox/src/lib.rs#L21)); Windows/Termux have no isolation |
+| W-129 no verification loop | **REFUTED** | `verify()` with repair callback + attempt budget + workspace isolation in [verification.rs](file:///home/himanshu/Desktop/VIKRAM-CLI/crates/vikram-runtime/src/verification.rs) (1,203 LOC) + the `verify` tool at [tools/verify.rs](file:///home/himanshu/Desktop/VIKRAM-CLI/crates/vikram-runtime/src/tools/verify.rs) (446 LOC) |
+| W-124 no durable mid-turn resume | **PARTIALLY IMPLEMENTED** | `recover_interrupted_session` landed (`a1fecc9`) and is exposed as `vikram sessions interrupted [--recover]` ([main.rs:684](file:///home/himanshu/Desktop/VIKRAM-CLI/crates/vikram-cli/src/main.rs#L684), [main.rs:1199](file:///home/himanshu/Desktop/VIKRAM-CLI/crates/vikram-cli/src/main.rs#L1199)); execution-state resume across a crash mid-turn is still missing |
 
 Also refuted as "missing": git integration (`Git` tool, status/diff at tools.rs:982-988),
 test execution (`TestRun`), build validation (`BuildRun`), code review (`CodeReview`),
@@ -28,7 +28,9 @@ LSP (5 tools). The audit docs contradict even each other — `EXECUTIVE_SUMMARY.
 "no OS sandbox" while `FEATURE_AUDIT.md:78` says it is partially built.
 
 **Action required:** rewrite `docs/audit/*` from source, or mark it superseded. Until then
-it must not drive prioritisation.
+it must not drive prioritisation. *(Done 2026-11-22: dated corrections are stamped at the
+top of `docs/audit/VIKRAM-AZ-AUDIT.md`, `EXECUTIVE_SUMMARY.md`,
+`WEAKNESSES_AND_GAPS.md`, and the superseded docs carry dated stamps.)*
 
 ## 2. Work completed this session
 

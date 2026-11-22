@@ -6,7 +6,7 @@ supported path today.
 
 ## Requirements (all platforms)
 
-- **Rust 1.86+** (1.89+ recommended) — `rustup` is the easiest way
+- **Rust 1.89+** — `rustup` is the easiest way
 - **git** — to clone the repository
 - **SQLite** — bundled (`rusqlite/bundled`); nothing to install
 - **TLS** — `ring` via rustls; no OpenSSL needed

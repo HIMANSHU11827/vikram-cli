@@ -26,6 +26,44 @@ new contract IDs/enums, a `TicketManager` in `vikram-runtime` with backend-enfor
 visibility, and `vikram tickets` CLI commands. Hive/bot/sub-agent workflows now share
 one engine. See `docs/tickets.md` and `README.md`.
 
+### Post-audit correction (2026-11-22)
+
+This file is a **historical snapshot of the tree at 2026-11-03** — do not read the
+findings below as current. Re-verified against `5a12d42`:
+
+- **Scale today:** 17 crates, 256 Rust files, 246,781 LOC, 3,387 tests passing at
+  `5a12d42`. The header metrics above (9 crates, ~15k LOC, ~775 tests) describe
+  2026-11-03 only.
+- **`vikram-kernel` was deleted** by its own follow-up commit (`fd929d9`); every
+  kernel section below (§1.1, §2.1, §3.3, §5.3, §7 "Kernel" row, W-077…W-081,
+  W-086, W-115, W-116, §10.2, §19) describes a crate that no longer exists.
+- **W-001 REFUTED** — tool requests are stamped per-origin trust:
+  `Origin::trust()` at `crates/vikram-runtime/src/turn.rs:57-65` and the
+  `originating_trust` re-stamp at `turn.rs:2061`.
+- **W-002 REFUTED** — `vikram mcp serve` is a real JSON-RPC stdio server behind a
+  deny-first approved-tools gate (`main.rs:2595`, `crates/vikram-mcp/src/server.rs`).
+- **W-003 REFUTED** — MCP child stdio is piped and used
+  (`crates/vikram-mcp/src/client.rs:483-485`).
+- **W-004 / W-005 FIXED** — memory-store methods return `Result` and propagate
+  errors (`memory.rs:262,279`); `connect_all` returns `Err` naming failed servers
+  (`mcp.rs:20`, regression test `client.rs:767`). See
+  `docs/VIKRAM_COMPLETE_REPAIR_ROADMAP.md` §2.
+- **W-125 REFUTED (partial)** — `vikram-sandbox` implements bubblewrap/seatbelt/
+  landlock with an honest Windows JobObjects stub and pass-through
+  (`crates/vikram-sandbox/src/lib.rs:21-28`).
+- **W-129 REFUTED** — the verification loop exists: `verification.rs` (1,203 LOC)
+  plus the `verify` tool (`tools/verify.rs`, 446 LOC).
+- **W-124 PARTIAL** — `recover_interrupted_session` landed (`a1fecc9`) and is
+  exposed as `vikram sessions interrupted [--recover]`; execution-resume across a
+  crash mid-turn is still missing.
+- Also since built and verified in the tree: `vikram-codeindex` (W-122),
+  `vikram-acp` (W-123), the daemon with cron + event triggers (W-126), an A2A
+  gateway module (W-130), `computer.notify` (W-131), git/test-run/build-run/
+  code-review tools, memory consolidation, FTS5 hybrid recall, and agent
+  performance trends.
+- W-006 and the remaining P1/P2/P3 rows were not re-verified in this pass and
+  may still stand. Live status: `CONTINUE.md` and `docs/comparison.md`.
+
 ---
 
 ## 1. Complete Repository Inventory
@@ -315,11 +353,11 @@ Working Memory (in-turn context)
 | Tools | ✅ Complete | Stable | No cancellation for spawn_blocking, hardcoded timeouts, no ToolContext identity |
 | Turn Loop | ✅ Complete | Stable | Skills loaded always 0, context_used heuristic |
 | MCP Client | ⚠️ Partial | Alpha | connect_all always Ok, silent failures |
-| MCP Server | ⚠️ Partial | Alpha | serve command is stub, null stdio pipes |
+| MCP Server | ⚠️ Partial | Alpha | serve command is stub, null stdio pipes — **both refuted 2026-11-22, see Post-audit correction at top** |
 | Plugins | ✅ Complete | Stable | — |
 | Skills | ✅ Complete | Stable | Trust file corrupt defaults, builtin source abstraction missing |
 | TUI | ✅ Complete | Stable | Hardcoded budgets/widths, UTF-8 byte slicing panic risk |
-| CLI | ✅ Complete | Stable | MCP serve stub, doctor terminal_size inaccurate |
+| CLI | ✅ Complete | Stable | MCP serve stub (**refuted 2026-11-22 — see correction at top**), doctor terminal_size inaccurate |
 | Hive Chat | ✅ Complete | Stable | update_state unused, Trust::User for all messages |
 | Tickets | ✅ Implemented (post-audit) | Alpha | Unified engine for Hive/bots/sub-agents; strategies recorded as metadata |
 | Teams | ⚠️ Duplicate | Alpha | Two incompatible team models (teams.rs vs hive.rs) |
@@ -383,11 +421,11 @@ Working Memory (in-turn context)
 
 | ID | Category | Description | Evidence | File/Module |
 |---|---|---|---|---|
-| W-001 | Architecture | Trust hardcoded to Model in kernel — all actions evaluated as model-sourced, undermining provenance | `machine.rs:219` `effect.permission_request(Trust::Model)` | vikram-kernel/src/machine.rs |
-| W-002 | Security | MCP serve command is a stub — prints success without starting server | `main.rs` ~805-810 | vikram-cli/src/main.rs |
-| W-003 | Security | MCP runtime sets stdio to null — cannot communicate with child processes | `runtime.rs:50-83` `Stdio::null()` | vikram-mcp/src/runtime.rs |
-| W-004 | Reliability | Silent error swallowing in memory store — DB errors hidden, returns empty | `memory.rs:119-131, 143-161, 169-183` | vikram-runtime/src/memory.rs |
-| W-005 | Reliability | connect_all always returns Ok even if servers failed | `mcp.rs:242` | vikram-runtime/src/mcp.rs |
+| W-001 | Architecture | ~~Trust hardcoded to Model in kernel~~ **REFUTED (2026-11-22): kernel crate deleted (`fd929d9`); requests are stamped per-origin — `turn.rs:57-65`, `turn.rs:2061`** | historical: `machine.rs:219` `effect.permission_request(Trust::Model)` | vikram-kernel/src/machine.rs (crate deleted) |
+| W-002 | Security | ~~MCP serve command is a stub~~ **REFUTED (2026-11-22): real JSON-RPC stdio server with deny-first approved-tools gate — `main.rs:2595`, `server.rs:285-639`** | historical: `main.rs` ~805-810 | vikram-cli/src/main.rs |
+| W-003 | Security | ~~MCP runtime sets stdio to null~~ **REFUTED (2026-11-22): stdin/stdout piped and used — `client.rs:483-485`** | historical: `runtime.rs:50-83` `Stdio::null()` | vikram-mcp/src/client.rs |
+| W-004 | Reliability | ~~Silent error swallowing in memory store~~ **FIXED (verified 2026-11-22): MemoryStore methods return `Result` and propagate store errors — `memory.rs:262,279`** | historical: `memory.rs:119-131, 143-161, 169-183` | vikram-runtime/src/memory.rs |
+| W-005 | Reliability | ~~connect_all always returns Ok~~ **FIXED (verified 2026-11-22): returns `Err` naming failed servers — `mcp.rs:20`, regression test `client.rs:767`** | historical: `mcp.rs:242` | vikram-runtime/src/mcp.rs |
 | W-006 | Reliability | Evolution engine open failure falls back to in-memory silently | `runtime.rs:462-466` | vikram-runtime/src/runtime.rs |
 
 ### P1 — High
@@ -521,12 +559,12 @@ Working Memory (in-turn context)
 | W-121 | Performance | CLI column widths hardcoded |
 | W-122 | UX | No code indexing (agentic grep only) |
 | W-123 | UX | No ACP support (can't host or be hosted by other agents) |
-| W-124 | UX | No durable mid-turn resume (crash = restart from scratch) |
-| W-125 | UX | No sandbox (policy-only, no OS isolation) |
-| W-126 | UX | No scheduling/proactive triggers |
-| W-127 | UX | No local model support (OpenAI-compatible only) |
-| W-128 | UX | No codebase understanding (no repo-map, no embeddings) |
-| W-129 | UX | No verification loop (edit→build→test→repair) |
+| W-124 | UX | ~~No durable mid-turn resume~~ **PARTIAL (2026-11-22): `recover_interrupted_session` + `vikram sessions interrupted [--recover]` landed (`a1fecc9`); execution-resume across a crash mid-turn is still missing** |
+| W-125 | UX | ~~No sandbox~~ **REFUTED (2026-11-22): `vikram-sandbox` — bubblewrap/seatbelt/landlock, Windows JobObjects stub, honest pass-through (`lib.rs:21-28`)** |
+| W-126 | UX | ~~No scheduling/proactive triggers~~ **REFUTED (2026-11-22): `vikram-daemon` — cron + `on <trigger>` event schedules, quiet hours, audit (`196f731`)** |
+| W-127 | UX | No local model support (OpenAI-compatible only) — *still true today, plus a native Anthropic provider landed (`a1fecc9`)* |
+| W-128 | UX | No codebase understanding (no repo-map, no embeddings) — *partially refuted: `vikram-codeindex` tree-sitter symbol index + repo map now exists* |
+| W-129 | UX | ~~No verification loop~~ **REFUTED (2026-11-22): `verification.rs` (1,203 LOC) + `verify` tool (`tools/verify.rs`, 446 LOC)** |
 | W-130 | UX | No A2A/multi-agent protocol |
 | W-131 | UX | No desktop/phone notification surface |
 | W-132 | UX | No durable background task scheduling |
@@ -687,8 +725,10 @@ Working Memory (in-turn context)
 4. **No secret scanning** — runtime doesn't scan for secrets in tool outputs or memory.
 5. **No at-rest encryption** — SQLite stores data in plaintext.
 6. **No dependency vulnerability scanning** — no cargo audit in CI.
-7. **MCP serve stub** — non-functional, security surface unclear.
-8. **MCP null stdio** — can't communicate, but also can't be exploited (broken).
+7. **MCP serve stub** — non-functional, security surface unclear. *(Refuted 2026-11-22 —
+   `vikram mcp serve` is a real deny-first server; see correction at top.)*
+8. **MCP null stdio** — can't communicate, but also can't be exploited (broken). *(Refuted
+   2026-11-22 — stdio is piped and used; see correction at top.)*
 9. **Compound command splitting** — policy splits shell commands but floor doesn't check all segments.
 10. **No output validation** — tool outputs not validated before entering context.
 
@@ -773,7 +813,8 @@ Working Memory (in-turn context)
 - Skills tests have compatibility fixtures (good).
 - Evolution tests cover lifecycle (good).
 - But: no tests for error paths, edge cases, or concurrent access.
-- No tests for MCP serve (because it's a stub).
+- No tests for MCP serve ~~(because it's a stub)~~ *(the stub claim was refuted
+  2026-11-22 — serve is real; see correction at top)*.
 - No tests for evolution integration (because it's dormant).
 
 ---

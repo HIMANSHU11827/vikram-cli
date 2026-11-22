@@ -16,7 +16,7 @@ what is still missing.
 [![Rust](https://img.shields.io/badge/rust-1.89%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![Edition](https://img.shields.io/badge/edition-2024-blue)]()
 [![Status](https://img.shields.io/badge/status-pre--release-yellow)]()
-[![Tests](https://img.shields.io/badge/tests-2000%2B-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-3300%2B-brightgreen)]()
 
 ---
 
@@ -32,8 +32,8 @@ Most terminal AI tools are a prompt box with tools bolted on. VIKRAM is a runtim
 - **Real multi-entity work** — hives (agent teams), bots (persistent workers), and sub-agents
   share one Ticket engine: conversations, assignments, reports, and recovery all live in SQLite.
 - **Beyond the terminal** — a gateway answers Telegram, Discord, Slack, WhatsApp, email, IRC,
-  matrix and ~30 more platforms, behind per-sender authorization. A daemon runs cron-scheduled
-  agent jobs with retries, delivery tracking, and heartbeats.
+  matrix and 21 more platforms (28 adapters in all), behind per-sender authorization. A daemon
+  runs cron-scheduled agent jobs with retries, delivery tracking, and heartbeats.
 - **Honest UI** — every drawn control has a handler, every key printed has an effect, and panels
   show live data or say why they can't.
 
@@ -46,7 +46,7 @@ cargo build --release
 ./target/release/vikram
 ```
 
-Requires **Rust 1.86+**. SQLite is bundled (`rusqlite/bundled`) — no system dependencies.
+Requires **Rust 1.89+**. SQLite is bundled (`rusqlite/bundled`) — no system dependencies.
 Full per-OS install guide (Linux, macOS, Windows, Termux): [`docs/install.md`](docs/install.md)
 
 ```sh
@@ -96,13 +96,13 @@ vikram-policy      deny-first evaluation + non-widenable mandatory floor
 vikram-store       SQLite durable state (WAL)
 vikram-runtime     host: sessions, agents, providers, tools, MCP, plugins, skills, memory,
                    context engine, learning, workspace, sandbox, tickets
-vikram-gateway     ~30 platform adapters + access control + ingress
+vikram-gateway     28 platform adapters + access control + ingress
 vikram-daemon      scheduled jobs: claim/settle transactions, retries, delivery, heartbeats
 vikram-evolution   experience → reflection → proposals learning pipeline
 vikram-tui         ratatui interface
 vikram-cli         the `vikram` binary: TUI, chat, operator commands, gateway, daemon, mcp serve
 supporting         vikram-skills · vikram-mcp · vikram-sandbox · vikram-terminals ·
-                   vikram-codeindex · vikram-acp · vikram-bench
+                   vikram-codeindex · vikram-acp · vikram-bench · vikram-voice
 ```
 
 ---
@@ -162,7 +162,7 @@ overdue semantics, and heartbeat monitoring. All scheduler writes are transactio
 vikram                  # TUI
 vikram chat "…"         # one-shot headless turn
 vikram sessions|project|workspace|files …
-vikram agents|entities|users|profiles …
+vikram entities|users|profiles …
 vikram hive|tickets …   # teams and unified work items
 vikram bots …           # bot lifecycle
 vikram cron …           # scheduled jobs (add/list/edit/remove/run)
@@ -202,8 +202,8 @@ cargo fmt --all
 cargo clippy --workspace --all-targets
 ```
 
-Rust 2024 edition, MSRV 1.86 (toolchain 1.89+ recommended). Tests live in crate-local
-`#[cfg(test)]` modules; the workspace currently passes 2000+ tests.
+Rust 2024 edition, MSRV 1.89. Tests live in crate-local `#[cfg(test)]` modules; the
+workspace currently passes 3,300+ tests (3,387 at `5a12d42`).
 
 Project conventions for agents: [`AGENTS.md`](AGENTS.md) · refinement log:
 [`REFINEMENT.md`](REFINEMENT.md)
@@ -231,6 +231,8 @@ Project conventions for agents: [`AGENTS.md`](AGENTS.md) · refinement log:
 | [`docs/cli.md`](docs/cli.md) | Operator command reference |
 | [`docs/session-workspace.md`](docs/session-workspace.md) | Workspaces, projects, checkpoints |
 | [`docs/roadmap.md`](docs/roadmap.md) | Priorities |
+| [`docs/voice-plan.md`](docs/voice-plan.md) | Voice pipeline plan (JARVIS-class track) |
+| [`docs/always-on.md`](docs/always-on.md) | Always-on presence-session design |
 | [`docs/docker.md`](docs/docker.md) · [`docs/kubernetes.md`](docs/kubernetes.md) · [`docs/termux.md`](docs/termux.md) | Deployment guides |
 
 ---

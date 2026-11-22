@@ -1,5 +1,12 @@
 # Vikram Overview — Architecture & Capabilities
 
+> **Superseded (2026-11-22):** this snapshot names `vikram-kernel`, which was
+> deleted in `fd929d9`; the workspace is now 17 crates (256 Rust files,
+> 246,781 LOC). Teams are now hive rosters, MCP serve is real (not a stub),
+> and the suite passes 3,387 tests at `5a12d42`. Current architecture:
+> [`../../HARNESS.md`](../../HARNESS.md); current capabilities:
+> [`../../README.md`](../../README.md). Kept as a historical record.
+
 ## What Vikram is
 
 A terminal AI runtime in Rust. Single binary (`vikram`) driving an interactive TUI,

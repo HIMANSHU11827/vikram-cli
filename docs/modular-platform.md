@@ -115,7 +115,8 @@ defaults in place; complete subsystem replacement is optional.
 ## Phases
 
 - **P1 Audit** — done across generations; this doc is the inventory.
-- **P2 Hardening** — done (~2,900 tests green, clippy clean).
+- **P2 Hardening** — done (~2,900 tests green at the time; 3,387 at `5a12d42`,
+  clippy clean).
 - **P3 Modular core** — subsystem boundaries: Provider, MemoryProvider,
   Tool, GatewayPlatform traits exist; stage pipeline gives ContextEngine +
   Orchestrator seams.

@@ -100,7 +100,7 @@ Proven by named passing tests (run against a green `vikram-runtime` / `vikram-st
     `cargo test --workspace` — was re-run in a single pass after all edits landed and is green:
     formatting clean, zero clippy errors, and zero test failures across the workspace (vikram-runtime
     459 lib + 5 integration, vikram-tui 151, vikram-skills 190, vikram-store 17 lib + 7 + 6
-    integration, plus the contracts, policy, kernel, mcp, and evolution suites). A concurrent writer
+    integration, plus the contracts, policy, mcp, and evolution suites). A concurrent writer
     was mid-edit in `learning.rs`/`turn.rs` during this work; their refactor settled before the gate,
     and no in-flight work was reverted.
 

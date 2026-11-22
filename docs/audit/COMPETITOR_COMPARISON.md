@@ -1,5 +1,12 @@
 # Competitor Comparison
 
+> **Superseded (2026-11-22) by [`../comparison.md`](../comparison.md):** the
+> current, evidence-cited parity table. This earlier matrix predates the
+> `vikram-sandbox` / `vikram-codeindex` / `vikram-acp` / `vikram-terminals` /
+> `vikram-daemon` crates and understates VIKRAM's rows (sandbox, scheduling,
+> code indexing, ACP, MCP serve are all present now). Kept as a historical
+> record.
+
 ## Competitors investigated
 
 Hermes Agent, OpenClaw, OpenAI Codex, OpenHands, Claude Code, Cursor, OpenCode,

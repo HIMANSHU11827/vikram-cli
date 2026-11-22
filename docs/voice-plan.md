@@ -12,7 +12,8 @@ hologram claim.
 - No audio dependency anywhere in the workspace (verified: `grep -r 'cpal\|rodio\|whisper\|tts' Cargo.toml crates/*/Cargo.toml` — zero hits).
 - `computer.*` helpers already shell out to host binaries (`wl-paste`, `xclip`, `notify-send`) with graceful missing-helper degradation — the established pattern this plan reuses.
 - Runtime is text-in/text-out: `RuntimeHandle::send`, `Block::Text/Image`, the gateway delivers text + ledgered verbs.
-- `vikram-terminals` + ACP PTY exists; daemon is cron-only until the proactivity work lands.
+- `vikram-terminals` + ACP PTY exists; the daemon's event-trigger work has
+  landed (`on <trigger>` schedules, quiet hours — `196f731`).
 
 ## 1. The pipeline (mirroring the Alexa-class stages from jarvis-class.md §1.4)
 
@@ -96,6 +97,15 @@ TTS prosody carries personality. Phase 3+ allows per-persona voice profiles
 identity the text persona uses, not a second personality.
 
 ## 3. Crate layout
+
+> **Status (2026-11-22): superseded by implementation.** `crates/vikram-voice`
+> landed at `5a12d42` as a transport-only scaffold — actual files are
+> `lib.rs`, `helpers.rs`, `session.rs`, `vad.rs`
+> (`VoiceSession::{start,listen_once,speak,status}`, energy-gate VAD, helper
+> discovery), and the only dependency is `thiserror`. The layout below was the
+> plan; the capture/asr/tts/player stages remain helper-driven shells and
+> `cpal`/`whisper-rs`/`piper` are still not dependencies. No new contract
+> types were added, as planned.
 
 New crate `crates/vikram-voice`, depending only on `vikram-contracts` for shared
 types (audio frames stay `Vec<i16>`/`Vec<f32>` primitives; no new contract types

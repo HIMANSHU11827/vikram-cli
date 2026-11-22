@@ -2,7 +2,7 @@
 
 ## Overview
 
-Vikram CLI is a terminal AI runtime (Rust workspace). This file provides project-wide development instructions. Runtime Agent entity definitions are separate (see `crates/vikram-store` entities table and `agents/` directories).
+Vikram CLI is a terminal AI runtime (Rust workspace). This file provides project-wide development instructions. Runtime Agent entity definitions are separate (see the `entities` tables in `crates/vikram-store`; per-entity `agents/` directories live under `$VIKRAM_HOME`, not in this repo).
 
 ## Architecture
 
@@ -10,7 +10,7 @@ See HARNESS.md for the full architecture.
 
 ## Technology Stack
 
-- Rust 2024 edition, rust-version 1.86
+- Rust 2024 edition, rust-version 1.89
 - tokio async runtime
 - rusqlite (bundled SQLite)
 - ratatui + crossterm TUI

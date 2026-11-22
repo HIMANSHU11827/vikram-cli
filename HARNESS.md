@@ -8,13 +8,21 @@ Vikram CLI is a terminal AI runtime built as a Rust workspace. It is a multi-use
 
 - `vikram-contracts`: stable typed contracts (IDs, messages, policy, journal, trust, versioning, tickets).
 - `vikram-policy`: deny-first permission evaluation with mandatory floor.
-- `vikram-store`: SQLite durable state (sessions, agents, teams, journal, users, profiles, entities, active identity, hive sessions/participants/messages, tickets, ticket participants/messages/assignments/events).
-- `vikram-runtime`: central process state, sessions, agents, teams, providers, tools, memory, skills, MCP, plugins, hook registry (`hooks.rs`), context loader, hive manager, ticket manager, sandbox.
+- `vikram-store`: SQLite durable state (sessions, bots, hive rosters, journal, users, profiles, entities, active identity, hive sessions/participants/messages, tickets, ticket participants/messages/assignments/events).
+- `vikram-runtime`: central process state, sessions, sub-agents, bots, hive rosters, providers, tools, memory, skills, MCP, plugins, hook registry (`hooks.rs`), context loader, hive manager, ticket manager, sandbox.
+- `vikram-gateway`: 28 platform adapters + access control + ingress.
+- `vikram-daemon`: scheduled jobs — cron + event triggers, retries, delivery targets, heartbeats, quiet hours.
+- `vikram-sandbox`: OS-level isolation (bubblewrap/seatbelt/landlock; honest pass-through where unavailable).
+- `vikram-terminals`: remote terminal backends (local/docker/ssh).
+- `vikram-codeindex`: tree-sitter symbol index + repo map.
+- `vikram-acp`: Agent Client Protocol client + server (JSON-RPC 2.0 over stdio).
+- `vikram-bench`: in-process performance + personality-consistency harness.
 - `vikram-skills`: skill discovery, loading, activation, installation.
 - `vikram-tui`: Ratatui terminal interface.
 - `vikram-cli`: Clap CLI entry point.
 - `vikram-mcp`: MCP server.
 - `vikram-evolution`: self-evolution engine (experiences, reflection, memory, skills, optimization).
+- `vikram-voice`: voice transport scaffold (`vikram voice status|listen|say`; helper-driven, no audio engines yet).
 
 ## Core Entities
 
@@ -24,7 +32,7 @@ Vikram CLI is a terminal AI runtime built as a Rust workspace. It is a multi-use
 - **Agent**: delegated sub-agent worker. Owns its own context files.
 - **Bot**: dedicated-purpose AI assistant. Owns its own context files.
 - **Hive**: group chat of agents/bots/mixed. Not an entity. Supports sequential and parallel execution.
-- **Team**: reusable group configuration.
+- **Hive roster**: reusable group configuration for hives (renamed from teams — see `docs/RENAME-TEAM-HIVE-AGENT-BOT.md`).
 - **Ticket**: one persistent unit of work shared by Hive teams, independent bots and sub-agents.
   Carries owner, participants, permissions, conversation, assignments, progress, history, reports.
 
@@ -56,4 +64,4 @@ User -> Vikram -> (direct | agent delegation | bot invocation | hive) -> result 
 
 ## CLI Commands
 
-sessions, agents, config, doctor, allow, tools, mcp, skills, users, profiles, entities, hive, tickets.
+sessions, config, doctor, allow, tools, mcp, skills, users, profiles, entities, hive, tickets.

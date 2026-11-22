@@ -1,7 +1,7 @@
 # VIKRAM — master continuation plan
 
-Status: **~2,900 tests passing, clippy clean, pushed to GitHub at `e3c95dd`**
-(47 commits this session). Architecture is production-grade.
+Status: **3,387 tests passing at local HEAD `5a12d42`**, clippy clean. Not pushed —
+origin/master is still at `196f731`. Architecture is production-grade.
 
 ## Done this session (committed + pushed)
 
@@ -12,7 +12,8 @@ Status: **~2,900 tests passing, clippy clean, pushed to GitHub at `e3c95dd`**
 - **Evolution**: full learning loop + verify detail + 8 benchmarks +
   opt-in scheduled cycles + performance metrics + relations tool +
   user/project/hive memory scopes + repeated-failure proposals +
-  self_* engines real/durable.
+  self_* engines real (durability partial — several engines are still
+  process-local; see `vikram-evolution/src/lib.rs`).
 - **Gateway**: all 6 outbound verbs have producers (text/media/poll/card/
   draft/reaction) via marker chains; ACP real PTY terminals; TUI images.
 - **Store**: pagination everywhere it matters, journal deep-prune protocol,
@@ -53,7 +54,11 @@ Status: **~2,900 tests passing, clippy clean, pushed to GitHub at `e3c95dd`**
 - [ ] Phase A: durable presence session identity
 - [ ] Phase B: liveness states (awake/dozing/asleep) + `/sleep` `/wake`
 - [ ] Phase C: proactive turns via triggers into presence session
-- [ ] Phase D: vikram-voice crate (Phase 1 push-to-talk per voice-plan.md)
+- [x] Phase D: vikram-voice transport landed at `5a12d42` — `vikram voice
+      status|listen|say`, session state machine, energy-gate VAD, helper
+      discovery (`crates/vikram-voice`, `crates/vikram-cli/src/voice.rs`).
+      Audio engines (cpal / whisper-rs / piper) are not yet dependencies, so
+      Phase 1 acceptance in voice-plan.md is NOT met — transport only.
 
 ### Verification
 ```bash

@@ -1,16 +1,29 @@
 # Weaknesses & Gaps
 
+> Corrected 2026-11-22 against tree `5a12d42`. This page summarized the 2026-11-03
+> audit; refuted/fixed P0 items are marked inline. W-006 and the P1–P3 lists were
+> not re-verified and may still stand. Live status: `CONTINUE.md`.
+
 ## P0 — Critical
 
-- W-001 Kernel trust hardcoded to Model → undermines provenance/floor.
-- W-002 MCP serve is a stub (prints success, no server).
-- W-003 MCP runtime uses null stdio → cannot talk to children.
-- W-004 Silent error swallowing in memory store.
-- W-005 connect_all always Ok even on failure.
-- W-006 Evolution engine silent fallback to in-memory.
-- W-125 No OS sandbox (policy-only).
-- W-129 No verification loop (edit→build→test→repair).
-- W-124 No durable mid-turn resume.
+- W-001 ~~Kernel trust hardcoded to Model~~ — **REFUTED (2026-11-22):** kernel crate
+  deleted (`fd929d9`); requests are stamped per-origin (`turn.rs:57-65, 2061`).
+- W-002 ~~MCP serve is a stub~~ — **REFUTED:** real deny-first serve
+  (`main.rs:2595`, `crates/vikram-mcp/src/server.rs`).
+- W-003 ~~MCP runtime uses null stdio~~ — **REFUTED:** piped and used
+  (`crates/vikram-mcp/src/client.rs:483-485`).
+- W-004 ~~Silent error swallowing in memory store~~ — **FIXED:** methods return
+  `Result` and propagate (`memory.rs:262,279`).
+- W-005 ~~connect_all always Ok~~ — **FIXED:** returns `Err` naming failed servers
+  (`mcp.rs:20`; regression test `client.rs:767`).
+- W-006 Evolution engine silent fallback to in-memory. *(not re-verified)*
+- W-125 ~~No OS sandbox~~ — **REFUTED (partial):** `vikram-sandbox` —
+  bubblewrap/seatbelt/landlock, Windows JobObjects stub, Termux pass-through.
+- W-129 ~~No verification loop~~ — **REFUTED:** `verification.rs` (1,203 LOC) +
+  `verify` tool (`tools/verify.rs`).
+- W-124 ~~No durable mid-turn resume~~ — **PARTIAL:** `recover_interrupted_session` +
+  `vikram sessions interrupted [--recover]` landed (`a1fecc9`); execution-resume
+  still missing.
 
 ## P1 — High
 
@@ -24,7 +37,7 @@
 - Skills loaded metric always 0; context_used heuristic (len/4).
 - Learning policies write-only (instruction/identity).
 - Hive messages Trust::User for all; hive entities get no tools.
-- Kernel grants not self-enforcing; approval tickets unaddressable; deferred leaves awaiting unset.
+- Kernel grants not self-enforcing; approval tickets unaddressable; deferred leaves awaiting unset. *(Kernel crate deleted `fd929d9` — moot.)*
 - Policy floor vetoes (deny) vs docs ("human"); floor only vetoes Write; normalize_request only Read/Write.
 - MCP visibility inconsistent persistence; auth_required not enforced; approved_tools empty = all.
 - TUI UTF-8 byte slicing panic risk; activity cap index off-by-one.
@@ -56,13 +69,16 @@
 
 ## Security gaps
 
-- No OS sandbox (now partially: bubblewrap/seatbelt; Windows/Termux pass-through).
+- ~~No OS sandbox~~ **Partial (2026-11-22):** bubblewrap/seatbelt/landlock in
+  `vikram-sandbox`; Windows JobObjects stub; Termux pass-through.
 - No taint tracking.
-- Floor bypassable via Trust hardcoding.
+- ~~Floor bypassable via Trust hardcoding~~ **REFUTED (2026-11-22):** per-origin
+  trust stamping (`turn.rs:57-65, 2061`).
 - No secret scanning.
 - No at-rest encryption.
 - No dependency vulnerability scanning.
-- MCP serve stub; MCP null stdio.
+- ~~MCP serve stub; MCP null stdio~~ **REFUTED (2026-11-22):** real deny-first
+  serve (`main.rs:2595`, `server.rs:285-639`); stdio piped (`client.rs:483-485`).
 - Compound command splitting: floor doesn't check all segments.
 - No output validation before context entry.
 

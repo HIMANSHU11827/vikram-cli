@@ -97,8 +97,8 @@ design fills the human-facing half and the multi-agent core.
 
 ## Honesty markers
 
-- "~2,900 tests passing, clippy clean" are CONTINUE.md claims — verified live at
-  Step 0 before being trusted
+- "3,387 tests passing at local HEAD `5a12d42`, clippy clean" are CONTINUE.md claims —
+  verified live at Step 0 before being trusted
 - Nyaya audit (Nov 08): CI historically red, `fmt --check` had 23 diff sites,
   e2e autonomy unproven; REFINEMENT batch 34 fixed several of these
 - Doc-check sub-agent reports (3 running) adjudicate remaining md claims; updates

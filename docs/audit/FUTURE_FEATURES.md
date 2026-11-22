@@ -1,5 +1,16 @@
 # Future Features
 
+> **Superseded (2026-11-22):** a historical idea list from the 2026-11-03 audit.
+> Verified as since built: code indexing (`vikram-codeindex`), the verification
+> loop (`verification.rs` + `tools/verify.rs`), ACP (`vikram-acp`), OS sandbox
+> (`vikram-sandbox`), scheduling/event triggers (`vikram-daemon`), remote
+> terminals (`vikram-terminals`), git/test-run/build-run/code-review/LSP tools,
+> memory consolidation + FTS5 hybrid recall, desktop notifications
+> (`computer.notify`), and agent performance trends. Genuinely still future:
+> local models, semantic memory (embeddings), taint tracking, secret scanning,
+> at-rest encryption, deadlock detection, and mid-turn execution-resume. Live
+> tracking: [`../../CONTINUE.md`](../../CONTINUE.md). Kept as a historical record.
+
 New capabilities worth exploring, beyond fixing existing gaps.
 
 ## Code intelligence

@@ -4,6 +4,12 @@
 > (see `docs/tickets.md` and `README.md`), providing the shared engine for Hive
 > teams, independent bots and sub-agents with conversations, participants,
 > permissions, assignments, reports and recovery.
+>
+> Renames since this audit: the old `vikram agents` CLI became
+> `vikram entities` (agents are entity rows), `teams` became hive rosters, and
+> the runtime's `agents`/`teams` stores became `bots`/`hive_rosters` — see
+> `docs/RENAME-TEAM-HIVE-AGENT-BOT.md`. Any pre-rename command or table name
+> below is historical.
 
 Mission: complete the HIVE (teams) and BOTS (agents) right-panel system inside the existing
 native Rust TUI, wired to the real runtime. No mocks, no duplicates, no hardcoded names.

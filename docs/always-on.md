@@ -26,8 +26,9 @@ Not "the TUI runs forever." An always-on session is:
   `vikram-store`; they already survive restarts.
 - `RuntimeHandle::spawn_agent`, hive sessions and tickets give multi-entity
   execution; the main agent's conversational session is the gap.
-- Daemon: cron scheduler + postbox + notify + heartbeat. Cron-only until the
-  proactivity trigger work lands (event triggers, quiet hours, audit).
+- Daemon: cron scheduler + postbox + notify + heartbeat, plus event triggers
+  (`on <trigger>` schedules, EventBus, `daemon_events` dedup, quiet hours,
+  `daemon_audit` trail — landed `196f731`).
 - Memory: user:/project:/session:/hive: scopes, relation model (`relations`,
   `relation_facts`), consolidated recall into `retrieved_memory`.
 - Permissions: deny-first tool permissions; `computer.*` helpers degrade

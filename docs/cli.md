@@ -5,7 +5,7 @@
 
 ## Command groups
 
-sessions, project, workspace, files, agents, config, doctor, allow, tools, mcp, skills,
+sessions, project, workspace, files, config, doctor, allow, tools, mcp, skills,
 users, profiles, entities, hive, tickets.
 
 ## Key commands
@@ -23,5 +23,6 @@ users, profiles, entities, hive, tickets.
 
 ## Notes
 
-`runtime()` uses `.expect()` (panic on failure). MCP serve is a stub. Doctor terminal
-size reads env.
+`runtime()` uses `.expect()` (panic on failure). MCP serve is real (`vikram mcp serve`
+starts a JSON-RPC stdio server behind a deny-first `approved_tools` gate — see
+`crates/vikram-mcp/src/server.rs`). Doctor terminal size reads env.

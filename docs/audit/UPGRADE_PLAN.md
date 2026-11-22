@@ -1,5 +1,10 @@
 # Vikram A-to-Z Architecture Upgrade — Plan
 
+> **Superseded (2026-11-22) by [`UPGRADE_REPORT.md`](UPGRADE_REPORT.md):** all
+> five planned subsystems landed as crates — `vikram-sandbox`,
+> FTS5 session search + memory consolidation, `vikram-codeindex`,
+> `vikram-acp`, `vikram-terminals`. Kept as the original plan of record.
+
 ## Goal
 Make Vikram a top-tier agent framework across 5 subsystems: Sandbox, Memory/Sessions, Code Indexing, ACP, Remote Terminals — competing with and exceeding Hermes/OpenClaw/OpenHands/OpenCode/Codex/Claude/Aider.
 

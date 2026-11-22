@@ -33,8 +33,8 @@ Reference implementation to mirror: `gateway/platforms/ADDING_A_PLATFORM.md`.
 
 ## VIKRAM target
 
-Workspace `/home/himanshu/Desktop/VIKRAM-CLI`, 14 crates, resolver 3, edition 2024,
-rust-version 1.86, license `MIT OR Apache-2.0`.
+Workspace `/home/himanshu/Desktop/VIKRAM-CLI`, 17 crates, resolver 3, edition 2024,
+rust-version 1.89, license `MIT OR Apache-2.0`.
 
 Gateway plugs into: `vikram_runtime::{Runtime, RuntimeHandle, EventBus}`
 (same pattern as `vikram-daemon::runner::turn`).
