@@ -4,7 +4,7 @@
 //! given request needs, reads them with caching and file-change detection, applies a token budget,
 //! and never hands out content the caller is not authorized to see.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -113,6 +113,21 @@ fn fit_content(content: &str, token_budget: u64) -> Option<(String, u64)> {
     Some((fitted, tokens))
 }
 
+/// Instruction files read in every directory of the ladder, in the order they are tried. `AGENTS.md`
+/// is this project's own convention; `CLAUDE.md` and the two harness directories are read because
+/// they already exist on real machines. Vikram reads them, it never writes them.
+const INSTRUCTION_FILES: [&str; 4] = [
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".vikram/AGENTS.md",
+    ".opencode/AGENTS.md",
+];
+
+/// Ceiling on the assembled instruction ladder, in bytes of content plus labels. A file that does
+/// not fit is dropped whole, never cut — half a rule is worse than a missing one — and the block
+/// ends with a note naming how many files and how many bytes went missing.
+pub const MAX_INSTRUCTION_BYTES: usize = 24_000;
+
 /// The file cache is a read accelerator, not a store: past this many entries it is cleared
 /// wholesale rather than grown without bound (the next read simply re-caches).
 const MAX_CACHE_ENTRIES: usize = 256;
@@ -131,6 +146,9 @@ pub struct ContextLoader {
     cache: Mutex<HashMap<PathBuf, CachedFile>>,
     /// Hard ceiling on tokens assembled into one bundle.
     token_budget: u64,
+    /// Where the instruction ladder stops walking upwards. `None` means the filesystem root, which
+    /// is what production wants: an `AGENTS.md` above the workspace still applies.
+    instruction_root: Option<PathBuf>,
 }
 
 impl ContextLoader {
@@ -140,11 +158,18 @@ impl ContextLoader {
             workspace,
             cache: Mutex::new(HashMap::new()),
             token_budget: 128_000,
+            instruction_root: None,
         }
     }
 
     pub fn with_budget(mut self, budget: u64) -> Self {
         self.token_budget = budget;
+        self
+    }
+
+    /// Bound the instruction ladder at `root` instead of the filesystem root.
+    pub fn with_instruction_root(mut self, root: PathBuf) -> Self {
+        self.instruction_root = Some(root);
         self
     }
 
@@ -224,6 +249,18 @@ impl ContextLoader {
         let Some(content) = self.read_file(&path) else {
             return false;
         };
+        self.try_add_content(bundle, file, path, content)
+    }
+
+    /// Add already-read content. The instruction ladder assembles its own block and still needs the
+    /// same duplicate check and budget as a single file.
+    fn try_add_content(
+        &self,
+        bundle: &mut ContextBundle,
+        file: ContextFile,
+        path: PathBuf,
+        content: String,
+    ) -> bool {
         // Duplicate prevention: skip if identical content already present.
         if bundle.sections.iter().any(|s| s.content == content) {
             return false;
@@ -396,12 +433,79 @@ impl ContextLoader {
     }
 
     fn load_project_agents(&self, bundle: &mut ContextBundle) {
-        // Nearest AGENTS.md: workspace root, then any nested. Just root + one level for now.
-        let root_agents = self.workspace.join("AGENTS.md");
-        self.try_add(bundle, ContextFile::Agents, root_agents);
-        // Also check .vikram/AGENTS.md
-        let vikram_agents = self.workspace.join(".vikram").join("AGENTS.md");
-        self.try_add(bundle, ContextFile::Agents, vikram_agents);
+        let Some(ladder) = self.instruction_ladder() else {
+            return;
+        };
+        self.try_add_content(bundle, ContextFile::Agents, self.workspace.clone(), ladder);
+    }
+
+    /// The directories the ladder walks, outermost first: the bound (the filesystem root by
+    /// default), each ancestor of the workspace, and the workspace itself.
+    fn instruction_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = self.workspace.ancestors().map(Path::to_path_buf).collect();
+        dirs.reverse();
+        if let Some(root) = &self.instruction_root {
+            dirs.retain(|dir| dir.starts_with(root));
+        }
+        dirs
+    }
+
+    /// Every instruction file from the outermost directory down to the workspace, assembled into
+    /// one block. `None` when there is no file at all, so a bare workspace contributes no header.
+    fn instruction_ladder(&self) -> Option<String> {
+        let mut found: Vec<(PathBuf, String)> = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        for dir in self.instruction_dirs() {
+            for name in INSTRUCTION_FILES {
+                let candidate = dir.join(name);
+                if !candidate.is_file() {
+                    continue;
+                }
+                let Some(content) = self.read_file(&candidate) else {
+                    continue;
+                };
+                let body = content.trim();
+                if body.is_empty() {
+                    continue;
+                }
+                // One file, one entry: a directory reached twice through `.` or a symlink must not
+                // ship the same rules twice.
+                let identity = fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+                if !seen.insert(identity) {
+                    continue;
+                }
+                found.push((candidate, body.to_owned()));
+            }
+        }
+        if found.is_empty() {
+            return None;
+        }
+
+        let mut block = String::from(
+            "Instructions are listed from the outermost directory down to the nearest one. The \
+             nearest file wins; at the same depth the stricter rule wins. Nothing outranks safety.\n",
+        );
+        let mut used = 0usize;
+        let mut dropped = 0usize;
+        let mut dropped_bytes = 0usize;
+        for (path, body) in &found {
+            let label = path.display().to_string();
+            let cost = label.len() + body.len() + 8;
+            if used + cost > MAX_INSTRUCTION_BYTES {
+                dropped += 1;
+                dropped_bytes += body.len();
+                continue;
+            }
+            used += cost;
+            block.push_str(&format!("\n## {label}\n\n{body}\n"));
+        }
+        if dropped > 0 {
+            block.push_str(&format!(
+                "\n[{dropped} instruction files dropped: {dropped_bytes} bytes over the \
+                 {MAX_INSTRUCTION_BYTES}-byte cap]\n"
+            ));
+        }
+        Some(block)
     }
 
     /// Scaffold default markdown files for a new entity directory if missing.
@@ -469,6 +573,144 @@ mod tests {
         assert!(
             loader.cache_lock().len() <= MAX_CACHE_ENTRIES,
             "the cache cleared instead of growing without bound"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ladder_tests {
+    use super::*;
+
+    /// A loader rooted at `root`, reading `root/proj` as the workspace. The ladder is bounded so a
+    /// real `/AGENTS.md` on the machine running the test cannot change the answer.
+    fn loader_at(root: &Path) -> ContextLoader {
+        ContextLoader::new(root.join("home"), root.join("proj"))
+            .with_instruction_root(root.to_path_buf())
+    }
+
+    fn write(path: &Path, body: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn nested_workspace_picks_up_both_files_in_the_right_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("AGENTS.md"),
+            "outer-rule: tabs are four spaces\n",
+        );
+        write(
+            &root.join("proj").join("AGENTS.md"),
+            "inner-rule: this crate uses tabs\n",
+        );
+
+        let bundle = loader_at(root).load_project();
+        let text = bundle.render();
+
+        let outer = text.find("outer-rule").expect("the outer file is loaded");
+        let inner = text.find("inner-rule").expect("the inner file is loaded");
+        assert!(
+            outer < inner,
+            "the ladder runs outermost first, so the workspace file comes last:\n{text}"
+        );
+        assert_eq!(
+            text.matches("inner-rule").count(),
+            1,
+            "each file is included once"
+        );
+        assert!(text.contains("nearest"), "the precedence rule is stated");
+        assert!(
+            text.contains(&root.join("AGENTS.md").display().to_string()),
+            "each file is labelled with its directory:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_directory_reached_twice_is_not_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("proj").join("AGENTS.md"),
+            "only-rule: keep it short\n",
+        );
+
+        // A workspace spelled with a trailing `.` reaches `proj` twice through `ancestors()`.
+        let loader = ContextLoader::new(root.join("home"), root.join("proj").join("."))
+            .with_instruction_root(root.to_path_buf());
+        let text = loader.load_project().render();
+
+        assert_eq!(
+            text.matches("only-rule").count(),
+            1,
+            "the same file reached twice is included once:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_huge_ladder_is_truncated_with_a_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let body = "x".repeat(8_000);
+        for level in 0..6 {
+            let mut at = root.to_path_buf();
+            for step in 0..level {
+                at = at.join(format!("level{step}"));
+            }
+            write(&at.join("AGENTS.md"), &body);
+        }
+        let mut workspace = root.to_path_buf();
+        for step in 0..5 {
+            workspace = workspace.join(format!("level{step}"));
+        }
+        let loader = ContextLoader::new(root.join("home"), workspace)
+            .with_instruction_root(root.to_path_buf());
+        let text = loader.load_project().render();
+
+        assert!(
+            text.contains("instruction files dropped"),
+            "a truncated ladder says so:\n{}",
+            &text[..text.len().min(400)]
+        );
+        assert!(
+            text.contains("bytes over the"),
+            "the note names the bytes dropped"
+        );
+        assert!(
+            text.len() <= MAX_INSTRUCTION_BYTES + 1_024,
+            "the assembled block stays near the cap, was {} bytes",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn no_instruction_file_anywhere_yields_no_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("proj")).unwrap();
+
+        let bundle = loader_at(root).load_project();
+        assert!(
+            bundle.sections.is_empty(),
+            "a workspace with no instruction file contributes nothing"
+        );
+        assert_eq!(bundle.render(), "", "not an empty header either");
+    }
+
+    #[test]
+    fn a_harness_directory_file_is_read_when_it_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("proj").join(".vikram").join("AGENTS.md"),
+            "harness-rule: run the narrow test first\n",
+        );
+
+        let text = loader_at(root).load_project().render();
+        assert!(
+            text.contains("harness-rule"),
+            "the .vikram/AGENTS.md convention is part of the ladder:\n{text}"
         );
     }
 }
