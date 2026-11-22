@@ -55,12 +55,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let show_notice = app.live_notice().is_some();
     let regions = layout::layout(area, show_hive, show_bots, input_lines, show_notice);
     app.bots_rect = regions.bots.map(|r| (r.x, r.y, r.width, r.height));
-    app.conversation_rect = Some((
-        regions.conversation.x,
-        regions.conversation.y,
-        regions.conversation.width,
-        regions.conversation.height,
-    ));
 
     widgets::session_tabs(frame, regions.tabs, app, &theme);
 
@@ -68,22 +62,50 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Without the reservation the panel clears the rows it is asking about, which is exactly what
     // the operator needs to read.
     let approvals_open = matches!(app.overlay, Some(Overlay::Approvals));
+
+    // The plan strip is one row the transcript lends, directly above the composer: what the agent
+    // intends belongs beside the input, not buried in the scrollback. A session with no plan keeps
+    // every row, and a question that needs an answer outranks the plan, so the strip yields to it.
+    let mut transcript = regions.conversation;
+    let plan_area = if approvals_open || transcript.height < 2 {
+        None
+    } else {
+        match app.display_session() {
+            Some(session) if widgets::panels::plan_lines(session, &theme, app.ascii).is_some() => {
+                let rect = Rect {
+                    y: transcript.y + transcript.height - 1,
+                    height: 1,
+                    ..transcript
+                };
+                transcript.height -= 1;
+                Some(rect)
+            }
+            _ => None,
+        }
+    };
+
     let reserved = if approvals_open {
         widgets::approval_panel_height(app, &theme)
-            .min(regions.conversation.height / 2)
-            .min(regions.conversation.height.saturating_sub(3))
+            .min(transcript.height / 2)
+            .min(transcript.height.saturating_sub(3))
     } else {
         0
     };
     let conversation = Rect {
-        height: regions.conversation.height.saturating_sub(reserved),
-        ..regions.conversation
+        height: transcript.height.saturating_sub(reserved),
+        ..transcript
     };
     let question = Rect {
-        y: regions.conversation.y + conversation.height,
+        y: transcript.y + conversation.height,
         height: reserved,
-        ..regions.conversation
+        ..transcript
     };
+    app.conversation_rect = Some((
+        conversation.x,
+        conversation.y,
+        conversation.width,
+        conversation.height,
+    ));
 
     let thought_hits = match app.display_session() {
         // A session that has not said anything yet is the same state as no session at all from the
@@ -102,6 +124,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
     };
     app.thought_hits = thought_hits;
+
+    if let Some(plan_area) = plan_area {
+        widgets::panels::plan_strip(frame, plan_area, app, &theme);
+    }
 
     if let Some(hive_area) = regions.hive {
         widgets::hive_panel(frame, hive_area, app, &theme);
@@ -382,6 +408,119 @@ mod tests {
             title_status: "ready".to_owned(),
             turn_times: Vec::new(),
         }
+    }
+
+    fn drawn(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal.draw(|frame| draw(frame, app)).expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn plan_view() -> vikram_runtime::types::PlanView {
+        vikram_runtime::types::PlanView {
+            steps: vec![
+                vikram_runtime::types::PlanStepView {
+                    title: "read the failing test".to_owned(),
+                    status: "done".to_owned(),
+                },
+                vikram_runtime::types::PlanStepView {
+                    title: "fix the parser".to_owned(),
+                    status: "in_progress".to_owned(),
+                },
+                vikram_runtime::types::PlanStepView {
+                    title: "run the suite".to_owned(),
+                    status: "pending".to_owned(),
+                },
+            ],
+        }
+    }
+
+    fn app_with_plan(ascii: bool) -> App {
+        let mut app = App::new(ascii);
+        let mut view = crate::app::SessionView::from_snapshot(snapshot("Plan", "hello"));
+        view.plan = Some(plan_view());
+        app.sessions.push(view);
+        app
+    }
+
+    #[test]
+    fn the_plan_strip_names_the_current_step_above_the_composer() {
+        let mut app = app_with_plan(false);
+        let text = drawn(&mut app, 100, 30);
+
+        assert!(
+            text.contains("▸ plan 1/3 · fix the parser"),
+            "the strip must say what the agent is doing: {text}"
+        );
+        assert_eq!(
+            app.conversation_rect,
+            Some((0, 1, 100, 23)),
+            "the strip takes one transcript row and nothing else"
+        );
+    }
+
+    #[test]
+    fn ascii_mode_draws_the_plan_without_glyphs() {
+        let mut app = app_with_plan(true);
+        let text = drawn(&mut app, 100, 30);
+
+        assert!(
+            text.contains("> plan 1/3 . fix the parser"),
+            "ascii mode must use plain characters: {text}"
+        );
+        assert!(!text.contains('▸'), "no glyphs in ascii mode: {text}");
+    }
+
+    #[test]
+    fn a_session_without_a_plan_keeps_every_row() {
+        let mut app = App::new(false);
+        app.sessions
+            .push(crate::app::SessionView::from_snapshot(snapshot(
+                "Plain", "hello",
+            )));
+        let text = drawn(&mut app, 100, 30);
+
+        assert!(
+            !text.contains("plan 1/3"),
+            "there is no plan to draw: {text}"
+        );
+        assert_eq!(
+            app.conversation_rect,
+            Some((0, 1, 100, 24)),
+            "a session that never planned renders exactly as it did before"
+        );
+    }
+
+    #[test]
+    fn adding_a_plan_changes_only_the_strip_row() {
+        let mut app = App::new(false);
+        app.sessions
+            .push(crate::app::SessionView::from_snapshot(snapshot(
+                "Plain", "hello",
+            )));
+        let before = drawn(&mut app, 100, 30);
+        app.sessions[0].plan = Some(plan_view());
+        let after = drawn(&mut app, 100, 30);
+
+        let mut changed: Vec<usize> = before
+            .chars()
+            .zip(after.chars())
+            .enumerate()
+            .filter(|(_, (was, now))| was != now)
+            .map(|(index, _)| index / 100)
+            .collect();
+        changed.dedup();
+        assert_eq!(
+            changed,
+            vec![24],
+            "the plan owns one row above the composer and no other"
+        );
     }
 
     #[test]

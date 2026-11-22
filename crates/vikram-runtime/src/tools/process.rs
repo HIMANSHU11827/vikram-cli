@@ -367,6 +367,15 @@ impl PlanStatus {
         }
     }
 
+    /// The word the model writes, which is the word an interface reads back.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Done => "done",
+        }
+    }
+
     fn mark(self) -> &'static str {
         match self {
             Self::Pending => "[ ]",
@@ -545,10 +554,33 @@ impl Tool for UpdatePlan {
             plans.insert(key, plan.clone());
             plan
         };
+        // A plan the operator cannot see is a plan nobody can hold the agent to. The event carries
+        // only what a view draws, and only a call made from a session publishes it: a direct tool
+        // call has no interface to update and no session to file it under.
+        if let (Some(runtime), Some(session)) = (ctx.runtime.as_ref(), ctx.session.as_ref()) {
+            runtime.emit(crate::types::RuntimeEvent::PlanUpdated {
+                session: session.clone(),
+                plan: plan_view(&plan),
+            });
+        }
         Ok(ToolOutput {
             content: plan.render(),
             ok: true,
         })
+    }
+}
+
+/// The plan in the shape an event carries: titles and status words, no tool types.
+fn plan_view(plan: &Plan) -> crate::types::PlanView {
+    crate::types::PlanView {
+        steps: plan
+            .steps
+            .iter()
+            .map(|step| crate::types::PlanStepView {
+                title: step.text.clone(),
+                status: step.status.as_str().to_owned(),
+            })
+            .collect(),
     }
 }
 
@@ -680,6 +712,70 @@ mod tests {
                 .is_err(),
             "a plan longer than the limit is refused, never clipped"
         );
+    }
+
+    /// `VIKRAM_HOME` is process-global, so a test that points the home at a temporary directory
+    /// holds the shared guard for its whole body.
+    fn isolated_home(dir: &std::path::Path) -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::config::lock_security_env();
+        unsafe { std::env::set_var("VIKRAM_HOME", dir.join("home")) };
+        guard
+    }
+
+    #[tokio::test]
+    // The home guard must outlive the boot: releasing it early would let a parallel test repoint
+    // `VIKRAM_HOME` at its own directory mid-startup. Same reason the runtime's own tests allow it.
+    #[allow(clippy::await_holding_lock)]
+    async fn update_plan_publishes_the_plan_to_the_interface() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = isolated_home(dir.path());
+        let config = crate::config::Config {
+            model: "test-model".into(),
+            workspace_root: Some(dir.path().to_path_buf()),
+            ..crate::config::Config::default()
+        };
+        let runtime = crate::runtime::Runtime::start(config)
+            .await
+            .expect("a runtime with no provider still boots");
+        let handle = runtime.handle();
+        let session = handle.snapshot().sessions[0].id.clone();
+        let mut events = handle.events();
+        let ctx = ToolContext {
+            runtime: Some(std::sync::Arc::clone(&handle.inner)),
+            session: Some(session.clone()),
+            ..ToolContext::default()
+        };
+
+        UpdatePlan
+            .run(
+                &steps(json!([
+                    {"text": "read the failing test", "status": "done"},
+                    {"text": "fix it", "status": "in_progress"},
+                ])),
+                &ctx,
+            )
+            .expect("the plan is accepted");
+
+        let plan = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let crate::types::RuntimeEvent::PlanUpdated { session: sid, plan } =
+                    events.recv().await.expect("the bus stays open")
+                    && sid == session
+                {
+                    return plan;
+                }
+            }
+        })
+        .await
+        .expect("the plan event arrives");
+
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].title, "read the failing test");
+        assert_eq!(plan.steps[0].status, "done");
+        assert_eq!(plan.steps[1].title, "fix it");
+        assert_eq!(plan.steps[1].status, "in_progress");
+        assert_eq!(plan.done(), 1);
+        assert_eq!(plan.current(), Some("fix it"));
     }
 
     #[test]

@@ -14,8 +14,8 @@ use vikram_contracts::{
 };
 use vikram_runtime::types::{
     ApprovalPrompt, BackgroundTask, BotSnapshot, BotState, ContextMeter, HiveRosterSnapshot,
-    Metrics, NoticeLevel, RuntimeEvent, RuntimeStatus, SessionSnapshot, StateSnapshot, TaskState,
-    TurnState, now_ms,
+    Metrics, NoticeLevel, PlanView, RuntimeEvent, RuntimeStatus, SessionSnapshot, StateSnapshot,
+    TaskState, TurnState, now_ms,
 };
 
 #[derive(Clone, Debug)]
@@ -645,6 +645,9 @@ pub struct SessionView {
     /// `generic`, `auto` or `manual` — how this session got its name.
     pub title_source: String,
     pub bot: Option<BotId>,
+    /// What the agent says it is doing, as the runtime last published it. `None` until the session
+    /// writes a plan, which is what keeps a session that never planned drawing exactly as before.
+    pub plan: Option<PlanView>,
     pub editor: Editor,
     pub scroll: usize,
     pub follow: bool,
@@ -697,6 +700,7 @@ impl SessionView {
             updated_ms: snapshot.updated_ms,
             title_source: snapshot.title_source,
             bot: snapshot.bot,
+            plan: None,
             editor: Editor::new(),
             scroll: 0,
             follow: true,
@@ -1887,6 +1891,26 @@ impl App {
                     self.overlay = Some(Overlay::Picker(picker));
                 }
             }
+            RuntimeEvent::PlanUpdated { session, plan } => {
+                let changed = match self.session_by_id(&session) {
+                    Some(view) => {
+                        let changed = view.plan.as_ref() != Some(&plan);
+                        view.plan = Some(plan.clone());
+                        changed
+                    }
+                    None => false,
+                };
+                // The strip already shows the plan, so a notice is only worth a row when the list
+                // moved. A re-send of the same steps would otherwise push the operator's last
+                // message off the notice line for nothing.
+                if changed && !plan.steps.is_empty() {
+                    let text = match plan.current() {
+                        Some(step) => format!("plan: {}/{} {step}", plan.done(), plan.steps.len()),
+                        None => format!("plan: {}/{} done", plan.done(), plan.steps.len()),
+                    };
+                    self.push_notice(NoticeLevel::Info, text);
+                }
+            }
             RuntimeEvent::Notice { level, text } => self.push_notice(level, text),
             RuntimeEvent::ModeChanged { mode, .. } => {
                 self.mode = mode;
@@ -2118,7 +2142,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vikram_runtime::types::SessionSnapshot;
+    use vikram_runtime::types::{PlanStepView, SessionSnapshot};
 
     #[test]
     fn a_reloaded_transcript_rebuilds_its_tool_rows() {
@@ -2159,6 +2183,73 @@ mod tests {
         }]);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ok, None, "no result means the call never reported");
+    }
+
+    fn plan_view(steps: &[(&str, &str)]) -> PlanView {
+        PlanView {
+            steps: steps
+                .iter()
+                .map(|(title, status)| PlanStepView {
+                    title: (*title).to_owned(),
+                    status: (*status).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_plan_event_is_kept_and_announced() {
+        let mut app = app_on(None);
+        let session = app.sessions[0].id.clone();
+        let plan = plan_view(&[
+            ("read the failing test", "done"),
+            ("fix it", "in_progress"),
+            ("run the suite", "pending"),
+        ]);
+
+        app.on_event(RuntimeEvent::PlanUpdated {
+            session,
+            plan: plan.clone(),
+        });
+
+        assert_eq!(
+            app.sessions[0].plan.as_ref(),
+            Some(&plan),
+            "the plan is kept for the strip to draw"
+        );
+        assert_eq!(app.notices.len(), 1, "a new plan is announced");
+        assert_eq!(app.notices[0].text, "plan: 1/3 fix it");
+    }
+
+    #[test]
+    fn a_plan_sent_twice_is_announced_once() {
+        let mut app = app_on(None);
+        let session = app.sessions[0].id.clone();
+        let plan = plan_view(&[("fix it", "in_progress"), ("run the suite", "pending")]);
+
+        app.on_event(RuntimeEvent::PlanUpdated {
+            session: session.clone(),
+            plan: plan.clone(),
+        });
+        app.on_event(RuntimeEvent::PlanUpdated { session, plan });
+
+        assert_eq!(
+            app.notices.len(),
+            1,
+            "an unchanged plan must not spend a second notice"
+        );
+    }
+
+    #[test]
+    fn an_empty_plan_is_stored_without_a_notice() {
+        let mut app = app_on(None);
+        let session = app.sessions[0].id.clone();
+        app.on_event(RuntimeEvent::PlanUpdated {
+            session,
+            plan: PlanView { steps: Vec::new() },
+        });
+        assert!(app.sessions[0].plan.is_some(), "the strip is told to go");
+        assert!(app.notices.is_empty(), "there is no step to announce");
     }
 
     fn app_on(model: Option<&str>) -> App {

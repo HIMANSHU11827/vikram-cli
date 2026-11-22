@@ -383,6 +383,42 @@ pub struct ActivityEvent {
     pub seq: u64,
 }
 
+/// One step of a plan, as an interface draws it: the line the model wrote and the status word it
+/// chose. Deliberately not [`crate::tools::PlanStep`] — an event that named a tool's type would make
+/// every consumer of the event depend on the tool module, and a view needs two strings per step.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanStepView {
+    pub title: String,
+    /// `pending`, `in_progress` or `done` — the same words the model writes.
+    pub status: String,
+}
+
+/// A session's plan, whole. It replaces the previous one on every write, so a view never has to
+/// merge two of them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanView {
+    pub steps: Vec<PlanStepView>,
+}
+
+impl PlanView {
+    pub fn done(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|step| step.status == "done")
+            .count()
+    }
+
+    /// The step being worked on: the first marked `in_progress`, else the first still open. `None`
+    /// for an empty plan, and for a plan with nothing left, where the figure says it all.
+    pub fn current(&self) -> Option<&str> {
+        self.steps
+            .iter()
+            .find(|step| step.status == "in_progress")
+            .or_else(|| self.steps.iter().find(|step| step.status != "done"))
+            .map(|step| step.title.as_str())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum RuntimeEvent {
     Status(RuntimeStatus),
@@ -517,6 +553,12 @@ pub enum RuntimeEvent {
     Notice {
         level: NoticeLevel,
         text: String,
+    },
+    /// The session's plan was replaced. Published by `update_plan` so an interface can show what the
+    /// agent intends without reading it back out of the transcript.
+    PlanUpdated {
+        session: SessionId,
+        plan: PlanView,
     },
     Error {
         text: String,

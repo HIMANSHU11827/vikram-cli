@@ -312,6 +312,13 @@ async fn stream_turn(
                 failed = true;
             }
             Ok(RuntimeEvent::Notice { text, .. }) => eprintln!("[notice] {text}"),
+            // The plan has no pane in a pipe, so it gets one line per write: what the agent says it
+            // is doing, where a log read afterwards can follow the shape of the work.
+            Ok(RuntimeEvent::PlanUpdated { session: sid, plan }) if sid == *session => {
+                if let Some(step) = plan.current() {
+                    eprintln!("plan: {}/{} {step}", plan.done(), plan.steps.len());
+                }
+            }
             Ok(RuntimeEvent::TurnFinished {
                 session: sid,
                 state,

@@ -14,7 +14,9 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use vikram_runtime::types::{BotState, NoticeLevel, TaskState};
 
-use crate::app::{ActivityKind, App, BotClick, Focus, InspectorKind, Overlay, Selection, TabHit};
+use crate::app::{
+    ActivityKind, App, BotClick, Focus, InspectorKind, Overlay, Selection, SessionView, TabHit,
+};
 use crate::theme::{StatusSegment, Theme};
 
 use super::preview;
@@ -436,6 +438,44 @@ pub fn plasma(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The plan, as one row: what the agent says it is doing right now. `None` when the session has no
+/// plan, which is what lets a session that never planned keep every row it had.
+pub fn plan_lines(session: &SessionView, theme: &Theme, ascii: bool) -> Option<Line<'static>> {
+    let plan = session.plan.as_ref()?;
+    if plan.steps.is_empty() {
+        return None;
+    }
+    let (glyph, separator) = if ascii { (">", ".") } else { ("▸", "·") };
+    // A plan with nothing left says so instead of naming a step that is already done.
+    let step = plan.current().unwrap_or("done");
+    Some(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(format!("{glyph} "), Style::default().fg(theme.accent)),
+        Span::styled(
+            format!("plan {}/{}", plan.done(), plan.steps.len()),
+            Style::default()
+                .fg(theme.accent_dim)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" {separator} "), theme.muted()),
+        Span::styled(step.to_owned(), theme.secondary()),
+    ]))
+}
+
+/// Draw the plan row in the one row the layout lent it. Nothing is drawn when there is no plan.
+pub fn plan_strip(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let Some(session) = app.display_session() else {
+        return;
+    };
+    let Some(line) = plan_lines(session, theme, theme.ascii) else {
+        return;
+    };
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 pub fn status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
