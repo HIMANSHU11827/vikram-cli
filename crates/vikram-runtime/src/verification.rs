@@ -24,6 +24,9 @@ pub enum FailureKind {
     RuntimeError,
     Timeout,
     Unknown,
+    /// Strict mode only: the run finished green but nothing was proven, or a declared
+    /// expectation did not hold. Never produced by `classify`.
+    ExpectationMissing,
 }
 
 impl FailureKind {
@@ -35,6 +38,7 @@ impl FailureKind {
             FailureKind::RuntimeError => "runtime_error",
             FailureKind::Timeout => "timeout",
             FailureKind::Unknown => "unknown",
+            FailureKind::ExpectationMissing => "expectation_missing",
         }
     }
 
@@ -112,6 +116,9 @@ pub struct VerificationOutcome {
     pub steps: Vec<StepResult>,
     /// What the workspace actually changed, collected after the last attempt.
     pub changes: ChangeReport,
+    /// Strict mode only: what could not be proven, in words the model can act on. `None`
+    /// when the plan itself decided the verdict.
+    pub expectation_failure: Option<String>,
 }
 
 /// Bounded evidence of what changed, not a judgment about whether the right thing
@@ -128,6 +135,10 @@ pub struct ChangeReport {
     /// content. Case-sensitive literal substring matches; `checked` is false
     /// when no file evidence was available (non-git workspace, git failure).
     pub expectations: Vec<Expectation>,
+    /// Declarations that did not hold: an unobserved `expected_changes` path, an
+    /// unsatisfied `expect` pattern, or evidence that could not be collected. Empty
+    /// when everything declared was observed. Strict mode turns these into failures.
+    pub unmet: Vec<String>,
 }
 
 /// One declared expectation vs the changed files. Evidence, not a verdict:
@@ -259,14 +270,14 @@ fn collect_changes(workspace_root: &Path, declared: &[String], expect: &[String]
             ..ChangeReport::default()
         };
         if !declared.is_empty() {
-            report
-                .warnings
-                .push("declared changes could not be checked without git evidence".to_owned());
+            let note = "declared changes could not be checked without git evidence";
+            report.warnings.push(note.to_owned());
+            report.unmet.push(note.to_owned());
         }
         if !patterns.is_empty() {
-            report
-                .warnings
-                .push("expected content could not be checked without git evidence".to_owned());
+            let note = "expected content could not be checked without git evidence";
+            report.warnings.push(note.to_owned());
+            report.unmet.push(note.to_owned());
             report.expectations = patterns
                 .iter()
                 .map(|pattern| Expectation {
@@ -338,14 +349,15 @@ fn collect_changes(workspace_root: &Path, declared: &[String], expect: &[String]
     };
 
     let mut warnings = Vec::new();
+    let mut unmet = Vec::new();
     for declared_path in declared {
         let normalized = normalize_declared_path(declared_path, workspace_root);
         let prefixed = format!("{prefix}{normalized}");
         let observed = files.iter().any(|f| f == &normalized || f == &prefixed);
         if !observed {
-            warnings.push(format!(
-                "declared change '{declared_path}' not observed in git status"
-            ));
+            let note = format!("declared change '{declared_path}' not observed in git status");
+            warnings.push(note.clone());
+            unmet.push(note);
         }
     }
 
@@ -364,10 +376,12 @@ fn collect_changes(workspace_root: &Path, declared: &[String], expect: &[String]
                 let (checked, truncated) = check_expectations(&root, &files, &patterns);
                 for expectation in &checked {
                     if expectation.checked && !expectation.found {
-                        warnings.push(format!(
+                        let note = format!(
                             "expected content '{}' not found in changed files",
                             expectation.pattern
-                        ));
+                        );
+                        warnings.push(note.clone());
+                        unmet.push(note);
                     }
                 }
                 if truncated {
@@ -378,8 +392,9 @@ fn collect_changes(workspace_root: &Path, declared: &[String], expect: &[String]
                 expectations = checked;
             }
             None => {
-                warnings
-                    .push("expected content could not be checked: git rev-parse failed".to_owned());
+                let note = "expected content could not be checked: git rev-parse failed";
+                warnings.push(note.to_owned());
+                unmet.push(note.to_owned());
                 expectations = patterns
                     .iter()
                     .map(|pattern| Expectation {
@@ -400,6 +415,7 @@ fn collect_changes(workspace_root: &Path, declared: &[String], expect: &[String]
         note,
         warnings,
         expectations,
+        unmet,
     }
 }
 
@@ -718,24 +734,107 @@ fn retryable(kind: &FailureKind) -> bool {
     !matches!(kind, FailureKind::Timeout)
 }
 
+/// What the caller claims the change proves, and how hard the claim is checked.
+///
+/// Lenient (the default, `strict: false`) is evidence: a declaration that does not hold is a
+/// warning in `ChangeReport::warnings` and the verdict is the plan's alone. Strict turns the
+/// same evidence into the verdict — a green build that proves nothing about the change is a
+/// failure, with kind `expectation_missing`.
+#[derive(Clone, Debug, Default)]
+pub struct ExpectationPolicy {
+    /// Workspace-relative paths the caller believes the change modified.
+    pub expected_changes: Vec<String>,
+    /// Literal case-sensitive substrings the changed files must now contain.
+    pub expect: Vec<String>,
+    /// When true, an absent or unsatisfied declaration fails the run.
+    pub strict: bool,
+}
+
+/// The step name a strict expectation failure is reported under: there is no shell step to
+/// name, and the model needs to know which part of the proof failed.
+const EXPECTATION_STEP: &str = "expectations";
+
 /// The loop. `repair` is called with the failing step and its output, and is expected to edit
 /// the workspace in place. Each attempt runs its own steps so double-counting successes is
-/// impossible: the loop stops at the first fully green attempt. `expected_changes` declares
-/// the paths the caller believes were modified; `expect` declares content patterns the
-/// caller expects to find in the changed files. The outcome's `changes` report compares
-/// both declarations against git evidence as warnings only — neither affects `ok`.
+/// impossible: the loop stops at the first fully green attempt. `expectations` declares what
+/// the change must prove; `ChangeReport` compares the declarations against git evidence, as
+/// warnings or — under `strict` — as the verdict itself.
 pub fn verify(
     workspace_root: &Path,
     plan: &VerificationPlan,
     budget: &Budget,
     sandbox: &Sandbox,
-    expected_changes: &[String],
-    expect: &[String],
+    expectations: &ExpectationPolicy,
     mut repair: impl FnMut(&str, &str) -> Option<Vec<PathBuf>>,
 ) -> Result<VerificationOutcome, VikramError> {
     let mut outcome = verify_attempts(workspace_root, plan, budget, sandbox, &mut repair)?;
-    outcome.changes = collect_changes(workspace_root, expected_changes, expect);
+    outcome.changes = collect_changes(
+        workspace_root,
+        &expectations.expected_changes,
+        &expectations.expect,
+    );
+    if expectations.strict {
+        let changes = outcome.changes.clone();
+        apply_strict(&mut outcome, expectations, &changes);
+    }
     Ok(outcome)
+}
+
+/// What strict mode refuses to accept, if anything.
+///
+/// Three ways a green plan proves nothing: the caller declared no expectation at all; a
+/// declared one did not hold; or the evidence could not be collected (no git). Each is
+/// returned as the sentence the model reads, because "failed" without "why" is the defect
+/// this mode exists to fix.
+fn strict_unproven(expectations: &ExpectationPolicy, report: &ChangeReport) -> Option<String> {
+    let declared_patterns = !report.expectations.is_empty();
+    let declared_paths = !expectations.expected_changes.is_empty();
+    if !declared_patterns && !declared_paths {
+        return Some(
+            "strict verification requires an expectation and none was declared: pass `expect` \
+             with the literal text the change must introduce (for example \"fn handle_poll\") \
+             or `expected_changes` with the paths it must touch. A green build alone does not \
+             prove the change is there."
+                .to_owned(),
+        );
+    }
+    if !report.unmet.is_empty() {
+        return Some(format!(
+            "strict verification could not prove the change: {}",
+            report.unmet.join("; ")
+        ));
+    }
+    if report
+        .expectations
+        .iter()
+        .any(|expectation| !expectation.checked)
+    {
+        return Some(
+            "strict verification could not check the declared expectations: no git evidence \
+             for the changed files"
+                .to_owned(),
+        );
+    }
+    None
+}
+
+/// Turn an unproven expectation into the verdict. A plan that already failed keeps its own
+/// failure — the build error is the more useful thing to read — and only a green plan is
+/// re-decided here.
+fn apply_strict(
+    outcome: &mut VerificationOutcome,
+    expectations: &ExpectationPolicy,
+    report: &ChangeReport,
+) {
+    if !outcome.ok {
+        return;
+    }
+    let Some(reason) = strict_unproven(expectations, report) else {
+        return;
+    };
+    outcome.ok = false;
+    outcome.failure = Some((EXPECTATION_STEP.to_owned(), FailureKind::ExpectationMissing));
+    outcome.expectation_failure = Some(reason);
 }
 
 fn verify_attempts(
@@ -777,6 +876,7 @@ fn verify_attempts(
                 failure: None,
                 steps: all_steps,
                 changes: ChangeReport::default(),
+                expectation_failure: None,
             });
         }
 
@@ -800,6 +900,7 @@ fn verify_attempts(
                 failure: Some((name, kind)),
                 steps: all_steps,
                 changes: ChangeReport::default(),
+                expectation_failure: None,
             });
         }
         let Some(edits) = repair(&name, &spent_out) else {
@@ -809,6 +910,7 @@ fn verify_attempts(
                 failure: Some((name, kind)),
                 steps: all_steps,
                 changes: ChangeReport::default(),
+                expectation_failure: None,
             });
         };
         if edits.is_empty() {
@@ -819,6 +921,7 @@ fn verify_attempts(
                 failure: Some((name, kind)),
                 steps: all_steps,
                 changes: ChangeReport::default(),
+                expectation_failure: None,
             });
         }
     }
@@ -891,8 +994,7 @@ mod tests {
             &plan,
             &Budget::attempts(3),
             &Sandbox::disabled("test"),
-            &[],
-            &[],
+            &ExpectationPolicy::default(),
             |_, _| None,
         )
         .unwrap();
@@ -916,8 +1018,7 @@ mod tests {
             &plan,
             &Budget::attempts(3),
             &Sandbox::disabled("test"),
-            &[],
-            &[],
+            &ExpectationPolicy::default(),
             |_, _| {
                 let seen = counter_for_repair.metadata().map(|m| m.len()).unwrap_or(0);
                 let mut f = std::fs::OpenOptions::new()
@@ -953,8 +1054,7 @@ mod tests {
             &plan,
             &Budget::attempts(2),
             &Sandbox::disabled("test"),
-            &[],
-            &[],
+            &ExpectationPolicy::default(),
             |_, _| Some(vec![dir.join("untouched.txt")]),
         )
         .unwrap();
@@ -979,8 +1079,7 @@ mod tests {
             &plan,
             &Budget::attempts(5),
             &Sandbox::disabled("test"),
-            &[],
-            &[],
+            &ExpectationPolicy::default(),
             |_, _| Some(Vec::new()),
         )
         .unwrap();
@@ -1149,8 +1248,10 @@ mod tests {
             &plan,
             &Budget::attempts(1),
             &Sandbox::disabled("test"),
-            &declared,
-            &[],
+            &ExpectationPolicy {
+                expected_changes: declared,
+                ..ExpectationPolicy::default()
+            },
             |_, _| None,
         )
         .unwrap();
@@ -1285,8 +1386,10 @@ mod tests {
             &plan,
             &Budget::attempts(1),
             &Sandbox::disabled("test"),
-            &[],
-            &["DEFINITELY_ABSENT".to_owned()],
+            &ExpectationPolicy {
+                expect: vec!["DEFINITELY_ABSENT".to_owned()],
+                ..ExpectationPolicy::default()
+            },
             |_, _| None,
         )
         .unwrap();
@@ -1303,6 +1406,202 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("DEFINITELY_ABSENT")),
             "{outcome:?}"
+        );
+    }
+
+    fn green_plan() -> VerificationPlan {
+        VerificationPlan {
+            steps: vec![PlanStep::new("true", "true", Duration::from_secs(5))],
+        }
+    }
+
+    #[test]
+    fn strict_verify_fails_when_no_expectation_is_declared() {
+        let dir = workspace_with("strict-none", "");
+        let outcome = verify(
+            &dir,
+            &green_plan(),
+            &Budget::attempts(1),
+            &Sandbox::disabled("test"),
+            &ExpectationPolicy {
+                strict: true,
+                ..ExpectationPolicy::default()
+            },
+            |_, _| None,
+        )
+        .unwrap();
+        assert!(
+            !outcome.ok,
+            "a green plan that proves nothing is not a pass: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.failure,
+            Some((EXPECTATION_STEP.to_owned(), FailureKind::ExpectationMissing))
+        );
+        assert_eq!(
+            outcome.failure.as_ref().map(|(_, k)| k.as_str()),
+            Some("expectation_missing")
+        );
+        let reason = outcome
+            .expectation_failure
+            .expect("strict mode must say why");
+        assert!(
+            reason.contains("`expect`") && reason.contains("`expected_changes`"),
+            "the message names what was expected: {reason}"
+        );
+    }
+
+    #[test]
+    fn non_strict_verify_keeps_the_old_lenient_verdict() {
+        let dir = workspace_with("lenient-none", "");
+        let outcome = verify(
+            &dir,
+            &green_plan(),
+            &Budget::attempts(1),
+            &Sandbox::disabled("test"),
+            &ExpectationPolicy::default(),
+            |_, _| None,
+        )
+        .unwrap();
+        assert!(
+            outcome.ok,
+            "non-strict keeps the old behaviour: {outcome:?}"
+        );
+        assert!(outcome.failure.is_none());
+        assert!(outcome.expectation_failure.is_none());
+    }
+
+    #[test]
+    fn strict_verify_fails_when_the_expected_symbol_is_missing() {
+        let Some(dir) = git_repo("strict-missing-symbol") else {
+            return;
+        };
+        std::fs::write(dir.join("a.txt"), "changed, but not the symbol\n").unwrap();
+        let outcome = verify(
+            &dir,
+            &green_plan(),
+            &Budget::attempts(1),
+            &Sandbox::disabled("test"),
+            &ExpectationPolicy {
+                expect: vec!["fn handle_poll".to_owned()],
+                strict: true,
+                ..ExpectationPolicy::default()
+            },
+            |_, _| None,
+        )
+        .unwrap();
+        assert!(!outcome.ok, "{outcome:?}");
+        let (step, kind) = outcome.failure.clone().expect("a failure is named");
+        assert_eq!(step, EXPECTATION_STEP);
+        assert_eq!(kind, FailureKind::ExpectationMissing);
+        let reason = outcome.expectation_failure.expect("reason");
+        assert!(
+            reason.contains("fn handle_poll"),
+            "the model must see the pattern it missed: {reason}"
+        );
+    }
+
+    #[test]
+    fn strict_verify_fails_when_a_declared_change_is_not_observed() {
+        let Some(dir) = git_repo("strict-missing-path") else {
+            return;
+        };
+        std::fs::write(dir.join("a.txt"), "changed\n").unwrap();
+        let outcome = verify(
+            &dir,
+            &green_plan(),
+            &Budget::attempts(1),
+            &Sandbox::disabled("test"),
+            &ExpectationPolicy {
+                expected_changes: vec!["ghost.rs".to_owned()],
+                strict: true,
+                ..ExpectationPolicy::default()
+            },
+            |_, _| None,
+        )
+        .unwrap();
+        assert!(!outcome.ok, "{outcome:?}");
+        let reason = outcome.expectation_failure.expect("reason");
+        assert!(reason.contains("ghost.rs"), "{reason}");
+    }
+
+    #[test]
+    fn strict_verify_passes_when_every_expectation_holds() {
+        let Some(dir) = git_repo("strict-satisfied") else {
+            return;
+        };
+        std::fs::write(dir.join("a.txt"), "fn handle_poll() {}\n").unwrap();
+        let outcome = verify(
+            &dir,
+            &green_plan(),
+            &Budget::attempts(1),
+            &Sandbox::disabled("test"),
+            &ExpectationPolicy {
+                expected_changes: vec!["a.txt".to_owned()],
+                expect: vec!["fn handle_poll".to_owned()],
+                strict: true,
+            },
+            |_, _| None,
+        )
+        .unwrap();
+        assert!(outcome.ok, "{outcome:?}");
+        assert!(outcome.expectation_failure.is_none(), "{outcome:?}");
+    }
+
+    #[test]
+    fn strict_verify_does_not_mask_a_real_build_failure() {
+        let dir = workspace_with("strict-build-failure", "");
+        let plan = VerificationPlan {
+            steps: vec![PlanStep::new(
+                "build",
+                "echo 'error[E0425]: no' && false",
+                Duration::from_secs(5),
+            )],
+        };
+        let outcome = verify(
+            &dir,
+            &plan,
+            &Budget::attempts(1),
+            &Sandbox::disabled("test"),
+            &ExpectationPolicy {
+                expect: vec!["unused".to_owned()],
+                strict: true,
+                ..ExpectationPolicy::default()
+            },
+            |_, _| None,
+        )
+        .unwrap();
+        assert!(!outcome.ok);
+        let (step, kind) = outcome.failure.clone().expect("failure named");
+        assert_eq!(step, "build", "the real failure keeps the verdict");
+        assert_eq!(kind, FailureKind::CompileError);
+        assert!(outcome.expectation_failure.is_none(), "{outcome:?}");
+    }
+
+    #[test]
+    fn attempts_above_the_old_clamp_are_honoured() {
+        let dir = workspace_with("attempts-honoured", "");
+        let marker = dir.join("marker.txt");
+        let plan = VerificationPlan {
+            steps: vec![PlanStep::new(
+                "check",
+                "test -f marker.txt",
+                Duration::from_secs(5),
+            )],
+        };
+        let outcome = verify(
+            &dir,
+            &plan,
+            &Budget::attempts(6),
+            &Sandbox::disabled("test"),
+            &ExpectationPolicy::default(),
+            |_, _| Some(vec![marker.clone()]),
+        )
+        .unwrap();
+        assert!(!outcome.ok, "the step never passes: {outcome:?}");
+        assert_eq!(
+            outcome.attempts, 6,
+            "a configured budget above the old clamp must actually run"
         );
     }
 
