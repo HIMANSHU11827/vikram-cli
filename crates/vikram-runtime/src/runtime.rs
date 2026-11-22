@@ -791,6 +791,30 @@ impl RuntimeInner {
 /// vetoes only where `vetoable` — today that is `session_lifecycle`/`create` alone; everywhere
 /// else a refusal is surfaced as a warning and the operation proceeds unchanged. `Err(reason)`
 /// is returned only for an honored veto.
+/// Put a stored session's transcript back on its runtime, receipts included.
+///
+/// Journal replay restores the conversation without re-applying any effect: the journal is a
+/// record, not a queue. The turn durations ride along because a receipt outlives the process that
+/// measured it and the journal is the only place that outlives the process.
+fn hydrate_transcript(session: &SessionRuntime, records: Vec<vikram_contracts::JournalRecord>) {
+    if records.is_empty() {
+        return;
+    }
+    let (messages, durations) = crate::compaction::replay_transcript(
+        records
+            .into_iter()
+            .map(|record| (record.seq, record.ts_ms, record.kind, record.payload)),
+    );
+    *session.messages.lock().unwrap_or_else(|e| {
+        eprintln!("vikram: runtime messages lock mutex poisoned; recovering");
+        e.into_inner()
+    }) = messages;
+    *session.turn_times.lock().unwrap_or_else(|e| {
+        eprintln!("vikram: runtime turn times lock mutex poisoned; recovering");
+        e.into_inner()
+    }) = durations;
+}
+
 fn dispatch_lifecycle_stage(
     inner: &Arc<RuntimeInner>,
     point: crate::pipeline::StagePoint,
@@ -2962,17 +2986,7 @@ impl Runtime {
                     Vec::new()
                 }
             };
-            if !records.is_empty() {
-                let messages = crate::compaction::project_from_journal(
-                    records
-                        .into_iter()
-                        .map(|record| (record.seq, record.kind, record.payload)),
-                );
-                *session.messages.lock().unwrap_or_else(|e| {
-                    eprintln!("vikram: runtime messages lock mutex poisoned; recovering");
-                    e.into_inner()
-                }) = messages;
-            }
+            hydrate_transcript(&session, records);
             inner.memory_providers().initialize_all(session.id.as_str());
             inner
                 .sessions
@@ -4176,17 +4190,7 @@ impl RuntimeHandle {
                 Vec::new()
             }
         };
-        if !records.is_empty() {
-            let messages = crate::compaction::project_from_journal(
-                records
-                    .into_iter()
-                    .map(|record| (record.seq, record.kind, record.payload)),
-            );
-            *live.messages.lock().unwrap_or_else(|e| {
-                eprintln!("vikram: runtime messages lock mutex poisoned; recovering");
-                e.into_inner()
-            }) = messages;
-        }
+        hydrate_transcript(&live, records);
         self.inner
             .sessions
             .lock()
@@ -4280,17 +4284,7 @@ impl RuntimeHandle {
                 Vec::new()
             }
         };
-        if !records.is_empty() {
-            let messages = crate::compaction::project_from_journal(
-                records
-                    .into_iter()
-                    .map(|record| (record.seq, record.kind, record.payload)),
-            );
-            *live.messages.lock().unwrap_or_else(|e| {
-                eprintln!("vikram: runtime messages lock mutex poisoned; recovering");
-                e.into_inner()
-            }) = messages;
-        }
+        hydrate_transcript(&live, records);
         self.inner
             .sessions
             .lock()

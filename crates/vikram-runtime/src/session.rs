@@ -4,11 +4,11 @@
 //! interface and the turn task, which is why switching a view can never destroy it: dropping a
 //! snapshot does not drop the session.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use vikram_contracts::{BotId, Message, ProjectId, SessionId};
+use vikram_contracts::{BotId, Message, ProjectId, Role, SessionId};
 use vikram_contracts::{CancellationToken, TokenMeter};
 use vikram_store::{SessionRow, TITLE_MANUAL};
 
@@ -58,6 +58,10 @@ pub struct SessionRuntime {
     pub updated_ms: AtomicU64,
     /// Set when a turn starts; cleared when it finishes. Used for the elapsed-time metric.
     pub turn_started_ms: Mutex<Option<u64>>,
+    /// How long each finished turn took, keyed by the index of the assistant message it ended with.
+    /// A receipt measures a turn, not a message, so it lives beside the transcript and rides the
+    /// snapshot into whichever interface opens this session next.
+    pub turn_times: Mutex<BTreeMap<usize, u64>>,
     /// Per-session activity history (in-memory; for the main agent and session-level activities).
     pub activities: Mutex<Vec<ActivityEvent>>,
     /// The project this session is associated with, if any. Restored on session switch.
@@ -110,6 +114,7 @@ impl SessionRuntime {
             created_ms: row.created_ms,
             updated_ms: AtomicU64::new(row.updated_ms),
             turn_started_ms: Mutex::new(None),
+            turn_times: Mutex::new(BTreeMap::new()),
             activities: Mutex::new(Vec::new()),
             project_id: Mutex::new(row.project_id),
             status: Mutex::new(row.status),
@@ -787,10 +792,33 @@ impl SessionRuntime {
 
     pub fn finish_turn(&self, state: TurnState, now_ms: u64) {
         self.set_turn(state);
-        *self.turn_started_ms.lock().unwrap_or_else(|e| {
-            eprintln!("vikram: session started lock mutex poisoned; recovering");
-            e.into_inner()
-        }) = None;
+        let started = self
+            .turn_started_ms
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: session started lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .take();
+        if let Some(started) = started {
+            // Pinned to the message this turn ended with, so the receipt still names the right
+            // turn after the next one starts and after the interface that measured it closes.
+            let messages = self.messages.lock().unwrap_or_else(|e| {
+                eprintln!("vikram: session messages lock mutex poisoned; recovering");
+                e.into_inner()
+            });
+            if let Some(index) = messages.len().checked_sub(1)
+                && messages[index].role == Role::Assistant
+            {
+                self.turn_times
+                    .lock()
+                    .unwrap_or_else(|e| {
+                        eprintln!("vikram: session turn times lock mutex poisoned; recovering");
+                        e.into_inner()
+                    })
+                    .insert(index, now_ms.saturating_sub(started));
+            }
+        }
         self.updated_ms.store(now_ms, Ordering::Relaxed);
     }
 
@@ -821,6 +849,16 @@ impl SessionRuntime {
             status: self.status(),
             title_source: self.title_source(),
             title_status: self.title_status(),
+            turn_times: self
+                .turn_times
+                .lock()
+                .unwrap_or_else(|e| {
+                    eprintln!("vikram: session turn times lock mutex poisoned; recovering");
+                    e.into_inner()
+                })
+                .iter()
+                .map(|(index, ms)| (*index, *ms))
+                .collect(),
         }
     }
 }

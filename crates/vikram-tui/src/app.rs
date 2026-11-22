@@ -706,7 +706,7 @@ impl SessionView {
             payloads,
             turn_started_ms: None,
             turn_elapsed_ms: 0,
-            turn_times: std::collections::HashMap::new(),
+            turn_times: snapshot.turn_times.into_iter().collect(),
             unread: 0,
         }
     }
@@ -856,6 +856,15 @@ impl SessionView {
     /// How long the turn that ended at `index` took, if it was timed.
     pub fn turn_time(&self, index: usize) -> Option<u64> {
         self.turn_times.get(&index).copied()
+    }
+
+    /// The turn on screen's own duration in milliseconds, live while it works and final once it is
+    /// done. The header's clock reads tenths, so the seconds figure would round it to a still row.
+    pub fn turn_elapsed_ms_live(&self) -> u64 {
+        match self.turn_started_ms {
+            Some(started) => now_ms().saturating_sub(started),
+            None => self.turn_elapsed_ms,
+        }
     }
 
     /// Seconds the turn on screen has run, live while it works and final once it is done.
@@ -2165,6 +2174,7 @@ mod tests {
                 status: "active".to_owned(),
                 title_source: "generic".to_owned(),
                 title_status: "pending".to_owned(),
+                turn_times: Vec::new(),
             }));
         app
     }
@@ -2386,6 +2396,7 @@ mod selection_and_folds {
             status: "active".to_owned(),
             title_source: "generic".to_owned(),
             title_status: "pending".to_owned(),
+            turn_times: Vec::new(),
         });
         session.toggle_thought((0, 0));
         assert!(session.thought_expanded((0, 0)));
@@ -2415,6 +2426,7 @@ mod selection_and_folds {
             status: "active".to_owned(),
             title_source: "generic".to_owned(),
             title_status: "pending".to_owned(),
+            turn_times: Vec::new(),
         }
     }
 

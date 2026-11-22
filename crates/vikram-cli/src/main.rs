@@ -20,6 +20,7 @@ mod skills;
 mod terminal;
 mod tools;
 mod transforms;
+mod voice;
 
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
@@ -119,6 +120,11 @@ enum Command {
     },
     /// Check the runtime's local prerequisites.
     Doctor,
+    /// Check local voice helpers or run one push-to-talk utterance.
+    Voice {
+        #[command(subcommand)]
+        action: voice::VoiceAction,
+    },
     /// Scaffold a new project (AGENTS.md, .vikram/config.json, README.md).
     Init {
         /// Directory to initialize (defaults to the current directory).
@@ -914,6 +920,7 @@ fn main() -> std::process::ExitCode {
         Command::Config { action } => config_command(action, config),
         Command::Presets { action } => exit(presets::run(action)),
         Command::Doctor => run_async(doctor::run(config)),
+        Command::Voice { action } => exit(voice::run(action)),
         Command::Init { path } => init(path),
         Command::Allow { action } => allow_command(action, &config),
         Command::Tools { action } => {

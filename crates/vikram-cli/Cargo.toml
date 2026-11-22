@@ -22,6 +22,7 @@ vikram-policy.workspace = true
 vikram-gateway = { path = "../vikram-gateway" }
 vikram-evolution = { path = "../vikram-evolution" }
 vikram-bench = { path = "../vikram-bench" }
+vikram-voice.workspace = true
 clap.workspace = true
 tokio.workspace = true
 futures-util.workspace = true

@@ -5,7 +5,7 @@
 //! folded away. Nothing is destroyed. A compacted session can still be asked for the original tool
 //! output, and a restart replays the same projection rather than reloading the whole transcript.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use vikram_contracts::{Block, Message, RecordKind, Role, Trust};
 
@@ -720,10 +720,25 @@ fn condense(text: &str, limit: usize) -> String {
 /// `folded` count exceeds what replayed then applies its summary without draining; with the
 /// rows still present it drains exactly as before, and a marker that lines up with neither is
 /// still refused.
-pub fn project_from_journal(
-    records: impl IntoIterator<Item = (u64, RecordKind, serde_json::Value)>,
-) -> Vec<Message> {
+/// How long each finished turn took, keyed by the index the answer lands at once the journal is
+/// projected. A receipt measures a turn, and a restart keeps no stopwatch, so the span the journal
+/// recorded between the question and the answer is the only evidence left.
+///
+/// Compaction rewrites indices — a folded prefix collapses into one summary message — so a journal
+/// that has been compacted yields no durations at all. A missing receipt is a smaller fault than a
+/// receipt attached to the wrong turn.
+///
+/// The durations come out of the same pass as the messages, because an index is only as stable as
+/// the projection that produced it: a second walk could name a turn it never measured.
+pub fn replay_transcript(
+    records: impl IntoIterator<Item = (u64, u64, RecordKind, serde_json::Value)>,
+) -> (Vec<Message>, BTreeMap<usize, u64>) {
+    let records: Vec<_> = records.into_iter().collect();
+    let folded = records
+        .iter()
+        .any(|(_, _, kind, _)| *kind == RecordKind::Compaction);
     let mut messages: Vec<Message> = Vec::new();
+    let mut durations: BTreeMap<usize, u64> = BTreeMap::new();
     // Calls the journal says were started. A process can die between the record and the result, and
     // a replay that loses the call loses the fact that anything happened at all.
     let mut unanswered: Vec<vikram_contracts::ToolCallId> = Vec::new();
@@ -732,7 +747,9 @@ pub fn project_from_journal(
     // cannot masquerade as a prune.
     let mut first_seq: Option<u64> = None;
     let mut prefix_pruned = false;
-    for (seq, kind, payload) in records {
+    // When the question the next answer belongs to was asked.
+    let mut opened: Option<u64> = None;
+    for (seq, ts_ms, kind, payload) in records {
         if first_seq.is_none() {
             first_seq = Some(seq);
             prefix_pruned = seq > 1;
@@ -790,6 +807,15 @@ pub fn project_from_journal(
                     unanswered.retain(|pending| pending != call);
                 }
             }
+            match message.role {
+                Role::User => opened = Some(ts_ms),
+                Role::Assistant => {
+                    if let Some(started) = opened.take() {
+                        durations.insert(messages.len(), ts_ms.saturating_sub(started));
+                    }
+                }
+                Role::System | Role::Tool => {}
+            }
             messages.push(message);
             continue;
         }
@@ -820,14 +846,42 @@ pub fn project_from_journal(
             false,
         ));
     }
-    messages
+    if folded {
+        durations.clear();
+    }
+    (messages, durations)
+}
+
+pub fn project_from_journal(
+    records: impl IntoIterator<Item = (u64, RecordKind, serde_json::Value)>,
+) -> Vec<Message> {
+    replay_transcript(
+        records
+            .into_iter()
+            .map(|(seq, kind, payload)| (seq, 0, kind, payload)),
+    )
+    .0
+}
+
+/// How long each finished turn in this journal took, keyed by the index of the assistant message
+/// it ended with.
+pub fn turn_durations(records: &[vikram_contracts::JournalRecord]) -> BTreeMap<usize, u64> {
+    replay_transcript(records.iter().map(|record| {
+        (
+            record.seq,
+            record.ts_ms,
+            record.kind,
+            record.payload.clone(),
+        )
+    }))
+    .1
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::context_engine::{LimitsSource, ModelLimits};
-    use vikram_contracts::ToolCall;
+    use vikram_contracts::{JournalRecord, SessionId, ToolCall};
 
     fn policy() -> CompactionPolicy {
         CompactionPolicy {
@@ -1642,5 +1696,70 @@ mod tests {
         };
         assert!(content.chars().count() <= ceiling);
         assert!(content.contains("elided"));
+    }
+
+    /// One journal row, the way the store hands it back: a kind, a clock and the message payload.
+    fn record(seq: u64, ts_ms: u64, kind: RecordKind, role: Role, text: &str) -> JournalRecord {
+        JournalRecord {
+            seq,
+            session: SessionId::generate(),
+            ts_ms,
+            kind,
+            effect: None,
+            // The store wraps a message in the row's payload; replay reads it from `message`.
+            payload: serde_json::json!({
+                "message": serde_json::to_value(Message::text(role, text, Trust::Host))
+                    .expect("a message serialises"),
+            }),
+        }
+    }
+
+    /// A bare call, the shape an operator-issued tool call journals: no message, just a call id.
+    fn tool_record(seq: u64, ts_ms: u64) -> JournalRecord {
+        JournalRecord {
+            seq,
+            session: SessionId::generate(),
+            ts_ms,
+            kind: RecordKind::ToolCall,
+            effect: None,
+            payload: serde_json::json!({"call": "call-1"}),
+        }
+    }
+
+    #[test]
+    fn a_replayed_turn_keeps_the_duration_it_was_measured_with() {
+        let records = vec![
+            record(1, 1_000, RecordKind::Message, Role::User, "how are you"),
+            tool_record(2, 1_400),
+            record(3, 2_500, RecordKind::Message, Role::Assistant, "doing well"),
+        ];
+        let durations = turn_durations(&records);
+        assert_eq!(durations.get(&1), Some(&1_500));
+        assert_eq!(durations.len(), 1);
+    }
+
+    #[test]
+    fn a_second_turn_is_timed_from_its_own_question() {
+        let records = vec![
+            record(1, 1_000, RecordKind::Message, Role::User, "first"),
+            record(2, 1_200, RecordKind::Message, Role::Assistant, "one"),
+            record(3, 9_000, RecordKind::Message, Role::User, "second"),
+            record(4, 9_750, RecordKind::Message, Role::Assistant, "two"),
+        ];
+        let durations = turn_durations(&records);
+        assert_eq!(durations.get(&1), Some(&200));
+        assert_eq!(durations.get(&3), Some(&750));
+    }
+
+    #[test]
+    fn a_compacted_journal_claims_no_durations() {
+        // A fold rewrites which message sits at which index, so a receipt derived from the raw
+        // record would name the wrong turn. No receipt beats a wrong one.
+        let records = vec![
+            record(1, 1_000, RecordKind::Message, Role::User, "first"),
+            record(2, 1_200, RecordKind::Message, Role::Assistant, "one"),
+            record(3, 1_300, RecordKind::Compaction, Role::System, "folded"),
+        ];
+        assert!(turn_durations(&records).is_empty());
     }
 }

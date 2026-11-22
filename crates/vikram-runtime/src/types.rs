@@ -249,6 +249,10 @@ pub struct SessionSnapshot {
     /// `pending`, `ready` or `failed` for automatic naming. `pending` is what a `generic` title
     /// carries before the first meaningful message has been named.
     pub title_status: String,
+    /// How long each finished turn took, keyed by the index of the assistant message it ended with.
+    /// A receipt measures a turn, not a message, so it is carried beside the transcript: an
+    /// interface that opens an already-finished session can still show what the turn cost.
+    pub turn_times: Vec<(usize, u64)>,
 }
 
 /// One row of the session catalogue: every session the store knows about, whether or not this process

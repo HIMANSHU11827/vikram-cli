@@ -2770,6 +2770,7 @@ mod tests {
                 status: "active".to_owned(),
                 title_source: "generic".to_owned(),
                 title_status: "pending".to_owned(),
+                turn_times: Vec::new(),
             }));
         app
     }
@@ -2866,6 +2867,7 @@ mod tests {
             status: "active".to_owned(),
             title_source: "generic".to_owned(),
             title_status: "pending".to_owned(),
+            turn_times: Vec::new(),
         });
         if live {
             session.payloads.insert(

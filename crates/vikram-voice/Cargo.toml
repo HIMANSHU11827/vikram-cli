@@ -1,0 +1,14 @@
+[package]
+name = "vikram-voice"
+description = "Helper-driven voice I/O for VIKRAM: capture, VAD, ASR, TTS and playback, with honest degradation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

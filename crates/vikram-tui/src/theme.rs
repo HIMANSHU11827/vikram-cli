@@ -17,6 +17,9 @@ pub struct Theme {
     pub border: Color,
     pub bg: Color,
     pub surface: Color,
+    /// Band behind the operator's own words. Lighter than `surface`, because that one is a panel
+    /// body and this one has to read as a strip of its own inside the transcript.
+    pub prompt_band: Color,
     /// Body of a dialog: a step above `bg`, so an open panel reads as a surface laid over the
     /// transcript instead of a line drawn around it.
     pub panel: Color,
@@ -42,6 +45,7 @@ impl Theme {
             border: Color::Rgb(62, 68, 78),
             bg: Color::Rgb(35, 37, 40),
             surface: Color::Rgb(41, 43, 47),
+            prompt_band: Color::Rgb(58, 61, 69),
             panel: Color::Rgb(35, 37, 40),
             selection: Color::Rgb(58, 60, 68),
             ok: Color::Rgb(120, 200, 140),
@@ -75,6 +79,34 @@ impl Theme {
 
     pub fn body(&self) -> Style {
         Style::default().fg(self.text)
+    }
+
+    /// The fill behind the operator's own message. Derived from the window colour rather than read
+    /// from the palette, so an operator colour still reads as a tint of their own background
+    /// instead of a stripe from someone else's theme.
+    pub fn band(&self) -> Color {
+        const WHITE_TINT: f32 = 0.16;
+        const BLACK_TINT: f32 = 0.03;
+        let Color::Rgb(red, green, blue) = self.bg else {
+            return Color::DarkGray;
+        };
+        let luminance =
+            (0.299 * f32::from(red) + 0.587 * f32::from(green) + 0.114 * f32::from(blue)) / 255.0;
+        let (target, amount) = if luminance < 0.5 {
+            (255u8, WHITE_TINT)
+        } else {
+            (0u8, BLACK_TINT)
+        };
+        let mix = |channel: u8| {
+            let channel = f32::from(channel);
+            (channel + (f32::from(target) - channel) * amount).round() as u8
+        };
+        Color::Rgb(mix(red), mix(green), mix(blue))
+    }
+
+    /// The operator's own words. The band is the boundary, so the row needs no rule and no label.
+    pub fn band_style(&self) -> Style {
+        Style::default().bg(self.band()).fg(self.user)
     }
 
     pub fn secondary(&self) -> Style {
@@ -179,6 +211,14 @@ impl Theme {
         if self.ascii { "-" } else { "─" }
     }
 
+    pub fn assistant_marker(&self) -> &'static str {
+        if self.ascii { "*" } else { "✻" }
+    }
+
+    pub fn prompt_border(&self) -> &'static str {
+        if self.ascii { "#" } else { "░" }
+    }
+
     pub fn bullet(&self) -> &'static str {
         if self.ascii { "*" } else { "·" }
     }
@@ -218,6 +258,12 @@ impl Theme {
     pub fn chevron(&self) -> &'static str {
         if self.ascii { ">" } else { "›" }
     }
+
+    /// Opens VIKRAM's own words. The spinner never draws it: a frozen answer wearing a spinner
+    /// frame would read as a stalled animation.
+    pub fn speaker(&self) -> &'static str {
+        if self.ascii { "*" } else { "✻" }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,6 +298,8 @@ mod tests {
             theme.hollow_dot(),
             theme.prompt(),
             theme.separator(),
+            theme.assistant_marker(),
+            theme.prompt_border(),
             theme.model_glyph(),
             theme.subagents_glyph(),
             theme.dash(),

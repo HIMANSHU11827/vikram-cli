@@ -355,109 +355,19 @@ pub fn bots_panel(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         }
     }
 
-    // The last rows belong to the actions. Without them this panel is a list an operator can only
-    // use by remembering ctrl+n / ctrl+c / ctrl+r — commands written down instead of buttons.
-    let chips: [(&str, BotClick); 11] = [
-        ("+ agent", BotClick::Spawn),
-        ("new bot", BotClick::NewBot),
-        ("rename", BotClick::Rename),
-        ("tag", BotClick::Tag),
-        ("soul", BotClick::Soul),
-        ("new chat", BotClick::NewChat),
-        ("pause", BotClick::Pause),
-        ("resume", BotClick::Resume),
-        ("stop", BotClick::Stop),
-        ("remove", BotClick::Remove),
-        ("mode", BotClick::Mode),
-    ];
-    // Wrapped, not dropped. A control the operator cannot see is a control they cannot press, and a
-    // narrow panel used to lose `remove` and `mode` outright. Two rows at most: the list is what
-    // this panel is for and the buttons are only the way into it.
-    let chip_width = |label: &str| UnicodeWidthStr::width(format!(" {label} ").as_str()) as u16 + 1;
-    let chips_total: u16 = chips.iter().map(|(label, _)| chip_width(label)).sum();
-    // Pack the chips into as many rows as they actually need, up to the room the panel has. The
-    // fixed one-or-two choice silently dropped the tail on a narrow sidebar — `[mode]` was never
-    // drawn, so it could not be pressed at all.
-    let chip_rows = if chips_total <= inner.width || inner.height < 4 {
-        1
-    } else {
-        let mut rows = 1u16;
-        let mut packed = 0u16;
-        for (label, _) in chips.iter() {
-            let width = chip_width(label);
-            if packed > 0 && packed + width > inner.width {
-                rows += 1;
-                packed = 0;
-            }
-            packed += width;
-        }
-        rows.min(inner.height.saturating_sub(1)).max(1)
-    };
-    let action_row = inner.height.saturating_sub(chip_rows);
-    let body_height = action_row as usize;
-
+    // The list is the panel. Every row selects the bot it names; the controls live on the keyboard
+    // (ctrl+n, ctrl+r, ctrl+c and friends), where they cost the list no rows at all.
     for (line, index) in row_lines {
-        if line < action_row {
-            app.bot_hits.push((
-                inner.y + line,
-                inner.x,
-                inner.x + inner.width,
-                BotClick::Row(index),
-            ));
-        }
-    }
-
-    lines.truncate(body_height);
-    let body = Rect {
-        height: body_height as u16,
-        ..inner
-    };
-    frame.render_widget(Paragraph::new(lines), body);
-
-    let mut row = 0u16;
-    let mut x = inner.x;
-    let limit = inner.x + inner.width;
-    let mut spans: Vec<Span> = Vec::new();
-    for (label, click) in chips {
-        let text = format!(" {label} ");
-        let span_width = UnicodeWidthStr::width(text.as_str()) as u16;
-        if x + span_width > limit {
-            if row + 1 >= chip_rows {
-                break;
-            }
-            frame.render_widget(
-                Paragraph::new(Line::from(std::mem::take(&mut spans))),
-                Rect {
-                    y: inner.y + action_row + row,
-                    height: 1,
-                    ..inner
-                },
-            );
-            row += 1;
-            x = inner.x;
-        }
-        app.bot_hits
-            .push((inner.y + action_row + row, x, x + span_width, click));
-        // The same band the open tab wears: one filled rectangle, square corners, no brackets. A
-        // bracketed label reads as text that happens to be clickable; a lit block reads as a button.
-        spans.push(Span::styled(
-            text,
-            Style::default()
-                .bg(theme.selection)
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
+        app.bot_hits.push((
+            inner.y + line,
+            inner.x,
+            inner.x + inner.width,
+            BotClick::Row(index),
         ));
-        spans.push(Span::raw(" "));
-        x += span_width + 1;
     }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)),
-        Rect {
-            y: inner.y + action_row + row,
-            height: 1,
-            ..inner
-        },
-    );
+
+    lines.truncate(inner.height as usize);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 pub fn plasma(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
@@ -526,6 +436,13 @@ pub fn status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if area.height == 0 || area.width == 0 {
         return;
     }
+
+    // The status line is the top row of the bottom bar, so it wears the bar's surface rather than
+    // the app background. Without this the composer, the facts and the hints stack as three tones
+    // and the bottom of the screen reads as three separate strips.
+    frame
+        .buffer_mut()
+        .set_style(area, Style::default().bg(theme.surface));
 
     let sep = if theme.ascii { " . " } else { " · " };
     let pipe = if theme.ascii { " | " } else { " │ " };
@@ -881,9 +798,14 @@ pub fn shortcuts(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         return;
     }
 
-    // Key and action carry different weights: the key is what the hand has to find, the action is
-    // what the head reads once it has found it. One flat sentence makes the row scannable at neither
-    // speed. Hints drop whole, never clipped mid-word.
+    // The row is chrome, not a sentence, so it sits on the same quiet band as the composer rather
+    // than floating on the app background. Key and action still carry different weights: the key is
+    // what the hand has to find, the action is what the head reads once it has found it. Hints drop
+    // whole, never clipped mid-word.
+    frame
+        .buffer_mut()
+        .set_style(area, Style::default().bg(theme.surface));
+
     let hints: &[(&str, &str)] = if app.overlay.is_some() {
         &[("Esc", "close"), ("Enter", "confirm")]
     } else {
@@ -901,10 +823,9 @@ pub fn shortcuts(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let mut used = 1usize;
     for (index, (key, action)) in hints.iter().enumerate() {
         let separator = if index == 0 { 0 } else { 3 };
-        // The key is a band, the same block every other control wears, so this row reads as the
-        // controls it is describing instead of as a line of small print.
-        let label = format!(" {key} ");
-        let needs = separator + label.width() + 1 + action.width();
+        // A key is a word in this row, not a box on it: the accent and the weight are enough to
+        // find it, and a filled chip beside a filled composer reads as two buttons competing.
+        let needs = separator + key.width() + 1 + action.width();
         if used + needs > area.width as usize {
             break;
         }
@@ -915,20 +836,27 @@ pub fn shortcuts(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             ));
             used += separator;
         }
-        spans.push(Span::styled(label.clone(), theme.button()));
+        spans.push(Span::styled(
+            *key,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(*action, theme.muted()));
-        used += label.width() + 1 + action.width();
+        used += key.width() + 1 + action.width();
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn panel_frame(title: Line<'static>, theme: &Theme) -> Block<'static> {
+    // A frame is a boundary, not a highlight. The accent belongs to the title that names the panel,
+    // never to the outline of a whole region: a thick orange box around a list reads as an alert,
+    // and a roster is not one.
     Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Thick)
-        .border_style(Style::default().fg(theme.accent))
+        .border_style(Style::default().fg(theme.border))
         .style(theme.dialog())
         .padding(Padding::new(1, 1, 1, 0))
         .title(title)
@@ -2006,6 +1934,7 @@ mod tests {
             status: "active".to_owned(),
             title_source: "generic".to_owned(),
             title_status: "pending".to_owned(),
+            turn_times: Vec::new(),
         }
     }
 
@@ -2106,9 +2035,8 @@ mod tests {
         app.bots[0].state = BotState::Running;
         app.bots[0].current_task = Some("porting the store".to_owned());
 
-        // 64 columns, not 32: nine chips need their own rows, and a tagged bot needs the width to
-        // show a task without clipping it. This test is about the rows the panel lists, not about
-        // how it degrades in a sliver.
+        // 64 columns, not 32: a tagged bot needs the width to show a task without clipping it.
+        // This test is about the rows the panel lists, not about how it degrades in a sliver.
         let rendered = draw(64, 12, |frame| {
             bots_panel(frame, frame.area(), &mut app, &Theme::new(false))
         });
@@ -2123,7 +2051,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bots_panel_writes_a_hit_for_every_row_and_chip() {
+    fn the_bots_panel_writes_a_hit_for_every_row() {
         let mut app = app_with_default_bots();
         draw(120, 12, |frame| {
             bots_panel(frame, frame.area(), &mut app, &Theme::new(false))
@@ -2146,21 +2074,6 @@ mod tests {
             "every drawn line of a bot must select it: {:?}",
             app.bot_hits
         );
-        for expected in [
-            BotClick::Spawn,
-            BotClick::NewBot,
-            BotClick::Rename,
-            BotClick::Pause,
-            BotClick::Mode,
-        ] {
-            assert!(
-                app.bot_hits
-                    .iter()
-                    .any(|(_, _, _, click)| *click == expected),
-                "{expected:?} has no clickable area: {:?}",
-                app.bot_hits
-            );
-        }
     }
 
     #[test]
@@ -2364,9 +2277,7 @@ mod tests {
             shortcuts(frame, frame.area(), &app, &Theme::new(false))
         });
         // The key and the action are separate spans, so the row reads at two speeds: the key is what
-        // the hand looks for, the action is what the head reads. The key sits in a filled band, so
-        // the two are asserted separately rather than as one joined string — the band's padding is
-        // the button, not a space that happens to be there.
+        // the hand looks for, the action is what the head reads.
         for (key, action) in [
             ("Enter", "send"),
             ("Tab", "mode"),
@@ -2714,6 +2625,7 @@ mod picker_panel_tests {
                 status: "active".to_owned(),
                 title_source: "generic".to_owned(),
                 title_status: "pending".to_owned(),
+                turn_times: Vec::new(),
             }));
         app
     }

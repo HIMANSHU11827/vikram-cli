@@ -4,7 +4,8 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Focus, Overlay};
 use crate::layout;
@@ -216,82 +217,74 @@ fn preview(text: &str) -> String {
 }
 
 fn render_input(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let focused = app.focus == Focus::Input;
-    // The composer keeps an accent-tinted frame whenever the keyboard can still land in it. Dropping
-    // to the plain border the moment a panel took focus made the box read as disabled — a dead grey
-    // control the operator is told not to type into, when typing there still works.
-    let border = match app.focus {
-        Focus::Input => theme.accent,
-        Focus::Bots => theme.accent_dim,
-        _ => theme.border,
-    };
-    let session = app.display_session();
-    let title = session.map_or_else(String::new, |s| {
-        if let Some(text) = &s.steer_text {
-            format!("{} steer {} ", theme.prompt(), preview(text))
-        } else if s.queued > 0 {
-            let msg = s
-                .queue_text
-                .as_deref()
-                .map(preview)
-                .unwrap_or_else(|| format!("{} pending", s.queued));
-            format!("{} queue {} ", theme.prompt(), msg)
-        } else {
-            format!("{} {} ", theme.prompt(), app.send_mode.label())
-        }
-    });
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Thick)
-        .border_style(Style::default().fg(border))
-        .padding(Padding::new(1, 1, 0, 0));
-    let block = if title.is_empty() {
-        block
+    // The composer is a strip, not a box: a full-width band with square edges that brightens while
+    // the keyboard can land in it. The fill separates it from the transcript, so no frame is drawn
+    // and no column is spent on a border the operator has to read past.
+    let band = if focused {
+        theme.prompt_band
     } else {
-        block.title(Line::from(Span::styled(
-            title,
-            Style::default()
-                .fg(theme.accent_dim)
-                .add_modifier(Modifier::BOLD),
-        )))
+        theme.surface
     };
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    frame
+        .buffer_mut()
+        .set_style(area, Style::default().bg(band));
 
-    let Some(session) = session else {
+    let Some(session) = app.display_session() else {
         return;
     };
     let editor = &session.editor;
     let prompt_width: u16 = 2;
-    let visible_rows = inner.height as usize;
+    let visible_rows = area.height as usize;
 
-    if visible_rows == 0 {
-        return;
-    }
+    // A queued or steered follow-up is the one thing the operator must not lose sight of while
+    // typing, so it takes the right margin ahead of everything else.
+    let tag = if let Some(text) = &session.steer_text {
+        Some(format!("steer {}", preview(text)))
+    } else if session.queued > 0 {
+        let msg = session
+            .queue_text
+            .as_deref()
+            .map(preview)
+            .unwrap_or_else(|| format!("{} pending", session.queued));
+        Some(format!("queue {msg}"))
+    } else {
+        None
+    };
 
     let mut lines: Vec<Line> = Vec::new();
     let mut cursor_row: u16 = 0;
 
     if editor.is_empty() {
-        // The empty box says what it is for and what else the row answers to, on one line: the
-        // shorthand lives at the margin where an operator can find it without leaving the box.
         let hint = if theme.ascii {
             "/ commands | @ files | ! shell"
         } else {
             "/ commands · @ files · ! shell"
         };
         let placeholder = "Type your message...";
-        let pad = (inner.width as usize).saturating_sub(2 + placeholder.len() + hint.len());
         let mut spans = vec![
             Span::styled(
-                format!("{} ", theme.prompt()),
-                Style::default().fg(theme.accent),
+                theme.prompt(),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
             ),
+            Span::raw(" "),
             Span::styled(placeholder, Style::default().fg(theme.faint)),
         ];
-        if pad >= 2 {
+        let (right, right_style) = match &tag {
+            Some(tag) => (tag.as_str(), Style::default().fg(theme.accent_dim)),
+            None => (hint, theme.muted()),
+        };
+        let used = prompt_width as usize + UnicodeWidthStr::width(placeholder);
+        let pad = (area.width as usize).saturating_sub(used + UnicodeWidthStr::width(right) + 2);
+        if pad >= 1 {
             spans.push(Span::raw(" ".repeat(pad)));
-            spans.push(Span::styled(hint, theme.muted()));
+            spans.push(Span::styled(right.to_owned(), right_style));
+            spans.push(Span::raw(" "));
         }
         lines.push(Line::from(spans));
     } else {
@@ -302,40 +295,60 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             let Some(text) = editor.line(index) else {
                 continue;
             };
-            let prefix = if lines.is_empty() {
-                Span::styled(
-                    format!("{} ", theme.prompt()),
-                    Style::default().fg(theme.accent),
-                )
+            let opener = lines.is_empty();
+            let mut spans = if opener {
+                vec![
+                    Span::styled(
+                        theme.prompt(),
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                ]
             } else {
-                Span::raw("  ")
+                vec![Span::raw("  ")]
             };
-            lines.push(Line::from(vec![
-                prefix,
-                Span::styled(text.to_owned(), Style::default().fg(theme.text)),
-            ]));
+            spans.push(Span::styled(
+                text.to_owned(),
+                Style::default().fg(theme.text),
+            ));
+            if opener {
+                let right = tag
+                    .clone()
+                    .unwrap_or_else(|| app.send_mode.label().to_owned());
+                let used = prompt_width as usize + UnicodeWidthStr::width(text);
+                let pad = (area.width as usize)
+                    .saturating_sub(used + UnicodeWidthStr::width(right.as_str()) + 2);
+                if pad >= 1 {
+                    spans.push(Span::raw(" ".repeat(pad)));
+                    spans.push(Span::styled(right, Style::default().fg(theme.faint)));
+                    spans.push(Span::raw(" "));
+                }
+            }
+            lines.push(Line::from(spans));
             if index == row {
                 cursor_row = (lines.len() - 1) as u16;
             }
         }
     }
 
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines), area);
 
+    let y = area
+        .y
+        .saturating_add(cursor_row)
+        .min(area.y + area.height.saturating_sub(1));
     if focused && !editor.is_empty() {
         let (_, col) = editor.cursor();
-        let x = inner
+        let x = area
             .x
             .saturating_add(prompt_width)
             .saturating_add(col as u16)
-            .min(inner.x + inner.width.saturating_sub(1));
-        let y = inner
-            .y
-            .saturating_add(cursor_row)
-            .min(inner.y + inner.height.saturating_sub(1));
+            .min(area.x + area.width.saturating_sub(1));
         frame.set_cursor_position((x, y));
     } else if focused {
-        frame.set_cursor_position((inner.x + prompt_width, inner.y));
+        frame.set_cursor_position((area.x + prompt_width, y));
     }
 }
 
@@ -367,6 +380,7 @@ mod tests {
             status: "active".to_owned(),
             title_source: "manual".to_owned(),
             title_status: "ready".to_owned(),
+            turn_times: Vec::new(),
         }
     }
 

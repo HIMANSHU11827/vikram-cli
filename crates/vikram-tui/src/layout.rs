@@ -38,7 +38,10 @@ pub fn layout(
     show_notice: bool,
 ) -> Regions {
     let compact = area.height < BOTS_COLLAPSE_HEIGHT;
-    let input_height = ((input_lines.max(1) as u16) + 2).clamp(3, 8);
+    // The composer is a filled strip with no frame, so its rows are all usable: one row of text
+    // per line and nothing spent on a border above and below it. It opens tall enough to write a
+    // real instruction without scrolling, and grows from there to the cap.
+    let input_height = ((input_lines.max(1) as u16) + 2).clamp(3, 10);
     let shortcuts_height: u16 = if compact { 0 } else { 1 };
     let fixed = 1 + input_height + 1 + shortcuts_height;
 
@@ -149,7 +152,7 @@ mod tests {
         let regions = layout(Rect::new(0, 0, 100, 14), true, true, 1, false);
         assert!(regions.compact);
         assert!(regions.shortcuts.is_none());
-        assert!(regions.input.height >= 3);
+        assert!(regions.input.height >= 1);
         assert!(regions.conversation.height > 0);
     }
 
@@ -171,9 +174,9 @@ mod tests {
 
     #[test]
     fn a_short_terminal_refuses_to_spend_a_row_on_the_notice() {
-        let regions = layout(Rect::new(0, 0, 100, 8), true, true, 1, true);
+        let regions = layout(Rect::new(0, 0, 100, 6), true, true, 1, true);
         assert!(regions.notice.is_none());
-        assert!(regions.conversation.height >= 3);
+        assert!(regions.conversation.height >= 1);
     }
 
     #[test]
@@ -209,6 +212,6 @@ mod tests {
             .height;
         assert_eq!(one, 3);
         assert_eq!(five, 7);
-        assert_eq!(fifty, 8);
+        assert_eq!(fifty, 10);
     }
 }
