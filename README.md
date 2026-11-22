@@ -74,6 +74,10 @@ border title always says which is armed).
   pickers scroll, filter, and answer clicks.
 - **Approvals that stay reachable** — pending permission requests queue up and each is answerable
   by key or click; `a`/`d`/`p` chords and `allow` rules persist what you decide.
+- **Voice, built in and local** — wavo ASR (`whisper-base.en`, downloaded on first use) and
+  piper/espeak-ng TTS run on this machine; `/voice` toggles hands-free mode, `Ctrl+G` dictates one
+  utterance into the prompt, and `vikram voice config set <key> <value>` persists a device, language
+  or VAD gate. Nothing leaves the machine.
 
 Key map and hit-region contract: [`docs/tui.md`](docs/tui.md)
 
