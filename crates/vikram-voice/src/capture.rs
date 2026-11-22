@@ -2,17 +2,58 @@
 //!
 //! The device is opened at whatever rate and channel count it supports; samples are converted
 //! to interleaved i16, mixed to mono, and linearly resampled to the config rate once, at this
-//! boundary, as `docs/voice-plan.md` §2.1 requires. Recording is bounded by `max_ms` and
-//! aborted within one poll interval of a cancel.
+//! boundary, as `docs/voice-plan.md` §2.1 requires. Recording stops as soon as speech has
+//! started and the trailing silence passes the hangover, with `max_ms` as the hard cap; a cancel
+//! lands within one poll interval.
 
 use crate::cancel::CancelToken;
 use crate::session::AudioSource;
+use crate::vad::detect_speech;
 use crate::{HelperSource, Result, VoiceConfig, VoiceError};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const POLL: Duration = Duration::from_millis(50);
+
+/// When a take is over. The gate is the VAD's own (`vad::detect_speech`, the same noise floor
+/// and ratio the session applies afterwards), fed the samples as they arrive, so capture stops
+/// when the speaker does instead of recording the rest of the cap. The knobs are the config's
+/// existing gate fields: `hangover_ms` is how long a pause may last before the take ends, and
+/// `min_speech_ms` keeps a cough from ending it.
+pub(crate) struct SilenceStop {
+    absolute: f32,
+    ratio: f32,
+    min_speech_ms: u64,
+    hangover_ms: u64,
+}
+
+impl SilenceStop {
+    fn from_config(config: &VoiceConfig) -> Self {
+        Self {
+            absolute: config.rms_threshold,
+            ratio: config.floor_ratio,
+            min_speech_ms: config.min_speech_ms,
+            hangover_ms: config.hangover_ms,
+        }
+    }
+
+    /// How much of `pcm` to keep once the speaker has stopped: everything up to the end of the
+    /// speech plus the hangover. Everything before it stays, so the frames ahead of the gate
+    /// opening are the take's pre-roll and the first syllable is never clipped. `None` means
+    /// speech has not started, or is still going.
+    fn keep(&self, pcm: &[i16], sample_rate: u32) -> Option<usize> {
+        let (_, end) = detect_speech(
+            pcm,
+            self.absolute,
+            self.ratio,
+            self.min_speech_ms,
+            self.hangover_ms,
+            sample_rate as u16,
+        )?;
+        (end < pcm.len()).then_some(end)
+    }
+}
 
 /// The default input device's name, without opening a stream. `None` means cpal cannot see a
 /// microphone on this machine.
@@ -174,6 +215,7 @@ fn u16_to_i16(samples: &[u16]) -> Vec<i16> {
 pub struct CpalSource {
     sample_rate: u16,
     device: Option<String>,
+    stop: SilenceStop,
 }
 
 impl CpalSource {
@@ -181,6 +223,7 @@ impl CpalSource {
         Self {
             sample_rate: config.sample_rate,
             device: config.input_device.clone(),
+            stop: SilenceStop::from_config(config),
         }
     }
 }
@@ -243,6 +286,7 @@ impl AudioSource for CpalSource {
             .map_err(|err| VoiceError::NoDevice(format!("start input stream: {err}")))?;
 
         let deadline = Instant::now() + Duration::from_millis(max_ms.max(1));
+        let cap = (max_ms.max(1) * u64::from(rate) / 1_000) as usize;
         let mut pcm = Vec::new();
         loop {
             if cancel.is_cancelled() {
@@ -255,7 +299,17 @@ impl AudioSource for CpalSource {
             }
             let wait = (deadline - now).min(POLL);
             match rx.recv_timeout(wait) {
-                Ok(chunk) => pcm.extend_from_slice(&chunk),
+                Ok(chunk) => {
+                    pcm.extend_from_slice(&chunk);
+                    if let Some(keep) = self.stop.keep(&pcm, rate) {
+                        pcm.truncate(keep);
+                        break;
+                    }
+                    if pcm.len() >= cap {
+                        pcm.truncate(cap);
+                        break;
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     if let Ok(err) = err_rx.try_recv() {
@@ -381,6 +435,107 @@ mod tests {
         assert_eq!(
             default_first(vec!["B".to_owned()], Some("A")),
             vec!["A", "B"]
+        );
+    }
+
+    fn gate() -> SilenceStop {
+        SilenceStop::from_config(&VoiceConfig::default())
+    }
+
+    fn tone(ms: u64, amplitude: f32, rate: u32) -> Vec<i16> {
+        let samples = (ms as u32 * rate / 1_000) as usize;
+        (0..samples)
+            .map(|i| {
+                let phase = (i as f64 * 0.08).sin();
+                (phase * f64::from(i16::MAX) * f64::from(amplitude)) as i16
+            })
+            .collect()
+    }
+
+    fn chunks(pcm: &[i16], frame: usize) -> Vec<Vec<i16>> {
+        pcm.chunks(frame).map(<[i16]>::to_vec).collect()
+    }
+
+    /// The capture loop's decision without a microphone: the same chunks, the same stop rule,
+    /// the same cap.
+    fn record_stream(stop: &SilenceStop, chunks: &[Vec<i16>], cap: usize, rate: u32) -> Vec<i16> {
+        let mut pcm = Vec::new();
+        for chunk in chunks {
+            pcm.extend_from_slice(chunk);
+            if let Some(keep) = stop.keep(&pcm, rate) {
+                pcm.truncate(keep);
+                break;
+            }
+            if pcm.len() >= cap {
+                pcm.truncate(cap);
+                break;
+            }
+        }
+        pcm
+    }
+
+    #[test]
+    fn a_take_ends_when_the_speaker_stops() {
+        let rate = 16_000;
+        let mut stream = chunks(&vec![0i16; rate as usize], 160);
+        stream.extend(chunks(&tone(600, 0.5, rate), 160));
+        stream.extend(chunks(&vec![0i16; 10 * rate as usize], 160));
+        let take = record_stream(&gate(), &stream, 8 * rate as usize, rate);
+        assert_eq!(
+            take.len(),
+            (1_000 + 600 + 200) as usize * rate as usize / 1_000,
+            "speech plus the hangover, not the 8 s cap"
+        );
+    }
+
+    #[test]
+    fn silence_only_still_runs_to_the_cap() {
+        let rate = 16_000;
+        let stream = chunks(&vec![0i16; 10 * rate as usize], 160);
+        let cap = 8 * rate as usize;
+        let take = record_stream(&gate(), &stream, cap, rate);
+        assert_eq!(take.len(), cap);
+        assert!(take.iter().all(|sample| *sample == 0));
+    }
+
+    #[test]
+    fn a_late_speaker_is_not_truncated() {
+        let rate = 16_000;
+        let mut stream = chunks(&vec![0i16; 6 * rate as usize], 160);
+        stream.extend(chunks(&tone(500, 0.5, rate), 160));
+        stream.extend(chunks(&vec![0i16; 10 * rate as usize], 160));
+        let cap = 8 * rate as usize;
+        let take = record_stream(&gate(), &stream, cap, rate);
+        assert_eq!(
+            take.len(),
+            (6_000 + 500 + 200) as usize * rate as usize / 1_000
+        );
+        assert!(
+            take.len() < cap,
+            "still stops before the cap: {}",
+            take.len()
+        );
+    }
+
+    #[test]
+    fn the_take_keeps_the_frames_from_before_the_gate_opened() {
+        let rate = 16_000;
+        let quiet: Vec<i16> = (0..rate as usize)
+            .map(|i| if (i / 8) % 2 == 0 { 6 } else { -6 })
+            .collect();
+        let mut stream = chunks(&quiet, 160);
+        stream.extend(chunks(&tone(600, 0.5, rate), 160));
+        stream.extend(chunks(&vec![0i16; 10 * rate as usize], 160));
+        let take = record_stream(&gate(), &stream, 8 * rate as usize, rate);
+        assert!(
+            take.len() > quiet.len(),
+            "the pre-roll and the speech are both kept: {}",
+            take.len()
+        );
+        assert_eq!(
+            &take[..quiet.len()],
+            &quiet[..],
+            "pre-roll: every frame before the gate opened"
         );
     }
 
