@@ -2,7 +2,9 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use vikram_contracts::{ActionKind, PermissionRequest, SideEffect, Trust, VikramError};
+use vikram_contracts::{
+    ActionKind, PermissionMode, PermissionRequest, SideEffect, Trust, VikramError,
+};
 
 use crate::config::resolve_within;
 
@@ -174,6 +176,208 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// What a tool needs from the posture before its schema is worth sending.
+///
+/// This is the schema gate, never the permission gate. A hidden tool is still registered and still
+/// callable; a shown tool still has to pass policy on every call. The gate exists because 103 schemas
+/// on every request is context the transcript needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolGate {
+    /// The strongest action the tool reports to policy. `Read` is the only action a read-only
+    /// posture runs, which is what keeps writes and commands out of plan mode.
+    pub action: ActionKind,
+    /// The tool's own permission is `SideEffect::Destructive`: it exists to remove something.
+    /// Tools that are only *sometimes* destructive because of their arguments (`shell.run`,
+    /// `terminal`, `process`) are not flagged: the arguments decide, and policy gates each call.
+    pub destructive: bool,
+    /// The tool cannot succeed unless a human answers.
+    pub interactive: bool,
+}
+
+const fn gate(action: ActionKind, destructive: bool, interactive: bool) -> ToolGate {
+    ToolGate {
+        action,
+        destructive,
+        interactive,
+    }
+}
+
+/// The posture in force, plus whether its policy can let an irreversible call run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolSurface {
+    pub mode: PermissionMode,
+    /// Widen this when the rule book already covers a destructive verb. The surface is a context
+    /// budget, so a tool the operator allowed must not disappear from the model's list.
+    pub destructive_allowed: bool,
+}
+
+impl ToolSurface {
+    /// The posture's own answer. `plan` is read-only and `unattended` cannot ask, so neither can
+    /// let a destructive call run; every other posture either asks a human or auto-approves.
+    pub fn for_mode(mode: PermissionMode) -> Self {
+        Self {
+            mode,
+            destructive_allowed: !matches!(mode, PermissionMode::Plan | PermissionMode::Unattended),
+        }
+    }
+
+    pub fn admits(&self, gate: ToolGate) -> bool {
+        if gate.interactive && self.mode == PermissionMode::Unattended {
+            return false;
+        }
+        if gate.destructive && !self.destructive_allowed {
+            return false;
+        }
+        if self.mode == PermissionMode::Plan {
+            // Exactly the posture's own test for a read: `PermissionMode::resolve` refuses every
+            // non-read in plan mode, so advertising one would spend a schema on a refusal.
+            return gate.action == ActionKind::Read;
+        }
+        true
+    }
+}
+
+/// The gate for one tool, keyed by the name the model calls. `None` for a family this table does
+/// not know — MCP servers, the daemon's scheduler — which `gate_of` keeps visible everywhere.
+///
+/// The classification follows each tool's own `permission`: a tool that can report
+/// `ActionKind::Write` is a write tool even when one subcommand only reads, because the schema is a
+/// promise about what the tool can do. `update_plan` is the one exception: its permission is
+/// `Write` with no side effect (it writes session state, not the world), and a read-only posture
+/// still needs it to report progress.
+fn gate_for(name: &str) -> Option<ToolGate> {
+    Some(match name {
+        // Reads and searches: every posture, including plan.
+        "fs.read"
+        | "fs.list"
+        | "search.text"
+        | "session.search"
+        | "output.read"
+        | "git"
+        | "git.status"
+        | "git.diff"
+        | "git.log"
+        | "git_status"
+        | "git_diff"
+        | "git_log"
+        | "lsp.hover"
+        | "lsp.definition"
+        | "lsp.references"
+        | "lsp.symbols"
+        | "lsp.diagnostics"
+        | "code_search"
+        | "code.review"
+        | "skill.list"
+        | "skill.load"
+        | "skill.search"
+        | "skill.read"
+        | "memory.search"
+        | "memory.list"
+        | "hive.list"
+        | "hive.show"
+        | "bot.list"
+        | "bot.show"
+        | "agent.list"
+        | "agent.show"
+        | "plugin.list"
+        | "plugin.validate"
+        | "plugin.inspect"
+        | "plugin.deps"
+        | "worker.collect"
+        | "permission.check"
+        | "browser.text"
+        | "browser.sessions"
+        | "computer.windows"
+        | "computer.status"
+        | "computer.ocr"
+        | "computer.read_screen"
+        | "computer.clipboard_read" => gate(ActionKind::Read, false, false),
+
+        // The plan is how a read-only posture says what it intends to do, so it stays everywhere.
+        "update_plan" => gate(ActionKind::Read, false, false),
+
+        // Needs a human at the keyboard: an unattended run cannot answer, so the schema is dead.
+        "ask_user" | "message.poll" | "message.card" | "message.draft" | "message.react" => {
+            gate(ActionKind::Read, false, true)
+        }
+
+        // Network reads: allowed wherever the posture is not read-only.
+        "web.search" | "browser.fetch" | "browser.dom" | "browser.links" | "browser.open"
+        | "browser.screenshot" => gate(ActionKind::Network, false, false),
+
+        // Writes inside the workspace or the runtime's own state.
+        "fs.write"
+        | "fs.edit"
+        | "memory.save"
+        | "memory.note"
+        | "memory.consolidate"
+        | "hive.create"
+        | "bot.create"
+        | "plugin.enable"
+        | "plugin.disable"
+        | "codeindex"
+        | "task"
+        | "computer.screenshot"
+        | "computer.clipboard_write" => gate(ActionKind::Write, false, false),
+
+        // Runs something: a command, a build, a browser page, a virtual keyboard.
+        "shell.run"
+        | "terminal"
+        | "build.run"
+        | "test.run"
+        | "verify"
+        | "process"
+        | "diagnostics.collect"
+        | "git_commit"
+        | "git_branch"
+        | "git_stash"
+        | "git.commit"
+        | "git.branch"
+        | "git.stash"
+        | "build_check"
+        | "test_run"
+        | "plugin.execute"
+        | "browser.eval"
+        | "browser.click"
+        | "browser.type"
+        | "browser.scroll"
+        | "browser.close"
+        | "computer.click"
+        | "computer.type"
+        | "computer.key"
+        | "computer.scroll"
+        | "computer.notify" => gate(ActionKind::Execute, false, false),
+
+        "hive.delegate" | "spawn_worker" => gate(ActionKind::Delegate, false, false),
+
+        // Irreversible: only where the policy can already let it run.
+        "fs.delete" | "memory.delete" | "hive.delete" | "relation" | "plugin.install"
+        | "plugin.uninstall" => gate(ActionKind::Write, true, false),
+
+        _ => return None,
+    })
+}
+
+/// The gate for a tool, including families this table does not know. An unknown family stays
+/// visible in every posture: hiding a tool we cannot classify would take away a capability, and a
+/// read-only posture refuses the call anyway.
+pub fn gate_of(name: &str) -> ToolGate {
+    gate_for(name).unwrap_or(gate(ActionKind::Read, false, false))
+}
+
+/// The schemas a request in `mode` carries.
+pub fn schemas_for_mode(mode: PermissionMode, specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
+    schemas_for_surface(ToolSurface::for_mode(mode), specs)
+}
+
+/// The schemas a request carries under an explicit surface.
+pub fn schemas_for_surface(surface: ToolSurface, specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
+    specs
+        .into_iter()
+        .filter(|spec| surface.admits(gate_of(&spec.name)))
+        .collect()
+}
+
 /// Extra tool families that the host installs at startup.
 ///
 /// The runtime cannot depend on the crates that own some families — the daemon owns the scheduler
@@ -341,6 +545,12 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// The schemas to send with a request in `mode`. What the model is told exists — not what the
+    /// host will run: every tool stays registered, and every call still passes policy.
+    pub fn specs_for_mode(&self, mode: PermissionMode) -> Vec<ToolSpec> {
+        schemas_for_mode(mode, self.specs())
+    }
+
     pub fn names(&self) -> Vec<String> {
         self.tools
             .lock()
@@ -445,4 +655,181 @@ pub(crate) fn canonical_resource(root: &Path, raw: &str) -> Result<(PathBuf, Str
         })?;
     let display = resolved.to_string_lossy().into_owned();
     Ok((resolved, display))
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    fn spec(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.to_owned(),
+            description: String::new(),
+            schema: json!({"type": "object"}),
+        }
+    }
+
+    fn builtins() -> ToolRegistry {
+        ToolRegistry::with_builtins()
+    }
+
+    /// Names advertised in `mode`, taken from every registered spec so a machine with tools
+    /// disabled in `disabled_tools.json` cannot change the answer.
+    fn names_in(mode: vikram_contracts::PermissionMode) -> Vec<String> {
+        let all: Vec<ToolSpec> = builtins()
+            .all()
+            .into_iter()
+            .map(|tool| tool.spec())
+            .collect();
+        schemas_for_mode(mode, all)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect()
+    }
+
+    fn has(names: &[String], name: &str) -> bool {
+        names.iter().any(|n| n == name)
+    }
+
+    #[test]
+    fn read_only_mode_omits_write_and_execute_tools() {
+        let names = names_in(vikram_contracts::PermissionMode::Plan);
+
+        for hidden in ["fs.write", "fs.edit", "fs.delete", "shell.run", "terminal"] {
+            assert!(
+                !has(&names, hidden),
+                "plan mode must not advertise `{hidden}`"
+            );
+        }
+        for kept in ["fs.read", "fs.list", "search.text", "update_plan"] {
+            assert!(has(&names, kept), "plan mode still needs `{kept}`");
+        }
+        assert!(
+            names.len() < builtins().all().len(),
+            "the gate actually removes something"
+        );
+    }
+
+    #[test]
+    fn edit_mode_includes_write_and_execute_tools() {
+        let names = names_in(vikram_contracts::PermissionMode::AcceptEdits);
+
+        for kept in [
+            "fs.write",
+            "fs.edit",
+            "shell.run",
+            "test.run",
+            "update_plan",
+        ] {
+            assert!(has(&names, kept), "edit-ok must advertise `{kept}`");
+        }
+    }
+
+    #[test]
+    fn destructive_tools_need_a_policy_that_allows_them() {
+        let specs = vec![spec("fs.read"), spec("fs.write"), spec("fs.delete")];
+
+        let asked = schemas_for_mode(vikram_contracts::PermissionMode::Ask, specs.clone());
+        assert!(asked.iter().any(|s| s.name == "fs.delete"));
+
+        let held = schemas_for_surface(
+            ToolSurface {
+                mode: vikram_contracts::PermissionMode::Ask,
+                destructive_allowed: false,
+            },
+            specs.clone(),
+        );
+        let names: Vec<&str> = held.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.contains(&"fs.delete"), "a held policy hides deletes");
+        assert!(
+            names.contains(&"fs.write"),
+            "it does not hide ordinary writes"
+        );
+
+        let unattended = names_in(vikram_contracts::PermissionMode::Unattended);
+        assert!(!has(&unattended, "fs.delete"));
+        assert!(
+            has(&unattended, "fs.write"),
+            "an allow rule can still cover a write"
+        );
+    }
+
+    #[test]
+    fn unattended_mode_hides_tools_that_need_a_human() {
+        let names = names_in(vikram_contracts::PermissionMode::Unattended);
+        for hidden in ["ask_user", "message.poll", "message.card"] {
+            assert!(
+                !has(&names, hidden),
+                "nobody can answer `{hidden}` in an unattended run"
+            );
+        }
+        assert!(has(&names, "update_plan"));
+    }
+
+    #[test]
+    fn update_plan_is_advertised_in_every_mode() {
+        for mode in vikram_contracts::PermissionMode::all() {
+            let names = names_in(mode);
+            assert!(
+                has(&names, "update_plan"),
+                "`{}` must keep the plan tool",
+                mode.as_str()
+            );
+            assert!(
+                has(&names, "fs.read"),
+                "`{}` must keep the read tools",
+                mode.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn the_gated_surface_is_pinned_per_mode() {
+        // Counted off every registered spec, so a machine with tools disabled in
+        // `disabled_tools.json` cannot change the answer. A new tool, or a gate that stops biting,
+        // moves one of these numbers and fails here on purpose.
+        let all: Vec<ToolSpec> = builtins()
+            .all()
+            .into_iter()
+            .map(|tool| tool.spec())
+            .collect();
+        let counts: Vec<(&str, usize)> = vikram_contracts::PermissionMode::all()
+            .into_iter()
+            .map(|mode| (mode.as_str(), schemas_for_mode(mode, all.clone()).len()))
+            .collect();
+        assert_eq!(
+            counts,
+            vec![
+                ("ask", 103),
+                ("edit-ok", 103),
+                ("allow-list", 103),
+                ("smart", 103),
+                ("unattended", 92),
+                ("yolo", 103),
+                ("plan", 50),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_builtin_tool_is_classified_and_the_count_is_pinned() {
+        let names = builtins().names();
+        let unknown: Vec<&String> = names
+            .iter()
+            .filter(|name| gate_for(name).is_none())
+            .collect();
+        assert!(unknown.is_empty(), "unclassified tools: {unknown:?}");
+        assert_eq!(
+            names.len(),
+            103,
+            "the builtin tool surface changed; classify the new tool in `gate_for` and update this \
+             number only when the change is deliberate"
+        );
+        for name in &names {
+            assert!(
+                gate_for(name).is_some(),
+                "`{name}` has no gate; add it to `gate_for` so a mode cannot silently hide it"
+            );
+        }
+    }
 }
