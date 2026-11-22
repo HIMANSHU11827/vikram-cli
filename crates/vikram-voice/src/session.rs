@@ -4,7 +4,7 @@ use crate::helpers::{
     Scratch, first_available, missing_tool_message, pcm_from_bytes, run, which, write_wav,
 };
 use crate::vad::{is_silent, trim_silence};
-use crate::{Result, StageStatus, VoiceConfig, VoiceError, VoiceStatus, probe};
+use crate::{AsrEngine, Result, StageStatus, VoiceConfig, VoiceError, VoiceStatus, probe};
 use std::fs;
 use std::path::PathBuf;
 
@@ -23,6 +23,23 @@ pub trait AudioSource: Send {
 /// Turn speech into text. `Ok(None)` means silence or an empty transcript, not failure.
 pub trait Recognizer: Send {
     fn transcribe(&mut self, pcm: &[i16]) -> Result<Option<String>>;
+
+    /// Transcribe with cooperative cancellation. Engines that can abort mid-inference override
+    /// this; the default checks once and delegates.
+    fn transcribe_cancellable(
+        &mut self,
+        pcm: &[i16],
+        cancel: &crate::CancelToken,
+    ) -> Result<Option<String>> {
+        cancel.check()?;
+        self.transcribe(pcm)
+    }
+
+    /// Degrade notes accumulated at run time (engine failures, fallbacks taken). Taking them
+    /// clears them; the session merges them into `VoiceStatus` instead of swallowing them.
+    fn notes(&mut self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Turn the model's reply text into WAV bytes.
@@ -101,7 +118,12 @@ impl HelperRecognizer {
 impl Recognizer for HelperRecognizer {
     fn transcribe(&mut self, pcm: &[i16]) -> Result<Option<String>> {
         if self.model.as_os_str().is_empty() || !self.model.is_file() {
-            return Err(VoiceError::ModelMissing(self.model.clone()));
+            let reason = if self.model.as_os_str().is_empty() {
+                "asr_model is not configured".into()
+            } else {
+                format!("asr_model {} is not a file", self.model.display())
+            };
+            return Err(VoiceError::ModelMissing(reason));
         }
         if which(&self.helper).is_none() {
             return Err(VoiceError::MissingHelper(missing_tool_message(
@@ -196,9 +218,9 @@ impl Player for HelperPlayer {
 }
 
 /// A push-to-talk loop. The four stages are traits so tests run without a microphone or model.
-/// The default source is the built-in cpal engine; the helper path is only a fallback when the
-/// machine exposes no input device to cpal.
-pub struct VoiceSession<S = DeviceSource, R = HelperRecognizer, Y = HelperSynth, P = HelperPlayer> {
+/// The default source is the built-in cpal engine and the default recognizer the built-in
+/// whisper chain; helper binaries are only fallback tiers inside those engines.
+pub struct VoiceSession<S = DeviceSource, R = AsrEngine, Y = HelperSynth, P = HelperPlayer> {
     config: VoiceConfig,
     cancel: CancelToken,
     source: S,
@@ -219,7 +241,7 @@ impl VoiceSession {
         Ok(Self::with_parts(
             config.clone(),
             DeviceSource::new(&config),
-            HelperRecognizer::new(&config),
+            AsrEngine::new(&config),
             HelperSynth::new(&config),
             HelperPlayer::new(&config),
         ))
@@ -268,10 +290,12 @@ where
         if start == end {
             return Ok(None);
         }
-        self.recognizer.transcribe(&pcm[start..end])
+        self.recognizer
+            .transcribe_cancellable(&pcm[start..end], &self.cancel)
     }
 
     pub fn speak(&mut self, text: &str) -> Result<()> {
+        self.cancel.check()?;
         let text = text.trim();
         if text.is_empty() {
             return Err(VoiceError::Config(
@@ -287,8 +311,11 @@ where
         self.player.play(&wav)
     }
 
-    pub fn status(&self) -> VoiceStatus {
-        probe(&self.config)
+    /// Probe the stages, plus every run-time degrade note the engines have accumulated.
+    pub fn status(&mut self) -> VoiceStatus {
+        let mut status = probe(&self.config);
+        status.notes.extend(self.recognizer.notes());
+        status
     }
 }
 

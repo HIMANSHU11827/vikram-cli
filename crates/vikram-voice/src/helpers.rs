@@ -65,22 +65,7 @@ pub fn probe(config: &VoiceConfig) -> VoiceStatus {
             config.capture_helper, config.capture_fallback
         ))
     };
-    let asr = if which(&config.asr_helper).is_none() {
-        StageStatus::Missing(missing_tool_message(&config.asr_helper))
-    } else if config.asr_model.as_os_str().is_empty() {
-        StageStatus::Missing("no asr_model configured".into())
-    } else if !config.asr_model.is_file() {
-        StageStatus::Missing(format!(
-            "model file missing: {}",
-            config.asr_model.display()
-        ))
-    } else {
-        StageStatus::Ready(format!(
-            "{} with {}",
-            config.asr_helper,
-            config.asr_model.display()
-        ))
-    };
+    let asr = crate::asr::probe_asr(config);
     let tts = match (
         which(&config.tts_helper).is_some() && config.tts_voice.is_some(),
         which(&config.tts_fallback).is_some(),

@@ -9,12 +9,17 @@
 //! Helpers are spawned with an argv vector, never a shell, and every invocation is bounded.
 //! Model weights are operator-downloaded files, never bundled.
 
+mod asr;
 mod cancel;
 mod capture;
 mod helpers;
 mod session;
 mod vad;
 
+pub use asr::{
+    AsrEngine, BASE_TIER, TINY_TIER, WhisperRecognizer, models_dir, probe_asr, resolve_model,
+    resolve_model_in,
+};
 pub use cancel::CancelToken;
 pub use capture::{CpalSource, DeviceSource, probe_capture};
 pub use helpers::{first_available, missing_tool_message, probe, which};
@@ -39,8 +44,8 @@ pub enum VoiceError {
     NoDevice(String),
     #[error("{0}")]
     MissingHelper(String),
-    #[error("ASR model file is missing: {0}. Set asr_model to a downloaded ggml model.")]
-    ModelMissing(PathBuf),
+    #[error("no usable ASR model: {0}")]
+    ModelMissing(String),
     #[error("voice helper failed: {0}")]
     Helper(String),
     #[error("voice helper timed out after {0}s")]
@@ -60,6 +65,10 @@ pub struct VoiceConfig {
     pub capture_fallback: String,
     pub asr_helper: String,
     pub asr_model: PathBuf,
+    /// None resolves under `models_dir` (or `<vikram home>/models` when unset).
+    pub models_dir: Option<PathBuf>,
+    /// None lets whisper auto-detect the spoken language.
+    pub asr_language: Option<String>,
     pub asr_timeout_secs: u64,
     pub tts_helper: String,
     pub tts_fallback: String,
@@ -80,6 +89,8 @@ impl Default for VoiceConfig {
             capture_fallback: "arecord".into(),
             asr_helper: "whisper-cli".into(),
             asr_model: PathBuf::new(),
+            models_dir: None,
+            asr_language: None,
             asr_timeout_secs: 120,
             tts_helper: "piper".into(),
             tts_fallback: "espeak-ng".into(),

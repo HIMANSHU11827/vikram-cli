@@ -11,6 +11,10 @@ publish = false
 thiserror.workspace = true
 cpal = "0.18"
 hound = "3.5"
+whisper-rs = "0.16"
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"
