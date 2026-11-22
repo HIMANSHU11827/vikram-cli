@@ -128,7 +128,8 @@ pub enum TriggerError {
 pub enum EmitOutcome {
     /// A new event row was written; the scheduler will see it.
     Recorded(EventRow),
-    /// The same kind and subject fired inside the dedup window, so nothing new was queued.
+    /// The same kind and subject fired inside the dedup window, so nothing new was queued. The
+    /// suppression is written to the audit ledger naming the window that held it back.
     Deduped,
 }
 
@@ -445,5 +446,37 @@ mod tests {
             trail.iter().any(|row| row.kind == "trigger.refused"),
             "a refused trigger is itself audited: {trail:?}"
         );
+    }
+
+    #[test]
+    fn duplicate_trigger_suppressed_and_logged() {
+        let store = store();
+        let bus = EventBus::without_wake(store.clone());
+        bus.emit("postbox", "job-1", "first", at(10, 0)).unwrap();
+        let second = bus
+            .emit("postbox", "job-1", "again", at(10, 0) + 5_000)
+            .unwrap();
+        assert!(matches!(second, EmitOutcome::Deduped));
+
+        // The suppressed fire is on the record, naming the rule that held it back.
+        let trail = store.audit_trail(20).unwrap();
+        let dedup = trail
+            .iter()
+            .find(|row| row.kind == "trigger.dedup" && row.subject == "postbox:job-1")
+            .expect("a suppressed fire leaves an audit row");
+        assert!(
+            dedup.detail.contains(&EVENT_DEDUP_MS.to_string()),
+            "the audit names the window, not just the word dedup: {dedup:?}"
+        );
+
+        // And the event queue itself was never duplicated.
+        assert_eq!(store.events_after(0).unwrap().len(), 1);
+
+        // Outside the window the same signal is a fresh fire, not a suppression.
+        let later = bus
+            .emit("postbox", "job-1", "posted", at(10, 0) + EVENT_DEDUP_MS + 1)
+            .unwrap();
+        assert!(matches!(later, EmitOutcome::Recorded(_)));
+        assert_eq!(store.events_after(0).unwrap().len(), 2);
     }
 }

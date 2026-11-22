@@ -884,9 +884,10 @@ impl ScheduleStore {
     // -- events ------------------------------------------------------------------------------
 
     /// Raise an internal event. Dedup is on `(kind, subject)` inside `dedup_ms`: a repeat inside
-    /// the window returns `None` instead of a second row, which is the same "a slot runs at most
-    /// once" rule the run table enforces for schedules. A written event also lands in the audit
-    /// ledger in the same commit, so a signal can never exist unrecorded.
+    /// the window returns `None` instead of a second row, and the suppression itself is written
+    /// to the audit ledger naming the window, so a quiet minute is as explainable as a loud one.
+    /// A written event also lands in the audit ledger in the same commit, so a signal can never
+    /// exist unrecorded.
     ///
     /// The table is bounded two ways: rows older than a week are dropped, and only the newest
     /// [`EVENT_KEEP`] survive regardless of age.
@@ -900,6 +901,11 @@ impl ScheduleStore {
     ) -> Result<Option<EventRow>, StoreError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
+        let name = if subject.is_empty() {
+            kind.to_string()
+        } else {
+            format!("{kind}:{subject}")
+        };
         if dedup_ms > 0 {
             let recent: Option<i64> = tx
                 .query_row(
@@ -911,6 +917,16 @@ impl ScheduleStore {
                 )
                 .optional()?;
             if recent.is_some() {
+                tx.execute(
+                    "INSERT INTO daemon_audit (at_ms, kind, subject, detail)
+                     VALUES (?1, 'trigger.dedup', ?2, ?3)",
+                    params![
+                        now,
+                        name,
+                        format!("suppressed: same signal inside the {dedup_ms}ms dedup window")
+                    ],
+                )?;
+                tx.commit()?;
                 return Ok(None);
             }
         }
@@ -919,11 +935,6 @@ impl ScheduleStore {
             params![kind, subject, detail, now],
         )?;
         let seq = tx.last_insert_rowid();
-        let name = if subject.is_empty() {
-            kind.to_string()
-        } else {
-            format!("{kind}:{subject}")
-        };
         tx.execute(
             "INSERT INTO daemon_audit (at_ms, kind, subject, detail) VALUES (?1, 'trigger.emit', ?2, ?3)",
             params![now, name, detail],
