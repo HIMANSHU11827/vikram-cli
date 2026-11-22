@@ -3495,4 +3495,33 @@ mod tests {
         let err = install_entity_pack(&store, &dir).unwrap_err();
         assert!(err.contains("not a module directory"), "{err}");
     }
+
+    #[test]
+    fn voice_model_flag_does_not_collide_with_the_global_model_flag() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "vikram",
+            "--model",
+            "opencode-go/deepseek-v4.1-flash",
+            "voice",
+            "listen",
+            "--enable",
+            "--asr-model",
+            "/tmp/ggml-base.en.bin",
+        ])
+        .expect("global --model and voice --asr-model must parse together");
+        assert_eq!(
+            cli.model.as_deref(),
+            Some("opencode-go/deepseek-v4.1-flash")
+        );
+        match cli.command {
+            Some(Command::Voice {
+                action: voice::VoiceAction::Listen { asr_model, .. },
+            }) => assert_eq!(
+                asr_model.as_deref(),
+                Some(std::path::Path::new("/tmp/ggml-base.en.bin"))
+            ),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
 }

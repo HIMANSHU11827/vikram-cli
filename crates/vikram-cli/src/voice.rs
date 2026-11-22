@@ -17,8 +17,8 @@ pub enum VoiceAction {
     /// Report which local voice helpers and models are available.
     Status {
         /// Whisper model to check, in addition to VIKRAM_ASR_MODEL.
-        #[arg(long, value_name = "PATH")]
-        model: Option<PathBuf>,
+        #[arg(long = "asr-model", value_name = "PATH")]
+        asr_model: Option<PathBuf>,
     },
     /// Record one utterance locally and print its transcript.
     Listen {
@@ -26,8 +26,8 @@ pub enum VoiceAction {
         #[arg(long)]
         enable: bool,
         /// Path to a downloaded Whisper ggml model. Defaults to VIKRAM_ASR_MODEL.
-        #[arg(long, value_name = "PATH")]
-        model: Option<PathBuf>,
+        #[arg(long = "asr-model", value_name = "PATH")]
+        asr_model: Option<PathBuf>,
         /// Recording cap in milliseconds.
         #[arg(long, value_name = "MS")]
         max_record_ms: Option<u64>,
@@ -49,8 +49,8 @@ pub enum VoiceAction {
         #[arg(long)]
         enable: bool,
         /// Path to a downloaded Whisper ggml model. Defaults to VIKRAM_ASR_MODEL.
-        #[arg(long, value_name = "PATH")]
-        model: Option<PathBuf>,
+        #[arg(long = "asr-model", value_name = "PATH")]
+        asr_model: Option<PathBuf>,
         /// Recording cap in milliseconds.
         #[arg(long, value_name = "MS")]
         max_record_ms: Option<u64>,
@@ -65,7 +65,7 @@ pub enum VoiceAction {
 
 fn config(
     enable: bool,
-    model: Option<PathBuf>,
+    asr_model: Option<PathBuf>,
     voice: Option<PathBuf>,
     max_record_ms: Option<u64>,
 ) -> VoiceConfig {
@@ -73,7 +73,8 @@ fn config(
         enabled: enable,
         ..Default::default()
     };
-    if let Some(path) = model.or_else(|| std::env::var("VIKRAM_ASR_MODEL").ok().map(PathBuf::from))
+    if let Some(path) =
+        asr_model.or_else(|| std::env::var("VIKRAM_ASR_MODEL").ok().map(PathBuf::from))
     {
         config.asr_model = path;
     }
@@ -178,7 +179,7 @@ pub(crate) fn speakable(reply: &str) -> &str {
 pub async fn chat(runtime_config: Config, action: VoiceAction) -> Result<(), String> {
     let VoiceAction::Chat {
         enable,
-        model,
+        asr_model,
         max_record_ms,
         voice,
         fresh,
@@ -186,7 +187,7 @@ pub async fn chat(runtime_config: Config, action: VoiceAction) -> Result<(), Str
     else {
         return Err("not a voice chat action".into());
     };
-    let voice_config = config(enable, model, voice, max_record_ms);
+    let voice_config = config(enable, asr_model, voice, max_record_ms);
     voice_config.validate().map_err(|err| err.to_string())?;
     let mut session = VoiceSession::start(voice_config).map_err(|err| err.to_string())?;
 
@@ -238,8 +239,8 @@ pub async fn chat(runtime_config: Config, action: VoiceAction) -> Result<(), Str
 
 pub fn run(action: VoiceAction) -> Result<(), String> {
     match action {
-        VoiceAction::Status { model } => {
-            let config = config(false, model, None, None);
+        VoiceAction::Status { asr_model } => {
+            let config = config(false, asr_model, None, None);
             let status = probe(&config);
             for line in status.lines() {
                 println!("{line}");
@@ -254,10 +255,10 @@ pub fn run(action: VoiceAction) -> Result<(), String> {
         }
         VoiceAction::Listen {
             enable,
-            model,
+            asr_model,
             max_record_ms,
         } => {
-            let config = config(enable, model, None, max_record_ms);
+            let config = config(enable, asr_model, None, max_record_ms);
             config.validate().map_err(|err| err.to_string())?;
             let mut session = VoiceSession::start(config).map_err(|err| err.to_string())?;
             #[cfg(unix)]
