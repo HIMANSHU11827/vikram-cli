@@ -2046,6 +2046,20 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// One artifact by its id, across sessions. A worker's result is consumed through this — the
+    /// orchestrator holds a reference, not the content, so reading it back starts here.
+    pub fn get_artifact(&self, id: &str) -> Result<Option<ArtifactRow>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id, session, project_id, bot_id, name, path, kind, mime, size, checksum, source, created_ms, updated_ms
+             FROM artifacts WHERE id = ?1",
+            params![id],
+            map_artifact,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     // ---- file changes ---------------------------------------------------
 
     pub fn record_file_change(&self, row: &FileChangeRow) -> Result<()> {
@@ -6687,5 +6701,38 @@ mod tests {
         assert_eq!(base64_len("QU===JD"), None);
         assert_eq!(base64_len("QUJD\n"), Some(3));
         assert_eq!(base64_len("!!!!"), None);
+    }
+
+    #[test]
+    fn an_artifact_round_trips_by_id_across_sessions() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store
+            .create_session("with artifact", Path::new("/work"), None, 1)
+            .unwrap();
+        let row = ArtifactRow {
+            id: "art-1".into(),
+            session: session.id.clone(),
+            project_id: None,
+            bot: None,
+            name: "result.md".into(),
+            path: PathBuf::from("/work/result.md"),
+            kind: "data".into(),
+            mime: Some("text/markdown".into()),
+            size: 12,
+            checksum: None,
+            source: Some("worker".into()),
+            created_ms: 1,
+            updated_ms: 1,
+        };
+        store.register_artifact(&row).unwrap();
+        let back = store.get_artifact("art-1").unwrap().expect("found by id");
+        assert_eq!(back, row);
+        assert_eq!(
+            store.get_artifact("art-missing").unwrap(),
+            None,
+            "an unknown id is absent, not an error"
+        );
+        assert!(store.remove_artifact("art-1").unwrap());
+        assert_eq!(store.get_artifact("art-1").unwrap(), None);
     }
 }

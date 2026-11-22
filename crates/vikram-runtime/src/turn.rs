@@ -1750,7 +1750,12 @@ fn finish(
         state: outcome,
     });
 
-    if let Some(run) = agent {
+    // A worker session settles its own account with its orchestrator: an artifact in the store
+    // and a reference in the parent's transcript, never the child transcript itself. Agent runs
+    // (bot delegations) keep their existing delivery path.
+    if inner.workers.by_session(&session.id).is_some() {
+        inner.finish_worker(session, outcome);
+    } else if let Some(run) = agent {
         let (state, task_state) = match outcome {
             TurnState::Cancelled => (BotState::Stopped, TaskState::Cancelled),
             TurnState::Failed => (BotState::Failed, TaskState::Failed),

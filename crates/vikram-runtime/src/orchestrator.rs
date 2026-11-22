@@ -20,9 +20,9 @@ use vikram_contracts::{
 use vikram_policy::CapabilityScope;
 
 use crate::error::{Result, RuntimeError};
-use crate::runtime::RuntimeHandle;
+use crate::runtime::{RuntimeHandle, RuntimeInner};
 use crate::tools::*;
-use crate::types::{RuntimeEvent, now_ms};
+use crate::types::{NoticeLevel, RuntimeEvent, now_ms};
 
 /// Unique identity of one spawned worker, stable for the life of the record.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -242,6 +242,178 @@ impl WorkerRegistry {
             }
             _ => AttemptOutcome::Reassign,
         }
+    }
+}
+
+/// `worker.collect` — how an orchestrator consumes a worker's result. It holds a reference from
+/// the moment the worker finished; this reads the artifact the reference names, so the child's
+/// transcript is never the delivery vehicle.
+pub(crate) struct WorkerCollect;
+
+impl Tool for WorkerCollect {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "worker.collect".into(),
+            description: "Read a spawned worker's stored result by worker id.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "the worker id returned by spawn_worker"}
+                },
+                "required": ["id"]
+            }),
+        }
+    }
+
+    fn permission(&self, args: &Value) -> std::result::Result<PermissionRequest, VikramError> {
+        let id = arg_str(args, "id")?;
+        Ok(PermissionRequest::new(
+            ActionKind::Read,
+            "worker.collect",
+            id,
+            SideEffect::None,
+            Trust::Model,
+        ))
+    }
+
+    fn run(&self, args: &Value, ctx: &ToolContext) -> std::result::Result<ToolOutput, VikramError> {
+        let id = arg_str(args, "id")?;
+        let Some(runtime) = ctx.runtime.as_ref() else {
+            return Ok(ToolOutput {
+                content: "worker.collect needs a live runtime".into(),
+                ok: false,
+            });
+        };
+        let Some(record) = runtime.workers.by_id(&WorkerId::new(id.clone())) else {
+            return Ok(ToolOutput {
+                content: format!("no worker named `{id}`"),
+                ok: false,
+            });
+        };
+        let Some(artifact) = record.artifact.clone() else {
+            return Ok(ToolOutput {
+                content: format!(
+                    "worker {id} has no stored result yet (status {:?})",
+                    record.status
+                ),
+                ok: false,
+            });
+        };
+        let row = runtime
+            .store
+            .get_artifact(&artifact)
+            .map_err(|e| VikramError::Storage(e.to_string()))?;
+        let Some(row) = row else {
+            return Ok(ToolOutput {
+                content: format!("artifact {artifact} is no longer registered"),
+                ok: false,
+            });
+        };
+        match std::fs::read_to_string(&row.path) {
+            Ok(content) => Ok(ToolOutput {
+                content: truncated(content),
+                ok: true,
+            }),
+            Err(err) => Ok(ToolOutput {
+                content: format!("artifact {artifact} could not be read: {err}"),
+                ok: false,
+            }),
+        }
+    }
+}
+
+impl RuntimeInner {
+    /// What a worker's finished turn owes its orchestrator: an artifact in the store and a
+    /// reference in the parent's transcript — never the child transcript itself. The worker
+    /// session is one-shot like a delegation: its work is done and its result is durable.
+    pub(crate) fn finish_worker(
+        self: &Arc<Self>,
+        session: &Arc<crate::session::SessionRuntime>,
+        outcome: crate::types::TurnState,
+    ) {
+        let Some(record) = self.workers.by_session(&session.id) else {
+            return;
+        };
+        if outcome != crate::types::TurnState::Idle {
+            // The worker did not finish its brief; the partial-result and retry contracts own
+            // the other outcomes. What finished is handed off; what did not is not.
+            return;
+        }
+        let answer = session
+            .messages()
+            .iter()
+            .rev()
+            .filter(|message| matches!(message.role, Role::Assistant))
+            .find_map(|message| {
+                let body = message.text_body();
+                (!body.trim().is_empty()).then_some(body)
+            })
+            .unwrap_or_else(|| "(the worker finished without a final statement)".to_owned());
+        let artifacts_dir = crate::config::vikram_home().join("artifacts");
+        let path = artifacts_dir.join(format!("{}.md", record.id.as_str()));
+        if let Err(err) =
+            std::fs::create_dir_all(&artifacts_dir).and_then(|_| std::fs::write(&path, &answer))
+        {
+            self.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!(
+                    "worker {} produced a result that could not be stored: {err}",
+                    record.id
+                ),
+            });
+            return;
+        }
+        let row = match self
+            .workspace
+            .register_artifact(&session.id, None, &path, Some("worker"))
+        {
+            Ok(row) => row,
+            Err(err) => {
+                self.emit(RuntimeEvent::Notice {
+                    level: NoticeLevel::Warn,
+                    text: format!(
+                        "worker {} produced a result that could not be registered: {err}",
+                        record.id
+                    ),
+                });
+                return;
+            }
+        };
+        self.workers.complete(&session.id, row.id.clone());
+        if let Some(parent) = self.session(&record.parent) {
+            let text = format!(
+                "[worker {} finished — result stored as artifact {}; read it with \
+                 worker.collect {{\"id\": \"{}\"}}]",
+                record.id, row.id, record.id
+            );
+            let message = Message::text(Role::System, text, Trust::Host);
+            parent.push_message(message.clone(), now_ms());
+            self.journal(
+                &record.parent,
+                RecordKind::Message,
+                serde_json::json!({"message": message}),
+            );
+            self.emit(RuntimeEvent::MessageCommitted {
+                session: record.parent.clone(),
+                message,
+            });
+        }
+        self.emit(RuntimeEvent::Notice {
+            level: NoticeLevel::Info,
+            text: format!("worker {} answered", record.id),
+        });
+        let _ = self
+            .store
+            .set_session_status(&session.id, "closed", now_ms());
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| {
+                eprintln!("vikram: runtime sessions lock mutex poisoned; recovering");
+                e.into_inner()
+            })
+            .retain(|live| live.id != session.id);
+        self.emit(RuntimeEvent::SessionClosed(session.id.clone()));
+        self.publish_metrics();
     }
 }
 
@@ -755,7 +927,9 @@ mod tests {
             "the refused spawn created nothing"
         );
 
-        // Phase two — a worker WITH the grant still cannot hand down more than it holds.
+        // Phase two — a worker WITH the grant still cannot hand down more than it holds. The
+        // lineage is built synchronously; turn starts happen only at the next await, so every
+        // session in the chain is alive while its child is being spawned.
         let mut granted = plain_brief(dir.path());
         granted.tool_allowlist = vec!["fs.read".into(), "fs.write".into(), "spawn_worker".into()];
         granted.file_scope = vec![scope_a.clone()];
@@ -763,7 +937,6 @@ mod tests {
             .spawn_worker(parent.clone(), granted, None)
             .expect("the granted worker spawns");
         let granted_record = handle.inner.workers.by_id(&granted_id).unwrap();
-        let _ = settle_worker(&handle, &mut events, &granted_id).await;
 
         // The granted worker's child asked for more than its parent holds — and got the
         // intersection, not the ask.
@@ -779,6 +952,23 @@ mod tests {
             .spawn_worker(granted_record.session.clone(), greedy, None)
             .expect("a granted worker may spawn");
         let child = handle.inner.workers.by_id(&child_id).unwrap();
+
+        // The chain is built to the floor in the same synchronous stretch.
+        let mut chain = plain_brief(dir.path());
+        chain.tool_allowlist = vec!["fs.read".into()];
+        chain.file_scope = vec![scope_a.clone()];
+        let grandchild_id = handle
+            .spawn_worker(child.session.clone(), chain.clone(), None)
+            .expect("depth 3 is the last link the floor permits");
+        let grandchild = handle.inner.workers.by_id(&grandchild_id).unwrap();
+        let refused = handle
+            .spawn_worker(grandchild.session.clone(), chain, None)
+            .expect_err("depth 4 exceeds the delegation floor");
+        assert!(
+            refused.to_string().contains("delegation depth"),
+            "{refused}"
+        );
+        let _ = settle_worker(&handle, &mut events, &granted_id).await;
         assert_eq!(child.depth, 2);
         assert_eq!(
             child.scope.tools,
@@ -853,21 +1043,94 @@ mod tests {
                 "what the orchestrator cannot do, nobody below it can re-obtain"
             );
         }
+    }
 
-        // The chain is cut at the floor: the grandchild exists, and its own spawn is refused.
-        let mut chain = plain_brief(dir.path());
-        chain.tool_allowlist = vec!["fs.read".into()];
-        chain.file_scope = vec![scope_a.clone()];
-        let grandchild_id = handle
-            .spawn_worker(child.session.clone(), chain.clone(), None)
-            .expect("depth 3 is the last link the floor permits");
-        let grandchild = handle.inner.workers.by_id(&grandchild_id).unwrap();
-        let refused = handle
-            .spawn_worker(grandchild.session.clone(), chain, None)
-            .expect_err("depth 4 exceeds the delegation floor");
+    #[tokio::test]
+    async fn worker_results_handoff_via_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("the audit found three findings: A, B, C".into()),
+            ProviderEvent::Finished {
+                input_tokens: Some(8),
+                output_tokens: Some(8),
+            },
+        ]]);
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::clone(&provider) as Arc<dyn Provider>,
+        )
+        .await
+        .expect("runtime boots with the scripted provider");
+        let handle = runtime.handle();
+        let parent = handle.snapshot().sessions[0].id.clone();
+        let mut events = handle.events();
+
+        let id = handle
+            .spawn_worker(parent.clone(), plain_brief(dir.path()), None)
+            .expect("the orchestrator spawns a worker");
+        let record = handle.inner.workers.by_id(&id).unwrap();
+        let _ = settle_worker(&handle, &mut events, &id).await;
+
+        // The finished run is an artifact in the store, registered against the worker session.
+        let settled = handle.inner.workers.by_id(&id).unwrap();
+        assert_eq!(settled.status, WorkerStatus::Done);
+        let artifact_id = settled.artifact.clone().expect("an artifact was stored");
+        let store = vikram_store::Store::open(&crate::config::database_path()).unwrap();
+        let row = store
+            .get_artifact(&artifact_id)
+            .unwrap()
+            .expect("the artifact row exists");
+        assert_eq!(row.session, record.session);
+        assert_eq!(row.source.as_deref(), Some("worker"));
+        let content = std::fs::read_to_string(&row.path).unwrap();
         assert!(
-            refused.to_string().contains("delegation depth"),
-            "{refused}"
+            content.contains("the audit found three findings: A, B, C"),
+            "{content}"
+        );
+
+        // The parent learned a reference, and never the child's transcript.
+        let parent_session = handle.inner.session(&parent).expect("parent is live");
+        let transcript = parent_session.messages();
+        assert!(
+            transcript
+                .iter()
+                .any(|m| m.text_body().contains(&artifact_id)),
+            "the reference reached the orchestrator"
+        );
+        assert!(
+            transcript
+                .iter()
+                .all(|m| !m.text_body().contains("the audit found three findings")),
+            "the child's answer text never crosses the boundary"
+        );
+
+        // One-shot: the finished worker's session is reaped, its row durable.
+        assert!(
+            handle.inner.session(&record.session).is_none(),
+            "the finished worker's session is reaped"
+        );
+        let closed = store
+            .get_session(&record.session)
+            .unwrap()
+            .expect("the row survives");
+        assert_eq!(closed.status, "closed");
+
+        // The orchestrator consumes the reference through the tool, not the transcript.
+        let ctx = ToolContext {
+            runtime: Some(Arc::clone(&handle.inner)),
+            session: Some(parent.clone()),
+            ..ToolContext::default()
+        };
+        let out = WorkerCollect
+            .run(&serde_json::json!({"id": id.to_string()}), &ctx)
+            .unwrap();
+        assert!(out.ok, "{}", out.content);
+        assert!(
+            out.content
+                .contains("the audit found three findings: A, B, C"),
+            "{}",
+            out.content
         );
     }
 }
