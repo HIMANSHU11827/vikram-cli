@@ -22,7 +22,7 @@ use vikram_policy::CapabilityScope;
 use crate::error::{Result, RuntimeError};
 use crate::runtime::{RuntimeHandle, RuntimeInner};
 use crate::tools::*;
-use crate::types::{NoticeLevel, RuntimeEvent, now_ms};
+use crate::types::{NoticeLevel, RuntimeEvent, TurnState, now_ms};
 
 /// Unique identity of one spawned worker, stable for the life of the record.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -334,9 +334,110 @@ impl RuntimeInner {
         let Some(record) = self.workers.by_session(&session.id) else {
             return;
         };
-        if outcome != crate::types::TurnState::Idle {
-            // The worker did not finish its brief; the partial-result and retry contracts own
-            // the other outcomes. What finished is handed off; what did not is not.
+        if outcome == TurnState::Failed {
+            // Exactly one retry, then reassign-or-degrade. Either way the team keeps running:
+            // nothing here cancels a sibling, interrupts the orchestrator, or ends the run.
+            match self.workers.attempt_failed(&session.id) {
+                AttemptOutcome::Retry => {
+                    let message = Message::text(
+                        Role::System,
+                        "Your run failed before it could finish. Retry the brief from the \
+                         start; the failure was not yours to answer for.",
+                        Trust::Host,
+                    );
+                    session.push_message(message.clone(), now_ms());
+                    self.journal(
+                        &session.id,
+                        RecordKind::Message,
+                        serde_json::json!({"message": message}),
+                    );
+                    self.notify_parent(
+                        &record,
+                        format!(
+                            "[worker {} failed once — retrying the same brief]",
+                            record.id
+                        ),
+                    );
+                    // The turn slot is still held by the finishing turn, so the retry queues
+                    // and the finishing turn's drain spawns it, exactly like a racing submit.
+                    crate::turn::spawn_turn(
+                        Arc::clone(self),
+                        Arc::clone(session),
+                        Message::user("Retry the brief from the start."),
+                        None,
+                    );
+                }
+                AttemptOutcome::Reassign => {
+                    let replacement = RuntimeHandle {
+                        inner: Arc::clone(self),
+                    }
+                    .spawn_worker(
+                        record.parent.clone(),
+                        record.brief.clone(),
+                        record.max_turns,
+                    );
+                    match replacement {
+                        Ok(fresh) => {
+                            self.workers.degrade(&record.id);
+                            self.notify_parent(
+                                &record,
+                                format!(
+                                    "[worker {} failed twice — its brief was reassigned to \
+                                     worker {fresh}]",
+                                    record.id
+                                ),
+                            );
+                        }
+                        Err(err) => {
+                            // No parent left to serve, or the floor refuses a replacement: the
+                            // result is forgone, the worker degrades, and the team goes on.
+                            self.workers.degrade(&record.id);
+                            self.emit(RuntimeEvent::Notice {
+                                level: NoticeLevel::Warn,
+                                text: format!(
+                                    "worker {} failed twice and could not be reassigned ({err}) \
+                                     — degraded",
+                                    record.id
+                                ),
+                            });
+                        }
+                    }
+                    self.reap_worker_session(session);
+                    self.publish_metrics();
+                }
+            }
+            return;
+        }
+        if outcome != TurnState::Idle {
+            // A cancellation ends the run without a handoff and without a retry.
+            return;
+        }
+        // A partial worker stopped at its turn budget: its session and transcript are kept for
+        // a resume, and the orchestrator is told what happened. The team keeps running.
+        if record.status == WorkerStatus::Partial {
+            if let Some(parent) = self.session(&record.parent) {
+                let text = format!(
+                    "[worker {} stopped at its turn budget — partial; its state is kept and can \
+                     be resumed]",
+                    record.id
+                );
+                let message = Message::text(Role::System, text, Trust::Host);
+                parent.push_message(message.clone(), now_ms());
+                self.journal(
+                    &record.parent,
+                    RecordKind::Message,
+                    serde_json::json!({"message": message}),
+                );
+                self.emit(RuntimeEvent::MessageCommitted {
+                    session: record.parent.clone(),
+                    message,
+                });
+            }
+            self.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Info,
+                text: format!("worker {} is partial and resumable", record.id),
+            });
+            self.publish_metrics();
             return;
         }
         let answer = session
@@ -380,28 +481,44 @@ impl RuntimeInner {
             }
         };
         self.workers.complete(&session.id, row.id.clone());
-        if let Some(parent) = self.session(&record.parent) {
-            let text = format!(
+        self.notify_parent(
+            &record,
+            format!(
                 "[worker {} finished — result stored as artifact {}; read it with \
                  worker.collect {{\"id\": \"{}\"}}]",
                 record.id, row.id, record.id
-            );
-            let message = Message::text(Role::System, text, Trust::Host);
-            parent.push_message(message.clone(), now_ms());
-            self.journal(
-                &record.parent,
-                RecordKind::Message,
-                serde_json::json!({"message": message}),
-            );
-            self.emit(RuntimeEvent::MessageCommitted {
-                session: record.parent.clone(),
-                message,
-            });
-        }
+            ),
+        );
         self.emit(RuntimeEvent::Notice {
             level: NoticeLevel::Info,
             text: format!("worker {} answered", record.id),
         });
+        self.reap_worker_session(session);
+        self.publish_metrics();
+    }
+
+    /// Put a line in the orchestrator's transcript and journal. Workers speak to their parent
+    /// through this — a reference, a state change, a reassignment — never through transcripts.
+    fn notify_parent(&self, record: &WorkerRecord, text: String) {
+        let Some(parent) = self.session(&record.parent) else {
+            return;
+        };
+        let message = Message::text(Role::System, text, Trust::Host);
+        parent.push_message(message.clone(), now_ms());
+        self.journal(
+            &record.parent,
+            RecordKind::Message,
+            serde_json::json!({"message": message}),
+        );
+        self.emit(RuntimeEvent::MessageCommitted {
+            session: record.parent.clone(),
+            message,
+        });
+    }
+
+    /// Close a worker session whose run is over: durable `closed` row, live handle dropped, one
+    /// last event so an interface stops showing it as busy.
+    fn reap_worker_session(&self, session: &Arc<crate::session::SessionRuntime>) {
         let _ = self
             .store
             .set_session_status(&session.id, "closed", now_ms());
@@ -413,7 +530,6 @@ impl RuntimeInner {
             })
             .retain(|live| live.id != session.id);
         self.emit(RuntimeEvent::SessionClosed(session.id.clone()));
-        self.publish_metrics();
     }
 }
 
@@ -520,6 +636,37 @@ impl RuntimeHandle {
         );
         Ok(id)
     }
+
+    /// Resume a partial worker: its session and transcript were kept at the budget wall; a
+    /// continuation turn runs from where it stopped, under the same brief and the same narrowed
+    /// scope.
+    pub fn resume_worker(&self, id: &WorkerId) -> Result<()> {
+        let Some(record) = self.inner.workers.by_id(id) else {
+            return Err(RuntimeError::InvalidState(format!(
+                "no worker named `{id}`"
+            )));
+        };
+        if record.status != WorkerStatus::Partial {
+            return Err(RuntimeError::InvalidState(format!(
+                "worker {id} is {:?}, not partial",
+                record.status
+            )));
+        }
+        let Some(session) = self.inner.session(&record.session) else {
+            return Err(RuntimeError::SessionNotFound(record.session.clone()));
+        };
+        self.inner.workers.set_running(&record.session);
+        crate::turn::spawn_turn(
+            Arc::clone(&self.inner),
+            session,
+            Message::user(format!(
+                "Continue your brief from where you stopped. Objective: {}",
+                record.brief.objective
+            )),
+            None,
+        );
+        Ok(())
+    }
 }
 
 /// `spawn_worker` — an orchestrator's only way to grow the team. Whether a session may call it
@@ -620,11 +767,25 @@ mod tests {
     /// A provider that replays one canned stream per request; running out of script yields an
     /// empty stream, which ends a turn the same way a model with nothing more to say would.
     struct ScriptedProvider {
-        script: std::sync::Mutex<std::collections::VecDeque<Vec<ProviderEvent>>>,
+        script: std::sync::Mutex<
+            std::collections::VecDeque<Vec<std::result::Result<ProviderEvent, VikramError>>>,
+        >,
     }
 
     impl ScriptedProvider {
         fn new(batches: Vec<Vec<ProviderEvent>>) -> Arc<Self> {
+            Arc::new(Self {
+                script: std::sync::Mutex::new(
+                    batches
+                        .into_iter()
+                        .map(|batch| batch.into_iter().map(Ok).collect())
+                        .collect(),
+                ),
+            })
+        }
+
+        /// A script of raw results, for turns that must fail mid-stream.
+        fn raw(batches: Vec<Vec<std::result::Result<ProviderEvent, VikramError>>>) -> Arc<Self> {
             Arc::new(Self {
                 script: std::sync::Mutex::new(batches.into()),
             })
@@ -651,9 +812,7 @@ mod tests {
                 .expect("script lock")
                 .pop_front()
                 .unwrap_or_default();
-            Box::pin(futures_util::stream::iter(
-                batch.into_iter().map(Ok::<_, VikramError>),
-            ))
+            Box::pin(futures_util::stream::iter(batch))
         }
     }
 
@@ -1132,5 +1291,215 @@ mod tests {
             "{}",
             out.content
         );
+    }
+
+    #[tokio::test]
+    async fn max_turns_marks_partial_and_resumable() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        // Round one spends the worker's single turn on a tool call; round two is what the
+        // resumed run consumes.
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ToolCall(vikram_contracts::ToolCall::new(
+                    "fs.read",
+                    serde_json::json!({"path": "scope"}),
+                )),
+                ProviderEvent::Finished {
+                    input_tokens: Some(4),
+                    output_tokens: Some(4),
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("resumed and finished the audit".into()),
+                ProviderEvent::Finished {
+                    input_tokens: Some(4),
+                    output_tokens: Some(4),
+                },
+            ],
+        ]);
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::clone(&provider) as Arc<dyn Provider>,
+        )
+        .await
+        .expect("runtime boots with the scripted provider");
+        let handle = runtime.handle();
+        let parent = handle.snapshot().sessions[0].id.clone();
+        let mut events = handle.events();
+
+        let mut brief = plain_brief(dir.path());
+        brief.tool_allowlist = vec!["fs.read".into(), "fs.write".into()];
+        brief.file_scope = vec![dir.path().join("scope").to_string_lossy().into_owned()];
+        let id = handle
+            .spawn_worker(parent.clone(), brief, Some(1))
+            .expect("the orchestrator spawns a budgeted worker");
+        let record = handle.inner.workers.by_id(&id).unwrap();
+        let _ = settle_worker(&handle, &mut events, &id).await;
+
+        // The budget wall: partial, not failed, and the session is kept for the resume.
+        let partial = handle.inner.workers.by_id(&id).unwrap();
+        assert_eq!(partial.status, WorkerStatus::Partial);
+        assert!(
+            handle.inner.session(&record.session).is_some(),
+            "a partial worker's session is kept, not reaped"
+        );
+        let parent_session = handle.inner.session(&parent).expect("parent is live");
+        assert!(
+            parent_session
+                .messages()
+                .iter()
+                .any(|m| m.text_body().contains("stopped at its turn budget")),
+            "the orchestrator was told the worker is partial"
+        );
+
+        // The team keeps running: the resume continues the same worker, same session.
+        handle.resume_worker(&id).expect("a partial worker resumes");
+        assert_eq!(
+            handle.inner.workers.by_id(&id).unwrap().status,
+            WorkerStatus::Running
+        );
+        let _ = settle_worker(&handle, &mut events, &id).await;
+
+        let done = handle.inner.workers.by_id(&id).unwrap();
+        assert_eq!(done.status, WorkerStatus::Done);
+        let artifact_id = done
+            .artifact
+            .clone()
+            .expect("the resumed run produced a result");
+        let store = vikram_store::Store::open(&crate::config::database_path()).unwrap();
+        let row = store
+            .get_artifact(&artifact_id)
+            .unwrap()
+            .expect("the artifact row exists");
+        let content = std::fs::read_to_string(&row.path).unwrap();
+        assert!(
+            content.contains("resumed and finished the audit"),
+            "{content}"
+        );
+        assert!(
+            handle.inner.session(&record.session).is_none(),
+            "the finished worker is reaped one-shot"
+        );
+        // And the orchestrator itself was never interrupted by any of it.
+        assert!(handle.inner.session(&parent).is_some());
+    }
+
+    #[tokio::test]
+    async fn worker_failure_one_retry_then_reassign() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        // Run one fails, the single retry fails, the replacement finishes.
+        let provider = ScriptedProvider::raw(vec![
+            vec![Err(VikramError::ProviderRejected("boom".into()))],
+            vec![Err(VikramError::ProviderRejected("boom again".into()))],
+            vec![
+                Ok(ProviderEvent::TextDelta(
+                    "the replacement finished it".into(),
+                )),
+                Ok(ProviderEvent::Finished {
+                    input_tokens: Some(4),
+                    output_tokens: Some(4),
+                }),
+            ],
+        ]);
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::clone(&provider) as Arc<dyn Provider>,
+        )
+        .await
+        .expect("runtime boots with the scripted provider");
+        let handle = runtime.handle();
+        let parent = handle.snapshot().sessions[0].id.clone();
+
+        let brief = plain_brief(dir.path());
+        let original_id = handle
+            .spawn_worker(parent.clone(), brief.clone(), None)
+            .expect("the orchestrator spawns a worker");
+
+        // The chain settles on its own: fail, retry, fail, reassign, replacement runs.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (original, replacement) = loop {
+            let workers = handle.inner.workers.list();
+            let original = workers
+                .iter()
+                .find(|record| record.id == original_id)
+                .expect("the original record survives its own failure");
+            let replacement = workers.iter().find(|record| {
+                record.id != original_id
+                    && record.parent == parent
+                    && record.brief == brief
+                    && record.status == WorkerStatus::Done
+            });
+            if original.status == WorkerStatus::Degraded
+                && original.attempts == 2
+                && let Some(replacement) = replacement
+            {
+                break (original.clone(), replacement.clone());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the fail-retry-reassign chain never settled: {workers:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+
+        // Exactly one retry, then the brief moved on.
+        assert_eq!(
+            original.attempts, 2,
+            "the second failure earns no third run"
+        );
+        assert_eq!(original.status, WorkerStatus::Degraded);
+        assert_eq!(
+            replacement.brief, brief,
+            "the replacement carries the same brief"
+        );
+        let artifact_id = replacement
+            .artifact
+            .clone()
+            .expect("the replacement produced a result");
+        let store = vikram_store::Store::open(&crate::config::database_path()).unwrap();
+        let row = store
+            .get_artifact(&artifact_id)
+            .unwrap()
+            .expect("the artifact row exists");
+        let content = std::fs::read_to_string(&row.path).unwrap();
+        assert!(content.contains("the replacement finished it"), "{content}");
+
+        // The orchestrator was told at every step, and nothing about it was interrupted.
+        let parent_session = handle.inner.session(&parent).expect("parent is live");
+        let transcript = parent_session.messages();
+        assert!(
+            transcript
+                .iter()
+                .any(|m| m.text_body().contains("failed once — retrying")),
+            "the orchestrator was told about the retry"
+        );
+        assert!(
+            transcript
+                .iter()
+                .any(|m| m.text_body().contains("failed twice")),
+            "the orchestrator was told about the reassignment"
+        );
+
+        // The team keeps running: a sibling spawns and settles long after the failure.
+        let sibling_id = handle
+            .spawn_worker(parent.clone(), plain_brief(dir.path()), None)
+            .expect("the team still accepts work");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if handle
+                .inner
+                .workers
+                .by_id(&sibling_id)
+                .is_some_and(|record| record.status == WorkerStatus::Done)
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the sibling never finished");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(handle.inner.session(&parent).is_some());
     }
 }

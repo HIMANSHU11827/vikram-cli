@@ -1085,6 +1085,15 @@ pub(crate) async fn run_turn(
             });
         }
 
+        // A worker's turn budget is a wall, not a notice: the interactive step budget keeps
+        // working and tells the operator, but a worker that has spent its turns stops where it
+        // stands — its state stays in the transcript, marked partial for a resume.
+        let worker_budget = session.worker_max_turns();
+        if worker_budget > 0 && steps_used >= worker_budget {
+            inner.workers.mark_partial(&session.id);
+            break;
+        }
+
         if cancelled_mid_tools {
             if cancel.is_cancelled() {
                 outcome = TurnState::Cancelled;
