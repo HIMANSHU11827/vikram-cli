@@ -3,6 +3,7 @@ use crate::capture::DeviceSource;
 use crate::helpers::{
     Scratch, first_available, missing_tool_message, pcm_from_bytes, run, which, write_wav,
 };
+use crate::player::DevicePlayer;
 use crate::vad::{is_silent, trim_silence};
 use crate::{AsrEngine, Result, StageStatus, VoiceConfig, VoiceError, VoiceStatus, probe};
 use std::fs;
@@ -50,6 +51,13 @@ pub trait Synthesizer: Send {
 /// Play WAV bytes.
 pub trait Player: Send {
     fn play(&mut self, wav: &[u8]) -> Result<()>;
+
+    /// Play with cooperative cancellation: engines that can stop mid-playback override this so
+    /// a cancel lands within one poll interval instead of after the whole clip.
+    fn play_cancellable(&mut self, wav: &[u8], cancel: &CancelToken) -> Result<()> {
+        cancel.check()?;
+        self.play(wav)
+    }
 }
 
 pub struct HelperSource {
@@ -218,9 +226,10 @@ impl Player for HelperPlayer {
 }
 
 /// A push-to-talk loop. The four stages are traits so tests run without a microphone or model.
-/// The default source is the built-in cpal engine and the default recognizer the built-in
-/// whisper chain; helper binaries are only fallback tiers inside those engines.
-pub struct VoiceSession<S = DeviceSource, R = AsrEngine, Y = HelperSynth, P = HelperPlayer> {
+/// The default source is the built-in cpal engine, the default recognizer the built-in whisper
+/// chain, and the default player the built-in cpal output; helper binaries are only fallback
+/// tiers inside those engines.
+pub struct VoiceSession<S = DeviceSource, R = AsrEngine, Y = HelperSynth, P = DevicePlayer> {
     config: VoiceConfig,
     cancel: CancelToken,
     source: S,
@@ -243,7 +252,7 @@ impl VoiceSession {
             DeviceSource::new(&config),
             AsrEngine::new(&config),
             HelperSynth::new(&config),
-            HelperPlayer::new(&config),
+            DevicePlayer::new(&config),
         ))
     }
 }
@@ -308,7 +317,7 @@ where
                 "synthesizer produced no audio".into(),
             ));
         }
-        self.player.play(&wav)
+        self.player.play_cancellable(&wav, &self.cancel)
     }
 
     /// Probe the stages, plus every run-time degrade note the engines have accumulated.

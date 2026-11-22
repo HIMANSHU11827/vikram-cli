@@ -80,15 +80,18 @@ pub fn probe(config: &VoiceConfig) -> VoiceStatus {
             config.tts_helper, config.tts_fallback
         )),
     };
-    let playback = match first_available(&[
+    let playback = if let Some(device) = crate::player::probe_playback() {
+        StageStatus::Ready(format!("built-in cpal output ({device})"))
+    } else if let Some(helper) = first_available(&[
         config.player_helper.as_str(),
         config.player_fallback.as_str(),
     ]) {
-        Some(helper) => StageStatus::Ready(helper),
-        None => StageStatus::Missing(format!(
-            "{} / {} not found",
+        StageStatus::Degraded(format!("no cpal output device; falling back to {helper}"))
+    } else {
+        StageStatus::Missing(format!(
+            "no cpal output device and {} / {} not found",
             config.player_helper, config.player_fallback
-        )),
+        ))
     };
     VoiceStatus {
         enabled: config.enabled,
