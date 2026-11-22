@@ -1256,7 +1256,8 @@ impl RuntimeInner {
     /// What the tool declarations cost in every request, on their own. Surfaced separately because
     /// it is the one part of the overhead an operator can actually shrink, by disabling a server.
     pub fn tool_schema_tokens(&self, estimator: &crate::context_engine::TokenEstimator) -> u64 {
-        let schemas = serde_json::to_string(&self.tools.specs_for_mode(self.mode())).unwrap_or_default();
+        let schemas =
+            serde_json::to_string(&self.tools.specs_for_mode(self.mode())).unwrap_or_default();
         estimator.estimate_text(&schemas)
     }
 

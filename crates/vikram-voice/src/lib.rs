@@ -304,7 +304,17 @@ mod tests {
         config.validate().expect("defaults must be valid");
         let status = probe(&config);
         assert!(!status.is_ready());
-        assert_eq!(status.lines().len(), 6);
+        // The status shape is what matters here, not how many stages happen to be degraded on
+        // the machine running the test: a box with piper installed has one line fewer.
+        let lines = status.lines();
+        assert_eq!(lines[0], "enabled: false");
+        for stage in ["capture:", "asr:", "tts:", "playback:"] {
+            assert!(
+                lines.iter().any(|line| line.starts_with(stage)),
+                "{stage} missing from {lines:?}"
+            );
+        }
+        assert!(lines.len() >= 5 && lines.len() <= 6, "{lines:?}");
     }
 
     #[test]
@@ -400,11 +410,15 @@ mod tests {
 
     #[test]
     fn a_ratio_at_or_below_one_is_refused() {
-        let mut config = VoiceConfig::default();
-        config.floor_ratio = 0.5;
-        assert!(config.validate().is_err());
-        config.floor_ratio = 2.5;
-        config.min_speech_ms = 0;
-        assert!(config.validate().is_err());
+        let refused = VoiceConfig {
+            floor_ratio: 0.5,
+            ..Default::default()
+        };
+        assert!(refused.validate().is_err());
+        let no_minimum = VoiceConfig {
+            min_speech_ms: 0,
+            ..Default::default()
+        };
+        assert!(no_minimum.validate().is_err());
     }
 }
