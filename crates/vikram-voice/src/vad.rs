@@ -34,6 +34,20 @@ pub fn noise_floor(frames: &[f32]) -> f32 {
     sorted[index]
 }
 
+/// A room this loud cannot be gated: playback, a fan at full speed or a clipped microphone puts
+/// the whole take near full scale, so every frame looks voiced and the gate rises above the
+/// speaker. Above this floor the honest answer is to say so, not to report "no speech".
+pub const LOUD_FLOOR: f32 = 0.12;
+
+/// Whether a take is so loud that energy gating cannot separate speech from background.
+pub fn is_loud(pcm: &[i16], sample_rate: u16) -> bool {
+    let frame = (sample_rate as usize * FRAME_MS as usize) / 1000;
+    if pcm.is_empty() || frame == 0 {
+        return false;
+    }
+    noise_floor(&frame_rms(pcm, frame)) >= LOUD_FLOOR
+}
+
 /// The level a frame must reach to be called voiced: above the noise floor by `FLOOR_RATIO`,
 /// never below `absolute`.
 pub fn speech_gate(frames: &[f32], absolute: f32, ratio: f32) -> f32 {
@@ -220,5 +234,18 @@ mod tests {
             speech_gate(&quiet, 0.01, 2.5) >= 0.01,
             "absolute floor still applies"
         );
+    }
+
+    #[test]
+    fn a_loud_room_is_reported_as_too_loud_to_gate() {
+        assert!(
+            !is_loud(&vec![200i16; 16_000], 16_000),
+            "a quiet room is fine"
+        );
+        assert!(
+            is_loud(&vec![12_000i16; 16_000], 16_000),
+            "playback or a clipped mic puts the floor above LOUD_FLOOR"
+        );
+        assert!(!is_loud(&[], 16_000), "an empty take is not loud");
     }
 }

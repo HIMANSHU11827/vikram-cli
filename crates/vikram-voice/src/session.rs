@@ -5,7 +5,7 @@ use crate::helpers::{
     write_wav,
 };
 use crate::player::DevicePlayer;
-use crate::vad::detect_speech;
+use crate::vad::{detect_speech, is_loud};
 use crate::{AsrEngine, Result, StageStatus, VoiceConfig, VoiceError, VoiceStatus, probe};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -635,6 +635,8 @@ pub struct VoiceSession<S = DeviceSource, R = AsrEngine, Y = HelperSynth, P = De
     recognizer: R,
     synth: Y,
     player: P,
+    /// Things worth telling the operator about this session's audio, said once.
+    notes: Mutex<Vec<String>>,
 }
 
 impl VoiceSession {
@@ -672,6 +674,7 @@ where
             recognizer,
             synth,
             player,
+            notes: Mutex::new(Vec::new()),
         }
     }
 
@@ -723,6 +726,12 @@ where
             self.config.sample_rate,
         ) else {
             self.phase = VoicePhase::Idle;
+            if is_loud(&pcm, self.config.sample_rate) {
+                self.note(
+                    "the microphone hears continuous loud audio — pause playback or use \
+                     headphones; speech cannot be separated from it",
+                );
+            }
             return Ok(None);
         };
         self.phase = VoicePhase::Transcribing;
@@ -769,7 +778,17 @@ where
         let mut status = probe(&self.config);
         status.notes.extend(self.recognizer.notes());
         status.notes.extend(self.synth.notes());
+        let audio = self.notes.lock().unwrap_or_else(|err| err.into_inner());
+        status.notes.extend(audio.iter().cloned());
         status
+    }
+
+    /// Record something the operator should hear about this session's audio, once.
+    fn note(&self, text: &str) {
+        let mut notes = self.notes.lock().unwrap_or_else(|err| err.into_inner());
+        if !notes.iter().any(|existing| existing == text) {
+            notes.push(text.to_owned());
+        }
     }
 }
 
@@ -1036,6 +1055,34 @@ mod tests {
         assert_eq!(session.phase(), VoicePhase::Idle);
         assert_eq!(recognizer_calls.load(Ordering::SeqCst), 1);
         assert_eq!(player_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_loud_room_is_reported_instead_of_a_quiet_no_speech() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let config = VoiceConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut session = VoiceSession::with_parts(
+            config,
+            FakeSource(vec![12_000i16; 16_000]),
+            FakeRecognizer {
+                text: Some("invented".to_owned()),
+                calls: calls.clone(),
+            },
+            FakeSynth(Vec::new()),
+            FakePlayer(Arc::new(Mutex::new(Vec::new()))),
+        );
+        assert_eq!(session.listen_once().unwrap(), None);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing to transcribe");
+        let notes = session.status().notes;
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("continuous loud audio")),
+            "the operator must be told why nothing was heard: {notes:?}"
+        );
     }
 
     #[test]
