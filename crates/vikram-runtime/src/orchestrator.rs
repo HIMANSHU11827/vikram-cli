@@ -1580,4 +1580,309 @@ mod tests {
         let _ = settle_worker(&handle, &mut events, &inherited_id).await;
         assert_eq!(provider.models()[1], "test-model");
     }
+
+    // ---- end to end: the seven contracts, composed -------------------------------------------
+
+    /// A provider that answers from the transcript it is handed, the way a model does: it learns
+    /// the worker id from the `spawn_worker` result and the result's content from
+    /// `worker.collect`. A canned script cannot do that, and a canned script is exactly what would
+    /// hide a broken handoff behind a hard-coded id.
+    struct ComposingProvider {
+        requests: std::sync::Mutex<Vec<Vec<Message>>>,
+        /// The subtree the brief names, so the composed `spawn_worker` call carries a real path.
+        scope: String,
+    }
+
+    impl ComposingProvider {
+        fn new(scope: &std::path::Path) -> Arc<Self> {
+            Arc::new(Self {
+                requests: std::sync::Mutex::new(Vec::new()),
+                scope: scope.to_string_lossy().into_owned(),
+            })
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.lock().expect("requests lock").len()
+        }
+    }
+
+    const WORKER_BRIEF_MARK: &str = "You are a worker spawned by an orchestrator";
+    const FINDINGS: &str = "the audit found three findings: A, B, C";
+
+    fn settle() -> ProviderEvent {
+        ProviderEvent::Finished {
+            input_tokens: Some(12),
+            output_tokens: Some(12),
+        }
+    }
+
+    fn call(name: &str, arguments: serde_json::Value) -> ProviderEvent {
+        ProviderEvent::ToolCall(vikram_contracts::ToolCall::new(name, arguments))
+    }
+
+    /// The worker id named in a spawn result or a finished-worker notice.
+    fn worker_id_in(text: &str) -> Option<String> {
+        let rest = &text[text.find("worker wrk-")? + "worker ".len()..];
+        let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+        Some(rest[..end].to_owned())
+    }
+
+    impl ComposingProvider {
+        /// One answer per request, decided from the transcript — the same information a model has.
+        fn compose(&self, messages: &[Message]) -> Vec<ProviderEvent> {
+            let transcript = messages
+                .iter()
+                .map(Message::text_body)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if transcript.contains(WORKER_BRIEF_MARK) {
+                // The worker: write one file inside its scope, then answer with the brief's format.
+                let wrote = messages.iter().any(|message| message.role == Role::Tool);
+                if !wrote {
+                    return vec![
+                        call(
+                            "fs.write",
+                            serde_json::json!({
+                                "path": "scope/findings.md",
+                                "content": "finding A: the brief was obeyed",
+                            }),
+                        ),
+                        settle(),
+                    ];
+                }
+                return vec![
+                    ProviderEvent::TextDelta(format!("{FINDINGS}\nwritten to scope/findings.md")),
+                    settle(),
+                ];
+            }
+            // The orchestrator.
+            if transcript.contains(FINDINGS) {
+                return vec![
+                    ProviderEvent::TextDelta(
+                        "done: the worker's findings are in the report".into(),
+                    ),
+                    settle(),
+                ];
+            }
+            if transcript.contains("finished — result stored as artifact") {
+                let id = worker_id_in(&transcript).expect("the notice names the worker");
+                return vec![
+                    call("worker.collect", serde_json::json!({ "id": id })),
+                    settle(),
+                ];
+            }
+            if transcript.contains("started; collect its result") {
+                return vec![
+                    ProviderEvent::TextDelta(
+                        "the worker is running; I will collect its result".into(),
+                    ),
+                    settle(),
+                ];
+            }
+            vec![
+                call(
+                    "spawn_worker",
+                    serde_json::json!({
+                        "objective": "audit the policy crate",
+                        "output_format": "a markdown findings report",
+                        "tool_allowlist": ["fs.read", "fs.write"],
+                        "file_scope": [self.scope.clone()],
+                        "boundary": "never edit a file outside the scope",
+                        "max_turns": 4,
+                    }),
+                ),
+                settle(),
+            ]
+        }
+    }
+
+    impl Provider for ComposingProvider {
+        fn name(&self) -> &str {
+            "composing"
+        }
+
+        fn model(&self) -> &str {
+            "test-model"
+        }
+
+        fn context_window(&self) -> Option<u64> {
+            Some(32_768)
+        }
+
+        fn stream(&self, request: CompletionRequest) -> ProviderStream {
+            self.requests
+                .lock()
+                .expect("requests lock")
+                .push(request.messages.clone());
+            let events = self.compose(&request.messages);
+            Box::pin(futures_util::stream::iter(events.into_iter().map(Ok)))
+        }
+    }
+
+    /// Read events until *this* session's turn ends. The worker's turn finishes on the same bus,
+    /// so waiting on "any TurnFinished" would return on the wrong one.
+    async fn drain_session(
+        events: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+        session: &SessionId,
+    ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the turn for {session} never finished"
+            );
+            if let Ok(Ok(RuntimeEvent::TurnFinished { session: ended, .. })) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), events.recv()).await
+                && ended == *session
+            {
+                return;
+            }
+        }
+    }
+
+    /// Wait for the worker to be *done*, not merely to have ended its turn: the artifact is
+    /// registered after `TurnFinished` is published, and a test that reads on the event races it.
+    async fn settle_done(handle: &RuntimeHandle, id: &WorkerId) -> WorkerRecord {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let record = handle
+                .inner
+                .workers
+                .by_id(id)
+                .expect("the worker is registered");
+            if record.status == WorkerStatus::Done {
+                return record;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "worker {id} never finished: {record:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The seven contracts, in one run: a typed brief crosses the boundary, the child's envelope is
+    /// narrower than its parent's, the spawn goes through the tool gate, the result crosses as an
+    /// artifact and never as a transcript, the parent reads it back through `worker.collect`, the
+    /// child session is reaped, and the run completes.
+    #[tokio::test]
+    async fn a_parent_spawns_a_worker_and_consumes_its_artifact_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let scope = dir.path().join("scope");
+        std::fs::create_dir_all(&scope).unwrap();
+        let provider = ComposingProvider::new(&scope);
+        let runtime = Runtime::start_with_provider(
+            config_for(dir.path()),
+            Arc::clone(&provider) as Arc<dyn Provider>,
+        )
+        .await
+        .expect("runtime boots with the composing provider");
+        let handle = runtime.handle();
+        let parent = handle.snapshot().sessions[0].id.clone();
+        handle
+            .rename_session(&parent, "Orchestrator".into())
+            .expect("the session is named, so no request is spent naming it");
+        let mut events = handle.events();
+
+        // Contract 4: the spawn is a tool call, so it passes the policy gate like any other.
+        handle
+            .submit(&parent, "audit the policy crate with one worker".into())
+            .expect("the turn is accepted");
+        drain_session(&mut events, &parent).await;
+
+        let workers = handle.inner.workers.list();
+        assert_eq!(workers.len(), 1, "one brief, one worker: {workers:?}");
+        let id = workers[0].id.clone();
+        let record = workers[0].clone();
+
+        // Contract 1: the brief is typed, and it is the brief the model asked for.
+        assert_eq!(record.brief.objective, "audit the policy crate");
+        assert_eq!(record.brief.output_format, "a markdown findings report");
+        assert_eq!(record.brief.boundary, "never edit a file outside the scope");
+        assert_eq!(record.parent, parent);
+        // Contract 2: the child holds the intersection of the parent's envelope and the brief.
+        assert!(record.scope.allows_verb("fs.write"));
+        assert!(
+            !record.scope.allows_verb("shell.run"),
+            "a tool the brief did not name is not in the envelope: {:?}",
+            record.scope
+        );
+        // Contract 3: depth and lineage.
+        assert_eq!(record.depth, 1);
+
+        let done = settle_done(&handle, &id).await;
+
+        // Contract 5: the result is an artifact in the store, registered against the child.
+        let artifact_id = done
+            .artifact
+            .clone()
+            .expect("the worker's result is an artifact");
+        let store = vikram_store::Store::open(&crate::config::database_path()).unwrap();
+        let row = store
+            .get_artifact(&artifact_id)
+            .unwrap()
+            .expect("the artifact row exists");
+        assert_eq!(row.session, record.session);
+        assert_eq!(row.source.as_deref(), Some("worker"));
+        let stored = std::fs::read_to_string(&row.path).unwrap();
+        assert!(stored.contains(FINDINGS), "{stored}");
+        // The worker's own tool call ran inside its scope, so the run was work, not just an answer.
+        let written = std::fs::read_to_string(scope.join("findings.md")).expect("the write landed");
+        assert!(written.contains("finding A"), "{written}");
+
+        // The parent learned a reference; the child's transcript never crossed the boundary.
+        let transcript = handle
+            .inner
+            .session(&parent)
+            .expect("the parent is live")
+            .messages();
+        assert!(
+            transcript
+                .iter()
+                .any(|m| m.text_body().contains("started; collect its result")),
+            "the spawn result reached the orchestrator through the tool: {transcript:?}"
+        );
+        assert!(
+            transcript.iter().all(|m| !m.text_body().contains(FINDINGS)),
+            "the child's answer never crosses as a message: {transcript:?}"
+        );
+
+        // Contract 6: the parent consumes the reference on its next turn, through the tool.
+        handle
+            .submit(&parent, "collect the worker's result".into())
+            .expect("the follow-up turn is accepted");
+        drain_session(&mut events, &parent).await;
+        let transcript = handle
+            .inner
+            .session(&parent)
+            .expect("the parent is live")
+            .messages();
+        assert!(
+            transcript.iter().any(|m| m.text_body().contains(FINDINGS)),
+            "the orchestrator read the artifact back: {transcript:?}"
+        );
+        assert!(
+            transcript.iter().rev().any(|m| m.role == Role::Assistant
+                && m.text_body().contains("the worker's findings are in")),
+            "the run completed with an answer that used the result: {transcript:?}"
+        );
+
+        // Contract 7: the worker is one-shot — reaped, and closed in the store.
+        assert!(
+            handle.inner.session(&record.session).is_none(),
+            "the finished worker's session is reaped"
+        );
+        let closed = store
+            .get_session(&record.session)
+            .unwrap()
+            .expect("the row survives");
+        assert_eq!(closed.status, "closed");
+        assert_eq!(done.status, WorkerStatus::Done);
+        assert!(
+            provider.request_count() >= 5,
+            "spawn, worker write, worker answer, collect, final answer: {}",
+            provider.request_count()
+        );
+    }
 }
