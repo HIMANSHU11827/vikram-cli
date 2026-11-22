@@ -408,7 +408,7 @@ impl Daemon {
         // Events land before the due scan so a job armed by one is claimed in this same pass.
         // The watch scan goes first of all so a change observed this pass is drained this pass.
         self.scan_watches(now)?;
-        self.drain_events(now, &mut report)?;
+        self.drain_events(now, &mut report).await?;
 
         let quiet = QuietHours::load(&self.store)?;
         let silent = quiet.is_quiet(now);
@@ -543,7 +543,11 @@ impl Daemon {
     /// it, which is what gives event fires the same once-only and retry semantics as cron slots.
     /// Events older than the catch-up window are passed over — a signal from before the daemon
     /// was away is history, not work — and the cursor still advances past them.
-    fn drain_events(&self, now: Millis, report: &mut TickReport) -> Result<(), StoreError> {
+    ///
+    /// A fire that armed anything is one decision, so it is recorded once: one audit row, and one
+    /// notification through the same local log every other daemon notice uses. Quiet hours hold
+    /// that notification back like any other non-urgent notice, and the hold is audited.
+    async fn drain_events(&self, now: Millis, report: &mut TickReport) -> Result<(), StoreError> {
         const SEEN_KEY: &str = "events.seen";
         let seen = self.store.state_ms(SEEN_KEY).ok().flatten().unwrap_or(0);
         let mut latest = seen;
@@ -578,12 +582,29 @@ impl Daemon {
                 }
             }
             if !armed.is_empty() {
-                self.store.audit(
-                    "trigger.fire",
-                    &format!("{}:{}", kind.as_str(), row.subject),
-                    &armed.join(", "),
-                    now,
-                )?;
+                let subject = format!("{}:{}", kind.as_str(), row.subject);
+                self.store
+                    .audit("trigger.fire", &subject, &armed.join(", "), now)?;
+                let silent = QuietHours::load(&self.store)
+                    .map(|quiet| quiet.is_quiet(now))
+                    .unwrap_or(false);
+                if silent {
+                    self.store
+                        .audit("notify.suppress", &subject, "quiet hours", now)?;
+                    report.suppressed.push(format!("notify:{subject}"));
+                } else {
+                    let notice = Notice {
+                        job: subject.clone(),
+                        name: "trigger".into(),
+                        status: "fired".into(),
+                        summary: format!("{subject} fired {}", armed.join(", ")),
+                        session: None,
+                        at: now,
+                    };
+                    let delivered =
+                        notify::deliver(&Destination::Local, &notice, &self.home, None).await;
+                    report.delivered.push((subject, delivered.delivered));
+                }
                 report.triggered.extend(armed);
             }
         }
@@ -1585,6 +1606,54 @@ mod tests {
             1,
             "a deduplicated event is one fire, not two"
         );
+    }
+
+    #[tokio::test]
+    async fn trigger_fire_emits_audit_and_notification() {
+        let store = store();
+        let manager = JobManager::new(store.clone());
+        let now = time::now_ms();
+        let job = manager
+            .create(
+                NewJob::new("on mail", "on postbox")
+                    .mode(JobMode::Script)
+                    .payload("echo fired")
+                    .target("none"),
+                now,
+            )
+            .unwrap();
+        let dir = home();
+        let mut daemon = Daemon::new(store.clone(), dir.path()).with_tick_ms(50);
+        daemon
+            .bus()
+            .emit("postbox", "job-1", "a report landed", now)
+            .unwrap();
+        let woke = daemon.tick(time::now_ms()).await.unwrap();
+        assert_eq!(woke.triggered, vec![job.id.clone()]);
+
+        // One fire is one decision: exactly one audit row, exactly one notification.
+        let fires = store
+            .audit_trail(50)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.kind == "trigger.fire" && row.subject == "postbox:job-1")
+            .count();
+        assert_eq!(fires, 1, "a fire is recorded once");
+        assert!(
+            woke.delivered
+                .iter()
+                .any(|(subject, ok)| subject == "postbox:job-1" && *ok),
+            "the fire is delivered through the existing local channel: {:?}",
+            woke.delivered
+        );
+
+        let log = std::fs::read_to_string(notify::log_path(dir.path())).unwrap();
+        let lines: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("postbox:job-1"))
+            .collect();
+        assert_eq!(lines.len(), 1, "one notification for one fire: {log}");
+        assert!(lines[0].contains("trigger"), "{log}");
     }
 
     #[tokio::test]
