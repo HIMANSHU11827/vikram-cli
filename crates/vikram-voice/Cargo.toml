@@ -16,7 +16,7 @@ gpu = ["whisper-rs/vulkan"]
 
 [dependencies]
 thiserror.workspace = true
-cpal = "0.18"
+cpal = { version = "0.18", features = ["pipewire"] }
 hound = "3.5"
 whisper-rs = { version = "0.16", default-features = false }
 
