@@ -10,6 +10,7 @@ use crate::{AsrEngine, Result, StageStatus, VoiceConfig, VoiceError, VoiceStatus
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, mpsc};
+use std::time::Instant;
 
 /// One bounded capture. Implementations must return 16 kHz mono s16le samples.
 pub trait AudioSource: Send {
@@ -81,6 +82,13 @@ pub trait Captioner {
     /// The transcript of the audio so far. A buffer too short to hold a word is an empty
     /// caption, not an error.
     fn transcribe_partial(&mut self, pcm: &[i16]) -> Result<String>;
+
+    /// Pay the one-time model load before the microphone opens. A first caption that has to
+    /// compile GPU kernels stalls capture for tens of seconds on an integrated GPU, which reads
+    /// to the operator as a hung microphone.
+    fn warm(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The built-in chain captions through wavo's partial path; `AsrEngine::transcribe_partial`
@@ -89,6 +97,10 @@ impl Captioner for AsrEngine {
     fn transcribe_partial(&mut self, pcm: &[i16]) -> Result<String> {
         // Inherent method wins over the trait one, so this is the caption path, not a loop.
         AsrEngine::transcribe_partial(self, pcm)
+    }
+
+    fn warm(&mut self) -> Result<()> {
+        AsrEngine::warm(self)
     }
 }
 
@@ -728,7 +740,10 @@ impl Player for HelperPlayer {
 
 /// How often a live caption is refreshed while the operator is still speaking. 400 ms reads as
 /// live typing; a shorter interval re-runs the decoder faster than words arrive, and a longer one
-/// stops feeling live.
+/// stops feeling live. This is the floor: a decoder that needs longer than the interval is asked
+/// again no sooner than it just took (see `listen_live_turn`), because asking on a fixed cadence
+/// regardless of cost queues one decode per chunk of backlog and turns a short utterance into
+/// minutes of work.
 const PARTIAL_INTERVAL_MS: u64 = 400;
 
 /// Only the most recent 8 s are re-transcribed for a caption. Decode cost grows with the buffer,
@@ -894,6 +909,12 @@ where
     where
         R: Captioner,
     {
+        // Pay the model load before the microphone opens: on an integrated GPU the first decode
+        // compiles kernels for tens of seconds, and doing that inside the first caption reads as a
+        // hung microphone.
+        if let Err(err) = self.recognizer.warm() {
+            self.note(&format!("live captions are unavailable: {err}"));
+        }
         let sample_rate = self.config.sample_rate;
         let step = samples_for(sample_rate, PARTIAL_INTERVAL_MS);
         let window = samples_for(sample_rate, PARTIAL_WINDOW_MS);
@@ -912,10 +933,18 @@ where
         let mut buffer: Vec<i16> = Vec::new();
         let mut caption = String::new();
         let mut next_at = 0usize;
+        let mut caption_due = Instant::now();
         let mut caption_error: Option<String> = None;
         let pcm = source.record_streaming(max_ms, cancel, &mut |chunk: &[i16]| {
             buffer.extend_from_slice(chunk);
-            if buffer.len() < next_at {
+            if caption_error.is_some() {
+                return;
+            }
+            // Two gates: enough new audio to be worth a decode, and enough wall time since the
+            // last one. The second is what keeps a slow decoder from being asked again for every
+            // chunk that arrived while it worked — the audio is queued, not lost, and the final
+            // transcript covers the words no caption got to.
+            if buffer.len() < next_at || Instant::now() < caption_due {
                 return;
             }
             next_at = buffer.len() + step;
@@ -934,6 +963,7 @@ where
                 return;
             }
             let tail = &buffer[buffer.len().saturating_sub(window)..];
+            let started = Instant::now();
             match recognizer.transcribe_partial(tail) {
                 Ok(text) if !text.is_empty() && text != caption => {
                     caption = text;
@@ -945,6 +975,10 @@ where
                     caption_error.get_or_insert_with(|| err.to_string());
                 }
             }
+            // The next decode is allowed once the last one has been paid for. The 400 ms
+            // cadence is already enforced by `next_at` in samples, which for audio arriving in
+            // real time is 400 ms of speech; this only adds the time a slow decoder spent.
+            caption_due = started + started.elapsed();
         })?;
         if let Some(err) = caption_error {
             self.note(&format!("live captions are unavailable: {err}"));
@@ -1787,6 +1821,16 @@ mod tests {
             heard_samples.windows(2).all(|pair| pair[0] < pair[1]),
             "each caption grows with the audio heard: {captions:?}"
         );
+        // The cadence is one caption per PARTIAL_INTERVAL_MS of audio, which is `step` samples.
+        let step = samples_for(VoiceConfig::default().sample_rate, PARTIAL_INTERVAL_MS);
+        let gaps: Vec<usize> = heard_samples
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .collect();
+        assert!(
+            gaps.iter().all(|gap| *gap == step),
+            "one caption per {step} samples: {gaps:?}"
+        );
         let distinct: std::collections::HashSet<&String> = captions.iter().collect();
         assert_eq!(
             distinct.len(),
@@ -2057,6 +2101,64 @@ mod tests {
         ));
         assert!(spoken.lock().unwrap().is_empty());
         assert!(played.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    #[ignore = "hardware test: the real microphone, the real ASR engine, and a 30 s bound"]
+    fn a_live_turn_on_the_real_device_returns_instead_of_hanging() {
+        if crate::probe_capture().is_none() {
+            return;
+        }
+        // The host runs on the operator's saved settings, not on defaults: same model, same
+        // gate, same devices. A test on defaults would test a different program.
+        let config = VoiceConfig {
+            enabled: true,
+            ..VoiceConfig::load().unwrap_or_default()
+        };
+        // Two turns in a row: the loop the worker runs. A stream leaked by the first turn would
+        // keep the second from opening, and a turn that never returns would hang here.
+        for turn in 1..=2 {
+            let Ok(mut session) = VoiceSession::start(config.clone()) else {
+                return;
+            };
+            let token = session.cancel_token();
+            let captions = Arc::new(AtomicUsize::new(0));
+            let heard = captions.clone();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let result = session.listen_live(|_| {
+                    heard.fetch_add(1, Ordering::SeqCst);
+                });
+                let _ = tx.send(result);
+            });
+            // The bound: a call that never returns is a dead feature, so the test reports it
+            // instead of hanging the suite.
+            let started = std::time::Instant::now();
+            let outcome = rx.recv_timeout(std::time::Duration::from_secs(30));
+            let elapsed = started.elapsed();
+            token.cancel();
+            let result = outcome.unwrap_or_else(|_| {
+                panic!("live turn {turn} never returned; it is stuck, not slow")
+            });
+            eprintln!(
+                "live turn {turn} returned in {elapsed:?}: {result:?}, captions {}",
+                captions.load(Ordering::SeqCst)
+            );
+            assert!(
+                !matches!(result, Err(VoiceError::Cancelled)),
+                "turn {turn} must finish on its own, not wait to be cancelled"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(25),
+                "turn {turn} took {elapsed:?} for one bounded take"
+            );
+            if matches!(result, Ok(Some(_))) {
+                assert!(
+                    captions.load(Ordering::SeqCst) >= 1,
+                    "a turn that heard words must have captioned something"
+                );
+            }
+        }
     }
 
     #[test]

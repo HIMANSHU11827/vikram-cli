@@ -7,3 +7,6 @@ openhands2/
 inspect_ai/
 harbor/
 research/
+
+# voice models are downloaded, not committed
+models/

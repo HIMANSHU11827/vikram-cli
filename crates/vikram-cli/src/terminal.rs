@@ -169,7 +169,10 @@ async fn event_loop(
             }
             received = runtime_events.recv() => {
                 match received {
-                    Ok(event) => app.on_event(event),
+                    Ok(event) => {
+                        speak_stream(&mut voice_mode, &event);
+                        app.on_event(event);
+                    }
                     Err(RecvError::Lagged(_)) => {
                         app.sync_snapshot(handle.snapshot());
                         app.push_notice(
@@ -420,6 +423,8 @@ enum Dictation {
 enum VoiceJob {
     /// Read this reply aloud, then listen again.
     Speak(String),
+    /// The turn this mode was speaking has ended: listen again.
+    Done,
     /// Nothing to say — listen again.
     Skip,
     /// Leave the mode; the microphone closes.
@@ -429,6 +434,8 @@ enum VoiceJob {
 /// What the voice worker reports while the mode is on.
 enum VoiceEvent {
     Heard(String),
+    /// The words so far, while the operator is still speaking.
+    Partial(String),
     Empty,
     Failed(String),
     /// Worth telling the operator, but the mode keeps running.
@@ -442,6 +449,11 @@ struct VoiceMode {
     jobs: Option<Sender<VoiceJob>>,
     /// The session started from a spoken turn, with the transcript length when it started.
     awaiting: Option<(SessionId, usize)>,
+    /// Assistant text that has streamed in but is not yet a whole sentence.
+    pending: String,
+    /// Whether any of this turn's answer has already been spoken, so the end of the turn does not
+    /// read the whole reply a second time.
+    spoke: bool,
 }
 
 /// Turn hands-free voice mode on or off. The worker owns the microphone and the model for the whole
@@ -530,7 +542,10 @@ fn voice_worker(jobs: Receiver<VoiceJob>, events: Sender<VoiceEvent>) {
     };
     loop {
         vdebug("worker: listening");
-        match session.listen_once() {
+        let heard = session.listen_live(|text| {
+            let _ = events.send(VoiceEvent::Partial(text.to_owned()));
+        });
+        match heard {
             Ok(Some(text)) if !text.trim().is_empty() => {
                 vdebug(&format!("worker: heard {} chars", text.len()));
                 if events.send(VoiceEvent::Heard(text)).is_err() {
@@ -550,16 +565,27 @@ fn voice_worker(jobs: Receiver<VoiceJob>, events: Sender<VoiceEvent>) {
                 return;
             }
         }
-        match jobs.recv() {
-            Ok(VoiceJob::Speak(text)) => {
-                vdebug(&format!("worker: speaking {} bytes", text.len()));
-                let spoken = session.speak(&text);
-                vdebug(&format!("worker: spoke {spoken:?}"));
-            }
-            Ok(VoiceJob::Skip) => vdebug("worker: skip"),
-            Ok(VoiceJob::Stop) | Err(_) => {
-                vdebug("worker: stop");
-                return;
+        // A turn can speak several sentences as they stream, so wait for the host to say the turn
+        // is over instead of treating the first sentence as the whole answer.
+        loop {
+            match jobs.recv() {
+                Ok(VoiceJob::Speak(text)) => {
+                    vdebug(&format!("worker: speaking {} bytes", text.len()));
+                    let spoken = session.speak(&text);
+                    vdebug(&format!("worker: spoke {spoken:?}"));
+                }
+                Ok(VoiceJob::Done) => {
+                    vdebug("worker: turn done");
+                    break;
+                }
+                Ok(VoiceJob::Skip) => {
+                    vdebug("worker: skip");
+                    break;
+                }
+                Ok(VoiceJob::Stop) | Err(_) => {
+                    vdebug("worker: stop");
+                    return;
+                }
             }
         }
     }
@@ -587,6 +613,8 @@ fn drain_voice_mode(app: &mut App, rx: &Receiver<VoiceEvent>, mode: &mut VoiceMo
                     .map(|view| view.messages.len())
                     .unwrap_or(0);
                 mode.awaiting = Some((session.clone(), before));
+                mode.pending.clear();
+                mode.spoke = false;
                 app.commands.push(UiCommand::Submit {
                     session,
                     text: heard,
@@ -594,6 +622,12 @@ fn drain_voice_mode(app: &mut App, rx: &Receiver<VoiceEvent>, mode: &mut VoiceMo
             }
             // Silence between utterances is the normal state of a room, not news.
             VoiceEvent::Empty => {}
+            VoiceEvent::Partial(text) => {
+                let text = text.trim();
+                if !text.is_empty() {
+                    app.push_notice(NoticeLevel::Info, format!("voice: {text}"));
+                }
+            }
             VoiceEvent::Note(text) => {
                 app.push_notice(NoticeLevel::Warn, format!("voice: {text}"));
             }
@@ -628,19 +662,99 @@ fn poll_voice_reply(app: &mut App, mode: &mut VoiceMode) {
         .map(|message| message.text_body())
         .unwrap_or_default();
     mode.awaiting = None;
+    let spoke = mode.spoke;
+    let tail = std::mem::take(&mut mode.pending);
+    mode.spoke = false;
     let Some(jobs) = mode.jobs.as_ref() else {
         return;
     };
-    let sent = if reply.trim().is_empty() {
-        jobs.send(VoiceJob::Skip)
+    // When the answer has already been spoken sentence by sentence, only the unfinished tail is
+    // left. Otherwise (a turn that streamed nothing, or a resumed session) the whole reply is read,
+    // exactly as before.
+    let said = if spoke {
+        let tail = tail.trim();
+        if tail.is_empty() {
+            None
+        } else {
+            Some(VoiceJob::Speak(tail.to_owned()))
+        }
+    } else if reply.trim().is_empty() {
+        Some(VoiceJob::Skip)
     } else {
-        jobs.send(VoiceJob::Speak(crate::voice::speakable(&reply).to_owned()))
+        Some(VoiceJob::Speak(crate::voice::speakable(&reply).to_owned()))
     };
-    if sent.is_err() {
+    let mut stopped = false;
+    if let Some(job) = said {
+        stopped = jobs.send(job).is_err();
+    }
+    if !stopped {
+        stopped = jobs.send(VoiceJob::Done).is_err();
+    }
+    if stopped {
         mode.jobs = None;
         app.voice_mode = false;
         app.push_notice(NoticeLevel::Warn, "voice: the voice worker stopped");
     }
+}
+
+/// Read the answer aloud while it is still being written: whole sentences only, and never the
+/// model's private reasoning — that arrives as a different event and is deliberately not spoken.
+fn speak_stream(mode: &mut VoiceMode, event: &vikram_runtime::types::RuntimeEvent) {
+    let vikram_runtime::types::RuntimeEvent::StreamDelta { session, text, .. } = event else {
+        return;
+    };
+    let Some((awaiting, _)) = mode.awaiting.clone() else {
+        return;
+    };
+    if &awaiting != session {
+        return;
+    }
+    let Some(jobs) = mode.jobs.as_ref() else {
+        return;
+    };
+    mode.pending.push_str(text);
+    for sentence in take_sentences(&mut mode.pending) {
+        if jobs.send(VoiceJob::Speak(sentence)).is_ok() {
+            mode.spoke = true;
+        }
+    }
+}
+
+/// Whole sentences from the front of `pending`, leaving the unterminated tail behind. A boundary
+/// is only taken when what follows looks like a new sentence — a capital letter or the end of the
+/// stream — and never inside the first `MIN_SENTENCE_CHARS`, so "1.5 seconds" and "e.g. on a cold
+/// cache" are read as one sentence instead of fragments.
+fn take_sentences(pending: &mut String) -> Vec<String> {
+    const MIN_SENTENCE_CHARS: usize = 24;
+    let mut out = Vec::new();
+    loop {
+        let mut cut = None;
+        for (index, character) in pending.char_indices() {
+            if !matches!(character, '.' | '!' | '?' | '\n') || index + 1 < MIN_SENTENCE_CHARS {
+                continue;
+            }
+            let after = index + character.len_utf8();
+            let ends_here = match pending[after..].trim_start().chars().next() {
+                None => true,
+                Some(next) => character == '\n' || next.is_uppercase(),
+            };
+            if ends_here {
+                cut = Some(after);
+                break;
+            }
+        }
+        let Some(cut) = cut else {
+            break;
+        };
+        let sentence = pending[..cut].trim().to_owned();
+        pending.drain(..cut);
+        let trimmed = pending.trim_start().len();
+        pending.drain(..pending.len() - trimmed);
+        if !sentence.is_empty() {
+            out.push(sentence);
+        }
+    }
+    out
 }
 
 /// Start one utterance in the background. A second request while the microphone is open is
@@ -3101,6 +3215,37 @@ mod tests {
             .draw(|frame| ui::draw(frame, app))
             .expect("the frame draws");
         terminal
+    }
+
+    #[test]
+    fn a_finished_sentence_is_read_aloud_while_the_answer_is_still_writing() {
+        let mut pending = String::from("The build finished in four minutes. Ready when you are");
+        assert_eq!(
+            take_sentences(&mut pending),
+            vec!["The build finished in four minutes."]
+        );
+        assert_eq!(pending, "Ready when you are");
+        assert!(take_sentences(&mut pending).is_empty());
+    }
+
+    #[test]
+    fn a_decimal_and_an_abbreviation_are_not_sentence_ends() {
+        let mut pending = String::from("It took 1.5 seconds, e.g. on a cold cache. Ready.");
+        assert_eq!(
+            take_sentences(&mut pending),
+            vec!["It took 1.5 seconds, e.g. on a cold cache."]
+        );
+        assert_eq!(pending, "Ready.");
+    }
+
+    #[test]
+    fn a_line_break_ends_a_sentence_even_before_a_lowercase_word() {
+        let mut pending = String::from("First line of the answer\nsecond line follows");
+        assert_eq!(
+            take_sentences(&mut pending),
+            vec!["First line of the answer"]
+        );
+        assert_eq!(pending, "second line follows");
     }
 
     #[test]

@@ -211,16 +211,10 @@ impl WavoRecognizer {
                     _ => self.download(name)?,
                 },
             };
-            // Vulkan first, on purpose: the operator asked for the GPU, and an integrated Intel
-            // part is still several times faster than the CPU on these kernels. A driver that
-            // cannot provide it falls back to whatever wavo would have picked, and says so.
-            let model = match wavo::Model::load_with(&path, wavo::Backend::Gpu) {
-                Ok(model) => model,
-                Err(err) => {
-                    eprintln!("voice: no gpu backend ({err}); transcribing on the cpu");
-                    wavo::Model::load(&path).map_err(wavo_error)?
-                }
-            };
+            // wavo's own choice: the GPU when the adapter it picks is a real one, the CPU when it
+            // is a software device. Forcing `Backend::Gpu` here deadlocked the first decode on
+            // this Intel UHD, which is worse than a slower backend that works.
+            let model = wavo::Model::load(&path).map_err(wavo_error)?;
             let device = model.device();
             let label = format!("{} ({:?})", device.name, device.api);
             eprintln!("voice: asr on {label}");
@@ -438,6 +432,16 @@ impl AsrEngine {
             helper_name: config.asr_helper.clone(),
             model_error,
             notes: Vec::new(),
+        }
+    }
+
+    /// Load the caption model now, so the first caption does not pay for a GPU kernel compile
+    /// while the operator is already talking. A missing model is not an error here: the mode can
+    /// run without captions, and the utterance path reports the real problem when it is used.
+    pub fn warm(&mut self) -> Result<()> {
+        match self.wavo.as_mut() {
+            Some(wavo) => wavo.ensure_resolved().map(|_| ()),
+            None => Ok(()),
         }
     }
 
