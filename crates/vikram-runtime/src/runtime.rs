@@ -3156,6 +3156,7 @@ impl Runtime {
                     tool: def.name,
                     description: def.description,
                     schema: def.input_schema,
+                    annotations: def.annotations,
                     registry: Arc::clone(&mcp_inner.mcp),
                     visibility: std::sync::Arc::clone(&mcp_inner.mcp_visibility),
                 };

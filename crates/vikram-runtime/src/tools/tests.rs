@@ -579,6 +579,7 @@ fn mcp_tool_declares_execute_network_permission() {
         tool: "read".into(),
         description: "read".into(),
         schema: json!({"type": "object"}),
+        annotations: Default::default(),
         registry: Arc::new(Mutex::new(McpRegistry::load(
             crate::config::McpConfig::default().into_specs(),
         ))),
@@ -589,7 +590,11 @@ fn mcp_tool_declares_execute_network_permission() {
     let req = tool.permission(&json!({})).unwrap();
     assert_eq!(req.action, ActionKind::Execute);
     assert_eq!(req.verb, "mcp.call");
-    assert_eq!(req.side_effect, SideEffect::LocalMutation);
+    assert_eq!(
+        req.side_effect,
+        SideEffect::ExternalChange,
+        "a server that publishes no hints is not a local file mutation"
+    );
 }
 
 #[test]

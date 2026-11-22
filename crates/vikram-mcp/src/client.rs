@@ -32,12 +32,71 @@ pub struct ServerState {
     pub error: Option<String>,
 }
 
+/// The optional behavioural hints a server publishes for a tool in `tools/list`. Every field is
+/// `Option` on purpose: an absent hint means "the server did not say", which is not the same as
+/// "safe", and the caller has to classify it cautiously.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolAnnotations {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destructive_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotent_hint: Option<bool>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolInfo {
     pub server: String,
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    #[serde(default)]
+    pub annotations: ToolAnnotations,
+}
+
+/// Read the optional `annotations` object of one `tools/list` entry.
+pub fn parse_annotations(value: &Value) -> ToolAnnotations {
+    let hint = |key: &str| value.get(key).and_then(Value::as_bool);
+    ToolAnnotations {
+        read_only_hint: hint("readOnlyHint"),
+        destructive_hint: hint("destructiveHint"),
+        idempotent_hint: hint("idempotentHint"),
+    }
+}
+
+/// Turn a `tools/list` result into tool definitions, keeping whatever annotations the server
+/// published. Entries without a usable name are dropped: a nameless tool cannot be called.
+pub fn tools_from_result(server: &str, result: &Value) -> Vec<ToolInfo> {
+    let Some(entries) = result.get("tools").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|t| {
+            let name = t.get("name").and_then(Value::as_str).unwrap_or("");
+            if name.is_empty() {
+                return None;
+            }
+            Some(ToolInfo {
+                server: server.to_owned(),
+                name: name.to_owned(),
+                description: t
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                input_schema: t
+                    .get("inputSchema")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type": "object"})),
+                annotations: t
+                    .get("annotations")
+                    .map(parse_annotations)
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -547,36 +606,8 @@ async fn establish(
                     Err(err) => format!("{rejected} (also failed to stop child: {err})"),
                 });
             }
-            if let Some(arr) = value
-                .get("result")
-                .and_then(|r| r.get("tools"))
-                .and_then(Value::as_array)
-            {
-                for t in arr {
-                    let name = t
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    if name.is_empty() {
-                        continue;
-                    }
-                    let description = t
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let input_schema = t
-                        .get("inputSchema")
-                        .cloned()
-                        .unwrap_or_else(|| json!({"type": "object"}));
-                    tools.push(ToolInfo {
-                        server: server.name.clone(),
-                        name,
-                        description,
-                        input_schema,
-                    });
-                }
+            if let Some(result) = value.get("result") {
+                tools = tools_from_result(&server.name, result);
             }
             break;
         }
@@ -868,5 +899,50 @@ done"#;
         let registry = McpRegistry::load(Vec::new());
         assert!(registry.tool_defs().is_empty());
         assert!(registry.server_tools("nope").is_none());
+    }
+
+    #[test]
+    fn tools_list_annotations_are_kept_when_the_server_sends_them() {
+        let result: Value = serde_json::from_str(
+            r#"{"tools":[
+                {"name":"read_file","description":"r","inputSchema":{"type":"object"},
+                 "annotations":{"readOnlyHint":true,"idempotentHint":true}},
+                {"name":"drop_table","annotations":{"destructiveHint":true}}
+            ]}"#,
+        )
+        .unwrap();
+        let tools = tools_from_result("srv", &result);
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].annotations.read_only_hint, Some(true));
+        assert_eq!(tools[0].annotations.idempotent_hint, Some(true));
+        assert_eq!(tools[0].annotations.destructive_hint, None);
+        assert_eq!(tools[1].annotations.destructive_hint, Some(true));
+        assert_eq!(tools[1].annotations.read_only_hint, None);
+    }
+
+    #[test]
+    fn tools_list_without_annotations_leaves_every_hint_unknown() {
+        let result: Value = serde_json::from_str(
+            r#"{"tools":[{"name":"t","description":"d","inputSchema":{"type":"object"}}]}"#,
+        )
+        .unwrap();
+        let tools = tools_from_result("srv", &result);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0].annotations,
+            ToolAnnotations::default(),
+            "an absent hint is unknown, never a default of false or true"
+        );
+        assert_eq!(tools[0].annotations.read_only_hint, None);
+        assert_eq!(tools[0].annotations.destructive_hint, None);
+    }
+
+    #[test]
+    fn a_nameless_tool_entry_is_dropped() {
+        let result: Value =
+            serde_json::from_str(r#"{"tools":[{"description":"d"},{"name":"ok"}]}"#).unwrap();
+        let tools = tools_from_result("srv", &result);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "ok");
     }
 }
