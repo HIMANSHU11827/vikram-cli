@@ -1,3 +1,5 @@
+use crate::cancel::CancelToken;
+use crate::capture::DeviceSource;
 use crate::helpers::{
     Scratch, first_available, missing_tool_message, pcm_from_bytes, run, which, write_wav,
 };
@@ -9,6 +11,13 @@ use std::path::PathBuf;
 /// One bounded capture. Implementations must return 16 kHz mono s16le samples.
 pub trait AudioSource: Send {
     fn record(&mut self, max_ms: u64) -> Result<Vec<i16>>;
+
+    /// Capture with cooperative cancellation. The default checks once and delegates; engines
+    /// that can abort mid-capture override this so a cancel lands within one poll interval.
+    fn record_cancellable(&mut self, max_ms: u64, cancel: &CancelToken) -> Result<Vec<i16>> {
+        cancel.check()?;
+        self.record(max_ms)
+    }
 }
 
 /// Turn speech into text. `Ok(None)` means silence or an empty transcript, not failure.
@@ -187,8 +196,11 @@ impl Player for HelperPlayer {
 }
 
 /// A push-to-talk loop. The four stages are traits so tests run without a microphone or model.
-pub struct VoiceSession<S = HelperSource, R = HelperRecognizer, Y = HelperSynth, P = HelperPlayer> {
+/// The default source is the built-in cpal engine; the helper path is only a fallback when the
+/// machine exposes no input device to cpal.
+pub struct VoiceSession<S = DeviceSource, R = HelperRecognizer, Y = HelperSynth, P = HelperPlayer> {
     config: VoiceConfig,
+    cancel: CancelToken,
     source: S,
     recognizer: R,
     synth: Y,
@@ -206,7 +218,7 @@ impl VoiceSession {
         }
         Ok(Self::with_parts(
             config.clone(),
-            HelperSource::new(&config),
+            DeviceSource::new(&config),
             HelperRecognizer::new(&config),
             HelperSynth::new(&config),
             HelperPlayer::new(&config),
@@ -224,6 +236,7 @@ where
     pub fn with_parts(config: VoiceConfig, source: S, recognizer: R, synth: Y, player: P) -> Self {
         Self {
             config,
+            cancel: CancelToken::new(),
             source,
             recognizer,
             synth,
@@ -231,8 +244,15 @@ where
         }
     }
 
+    /// Ask every stage of this session to stop what it is doing. Safe to call from any thread.
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
     pub fn listen_once(&mut self) -> Result<Option<String>> {
-        let pcm = self.source.record(self.config.max_record_ms)?;
+        let pcm = self
+            .source
+            .record_cancellable(self.config.max_record_ms, &self.cancel)?;
         if pcm.len() < self.config.sample_rate as usize / 100 {
             return Ok(None);
         }
@@ -379,5 +399,35 @@ mod tests {
             VoiceSession::start(VoiceConfig::default()),
             Err(VoiceError::Disabled)
         ));
+    }
+
+    #[test]
+    fn cancel_before_listen_aborts_without_touching_the_source() {
+        struct CountingSource(Arc<AtomicUsize>);
+        impl AudioSource for CountingSource {
+            fn record(&mut self, _: u64) -> Result<Vec<i16>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let config = VoiceConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut session = VoiceSession::with_parts(
+            config,
+            CountingSource(calls.clone()),
+            FakeRecognizer {
+                text: None,
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            FakeSynth(Vec::new()),
+            FakePlayer(heard),
+        );
+        session.cancel();
+        assert!(matches!(session.listen_once(), Err(VoiceError::Cancelled)));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

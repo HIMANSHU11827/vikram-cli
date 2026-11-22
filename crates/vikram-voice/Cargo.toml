@@ -9,6 +9,8 @@ publish = false
 
 [dependencies]
 thiserror.workspace = true
+cpal = "0.18"
+hound = "3.5"
 
 [lints.rust]
 unsafe_code = "forbid"

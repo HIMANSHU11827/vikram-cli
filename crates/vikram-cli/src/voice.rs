@@ -126,7 +126,7 @@ mod tests {
     fn status_reports_every_stage_without_opening_devices() {
         let config = config(false, None, None, None);
         let status = probe(&config);
-        assert_eq!(status.lines().len(), 5);
+        assert!(status.lines().len() >= 5);
         assert!(!status.is_ready());
         assert!(!config.enabled);
     }

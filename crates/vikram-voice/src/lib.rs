@@ -1,17 +1,22 @@
-//! Voice I/O for VIKRAM, built on the same helper shell-out pattern as `computer.*`.
+//! Voice I/O for VIKRAM: built-in engines first, helper shell-outs only as detected fallbacks.
 //!
-//! Phase 1 is push-to-talk: an operator invokes it explicitly, audio is captured as raw PCM,
-//! silence is trimmed locally, a local Whisper helper transcribes it, and a local TTS helper
-//! speaks the model's real reply. Every stage is optional and reports why it is unavailable;
-//! nothing here pretends a missing microphone or model is a working voice.
+//! Phase 1 is push-to-talk: an operator invokes it explicitly, audio is captured with the
+//! linked cpal engine (helper binaries are the fallback where cpal has no device), silence is
+//! trimmed locally, a local ASR engine transcribes it, and a local TTS helper speaks the
+//! model's real reply. Every stage is optional and reports why it is unavailable; nothing here
+//! pretends a missing microphone or model is a working voice.
 //!
-//! No audio library is linked. Helpers are spawned with an argv vector, never a shell, and every
-//! invocation is bounded. Model weights are operator-downloaded files, never bundled.
+//! Helpers are spawned with an argv vector, never a shell, and every invocation is bounded.
+//! Model weights are operator-downloaded files, never bundled.
 
+mod cancel;
+mod capture;
 mod helpers;
 mod session;
 mod vad;
 
+pub use cancel::CancelToken;
+pub use capture::{CpalSource, DeviceSource, probe_capture};
 pub use helpers::{first_available, missing_tool_message, probe, which};
 pub use session::{
     AudioSource, HelperPlayer, HelperRecognizer, HelperSource, HelperSynth, Player, Recognizer,
@@ -28,6 +33,10 @@ pub type Result<T> = std::result::Result<T, VoiceError>;
 pub enum VoiceError {
     #[error("voice is disabled; set enabled = true for this session before opening audio devices")]
     Disabled,
+    #[error("cancelled")]
+    Cancelled,
+    #[error("no audio device: {0}")]
+    NoDevice(String),
     #[error("{0}")]
     MissingHelper(String),
     #[error("ASR model file is missing: {0}. Set asr_model to a downloaded ggml model.")]
@@ -109,19 +118,28 @@ impl VoiceConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StageStatus {
-    Ready,
+    /// Usable on the built-in engine this stage prefers. The string names that engine.
+    Ready(String),
+    /// Usable, but only on a fallback path (helper binary, detected engine). The string says
+    /// what is missing and what is being used instead.
+    Degraded(String),
     Missing(String),
     Disabled(String),
 }
 
 impl StageStatus {
     pub fn is_ready(&self) -> bool {
-        matches!(self, Self::Ready)
+        matches!(self, Self::Ready(_) | Self::Degraded(_))
+    }
+
+    pub fn is_degraded(&self) -> bool {
+        !matches!(self, Self::Ready(_))
     }
 
     pub fn label(&self) -> String {
         match self {
-            Self::Ready => "ready".into(),
+            Self::Ready(engine) => format!("ready: {engine}"),
+            Self::Degraded(reason) => format!("degraded: {reason}"),
             Self::Missing(reason) => format!("missing: {reason}"),
             Self::Disabled(reason) => format!("disabled: {reason}"),
         }
@@ -135,6 +153,12 @@ pub struct VoiceStatus {
     pub asr: StageStatus,
     pub tts: StageStatus,
     pub playback: StageStatus,
+    /// True when any stage is not running on its built-in engine: a reportable degradation,
+    /// not a silent substitution.
+    pub degraded: bool,
+    /// Runtime degradation notes (fast-path failures, fallbacks taken at run time), appended
+    /// to `lines()` so the CLI reports them instead of swallowing them.
+    pub notes: Vec<String>,
 }
 
 impl VoiceStatus {
@@ -147,13 +171,18 @@ impl VoiceStatus {
     }
 
     pub fn lines(&self) -> Vec<String> {
-        vec![
+        let mut lines = vec![
             format!("enabled: {}", self.enabled),
             format!("capture:  {}", self.capture.label()),
             format!("asr:      {}", self.asr.label()),
             format!("tts:      {}", self.tts.label()),
             format!("playback: {}", self.playback.label()),
-        ]
+        ];
+        if self.degraded {
+            lines.push("degraded: true (some stage is off its built-in engine)".into());
+        }
+        lines.extend(self.notes.iter().cloned());
+        lines
     }
 }
 
@@ -168,7 +197,8 @@ mod tests {
         config.validate().expect("defaults must be valid");
         let status = probe(&config);
         assert!(!status.is_ready());
-        assert_eq!(status.lines().len(), 5);
+        assert!(status.degraded);
+        assert_eq!(status.lines().len(), 6);
     }
 
     #[test]
@@ -186,8 +216,15 @@ mod tests {
     }
 
     #[test]
-    fn stage_labels_name_the_problem() {
-        assert_eq!(StageStatus::Ready.label(), "ready");
+    fn stage_labels_name_the_engine_or_the_problem() {
+        assert_eq!(
+            StageStatus::Ready("built-in cpal".into()).label(),
+            "ready: built-in cpal"
+        );
+        assert_eq!(
+            StageStatus::Degraded("no cpal device; using parec".into()).label(),
+            "degraded: no cpal device; using parec"
+        );
         assert_eq!(
             StageStatus::Missing("no whisper-cli".into()).label(),
             "missing: no whisper-cli"
@@ -196,6 +233,26 @@ mod tests {
             StageStatus::Disabled("operator opt-in".into()).label(),
             "disabled: operator opt-in"
         );
+        assert!(StageStatus::Degraded("x".into()).is_ready());
+        assert!(StageStatus::Degraded("x".into()).is_degraded());
+        assert!(!StageStatus::Ready("built-in".into()).is_degraded());
+    }
+
+    #[test]
+    fn runtime_notes_are_reported_not_swallowed() {
+        let status = VoiceStatus {
+            enabled: true,
+            capture: StageStatus::Ready("built-in cpal".into()),
+            asr: StageStatus::Ready("whisper".into()),
+            tts: StageStatus::Degraded("no piper voice; using espeak-ng".into()),
+            playback: StageStatus::Ready("built-in cpal".into()),
+            degraded: true,
+            notes: vec!["voxtype fast path failed; fell back to whisper".into()],
+        };
+        let lines = status.lines().join("\n");
+        assert!(status.is_ready());
+        assert!(lines.contains("voxtype fast path failed"));
+        assert!(lines.contains("degraded: true"));
     }
 
     #[test]

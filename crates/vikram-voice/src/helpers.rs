@@ -52,12 +52,18 @@ pub fn first_available(names: &[&str]) -> Option<String> {
 }
 
 pub fn probe(config: &VoiceConfig) -> VoiceStatus {
-    let capture = match first_available(&[
+    let capture = if let Some(device) = crate::capture::probe_capture() {
+        StageStatus::Ready(format!("built-in cpal ({device})"))
+    } else if let Some(helper) = first_available(&[
         config.capture_helper.as_str(),
         config.capture_fallback.as_str(),
     ]) {
-        Some(_) => StageStatus::Ready,
-        None => StageStatus::Missing(missing_tool_message(&config.capture_helper)),
+        StageStatus::Degraded(format!("no cpal input device; falling back to {helper}"))
+    } else {
+        StageStatus::Missing(format!(
+            "no cpal input device and {} / {} not found",
+            config.capture_helper, config.capture_fallback
+        ))
     };
     let asr = if which(&config.asr_helper).is_none() {
         StageStatus::Missing(missing_tool_message(&config.asr_helper))
@@ -69,13 +75,21 @@ pub fn probe(config: &VoiceConfig) -> VoiceStatus {
             config.asr_model.display()
         ))
     } else {
-        StageStatus::Ready
+        StageStatus::Ready(format!(
+            "{} with {}",
+            config.asr_helper,
+            config.asr_model.display()
+        ))
     };
     let tts = match (
         which(&config.tts_helper).is_some() && config.tts_voice.is_some(),
         which(&config.tts_fallback).is_some(),
     ) {
-        (true, _) | (_, true) => StageStatus::Ready,
+        (true, _) => StageStatus::Ready(format!("{} with operator voice", config.tts_helper)),
+        (false, true) => StageStatus::Degraded(format!(
+            "no {} voice model; robotic {} fallback",
+            config.tts_helper, config.tts_fallback
+        )),
         _ => StageStatus::Missing(format!(
             "{} with a voice model, or {}, not found",
             config.tts_helper, config.tts_fallback
@@ -85,15 +99,23 @@ pub fn probe(config: &VoiceConfig) -> VoiceStatus {
         config.player_helper.as_str(),
         config.player_fallback.as_str(),
     ]) {
-        Some(_) => StageStatus::Ready,
-        None => StageStatus::Missing(missing_tool_message(&config.player_helper)),
+        Some(helper) => StageStatus::Ready(helper),
+        None => StageStatus::Missing(format!(
+            "{} / {} not found",
+            config.player_helper, config.player_fallback
+        )),
     };
     VoiceStatus {
         enabled: config.enabled,
+        degraded: capture.is_degraded()
+            || asr.is_degraded()
+            || tts.is_degraded()
+            || playback.is_degraded(),
         capture,
         asr,
         tts,
         playback,
+        notes: Vec::new(),
     }
 }
 
