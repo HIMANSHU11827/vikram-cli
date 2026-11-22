@@ -28,7 +28,25 @@ pub async fn run_with_images(
         .iter()
         .map(|path| load_image(path))
         .collect::<Result<Vec<_>, _>>()?;
+    run_prepared(config, message, fresh, sources, &mut String::new()).await
+}
 
+/// One headless turn whose visible reply is returned instead of only printed. Voice needs the
+/// text to speak it; a caller with no voice behaves exactly like [`run`].
+pub async fn run_capture(config: Config, message: String, fresh: bool) -> Result<String, String> {
+    let mut reply = String::new();
+    run_prepared(config, message, fresh, Vec::new(), &mut reply).await?;
+    Ok(reply)
+}
+
+/// The headless turn both entry points run, so their behaviour cannot diverge.
+async fn run_prepared(
+    config: Config,
+    message: String,
+    fresh: bool,
+    sources: Vec<ImageSource>,
+    capture: &mut String,
+) -> Result<(), String> {
     let runtime = Runtime::start(config)
         .await
         .map_err(|err| format!("could not start runtime: {err}"))?;
@@ -45,7 +63,7 @@ pub async fn run_with_images(
             .submit_message(&session, Message::user_with_images(message, sources))
             .map_err(|err| err.to_string())?;
     }
-    let failed = stream_turn(&handle, &session, &mut events).await?;
+    let failed = stream_turn(&handle, &session, &mut events, capture).await?;
 
     settle_learning(&handle).await;
     if failed {
@@ -139,7 +157,7 @@ pub async fn run_interactive(
         handle
             .submit(&session, message)
             .map_err(|err| err.to_string())?;
-        stream_turn(&handle, &session, &mut events).await?;
+        stream_turn(&handle, &session, &mut events, &mut String::new()).await?;
     }
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -195,7 +213,7 @@ pub async fn run_interactive(
                 handle
                     .submit(&session, line.to_owned())
                     .map_err(|err| err.to_string())?;
-                stream_turn(&handle, &session, &mut events).await?;
+                stream_turn(&handle, &session, &mut events, &mut String::new()).await?;
             }
         }
     }
@@ -227,10 +245,13 @@ fn open_session(handle: &RuntimeHandle, message: &str, fresh: bool) -> Result<Se
 }
 
 /// Stream one turn to the terminal. Returns `true` when the turn failed.
+/// The visible reply is also collected into `capture`: voice needs the text to speak, and reading
+/// it back off the terminal would pay for a second, lossy parse of what was already in hand.
 async fn stream_turn(
     handle: &RuntimeHandle,
     session: &SessionId,
     events: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+    capture: &mut String,
 ) -> Result<bool, String> {
     let mut failed = false;
     let mut printed = false;
@@ -253,6 +274,7 @@ async fn stream_turn(
             }) if sid == *session => {
                 print!("{text}");
                 let _ = std::io::stdout().flush();
+                capture.push_str(&text);
                 printed = true;
             }
             Ok(RuntimeEvent::ToolStarted {

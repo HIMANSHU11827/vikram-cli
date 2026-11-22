@@ -931,7 +931,10 @@ fn main() -> std::process::ExitCode {
         Command::Config { action } => config_command(action, config),
         Command::Presets { action } => exit(presets::run(action)),
         Command::Doctor => run_async(doctor::run(config)),
-        Command::Voice { action } => exit(voice::run(action)),
+        Command::Voice { action } => match action {
+            voice::VoiceAction::Chat { .. } => run_async(voice::chat(config, action)),
+            other => exit(voice::run(other)),
+        },
         Command::Init { path } => init(path),
         Command::Allow { action } => allow_command(action, &config),
         Command::Tools { action } => {

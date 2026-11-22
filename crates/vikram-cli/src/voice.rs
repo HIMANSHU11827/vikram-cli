@@ -7,7 +7,10 @@
 use std::path::PathBuf;
 
 use clap::Subcommand;
+use vikram_runtime::config::Config;
 use vikram_voice::{VoiceConfig, VoiceError, VoiceSession, probe};
+
+use crate::chat;
 
 #[derive(Debug, Subcommand)]
 pub enum VoiceAction {
@@ -39,6 +42,24 @@ pub enum VoiceAction {
         /// Piper voice model. Defaults to VIKRAM_TTS_VOICE.
         #[arg(long, value_name = "PATH")]
         voice: Option<PathBuf>,
+    },
+    /// Record one utterance, run it as a normal turn, and speak the reply.
+    Chat {
+        /// Open an audio device for this invocation. Voice I/O is opt-in.
+        #[arg(long)]
+        enable: bool,
+        /// Path to a downloaded Whisper ggml model. Defaults to VIKRAM_ASR_MODEL.
+        #[arg(long, value_name = "PATH")]
+        model: Option<PathBuf>,
+        /// Recording cap in milliseconds.
+        #[arg(long, value_name = "MS")]
+        max_record_ms: Option<u64>,
+        /// Piper voice model for the spoken reply. Defaults to VIKRAM_TTS_VOICE.
+        #[arg(long, value_name = "PATH")]
+        voice: Option<PathBuf>,
+        /// Start a new session instead of continuing the most recent one.
+        #[arg(long)]
+        fresh: bool,
     },
 }
 
@@ -128,6 +149,93 @@ fn report_notes(session: &mut VoiceSession) {
     }
 }
 
+/// The most of a reply the local synthesizer is asked to read. A turn can produce pages; reading
+/// all of them buries the answer in narration, so the voice stops at the last sentence inside the
+/// budget and the rest stays on screen.
+const SPOKEN_MAX_BYTES: usize = 1_200;
+
+/// The part of `reply` worth hearing: whole and under budget, cut at a sentence end when it has to
+/// be cut at all.
+fn speakable(reply: &str) -> &str {
+    if reply.len() <= SPOKEN_MAX_BYTES {
+        return reply.trim();
+    }
+    let mut end = SPOKEN_MAX_BYTES;
+    while end > 0 && !reply.is_char_boundary(end) {
+        end -= 1;
+    }
+    let slice = &reply[..end];
+    match slice.rfind(['.', '!', '?', '\n']) {
+        Some(pos) => &slice[..=pos],
+        None => slice.trim(),
+    }
+}
+
+/// A spoken turn: record one utterance, send its transcript through the same headless turn `vikram
+/// chat` runs, then speak the reply. Each stage is honest about failing — no speech stops the turn
+/// before it is sent, and a synthesizer that cannot run leaves the answer on screen instead of
+/// failing the command.
+pub async fn chat(runtime_config: Config, action: VoiceAction) -> Result<(), String> {
+    let VoiceAction::Chat {
+        enable,
+        model,
+        max_record_ms,
+        voice,
+        fresh,
+    } = action
+    else {
+        return Err("not a voice chat action".into());
+    };
+    let voice_config = config(enable, model, voice, max_record_ms);
+    voice_config.validate().map_err(|err| err.to_string())?;
+    let mut session = VoiceSession::start(voice_config).map_err(|err| err.to_string())?;
+
+    eprintln!("voice: listening — speak, then pause");
+    let recording = {
+        #[cfg(unix)]
+        let guard = interrupt::Guard::install(session.cancel_token());
+        let result = session.listen_once();
+        #[cfg(unix)]
+        drop(guard);
+        result
+    };
+    let heard = match recording {
+        Err(VoiceError::Cancelled) => {
+            println!("voice: cancelled");
+            return Ok(());
+        }
+        Err(err) => return Err(err.to_string()),
+        Ok(None) => {
+            report_notes(&mut session);
+            println!("no speech detected");
+            return Ok(());
+        }
+        Ok(Some(text)) => text,
+    };
+    if heard.trim().is_empty() {
+        println!("no speech detected");
+        return Ok(());
+    }
+    println!("you: {heard}");
+
+    let reply = chat::run_capture(runtime_config, heard, fresh).await?;
+    let spoken = speakable(&reply);
+    if spoken.is_empty() {
+        return Ok(());
+    }
+    if spoken.len() < reply.trim().len() {
+        eprintln!(
+            "voice: speaking the first {} bytes of the reply",
+            spoken.len()
+        );
+    }
+    if let Err(err) = session.speak(spoken) {
+        report_notes(&mut session);
+        eprintln!("voice: reply not spoken: {err}");
+    }
+    Ok(())
+}
+
 pub fn run(action: VoiceAction) -> Result<(), String> {
     match action {
         VoiceAction::Status { model } => {
@@ -199,6 +307,7 @@ pub fn run(action: VoiceAction) -> Result<(), String> {
             report_notes(&mut session);
             result.map_err(|err| err.to_string())
         }
+        VoiceAction::Chat { .. } => Err("voice chat runs through the async path".into()),
     }
 }
 
@@ -227,5 +336,29 @@ mod tests {
         assert_eq!(config.asr_model, PathBuf::from("model.bin"));
         assert_eq!(config.tts_voice, Some(PathBuf::from("voice.onnx")));
         assert_eq!(config.max_record_ms, 4_000);
+    }
+
+    #[test]
+    fn short_replies_are_spoken_whole() {
+        let reply = "  The build passed.  ";
+        assert_eq!(speakable(reply), "The build passed.");
+    }
+
+    #[test]
+    fn long_replies_stop_at_the_last_sentence_inside_the_budget() {
+        let sentence = "This sentence fills a fair share of the spoken budget. ";
+        let reply = sentence.repeat(40);
+        let spoken = speakable(&reply);
+        assert!(spoken.len() <= SPOKEN_MAX_BYTES);
+        assert!(spoken.ends_with('.'));
+        assert!(reply.starts_with(spoken));
+    }
+
+    #[test]
+    fn a_budget_cut_that_lands_mid_character_still_yields_valid_text() {
+        let reply = "é".repeat(SPOKEN_MAX_BYTES);
+        let spoken = speakable(&reply);
+        assert!(spoken.len() <= SPOKEN_MAX_BYTES);
+        assert!(spoken.chars().all(|c| c == 'é'));
     }
 }
