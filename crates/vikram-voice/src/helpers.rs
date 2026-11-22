@@ -66,16 +66,27 @@ pub fn probe(config: &VoiceConfig) -> VoiceStatus {
         ))
     };
     let asr = crate::asr::probe_asr(config);
-    let tts = match (
-        which(&config.tts_helper).is_some() && config.tts_voice.is_some(),
-        which(&config.tts_fallback).is_some(),
-    ) {
-        (true, _) => StageStatus::Ready(format!("{} with operator voice", config.tts_helper)),
-        (false, true) => StageStatus::Degraded(format!(
+    let voice = crate::session::pick_voice(config.tts_voice.as_deref());
+    let piper = which(&config.tts_helper).is_some();
+    let espeak = which(&config.tts_fallback).is_some();
+    let tts = match (piper, voice) {
+        (true, Some(voice)) => {
+            StageStatus::Ready(format!("{} with {}", config.tts_helper, voice.display()))
+        }
+        (false, Some(_)) => StageStatus::Missing(missing_tool_message(&config.tts_helper)),
+        (true, None) if espeak => StageStatus::Degraded(format!(
             "no {} voice model; robotic {} fallback",
             config.tts_helper, config.tts_fallback
         )),
-        _ => StageStatus::Missing(format!(
+        (true, None) => StageStatus::Missing(format!(
+            "no {} voice model; {} not found",
+            config.tts_helper, config.tts_fallback
+        )),
+        (false, None) if espeak => StageStatus::Degraded(format!(
+            "{} and no voice model; robotic {} fallback",
+            config.tts_helper, config.tts_fallback
+        )),
+        (false, None) => StageStatus::Missing(format!(
             "{} with a voice model, or {}, not found",
             config.tts_helper, config.tts_fallback
         )),
@@ -108,18 +119,8 @@ pub fn probe(config: &VoiceConfig) -> VoiceStatus {
 }
 
 /// Run one helper with bounded output and a deadline. `input` is written on a detached thread so
-/// a wedged helper cannot block the write past the deadline.
-pub(crate) fn run(
-    program: &str,
-    args: &[&str],
-    input: Option<&[u8]>,
-    timeout_secs: u64,
-) -> Result<Vec<u8>, VoiceError> {
-    run_with(program, args, input, timeout_secs, None)
-}
-
-/// Like [`run`], but a cancel observed mid-run kills the helper and returns
-/// [`VoiceError::Cancelled`] instead of waiting the helper out.
+/// a wedged helper cannot block the write past the deadline. A cancel observed mid-run kills the
+/// helper and returns [`VoiceError::Cancelled`] instead of waiting the helper out.
 pub(crate) fn run_cancellable(
     program: &str,
     args: &[&str],

@@ -27,7 +27,7 @@ pub use helpers::{first_available, missing_tool_message, probe, which};
 pub use player::{CpalPlayer, DevicePlayer, output_devices, probe_playback};
 pub use session::{
     AudioSource, HelperPlayer, HelperRecognizer, HelperSource, HelperSynth, Player, Recognizer,
-    Synthesizer, VoiceSession,
+    Synthesizer, VoiceSession, pick_voice, piper_voices, spoken_text,
 };
 pub use vad::{detect_speech, is_silent, noise_floor, speech_gate, trim_silence};
 
@@ -79,6 +79,11 @@ pub struct VoiceConfig {
     pub tts_helper: String,
     pub tts_fallback: String,
     pub tts_voice: Option<PathBuf>,
+    /// Speaking rate in words per minute (80..=450). 175 is espeak-ng's own default; piper gets
+    /// the reciprocal as `--length_scale`.
+    pub rate: u32,
+    /// Output amplitude, 0.0 silent ..= 1.0 unattenuated.
+    pub volume: f32,
     pub player_helper: String,
     pub player_fallback: String,
     pub max_record_ms: u64,
@@ -110,6 +115,8 @@ impl Default for VoiceConfig {
             tts_helper: "piper".into(),
             tts_fallback: "espeak-ng".into(),
             tts_voice: None,
+            rate: 175,
+            volume: 1.0,
             player_helper: "paplay".into(),
             player_fallback: "aplay".into(),
             max_record_ms: 8_000,
@@ -149,6 +156,14 @@ impl VoiceConfig {
         }
         if self.min_speech_ms == 0 {
             return Err(VoiceError::Config("min_speech_ms must be positive".into()));
+        }
+        if !(80..=450).contains(&self.rate) {
+            return Err(VoiceError::Config(
+                "rate must be between 80 and 450 words per minute".into(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.volume) {
+            return Err(VoiceError::Config("volume must be between 0 and 1".into()));
         }
         Ok(())
     }
@@ -277,7 +292,6 @@ mod tests {
         config.validate().expect("defaults must be valid");
         let status = probe(&config);
         assert!(!status.is_ready());
-        assert!(status.degraded);
         assert_eq!(status.lines().len(), 6);
     }
 
