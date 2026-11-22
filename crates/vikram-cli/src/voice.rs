@@ -156,7 +156,7 @@ const SPOKEN_MAX_BYTES: usize = 1_200;
 
 /// The part of `reply` worth hearing: whole and under budget, cut at a sentence end when it has to
 /// be cut at all.
-fn speakable(reply: &str) -> &str {
+pub(crate) fn speakable(reply: &str) -> &str {
     if reply.len() <= SPOKEN_MAX_BYTES {
         return reply.trim();
     }

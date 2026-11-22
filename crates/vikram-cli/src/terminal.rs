@@ -5,6 +5,9 @@
 //! observations and the UI tick are three independent sources.
 
 use std::io::{self, IsTerminal, Stdout};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use crossterm::event::{
@@ -27,6 +30,7 @@ use vikram_tui::app::{App, BotAction, Focus, Overlay, UiCommand};
 use vikram_tui::commands::{self, Outcome};
 use vikram_tui::widgets::{Picker, PickerItem, PickerKind, Verb};
 use vikram_tui::{input, ui};
+use vikram_voice::{VoiceConfig, VoiceSession};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -109,6 +113,13 @@ async fn event_loop(
     let mut term_events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(120));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Dictation runs on its own thread: opening the microphone and waiting for speech would
+    // otherwise freeze the interface for the whole utterance.
+    let (voice_tx, voice_rx) = std::sync::mpsc::channel::<Dictation>();
+    let voice_busy = Arc::new(AtomicBool::new(false));
+    // Voice mode's worker outlives a single utterance, so it has its own channels and state.
+    let (voice_mode_tx, voice_mode_rx) = std::sync::mpsc::channel::<VoiceEvent>();
+    let mut voice_mode = VoiceMode::default();
 
     loop {
         let completed = terminal
@@ -116,14 +127,27 @@ async fn event_loop(
             .map_err(|err| format!("draw: {err}"))?;
         app.capture_screen(completed.buffer);
 
+        drain_dictation(app, &voice_rx, &voice_busy);
+        drain_voice_mode(app, &voice_mode_rx, &mut voice_mode);
+
         for command in app.take_commands() {
             // Repainting needs the terminal handle, which the command dispatcher does not hold.
             if matches!(command, UiCommand::Redraw) {
                 terminal.clear().map_err(|err| format!("clear: {err}"))?;
                 continue;
             }
+            // The microphone is a host resource too, and capture blocks for seconds.
+            if matches!(command, UiCommand::VoiceDictate) {
+                start_dictation(app, &voice_tx, &voice_busy);
+                continue;
+            }
+            if matches!(command, UiCommand::VoiceToggle) {
+                toggle_voice_mode(app, &voice_mode_tx, &mut voice_mode);
+                continue;
+            }
             execute(handle, app, command);
         }
+        poll_voice_reply(app, &mut voice_mode);
         for (request_id, answer) in app.take_answers() {
             if let Err(err) = handle.answer_question(&request_id, answer) {
                 app.answer_rejected(&request_id);
@@ -382,6 +406,232 @@ fn apply_terminal_event(app: &mut App, event: Event) {
         },
         Event::Resize(_, _) => {}
         _ => {}
+    }
+}
+
+/// The outcome of one push-to-talk capture, produced off the interface thread.
+enum Dictation {
+    Heard(String),
+    Empty,
+    Failed(String),
+}
+
+/// What the interface asks the voice worker to do while the mode is on.
+enum VoiceJob {
+    /// Read this reply aloud, then listen again.
+    Speak(String),
+    /// Nothing to say — listen again.
+    Skip,
+    /// Leave the mode; the microphone closes.
+    Stop,
+}
+
+/// What the voice worker reports while the mode is on.
+enum VoiceEvent {
+    Heard(String),
+    Empty,
+    Failed(String),
+}
+
+/// The host's half of voice mode: how to reach the worker, and which turn the operator is still
+/// waiting to hear.
+#[derive(Default)]
+struct VoiceMode {
+    jobs: Option<Sender<VoiceJob>>,
+    /// The session started from a spoken turn, with the transcript length when it started.
+    awaiting: Option<(SessionId, usize)>,
+}
+
+/// Turn hands-free voice mode on or off. The worker owns the microphone and the model for the whole
+/// mode, so a session is not reopened for every utterance.
+fn toggle_voice_mode(app: &mut App, events: &Sender<VoiceEvent>, mode: &mut VoiceMode) {
+    if let Some(jobs) = mode.jobs.take() {
+        let _ = jobs.send(VoiceJob::Stop);
+        mode.awaiting = None;
+        app.voice_mode = false;
+        app.push_notice(NoticeLevel::Info, "voice mode off");
+        return;
+    }
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<VoiceJob>();
+    let events = events.clone();
+    app.voice_mode = true;
+    app.push_notice(
+        NoticeLevel::Info,
+        "voice mode on — speak; /voice again stops it",
+    );
+    mode.jobs = Some(job_tx);
+    std::thread::spawn(move || voice_worker(job_rx, events));
+}
+
+/// The worker's whole life: listen, report, wait to be told what to say, speak, listen again. It
+/// never listens while it speaks — the reply comes out of the same room, and a microphone left open
+/// would transcribe the assistant's own voice as the operator's next turn.
+fn voice_worker(jobs: Receiver<VoiceJob>, events: Sender<VoiceEvent>) {
+    let config = VoiceConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    let mut session = match VoiceSession::start(config) {
+        Ok(session) => session,
+        Err(err) => {
+            let _ = events.send(VoiceEvent::Failed(err.to_string()));
+            return;
+        }
+    };
+    loop {
+        match session.listen_once() {
+            Ok(Some(text)) if !text.trim().is_empty() => {
+                if events.send(VoiceEvent::Heard(text)).is_err() {
+                    return;
+                }
+            }
+            Ok(_) => {
+                if events.send(VoiceEvent::Empty).is_err() {
+                    return;
+                }
+            }
+            Err(err) => {
+                let _ = events.send(VoiceEvent::Failed(err.to_string()));
+                return;
+            }
+        }
+        match jobs.recv() {
+            Ok(VoiceJob::Speak(text)) => {
+                let _ = session.speak(&text);
+            }
+            Ok(VoiceJob::Skip) => {}
+            Ok(VoiceJob::Stop) | Err(_) => return,
+        }
+    }
+}
+
+/// A spoken transcript becomes a turn without the operator pressing enter: that is what the mode is
+/// for. The turn is started through the ordinary submit path so trust, approvals and the transcript
+/// look exactly like a typed one.
+fn drain_voice_mode(app: &mut App, rx: &Receiver<VoiceEvent>, mode: &mut VoiceMode) {
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            VoiceEvent::Heard(text) => {
+                let heard = text.trim().to_owned();
+                if heard.is_empty() {
+                    continue;
+                }
+                let Some(session) = app.display_session().map(|view| view.id.clone()) else {
+                    continue;
+                };
+                app.push_notice(NoticeLevel::Info, format!("voice: {heard}"));
+                let before = app
+                    .sessions
+                    .iter()
+                    .find(|view| view.id == session)
+                    .map(|view| view.messages.len())
+                    .unwrap_or(0);
+                mode.awaiting = Some((session.clone(), before));
+                app.commands.push(UiCommand::Submit {
+                    session,
+                    text: heard,
+                });
+            }
+            // Silence between utterances is the normal state of a room, not news.
+            VoiceEvent::Empty => {}
+            VoiceEvent::Failed(err) => {
+                mode.jobs = None;
+                mode.awaiting = None;
+                app.voice_mode = false;
+                app.push_notice(NoticeLevel::Warn, format!("voice: {err}"));
+            }
+        }
+    }
+}
+
+/// Once the spoken turn settles, read the answer aloud and let the worker listen again. A turn that
+/// produced no text is skipped rather than left hanging: the worker is blocked until told something.
+fn poll_voice_reply(app: &mut App, mode: &mut VoiceMode) {
+    let Some((session, before)) = mode.awaiting.clone() else {
+        return;
+    };
+    let Some(view) = app.sessions.iter().find(|view| view.id == session) else {
+        return;
+    };
+    if view.is_busy() {
+        return;
+    }
+    let reply = view
+        .messages
+        .iter()
+        .skip(before)
+        .rev()
+        .find(|message| message.role == vikram_contracts::Role::Assistant)
+        .map(|message| message.text_body())
+        .unwrap_or_default();
+    mode.awaiting = None;
+    let Some(jobs) = mode.jobs.as_ref() else {
+        return;
+    };
+    let sent = if reply.trim().is_empty() {
+        jobs.send(VoiceJob::Skip)
+    } else {
+        jobs.send(VoiceJob::Speak(crate::voice::speakable(&reply).to_owned()))
+    };
+    if sent.is_err() {
+        mode.jobs = None;
+        app.voice_mode = false;
+        app.push_notice(NoticeLevel::Warn, "voice: the voice worker stopped");
+    }
+}
+
+/// Start one utterance in the background. A second request while the microphone is open is
+/// refused with a note instead of opening two capture sessions at once.
+fn start_dictation(app: &mut App, tx: &Sender<Dictation>, busy: &Arc<AtomicBool>) {
+    if busy.swap(true, Ordering::SeqCst) {
+        app.push_notice(NoticeLevel::Info, "voice: already listening");
+        return;
+    }
+    app.push_notice(NoticeLevel::Info, "voice: listening — speak, then pause");
+    let tx = tx.clone();
+    let busy = Arc::clone(busy);
+    std::thread::spawn(move || {
+        let config = VoiceConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let outcome = match VoiceSession::start(config) {
+            Err(err) => Dictation::Failed(err.to_string()),
+            Ok(mut session) => match session.listen_once() {
+                Ok(Some(text)) if !text.trim().is_empty() => Dictation::Heard(text),
+                Ok(_) => Dictation::Empty,
+                Err(err) => Dictation::Failed(err.to_string()),
+            },
+        };
+        busy.store(false, Ordering::SeqCst);
+        let _ = tx.send(outcome);
+    });
+}
+
+/// Type any finished transcript into the prompt. Dictation fills the editor; it never sends, so the
+/// operator still reads what was heard before it becomes a turn.
+fn drain_dictation(app: &mut App, rx: &Receiver<Dictation>, busy: &Arc<AtomicBool>) {
+    while let Ok(outcome) = rx.try_recv() {
+        busy.store(false, Ordering::SeqCst);
+        match outcome {
+            Dictation::Heard(text) => {
+                let heard = text.trim().to_owned();
+                match app.display_session_mut() {
+                    Some(session) => {
+                        if !session.editor.text().trim().is_empty() {
+                            session.editor.insert_str(" ");
+                        }
+                        session.editor.insert_str(&heard);
+                        app.push_notice(NoticeLevel::Info, "voice: transcribed into the prompt");
+                    }
+                    None => app.push_notice(NoticeLevel::Warn, format!("voice: {heard}")),
+                }
+            }
+            Dictation::Empty => app.push_notice(NoticeLevel::Info, "voice: no speech detected"),
+            Dictation::Failed(err) => {
+                app.push_notice(NoticeLevel::Warn, format!("voice: {err}"));
+            }
+        }
     }
 }
 
@@ -746,6 +996,11 @@ fn execute(handle: &RuntimeHandle, app: &mut App, command: UiCommand) {
         UiCommand::RefreshMetrics => {
             app.sync_snapshot(handle.snapshot());
         }
+        // Never reaches here: the event loop intercepts it, because the microphone is a host
+        // resource and capture blocks for the length of an utterance.
+        UiCommand::VoiceDictate => {}
+        // Never reaches here: the event loop owns the voice worker, which lives across turns.
+        UiCommand::VoiceToggle => {}
         // Never reaches here: the event loop intercepts it, because clearing a screen needs the
         // terminal handle and this dispatcher only holds the runtime.
         UiCommand::Redraw => {}
@@ -1692,6 +1947,7 @@ fn open_panel(handle: &RuntimeHandle, app: &mut App, kind: PickerKind) {
                 PickerItem::new("Ctrl+N", "new session", "ctrl_n".to_owned()),
                 PickerItem::new("Ctrl+Tab", "next session", "ctrl_tab".to_owned()),
                 PickerItem::new("Ctrl+B", "toggle the BOTS panel", "ctrl_b".to_owned()),
+                PickerItem::new("Ctrl+G", "dictate into the prompt", "ctrl_g".to_owned()),
                 PickerItem::new("Ctrl+O", "approvals", "ctrl_o".to_owned()),
                 PickerItem::new(
                     "Ctrl+R",
@@ -2640,6 +2896,7 @@ fn run_action(app: &mut App, session: &SessionId, name: &str) {
             });
         }
         "keys" => app.overlay = Some(Overlay::Help),
+        "voice" => app.commands.push(UiCommand::VoiceToggle),
         "copy" => {
             app.copy_last_assistant_message();
         }

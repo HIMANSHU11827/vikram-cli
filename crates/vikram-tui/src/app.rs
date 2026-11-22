@@ -542,6 +542,12 @@ pub enum UiCommand {
         scope: String,
         key: String,
     },
+    /// Record one utterance with the local voice engine and type its transcript into the prompt.
+    /// The host owns the microphone, so this is an intent, not an action.
+    VoiceDictate,
+    /// Enter or leave hands-free voice mode: the host keeps the microphone open, sends each
+    /// transcript as a turn, and speaks the reply. The view only shows that the mode is on.
+    VoiceToggle,
     RefreshMetrics,
     /// Repaint the terminal from scratch. The interface cannot clear a screen it does not own, so
     /// it asks the host; the transcript itself is untouched, only the pixels are redrawn.
@@ -965,6 +971,8 @@ pub struct App {
     pub tick: u64,
     pub show_bots: bool,
     pub should_quit: bool,
+    /// Hands-free voice mode is on: kept by the host, shown here so the bar says so.
+    pub voice_mode: bool,
     /// Hit regions for session tabs and their close buttons, recomputed each draw.
     pub tab_hits: Vec<TabHit>,
     /// X range (start, end) of the "+ New" control, if rendered.
@@ -1059,6 +1067,7 @@ impl App {
             tick: 0,
             show_bots: true,
             should_quit: false,
+            voice_mode: false,
             tab_hits: Vec::new(),
             new_session_x: None,
             suggestions: None,

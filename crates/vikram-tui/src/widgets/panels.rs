@@ -466,6 +466,17 @@ pub fn status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         theme.status_style(StatusSegment::Value),
     ));
 
+    // Voice mode is a standing state, not an event: an operator glancing at the bar must be able
+    // to tell whether the microphone is open. Nothing is drawn when it is off.
+    if app.voice_mode {
+        let mic = if theme.ascii { "mic" } else { "◉" };
+        left.push(Span::raw(sep.to_owned()));
+        left.push(Span::styled(
+            format!("{mic} voice"),
+            theme.status_style(StatusSegment::Label),
+        ));
+    }
+
     // ctx — the boxed meter is drawn in every state, because the shape is what an operator reads at
     // a glance: how full, and how close to full. What changes behind it is the figure. A window the
     // provider reported gets a percentage; a window nobody reported gets the measured count instead,

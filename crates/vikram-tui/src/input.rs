@@ -153,6 +153,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             );
             return true;
         }
+        KeyCode::Char('g') if ctrl => {
+            // Push-to-talk: the host owns the microphone, so the interface only asks for one
+            // utterance and shows what came back.
+            app.commands.push(UiCommand::VoiceDictate);
+            return true;
+        }
         KeyCode::Char('t') if ctrl => {
             // Thinking is folded by default because a reasoning stream is the longest thing a
             // model emits and it should not push the answer off the screen.

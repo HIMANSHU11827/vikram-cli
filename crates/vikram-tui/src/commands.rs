@@ -250,6 +250,12 @@ pub const COMMANDS: &[Command] = &[
         description: "Copy the last assistant reply to the clipboard",
         outcome: Outcome::Action,
     },
+    Command {
+        name: "voice",
+        aliases: &["dictate", "mic"],
+        description: "Talk hands-free: speak, hear the answer (Ctrl+G dictates once)",
+        outcome: Outcome::Action,
+    },
 ];
 
 /// Look a command up by the word typed after `/`. Aliases resolve to the command they name.
