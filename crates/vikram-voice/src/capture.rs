@@ -21,6 +21,7 @@ const POLL: Duration = Duration::from_millis(50);
 /// when the speaker does instead of recording the rest of the cap. The knobs are the config's
 /// existing gate fields: `hangover_ms` is how long a pause may last before the take ends, and
 /// `min_speech_ms` keeps a cough from ending it.
+#[derive(Clone, Copy)]
 pub(crate) struct SilenceStop {
     absolute: f32,
     ratio: f32,
@@ -210,6 +211,133 @@ fn u16_to_i16(samples: &[u16]) -> Vec<i16> {
         .collect()
 }
 
+/// What the capture thread tells the consumer: audio as it arrives, then the trimmed take, or
+/// why the take could not be made. Private to this module; the consumer sees a callback.
+enum LiveMsg {
+    Chunk(Vec<i16>),
+    Done(Vec<i16>),
+    Failed(String),
+}
+
+/// Build and start an input stream that delivers mono i16 chunks at the device's own rate.
+/// Returns the running stream and the channel a stream error arrives on.
+fn start_mono_stream(
+    device: &cpal::Device,
+    format: cpal::SampleFormat,
+    stream_config: cpal::StreamConfig,
+    channels: usize,
+    tx: mpsc::Sender<Vec<i16>>,
+) -> Result<(cpal::Stream, mpsc::Receiver<String>)> {
+    let (err_tx, err_rx) = mpsc::channel::<String>();
+    let err_fn = move |err: cpal::Error| {
+        let _ = err_tx.send(err.to_string());
+    };
+    let stream = match format {
+        cpal::SampleFormat::F32 => device.build_input_stream(
+            stream_config,
+            move |data: &[f32], _| {
+                let _ = tx.send(mix_to_mono(&f32_to_i16(data), channels));
+            },
+            err_fn,
+            None,
+        ),
+        cpal::SampleFormat::I16 => device.build_input_stream(
+            stream_config,
+            move |data: &[i16], _| {
+                let _ = tx.send(mix_to_mono(data, channels));
+            },
+            err_fn,
+            None,
+        ),
+        cpal::SampleFormat::U16 => device.build_input_stream(
+            stream_config,
+            move |data: &[u16], _| {
+                let _ = tx.send(mix_to_mono(&u16_to_i16(data), channels));
+            },
+            err_fn,
+            None,
+        ),
+        other => {
+            return Err(VoiceError::NoDevice(format!(
+                "device sample format {other:?} is not supported"
+            )));
+        }
+    };
+    let stream = stream.map_err(|err| VoiceError::NoDevice(format!("open input stream: {err}")))?;
+    stream
+        .play()
+        .map_err(|err| VoiceError::NoDevice(format!("start input stream: {err}")))?;
+    Ok((stream, err_rx))
+}
+
+/// The capture thread's body: drain the device, hand each chunk to the consumer as it arrives,
+/// and stop on the same end-of-speech rule as a plain take. The returned buffer is the trimmed
+/// take at config rate, identical to what `record_cancellable` produces for the same audio.
+fn stream_capture(
+    device: Option<&str>,
+    config_rate: u16,
+    stop: &SilenceStop,
+    max_ms: u64,
+    cancel: &CancelToken,
+    tx: &mpsc::Sender<LiveMsg>,
+) -> Result<Vec<i16>> {
+    cancel.check()?;
+    let device = open_input(device)?;
+    let supported = device
+        .default_input_config()
+        .map_err(|err| VoiceError::NoDevice(format!("input device has no config: {err}")))?;
+    let rate = supported.sample_rate();
+    let channels = supported.channels().max(1) as usize;
+    let format = supported.sample_format();
+    let stream_config: cpal::StreamConfig = supported.into();
+    let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<i16>>();
+    let (stream, err_rx) = start_mono_stream(&device, format, stream_config, channels, chunk_tx)?;
+
+    let deadline = Instant::now() + Duration::from_millis(max_ms.max(1));
+    let cap = (max_ms.max(1) * u64::from(rate) / 1_000) as usize;
+    let mut pcm = Vec::new();
+    let outcome = loop {
+        if cancel.is_cancelled() {
+            break Err(VoiceError::Cancelled);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break Ok(());
+        }
+        let wait = (deadline - now).min(POLL);
+        match chunk_rx.recv_timeout(wait) {
+            Ok(chunk) => {
+                pcm.extend_from_slice(&chunk);
+                // The tap gets the audio before the trim, so the last chunk may carry the
+                // hangover: a caption may trail the speaker by that much and never leads.
+                let _ = tx.send(LiveMsg::Chunk(resample(
+                    &chunk,
+                    rate,
+                    u32::from(config_rate),
+                )));
+                if let Some(keep) = stop.keep(&pcm, rate) {
+                    pcm.truncate(keep);
+                    break Ok(());
+                }
+                if pcm.len() >= cap {
+                    pcm.truncate(cap);
+                    break Ok(());
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if let Ok(err) = err_rx.try_recv() {
+                    break Err(VoiceError::NoDevice(format!("input stream stopped: {err}")));
+                }
+                break Ok(());
+            }
+        }
+    };
+    drop(stream);
+    outcome?;
+    Ok(resample(&pcm, rate, u32::from(config_rate)))
+}
+
 /// One capture from the configured input device (the host default when unset), converted to
 /// config-rate mono i16.
 pub struct CpalSource {
@@ -244,46 +372,7 @@ impl AudioSource for CpalSource {
         let format = supported.sample_format();
         let stream_config: cpal::StreamConfig = supported.into();
         let (tx, rx) = mpsc::channel::<Vec<i16>>();
-        let (err_tx, err_rx) = mpsc::channel::<String>();
-        let err_fn = move |err: cpal::Error| {
-            let _ = err_tx.send(err.to_string());
-        };
-        let stream = match format {
-            cpal::SampleFormat::F32 => device.build_input_stream(
-                stream_config,
-                move |data: &[f32], _| {
-                    let _ = tx.send(mix_to_mono(&f32_to_i16(data), channels));
-                },
-                err_fn,
-                None,
-            ),
-            cpal::SampleFormat::I16 => device.build_input_stream(
-                stream_config,
-                move |data: &[i16], _| {
-                    let _ = tx.send(mix_to_mono(data, channels));
-                },
-                err_fn,
-                None,
-            ),
-            cpal::SampleFormat::U16 => device.build_input_stream(
-                stream_config,
-                move |data: &[u16], _| {
-                    let _ = tx.send(mix_to_mono(&u16_to_i16(data), channels));
-                },
-                err_fn,
-                None,
-            ),
-            other => {
-                return Err(VoiceError::NoDevice(format!(
-                    "device sample format {other:?} is not supported"
-                )));
-            }
-        };
-        let stream =
-            stream.map_err(|err| VoiceError::NoDevice(format!("open input stream: {err}")))?;
-        stream
-            .play()
-            .map_err(|err| VoiceError::NoDevice(format!("start input stream: {err}")))?;
+        let (stream, err_rx) = start_mono_stream(&device, format, stream_config, channels, tx)?;
 
         let deadline = Instant::now() + Duration::from_millis(max_ms.max(1));
         let cap = (max_ms.max(1) * u64::from(rate) / 1_000) as usize;
@@ -322,6 +411,64 @@ impl AudioSource for CpalSource {
         drop(stream);
         Ok(resample(&pcm, rate, u32::from(self.sample_rate)))
     }
+
+    /// The live path: the cpal stream is owned by a capture thread, so the caller's thread is
+    /// free to transcribe the audio that has already arrived while the microphone keeps running.
+    /// Nothing is dropped between the two: the thread sends every chunk as it comes, and the take
+    /// it finally returns is trimmed by the same `SilenceStop` a plain recording uses.
+    fn record_streaming(
+        &mut self,
+        max_ms: u64,
+        cancel: &CancelToken,
+        on_chunk: &mut dyn FnMut(&[i16]),
+    ) -> Result<Vec<i16>> {
+        cancel.check()?;
+        let (tx, rx) = mpsc::channel::<LiveMsg>();
+        let device = self.device.clone();
+        let config_rate = self.sample_rate;
+        let stop = self.stop;
+        let thread_cancel = cancel.clone();
+        let capture = std::thread::spawn(move || {
+            let result = stream_capture(
+                device.as_deref(),
+                config_rate,
+                &stop,
+                max_ms,
+                &thread_cancel,
+                &tx,
+            );
+            match result {
+                Ok(pcm) => {
+                    let _ = tx.send(LiveMsg::Done(pcm));
+                }
+                // The consumer already knows it cancelled; a second word would race it.
+                Err(VoiceError::Cancelled) => {}
+                Err(err) => {
+                    let _ = tx.send(LiveMsg::Failed(err.to_string()));
+                }
+            }
+        });
+        let outcome = loop {
+            if cancel.is_cancelled() {
+                break Err(VoiceError::Cancelled);
+            }
+            match rx.recv_timeout(POLL) {
+                Ok(LiveMsg::Chunk(chunk)) => on_chunk(&chunk),
+                Ok(LiveMsg::Done(pcm)) => break Ok(pcm),
+                Ok(LiveMsg::Failed(err)) => break Err(VoiceError::NoDevice(err)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err(VoiceError::NoDevice(
+                        "input capture thread stopped without a take".into(),
+                    ));
+                }
+            }
+        };
+        // Joining on every path is what guarantees no stream outlives the call: the thread drops
+        // the cpal stream when its loop ends, and its loop polls the token every 50 ms.
+        let _ = capture.join();
+        outcome
+    }
 }
 
 /// Built-in cpal when the machine has an input device; the helper path only when it does not.
@@ -359,6 +506,18 @@ impl AudioSource for DeviceSource {
         match self {
             Self::BuiltIn(source) => source.record_cancellable(max_ms, cancel),
             Self::Helper(source) => source.record_cancellable(max_ms, cancel),
+        }
+    }
+
+    fn record_streaming(
+        &mut self,
+        max_ms: u64,
+        cancel: &CancelToken,
+        on_chunk: &mut dyn FnMut(&[i16]),
+    ) -> Result<Vec<i16>> {
+        match self {
+            Self::BuiltIn(source) => source.record_streaming(max_ms, cancel, on_chunk),
+            Self::Helper(source) => source.record_streaming(max_ms, cancel, on_chunk),
         }
     }
 }
@@ -585,6 +744,29 @@ mod tests {
             .to_string();
         assert!(err.contains("No Such Microphone"), "{err}");
         assert!(err.contains(&default), "{err}");
+    }
+
+    #[test]
+    #[ignore = "hardware test: records from the machine's microphone for 1.5 s"]
+    fn the_live_tap_delivers_chunks_while_the_microphone_is_open() {
+        if probe_capture().is_none() {
+            return;
+        }
+        let config = VoiceConfig::default();
+        let mut source = CpalSource::start(&config);
+        let mut chunks = 0usize;
+        let take = source
+            .record_streaming(1_500, &CancelToken::new(), &mut |chunk: &[i16]| {
+                if !chunk.is_empty() {
+                    chunks += 1;
+                }
+            })
+            .expect("the live path must capture from the default microphone");
+        assert!(
+            chunks >= 1,
+            "the tap must deliver audio, not only the final take"
+        );
+        assert!(!take.is_empty(), "a 1.5 s take is not empty");
     }
 
     #[test]

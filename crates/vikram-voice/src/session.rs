@@ -21,6 +21,22 @@ pub trait AudioSource: Send {
         cancel.check()?;
         self.record(max_ms)
     }
+
+    /// Capture with a live tap: `on_chunk` sees config-rate mono samples as they arrive, and the
+    /// return value is the whole take, trimmed and resampled exactly as
+    /// [`record_cancellable`](Self::record_cancellable) returns it. The default records the take
+    /// and hands it over once — a source that cannot stream still works, it just produces a
+    /// caption only after the speaker has stopped.
+    fn record_streaming(
+        &mut self,
+        max_ms: u64,
+        cancel: &CancelToken,
+        on_chunk: &mut dyn FnMut(&[i16]),
+    ) -> Result<Vec<i16>> {
+        let pcm = self.record_cancellable(max_ms, cancel)?;
+        on_chunk(&pcm);
+        Ok(pcm)
+    }
 }
 
 /// Where a session is in its listen → transcribe → speak cycle. Idle is both the start and
@@ -52,6 +68,27 @@ pub trait Recognizer: Send {
     /// clears them; the session merges them into `VoiceStatus` instead of swallowing them.
     fn notes(&mut self) -> Vec<String> {
         Vec::new()
+    }
+}
+
+/// An engine that can caption a growing buffer while the operator is still speaking.
+///
+/// Kept apart from [`Recognizer`] on purpose: captioning is only honest on an engine that can
+/// run on a partial take, and the helper paths (whisper-cli, the voxtype CLI) re-transcribe a
+/// whole file per call, so they cannot. A session whose recognizer does not implement this has
+/// no [`VoiceSession::listen_live`] at all rather than one that never fires.
+pub trait Captioner {
+    /// The transcript of the audio so far. A buffer too short to hold a word is an empty
+    /// caption, not an error.
+    fn transcribe_partial(&mut self, pcm: &[i16]) -> Result<String>;
+}
+
+/// The built-in chain captions through wavo's partial path; `AsrEngine::transcribe_partial`
+/// is the inherent method that already refuses to download mid-stream.
+impl Captioner for AsrEngine {
+    fn transcribe_partial(&mut self, pcm: &[i16]) -> Result<String> {
+        // Inherent method wins over the trait one, so this is the caption path, not a loop.
+        AsrEngine::transcribe_partial(self, pcm)
     }
 }
 
@@ -623,6 +660,20 @@ impl Player for HelperPlayer {
     }
 }
 
+/// How often a live caption is refreshed while the operator is still speaking. 400 ms reads as
+/// live typing; a shorter interval re-runs the decoder faster than words arrive, and a longer one
+/// stops feeling live.
+const PARTIAL_INTERVAL_MS: u64 = 400;
+
+/// Only the most recent 8 s are re-transcribed for a caption. Decode cost grows with the buffer,
+/// and a caption that needs the whole take to be right is not live; 8 s is longer than a sentence
+/// spoken without a breath, so the tail always holds the words being said.
+const PARTIAL_WINDOW_MS: u64 = 8_000;
+
+fn samples_for(sample_rate: u16, ms: u64) -> usize {
+    (u64::from(sample_rate) * ms / 1_000) as usize
+}
+
 /// A push-to-talk loop. The four stages are traits so tests run without a microphone or model.
 /// The default source is the built-in cpal engine, the default recognizer the built-in whisper
 /// chain, and the default player the built-in cpal output; helper binaries are only fallback
@@ -709,10 +760,36 @@ where
         turn
     }
 
+    /// Listen with live captions: `on_partial` is called with the transcript of what has been
+    /// said so far, roughly every [`PARTIAL_INTERVAL_MS`] while the operator is still speaking,
+    /// and only when the text actually changed. The final transcript is delivered as the last
+    /// caption, so a caption line ends on the authoritative text instead of on a guess made from
+    /// the tail of the take, and it is also the return value — the same one [`listen_once`]
+    /// produces for the same audio, because the take is trimmed and transcribed by the same code.
+    /// Captioning is best effort: an engine that cannot caption, or a model that is not on disk,
+    /// costs the captions, never the turn.
+    pub fn listen_live<F: FnMut(&str)>(&mut self, mut on_partial: F) -> Result<Option<String>>
+    where
+        R: Captioner,
+    {
+        self.phase = VoicePhase::Capturing;
+        let turn = self.listen_live_turn(&mut on_partial);
+        if turn.is_err() {
+            self.phase = VoicePhase::Idle;
+        }
+        turn
+    }
+
     fn listen_turn(&mut self) -> Result<Option<String>> {
         let pcm = self
             .source
             .record_cancellable(self.config.max_record_ms, &self.cancel)?;
+        self.transcribe_take(pcm)
+    }
+
+    /// The half both listen paths share: trim the take to its speech, then transcribe it. One
+    /// implementation, so a live turn cannot end on a different transcript than a plain one.
+    fn transcribe_take(&mut self, pcm: Vec<i16>) -> Result<Option<String>> {
         if pcm.len() < self.config.sample_rate as usize / 100 {
             self.phase = VoicePhase::Idle;
             return Ok(None);
@@ -740,6 +817,74 @@ where
             .transcribe_cancellable(&pcm[start..end], &self.cancel);
         self.phase = VoicePhase::Idle;
         turn
+    }
+
+    fn listen_live_turn(&mut self, on_partial: &mut dyn FnMut(&str)) -> Result<Option<String>>
+    where
+        R: Captioner,
+    {
+        let sample_rate = self.config.sample_rate;
+        let step = samples_for(sample_rate, PARTIAL_INTERVAL_MS);
+        let window = samples_for(sample_rate, PARTIAL_WINDOW_MS);
+        let max_ms = self.config.max_record_ms;
+        let absolute = self.config.rms_threshold;
+        let ratio = self.config.floor_ratio;
+        let min_speech_ms = self.config.min_speech_ms;
+        let hangover_ms = self.config.hangover_ms;
+
+        let Self {
+            source,
+            recognizer,
+            cancel,
+            ..
+        } = self;
+        let mut buffer: Vec<i16> = Vec::new();
+        let mut caption = String::new();
+        let mut next_at = 0usize;
+        let mut caption_error: Option<String> = None;
+        let pcm = source.record_streaming(max_ms, cancel, &mut |chunk: &[i16]| {
+            buffer.extend_from_slice(chunk);
+            if buffer.len() < next_at {
+                return;
+            }
+            next_at = buffer.len() + step;
+            // Silence is not captioned: the gate that ends the take also decides when a caption
+            // is worth asking for, so a quiet room never reaches the model.
+            if detect_speech(
+                &buffer,
+                absolute,
+                ratio,
+                min_speech_ms,
+                hangover_ms,
+                sample_rate,
+            )
+            .is_none()
+            {
+                return;
+            }
+            let tail = &buffer[buffer.len().saturating_sub(window)..];
+            match recognizer.transcribe_partial(tail) {
+                Ok(text) if !text.is_empty() && text != caption => {
+                    caption = text;
+                    on_partial(&caption);
+                }
+                Ok(_) => {}
+                Err(VoiceError::Cancelled) => {}
+                Err(err) => {
+                    caption_error.get_or_insert_with(|| err.to_string());
+                }
+            }
+        })?;
+        if let Some(err) = caption_error {
+            self.note(&format!("live captions are unavailable: {err}"));
+        }
+        let turn = self.transcribe_take(pcm)?;
+        if let Some(text) = &turn
+            && *text != caption
+        {
+            on_partial(text);
+        }
+        Ok(turn)
     }
 
     /// Speak a reply. Interruptible: a cancel during synthesis or playback returns
@@ -1382,6 +1527,193 @@ mod tests {
         assert!(matches!(err, VoiceError::Cancelled));
         assert!(!matches!(err, VoiceError::Config(_)));
         assert!(heard.lock().unwrap().is_empty());
+    }
+
+    /// A source that hands its audio over the way the device does: chunk by chunk, while the
+    /// caller is free to work on what has already arrived.
+    struct StreamingSource(Vec<Vec<i16>>);
+
+    impl AudioSource for StreamingSource {
+        fn record(&mut self, _: u64) -> Result<Vec<i16>> {
+            Ok(self.0.concat())
+        }
+
+        fn record_streaming(
+            &mut self,
+            _: u64,
+            cancel: &crate::CancelToken,
+            on_chunk: &mut dyn FnMut(&[i16]),
+        ) -> Result<Vec<i16>> {
+            let mut pcm = Vec::new();
+            for chunk in &self.0 {
+                cancel.check()?;
+                pcm.extend_from_slice(chunk);
+                on_chunk(chunk);
+            }
+            Ok(pcm)
+        }
+    }
+
+    /// Captions whatever it was given, sized so every refresh is visibly a new caption.
+    struct CaptioningRecognizer {
+        text: Option<String>,
+        calls: Arc<AtomicUsize>,
+        captions: Arc<AtomicUsize>,
+    }
+
+    impl Recognizer for CaptioningRecognizer {
+        fn transcribe(&mut self, _: &[i16]) -> Result<Option<String>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.text.clone())
+        }
+    }
+
+    impl Captioner for CaptioningRecognizer {
+        fn transcribe_partial(&mut self, pcm: &[i16]) -> Result<String> {
+            self.captions.fetch_add(1, Ordering::SeqCst);
+            Ok(format!("{} samples", pcm.len()))
+        }
+    }
+
+    type LiveSession = VoiceSession<StreamingSource, CaptioningRecognizer, FakeSynth, FakePlayer>;
+
+    fn live_session(
+        chunks: Vec<Vec<i16>>,
+        transcript: Option<&str>,
+    ) -> (LiveSession, Arc<AtomicUsize>) {
+        let captions = Arc::new(AtomicUsize::new(0));
+        let config = VoiceConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let session = VoiceSession::with_parts(
+            config,
+            StreamingSource(chunks),
+            CaptioningRecognizer {
+                text: transcript.map(str::to_owned),
+                calls: Arc::new(AtomicUsize::new(0)),
+                captions: captions.clone(),
+            },
+            FakeSynth(b"RIFFfake".to_vec()),
+            FakePlayer(Arc::new(Mutex::new(Vec::new()))),
+        );
+        (session, captions)
+    }
+
+    /// Speech-like audio in 10 ms chunks, the way a device delivers it: 300 ms of voiced sound
+    /// then 100 ms of silence, repeated. The pauses matter — a single unbroken tone raises the
+    /// adaptive noise floor until the gate closes on it, which is the VAD's documented limit.
+    fn spoken_chunks() -> Vec<Vec<i16>> {
+        let mut pcm = vec![0i16; 9_600];
+        for _ in 0..10 {
+            pcm.extend((0..4_800).map(|i| ((i as f64 * 0.08).sin() * 16_000.0) as i16));
+            pcm.extend(vec![0i16; 1_600]);
+        }
+        pcm.extend(vec![0i16; 3_200]);
+        pcm.chunks(160).map(<[i16]>::to_vec).collect()
+    }
+
+    #[test]
+    fn live_captions_arrive_while_the_operator_is_still_speaking() {
+        let (mut session, caption_calls) = live_session(spoken_chunks(), Some("hello vikram"));
+        let mut captions: Vec<String> = Vec::new();
+        let heard = session.listen_live(|text| captions.push(text.to_owned()));
+        assert!(
+            captions.len() >= 2,
+            "a live turn must caption before the speaker stops: {captions:?}"
+        );
+        // Every partial but the last is the recognizer's caption of the audio so far, which this
+        // fake reports as a sample count: it must grow, or the caption is not tracking the speech.
+        let partials = &captions[..captions.len() - 1];
+        let heard_samples: Vec<usize> = partials
+            .iter()
+            .map(|caption| caption.split(' ').next().unwrap().parse().unwrap())
+            .collect();
+        assert!(
+            heard_samples.windows(2).all(|pair| pair[0] < pair[1]),
+            "each caption grows with the audio heard: {captions:?}"
+        );
+        let distinct: std::collections::HashSet<&String> = captions.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            captions.len(),
+            "a caption is only reported when it changed: {captions:?}"
+        );
+        assert!(
+            caption_calls.load(Ordering::SeqCst) >= partials.len(),
+            "every partial came from the recognizer, not from the session"
+        );
+        assert_eq!(heard.unwrap().as_deref(), Some("hello vikram"));
+        assert_eq!(
+            captions.last().map(String::as_str),
+            Some("hello vikram"),
+            "the line ends on the final transcript, not on a partial: {captions:?}"
+        );
+    }
+
+    #[test]
+    fn silence_never_gets_a_caption() {
+        let chunks = vec![vec![0i16; 16_000]; 30];
+        let (mut session, caption_calls) = live_session(chunks, Some("invented"));
+        let mut captions: Vec<String> = Vec::new();
+        assert_eq!(
+            session
+                .listen_live(|text| captions.push(text.to_owned()))
+                .unwrap(),
+            None
+        );
+        assert!(
+            captions.is_empty(),
+            "a quiet room is not captioned: {captions:?}"
+        );
+        assert_eq!(caption_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cancel_mid_utterance_stops_the_captions() {
+        let (mut session, _) = live_session(spoken_chunks(), Some("hello vikram"));
+        let token = session.cancel_token();
+        let mut captions: Vec<String> = Vec::new();
+        let result = session.listen_live(|text| {
+            captions.push(text.to_owned());
+            if captions.len() == 2 {
+                token.cancel();
+            }
+        });
+        assert!(matches!(result, Err(VoiceError::Cancelled)), "{result:?}");
+        assert_eq!(
+            captions.len(),
+            2,
+            "no caption after the cancel: {captions:?}"
+        );
+        assert_eq!(session.phase(), VoicePhase::Idle);
+    }
+
+    #[test]
+    fn a_live_turn_ends_on_the_same_transcript_as_a_plain_one() {
+        let (mut live, _) = live_session(spoken_chunks(), Some("hello vikram"));
+        let (mut plain, _, _) = session(spoken_chunks().concat(), Some("hello vikram"));
+        let live_text = live.listen_live(|_| {}).unwrap();
+        let plain_text = plain.listen_once().unwrap();
+        assert_eq!(live_text, plain_text);
+        assert_eq!(live_text.as_deref(), Some("hello vikram"));
+    }
+
+    #[test]
+    fn the_built_in_engine_captions_through_the_captioner() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = VoiceConfig {
+            enabled: true,
+            models_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let mut engine = AsrEngine::new(&config);
+        // A short buffer returns before the model is touched, so this exercises the delegation
+        // itself: a self-recursive impl would overflow the stack here.
+        assert_eq!(
+            <AsrEngine as Captioner>::transcribe_partial(&mut engine, &[0i16; 10]).unwrap(),
+            ""
+        );
     }
 
     #[test]

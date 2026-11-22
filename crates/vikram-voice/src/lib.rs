@@ -26,8 +26,8 @@ pub use capture::{CpalSource, DeviceSource, input_devices, probe_capture};
 pub use helpers::{first_available, missing_tool_message, probe, which};
 pub use player::{CpalPlayer, DevicePlayer, output_devices, probe_playback};
 pub use session::{
-    AudioSource, HelperPlayer, HelperRecognizer, HelperSource, HelperSynth, Player, Recognizer,
-    Synthesizer, VoiceSession, pick_voice, piper_voices, spoken_text,
+    AudioSource, Captioner, HelperPlayer, HelperRecognizer, HelperSource, HelperSynth, Player,
+    Recognizer, Synthesizer, VoiceSession, pick_voice, piper_voices, spoken_text,
 };
 pub use vad::{detect_speech, is_silent, noise_floor, speech_gate, trim_silence};
 
