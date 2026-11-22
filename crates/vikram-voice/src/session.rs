@@ -9,7 +9,7 @@ use crate::vad::{detect_speech, is_loud};
 use crate::{AsrEngine, Result, StageStatus, VoiceConfig, VoiceError, VoiceStatus, probe};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, mpsc};
 
 /// One bounded capture. Implementations must return 16 kHz mono s16le samples.
 pub trait AudioSource: Send {
@@ -280,6 +280,11 @@ fn pick_voice_in(configured: Option<&Path>, discovered: Vec<PathBuf>) -> Option<
         .or_else(|| discovered.into_iter().next())
 }
 
+/// The most one synthesized chunk may carry. Mirrors the CLI's spoken budget (`voice.rs`'s
+/// `SPOKEN_MAX_BYTES`): a sentence longer than this is a paragraph read aloud, and splitting it
+/// is what keeps the first sound from waiting on the whole reply.
+const SPOKEN_MAX_BYTES: usize = 1_200;
+
 /// The part of a reply worth hearing. Replies are written for the screen: markdown layout,
 /// backticked identifiers, file references and emoji all read badly aloud, so they are removed
 /// or spelled out before synthesis.
@@ -301,6 +306,67 @@ pub fn spoken_text(text: &str) -> String {
         out.push('\n');
     }
     out.trim().to_owned()
+}
+
+/// The spoken text cut where a synthesizer can start: sentence ends and line breaks, each piece
+/// non-empty and inside [`SPOKEN_MAX_BYTES`]. Splitting is what makes speech start on the first
+/// sentence instead of after the whole reply has been synthesized.
+fn sentences(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        current.push(c);
+        // A period only ends a sentence when something can follow it: "1.5 seconds" and
+        // "example.com" stay one chunk, while "done. Next" and a trailing "done." split.
+        let ends = match c {
+            '\n' => true,
+            '.' | '!' | '?' => chars
+                .peek()
+                .is_none_or(|next| next.is_whitespace() || matches!(next, '"' | '\'' | ')' | ']')),
+            _ => false,
+        };
+        if ends {
+            push_sentence(&mut out, std::mem::take(&mut current));
+        }
+    }
+    push_sentence(&mut out, current);
+    out
+}
+
+fn push_sentence(out: &mut Vec<String>, text: String) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    out.extend(within_budget(text));
+}
+
+/// Cut at the last word boundary inside the budget, so a piece never splits a word or a UTF-8
+/// sequence; a single token longer than the budget is cut where the budget ends.
+fn within_budget(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while rest.len() > SPOKEN_MAX_BYTES {
+        let mut end = SPOKEN_MAX_BYTES;
+        while end > 0 && !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        let head = &rest[..end];
+        let cut = head
+            .rfind(char::is_whitespace)
+            .filter(|cut| *cut > 0)
+            .unwrap_or(end);
+        let piece = head[..cut].trim();
+        if !piece.is_empty() {
+            out.push(piece.to_owned());
+        }
+        rest = rest[cut..].trim_start();
+    }
+    if !rest.is_empty() {
+        out.push(rest.to_owned());
+    }
+    out
 }
 
 fn strip_fences(text: &str) -> String {
@@ -670,6 +736,11 @@ const PARTIAL_INTERVAL_MS: u64 = 400;
 /// spoken without a breath, so the tail always holds the words being said.
 const PARTIAL_WINDOW_MS: u64 = 8_000;
 
+/// WAVs the synthesizer may run ahead of playback. Two is enough to synthesize the next sentence
+/// while the current one plays, and bounded so a long reply cannot hold the whole of itself in
+/// memory as audio.
+const PENDING_WAVS: usize = 2;
+
 fn samples_for(sample_rate: u16, ms: u64) -> usize {
     (u64::from(sample_rate) * ms / 1_000) as usize
 }
@@ -916,6 +987,89 @@ where
             ));
         }
         self.player.play_cancellable(&wav, &self.cancel)
+    }
+
+    /// Speak a reply sentence by sentence: the first sentence starts playing while the second is
+    /// still being synthesized, so the operator hears Vikram begin instead of waiting out the
+    /// whole reply. Cancellation stops synthesis and playback; a synthesis failure on sentence N
+    /// still plays 1..N-1 first, because those sentences are already spoken.
+    pub fn speak_streaming(&mut self, text: &str) -> Result<()>
+    where
+        Y: Sync,
+    {
+        self.cancel.check()?;
+        if text.trim().is_empty() {
+            return Err(VoiceError::Config(
+                "refusing to speak an empty reply".into(),
+            ));
+        }
+        let spoken = spoken_text(text);
+        if spoken.is_empty() {
+            return Err(VoiceError::Config(
+                "refusing to speak a reply with nothing but layout in it".into(),
+            ));
+        }
+        let chunks = sentences(&spoken);
+        self.phase = VoicePhase::Speaking;
+        let turn = if chunks.len() == 1 {
+            self.speak_turn(&chunks[0])
+        } else {
+            self.stream_turn(&chunks)
+        };
+        self.phase = VoicePhase::Idle;
+        turn
+    }
+
+    fn stream_turn(&mut self, chunks: &[String]) -> Result<()>
+    where
+        Y: Sync,
+    {
+        debug_assert!(
+            !chunks.is_empty(),
+            "spoken text always yields at least one chunk"
+        );
+        let Self {
+            synth,
+            player,
+            cancel,
+            ..
+        } = self;
+        let synth: &Y = synth;
+        let play_cancel = cancel.clone();
+        let worker_cancel = cancel.clone();
+        let (tx, rx) = mpsc::sync_channel::<Result<Vec<u8>>>(PENDING_WAVS);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                for chunk in chunks {
+                    if worker_cancel.is_cancelled() {
+                        return;
+                    }
+                    let wav = synth.synthesize_cancellable(chunk, &worker_cancel);
+                    let failed = wav.is_err();
+                    if tx.send(wav).is_err() || failed {
+                        return;
+                    }
+                }
+            });
+            // Receiving in order is what keeps playback in order: one channel, one producer.
+            for _ in chunks {
+                match rx.recv() {
+                    Ok(Ok(wav)) => {
+                        if wav.is_empty() {
+                            return Err(VoiceError::InvalidAudio(
+                                "synthesizer produced no audio".into(),
+                            ));
+                        }
+                        player.play_cancellable(&wav, &play_cancel)?;
+                    }
+                    Ok(Err(err)) => return Err(err),
+                    Err(_) => break,
+                }
+            }
+            // A worker that stopped without a word stopped for the cancel token; calling that
+            // success would report an interrupted reply as fully spoken.
+            play_cancel.check()
+        })
     }
 
     /// Probe the stages, plus every run-time degrade note the engines have accumulated.
@@ -1714,6 +1868,195 @@ mod tests {
             <AsrEngine as Captioner>::transcribe_partial(&mut engine, &[0i16; 10]).unwrap(),
             ""
         );
+    }
+
+    #[test]
+    fn sentences_split_on_ends_and_cap_a_long_one() {
+        assert_eq!(
+            sentences("One. Two! Three?\nFour"),
+            vec!["One.", "Two!", "Three?", "Four"]
+        );
+        assert_eq!(
+            sentences("It takes 1.5 seconds. Then it stops."),
+            vec!["It takes 1.5 seconds.", "Then it stops."],
+            "a decimal point is not a sentence end"
+        );
+        assert_eq!(
+            sentences("Wait... what? Yes."),
+            vec!["Wait...", "what?", "Yes."]
+        );
+        assert!(sentences("   \n ").is_empty());
+        let long = "word ".repeat(400);
+        let pieces = sentences(&long);
+        assert!(pieces.len() >= 2, "{pieces:?}");
+        assert!(pieces.iter().all(|piece| piece.len() <= SPOKEN_MAX_BYTES));
+        assert!(
+            pieces
+                .iter()
+                .all(|piece| !piece.starts_with(' ') && !piece.ends_with(' ')),
+            "no piece carries edge whitespace: {pieces:?}"
+        );
+    }
+
+    /// Returns the text it was asked to speak as the "WAV", so playback order is visible.
+    struct EchoSynth(Arc<Mutex<Vec<String>>>);
+
+    impl Synthesizer for EchoSynth {
+        fn synthesize(&self, text: &str) -> Result<Vec<u8>> {
+            self.0.lock().unwrap().push(text.to_owned());
+            Ok(text.as_bytes().to_vec())
+        }
+    }
+
+    struct RecordingPlayer(Arc<Mutex<Vec<Vec<u8>>>>);
+
+    impl Player for RecordingPlayer {
+        fn play(&mut self, wav: &[u8]) -> Result<()> {
+            self.0.lock().unwrap().push(wav.to_vec());
+            Ok(())
+        }
+    }
+
+    fn streaming_session<Y, P>(
+        synth: Y,
+        player: P,
+    ) -> VoiceSession<FakeSource, FakeRecognizer, Y, P>
+    where
+        Y: Synthesizer,
+        P: Player,
+    {
+        VoiceSession::with_parts(
+            VoiceConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            FakeSource(Vec::new()),
+            FakeRecognizer {
+                text: None,
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            synth,
+            player,
+        )
+    }
+
+    #[test]
+    fn a_three_sentence_reply_plays_in_order() {
+        let spoken = Arc::new(Mutex::new(Vec::new()));
+        let played = Arc::new(Mutex::new(Vec::new()));
+        let mut session =
+            streaming_session(EchoSynth(spoken.clone()), RecordingPlayer(played.clone()));
+        session
+            .speak_streaming("First one. Second one. Third one.")
+            .unwrap();
+        assert_eq!(
+            *spoken.lock().unwrap(),
+            vec!["First one.", "Second one.", "Third one."]
+        );
+        let played: Vec<String> = played
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|wav| String::from_utf8(wav.clone()).unwrap())
+            .collect();
+        assert_eq!(played, vec!["First one.", "Second one.", "Third one."]);
+    }
+
+    struct SteppedSynth(Arc<AtomicUsize>);
+
+    impl Synthesizer for SteppedSynth {
+        fn synthesize(&self, _: &str) -> Result<Vec<u8>> {
+            Ok(b"RIFFone".to_vec())
+        }
+
+        fn synthesize_cancellable(&self, _: &str, cancel: &crate::CancelToken) -> Result<Vec<u8>> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(b"RIFFone".to_vec());
+            }
+            abort_on_cancel(cancel)?;
+            Ok(b"RIFFtwo".to_vec())
+        }
+    }
+
+    #[test]
+    fn cancel_during_the_second_sentence_stops_playback() {
+        let played = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut session =
+            streaming_session(SteppedSynth(calls.clone()), RecordingPlayer(played.clone()));
+        cancel_soon(session.cancel_token(), 30);
+        let result = session.speak_streaming("First one. Second one.");
+        assert!(matches!(result, Err(VoiceError::Cancelled)), "{result:?}");
+        assert_eq!(session.phase(), VoicePhase::Idle);
+        assert_eq!(
+            played.lock().unwrap().len(),
+            1,
+            "only the sentence already synthesized was heard"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the cancel landed in the second synthesis"
+        );
+    }
+
+    struct FailingSynth(Arc<AtomicUsize>);
+
+    impl Synthesizer for FailingSynth {
+        fn synthesize(&self, _: &str) -> Result<Vec<u8>> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(b"RIFFone".to_vec())
+            } else {
+                Err(VoiceError::Helper("boom".into()))
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_sentence_still_plays_the_ones_before_it() {
+        let played = Arc::new(Mutex::new(Vec::new()));
+        let mut session = streaming_session(
+            FailingSynth(Arc::new(AtomicUsize::new(0))),
+            RecordingPlayer(played.clone()),
+        );
+        let err = session
+            .speak_streaming("First one. Second one.")
+            .unwrap_err();
+        assert!(matches!(err, VoiceError::Helper(_)), "{err:?}");
+        assert!(err.to_string().contains("boom"), "{err}");
+        assert_eq!(*played.lock().unwrap(), vec![b"RIFFone".to_vec()]);
+        assert_eq!(session.phase(), VoicePhase::Idle);
+    }
+
+    #[test]
+    fn a_single_sentence_reply_takes_the_one_shot_path() {
+        let heard = Arc::new(Mutex::new(String::new()));
+        let played = Arc::new(Mutex::new(Vec::new()));
+        let mut session = streaming_session(
+            RecordingSynth(heard.clone()),
+            RecordingPlayer(played.clone()),
+        );
+        session.speak_streaming("turn on the lights").unwrap();
+        assert_eq!(*heard.lock().unwrap(), "turn on the lights");
+        assert_eq!(*played.lock().unwrap(), vec![b"RIFFfake".to_vec()]);
+    }
+
+    #[test]
+    fn streaming_refuses_an_empty_or_layout_only_reply() {
+        let spoken = Arc::new(Mutex::new(Vec::new()));
+        let played = Arc::new(Mutex::new(Vec::new()));
+        let mut session =
+            streaming_session(EchoSynth(spoken.clone()), RecordingPlayer(played.clone()));
+        assert!(matches!(
+            session.speak_streaming("   "),
+            Err(VoiceError::Config(_))
+        ));
+        assert!(matches!(
+            session.speak_streaming("```rust\nlet x = 1;\n```"),
+            Err(VoiceError::Config(_))
+        ));
+        assert!(spoken.lock().unwrap().is_empty());
+        assert!(played.lock().unwrap().is_empty());
     }
 
     #[test]
