@@ -541,6 +541,19 @@ impl Config {
 
     pub fn save(&self) -> Result<(), RuntimeError> {
         let path = config_path();
+        // A test that forgets VIKRAM_HOME would otherwise rewrite the operator's real config —
+        // which is exactly how "test-model" ended up in a live config once. Refuse loudly instead.
+        if cfg!(test)
+            && std::env::var_os("VIKRAM_HOME").is_none()
+            && std::env::var_os("VIKRAM_ALLOW_REAL_HOME").is_none()
+        {
+            return Err(RuntimeError::Config {
+                path,
+                reason: "a test tried to write the real config; set VIKRAM_HOME to a temp dir \
+                         (or VIKRAM_ALLOW_REAL_HOME=1 if that is genuinely intended)"
+                    .into(),
+            });
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| RuntimeError::Config {
                 path: parent.to_path_buf(),
