@@ -8,6 +8,7 @@ use crate::helpers::{
 };
 use crate::player::DevicePlayer;
 use crate::vad::{detect_speech, is_loud};
+use crate::webspeech::WebSpeechRecognizer;
 use crate::{
     AsrEngine, Result, StageStatus, SttProvider, TtsProvider, VoiceConfig, VoiceError, VoiceStatus,
     probe,
@@ -68,6 +69,23 @@ pub trait Recognizer: Send {
     ) -> Result<Option<String>> {
         cancel.check()?;
         self.transcribe(pcm)
+    }
+
+    /// True when this engine transcribes the local take. The browser bridge captures in the
+    /// page, so a session asks it for a transcript without opening a microphone first.
+    fn captures_audio(&self) -> bool {
+        true
+    }
+
+    /// Transcribe with the built-in chain, whatever provider is selected. Used after a bridge
+    /// already failed, so a fallback does not open a second browser window; engines without a
+    /// bridge simply transcribe.
+    fn transcribe_local(
+        &mut self,
+        pcm: &[i16],
+        cancel: &crate::CancelToken,
+    ) -> Result<Option<String>> {
+        self.transcribe_cancellable(pcm, cancel)
     }
 
     /// Degrade notes accumulated at run time (engine failures, fallbacks taken). Taking them
@@ -841,7 +859,8 @@ impl Synthesizer for VoiceSynth {
 }
 
 /// The recognizer a session listens through. `Local` is the built-in wavo chain; `Cloud` is the
-/// opt-in cloud recognizer with the local chain behind it, so a cloud failure costs one note and
+/// opt-in cloud recognizer with the local chain behind it; `WebSpeech` is the optional keyless
+/// browser bridge, also with the local chain behind it. Either opt-in failure costs one note and
 /// never the turn. Captions always come from the local chain: a cloud call every 400 ms of speech
 /// would bill the operator for a guess, and a caption is a guess by design.
 pub enum VoiceRecognizer {
@@ -853,6 +872,12 @@ pub enum VoiceRecognizer {
         /// the recognizer chain.
         note: Option<String>,
     },
+    WebSpeech {
+        webspeech: WebSpeechRecognizer,
+        local: AsrEngine,
+        /// The one degrade note a bridge failure leaves behind.
+        note: Option<String>,
+    },
 }
 
 impl VoiceRecognizer {
@@ -861,6 +886,11 @@ impl VoiceRecognizer {
     pub fn new(config: &VoiceConfig) -> Self {
         let local = AsrEngine::new(config);
         match SttProvider::parse(&config.stt_provider) {
+            Some(SttProvider::WebSpeech) => Self::WebSpeech {
+                webspeech: WebSpeechRecognizer::new(config),
+                local,
+                note: None,
+            },
             Some(provider) if provider.is_cloud() => Self::Cloud {
                 cloud: CloudRecognizer::new(config),
                 local,
@@ -875,24 +905,60 @@ impl VoiceRecognizer {
         matches!(self, Self::Cloud { .. })
     }
 
+    /// True when the optional browser bridge transcribes first.
+    pub fn is_webspeech(&self) -> bool {
+        matches!(self, Self::WebSpeech { .. })
+    }
+
     /// The cloud half, when a cloud provider is selected.
     pub fn cloud(&self) -> Option<&CloudRecognizer> {
         match self {
-            Self::Local(_) => None,
+            Self::Local(_) | Self::WebSpeech { .. } => None,
             Self::Cloud { cloud, .. } => Some(cloud),
+        }
+    }
+
+    /// The browser bridge, when it is selected.
+    pub fn webspeech(&self) -> Option<&WebSpeechRecognizer> {
+        match self {
+            Self::WebSpeech { webspeech, .. } => Some(webspeech),
+            _ => None,
         }
     }
 
     fn local_mut(&mut self) -> &mut AsrEngine {
         match self {
             Self::Local(local) => local,
-            Self::Cloud { local, .. } => local,
+            Self::Cloud { local, .. } | Self::WebSpeech { local, .. } => local,
         }
     }
 }
 
-/// Cloud first, local second: any cloud failure except a cancel leaves one note and hands the take
-/// to the local chain, so the turn is never dead and never silent.
+/// Opt-in engine first, local second: any failure except a cancel leaves one note and hands the
+/// take to the local chain, so the turn is never dead and never silent.
+fn transcribe_via(
+    primary: &mut dyn Recognizer,
+    label: &str,
+    local: &mut dyn Recognizer,
+    pcm: &[i16],
+    cancel: &CancelToken,
+    note: &mut Option<String>,
+) -> Result<Option<String>> {
+    match primary.transcribe_cancellable(pcm, cancel) {
+        Ok(text) => Ok(text),
+        Err(VoiceError::Cancelled) => Err(VoiceError::Cancelled),
+        Err(err) => {
+            if note.is_none() {
+                *note = Some(format!(
+                    "{label}: {err}; transcribing with the built-in wavo model"
+                ));
+            }
+            local.transcribe_cancellable(pcm, cancel)
+        }
+    }
+}
+
+/// The cloud half of [`transcribe_via`], kept as its own name for the existing call sites.
 fn transcribe_via_cloud(
     cloud: &mut CloudRecognizer,
     local: &mut dyn Recognizer,
@@ -900,19 +966,8 @@ fn transcribe_via_cloud(
     cancel: &CancelToken,
     note: &mut Option<String>,
 ) -> Result<Option<String>> {
-    match cloud.transcribe_cancellable(pcm, cancel) {
-        Ok(text) => Ok(text),
-        Err(VoiceError::Cancelled) => Err(VoiceError::Cancelled),
-        Err(err) => {
-            if note.is_none() {
-                *note = Some(format!(
-                    "{}: {err}; transcribing with the built-in wavo model",
-                    cloud.provider().as_str()
-                ));
-            }
-            local.transcribe_cancellable(pcm, cancel)
-        }
-    }
+    let label = cloud.provider().as_str();
+    transcribe_via(cloud, label, local, pcm, cancel, note)
 }
 
 impl Recognizer for VoiceRecognizer {
@@ -930,13 +985,26 @@ impl Recognizer for VoiceRecognizer {
             Self::Cloud { cloud, local, note } => {
                 transcribe_via_cloud(cloud, local, pcm, cancel, note)
             }
+            Self::WebSpeech {
+                webspeech,
+                local,
+                note,
+            } => transcribe_via(webspeech, "webspeech", local, pcm, cancel, note),
         }
+    }
+
+    fn captures_audio(&self) -> bool {
+        !matches!(self, Self::WebSpeech { .. })
+    }
+
+    fn transcribe_local(&mut self, pcm: &[i16], cancel: &CancelToken) -> Result<Option<String>> {
+        self.local_mut().transcribe_cancellable(pcm, cancel)
     }
 
     fn notes(&mut self) -> Vec<String> {
         match self {
             Self::Local(local) => local.notes(),
-            Self::Cloud { local, note, .. } => {
+            Self::Cloud { local, note, .. } | Self::WebSpeech { local, note, .. } => {
                 let mut notes = local.notes();
                 if let Some(note) = note.take() {
                     notes.push(note);
@@ -1030,13 +1098,18 @@ impl VoiceSession {
         if !config.enabled {
             return Err(VoiceError::Disabled);
         }
-        if let StageStatus::Missing(reason) = probe(&config).capture {
+        let recognizer = VoiceRecognizer::new(&config);
+        // The browser bridge captures in the page, so a machine with no microphone can still
+        // dictate through it. Every other provider records here and needs the device.
+        if recognizer.captures_audio()
+            && let StageStatus::Missing(reason) = probe(&config).capture
+        {
             return Err(VoiceError::MissingHelper(reason));
         }
         Ok(Self::with_parts(
             config.clone(),
             DeviceSource::new(&config),
-            VoiceRecognizer::new(&config),
+            recognizer,
             VoiceSynth::new(&config),
             DevicePlayer::new(&config),
         ))
@@ -1106,6 +1179,11 @@ where
     where
         R: Captioner,
     {
+        // The browser bridge records in the page, so there is no local audio to caption. The
+        // plain path is the honest one, and it needs no microphone.
+        if !self.recognizer.captures_audio() {
+            return self.listen_once();
+        }
         self.phase = VoicePhase::Capturing;
         let turn = self.listen_live_turn(&mut on_partial);
         if turn.is_err() {
@@ -1115,6 +1193,25 @@ where
     }
 
     fn listen_turn(&mut self) -> Result<Option<String>> {
+        // The browser bridge records the microphone in the page; opening the local one as well
+        // would be a second microphone for one utterance, and its audio would be thrown away.
+        if !self.recognizer.captures_audio() {
+            self.phase = VoicePhase::Transcribing;
+            let turn = self.recognizer.transcribe_cancellable(&[], &self.cancel);
+            self.phase = VoicePhase::Idle;
+            return match turn {
+                Ok(text) => Ok(text),
+                Err(VoiceError::Cancelled) => Err(VoiceError::Cancelled),
+                // The bridge is gone and the recognizer left its note. Record the take now and
+                // transcribe it locally, so the fallback is real audio rather than silence.
+                Err(_) => {
+                    let pcm = self
+                        .source
+                        .record_cancellable(self.config.max_record_ms, &self.cancel)?;
+                    self.transcribe_take_with(pcm, true)
+                }
+            };
+        }
         let pcm = self
             .source
             .record_cancellable(self.config.max_record_ms, &self.cancel)?;
@@ -1124,6 +1221,12 @@ where
     /// The half both listen paths share: trim the take to its speech, then transcribe it. One
     /// implementation, so a live turn cannot end on a different transcript than a plain one.
     fn transcribe_take(&mut self, pcm: Vec<i16>) -> Result<Option<String>> {
+        self.transcribe_take_with(pcm, false)
+    }
+
+    /// `local_only` skips the selected provider: the path a failed bridge takes so it is not
+    /// opened a second time for the take that was just recorded for the fallback.
+    fn transcribe_take_with(&mut self, pcm: Vec<i16>, local_only: bool) -> Result<Option<String>> {
         if pcm.len() < self.config.sample_rate as usize / 100 {
             self.phase = VoicePhase::Idle;
             return Ok(None);
@@ -1146,9 +1249,12 @@ where
             return Ok(None);
         };
         self.phase = VoicePhase::Transcribing;
-        let turn = self
-            .recognizer
-            .transcribe_cancellable(&pcm[start..end], &self.cancel);
+        let take = &pcm[start..end];
+        let turn = if local_only {
+            self.recognizer.transcribe_local(take, &self.cancel)
+        } else {
+            self.recognizer.transcribe_cancellable(take, &self.cancel)
+        };
         self.phase = VoicePhase::Idle;
         turn
     }
@@ -1610,6 +1716,72 @@ mod tests {
         assert_eq!(session.phase(), VoicePhase::Idle);
         assert_eq!(source_calls.load(Ordering::SeqCst), 1);
         assert_eq!(recognizer_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A source that counts how often it is asked for audio: a browser turn must ask zero times.
+    struct CountingSource(Arc<AtomicUsize>);
+    impl AudioSource for CountingSource {
+        fn record(&mut self, _: u64) -> Result<Vec<i16>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![0i16; 1_600])
+        }
+    }
+
+    /// A recognizer shaped like the browser bridge: it has words without a local take.
+    struct BridgeLike {
+        text: Option<String>,
+        calls: Arc<AtomicUsize>,
+        captions: Arc<AtomicUsize>,
+    }
+    impl Recognizer for BridgeLike {
+        fn transcribe(&mut self, _: &[i16]) -> Result<Option<String>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.text.clone())
+        }
+        fn captures_audio(&self) -> bool {
+            false
+        }
+    }
+    impl Captioner for BridgeLike {
+        fn transcribe_partial(&mut self, _: &[i16]) -> Result<String> {
+            self.captions.fetch_add(1, Ordering::SeqCst);
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn a_bridge_session_opens_no_microphone_for_a_turn_or_a_caption() {
+        let source_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captions = Arc::new(AtomicUsize::new(0));
+        let mut session = VoiceSession::with_parts(
+            VoiceConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            CountingSource(source_calls.clone()),
+            BridgeLike {
+                text: Some("from the browser".into()),
+                calls: calls.clone(),
+                captions: captions.clone(),
+            },
+            FakeSynth(Vec::new()),
+            FakePlayer(Arc::new(Mutex::new(Vec::new()))),
+        );
+        let mut shown = Vec::new();
+        let text = session
+            .listen_live(|caption| shown.push(caption.to_string()))
+            .unwrap();
+        assert_eq!(text.as_deref(), Some("from the browser"));
+        assert_eq!(
+            source_calls.load(Ordering::SeqCst),
+            0,
+            "a browser turn must not open the local microphone"
+        );
+        assert!(shown.is_empty(), "there is no local audio to caption");
+        assert_eq!(captions.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one bridge turn");
+        assert_eq!(session.phase(), VoicePhase::Idle);
     }
 
     #[test]
@@ -2673,6 +2845,131 @@ mod tests {
             cloud.cloud().map(CloudRecognizer::provider),
             Some(SttProvider::Google)
         );
+    }
+
+    #[test]
+    fn the_webspeech_provider_is_selected_and_needs_no_local_microphone() {
+        let config = VoiceConfig {
+            stt_provider: "webspeech".into(),
+            stt_language: "en-GB".into(),
+            ..Default::default()
+        };
+        let recognizer = VoiceRecognizer::new(&config);
+        assert!(recognizer.is_webspeech());
+        assert!(!recognizer.is_cloud());
+        assert!(
+            !recognizer.captures_audio(),
+            "the page records the microphone, not this process"
+        );
+        assert!(recognizer.cloud().is_none());
+        let bridge = recognizer.webspeech().expect("the bridge is selected");
+        assert_eq!(bridge.language(), "en-GB");
+
+        let local = VoiceRecognizer::new(&VoiceConfig::default());
+        assert!(!local.is_webspeech());
+        assert!(local.captures_audio());
+    }
+
+    /// A bridge that fails the way a machine without a browser does.
+    struct FailingBridge;
+
+    impl crate::webspeech::WebSpeechTransport for FailingBridge {
+        fn transcribe(
+            &self,
+            _request: &crate::webspeech::WebSpeechRequest,
+            _cancel: &CancelToken,
+        ) -> Result<Option<String>> {
+            Err(VoiceError::WebSpeech(
+                "xdg-open is not installed, so no browser can be opened".into(),
+            ))
+        }
+    }
+
+    #[test]
+    fn a_webspeech_failure_transcribes_locally_and_leaves_one_note() {
+        let config = VoiceConfig {
+            stt_provider: "webspeech".into(),
+            ..Default::default()
+        };
+        let mut bridge = WebSpeechRecognizer::with_parts(&config, Box::new(FailingBridge));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut local = FakeRecognizer {
+            text: Some("local words".into()),
+            calls: calls.clone(),
+        };
+        let mut note = None;
+        let text = transcribe_via(
+            &mut bridge,
+            "webspeech",
+            &mut local,
+            &[1, 2],
+            &CancelToken::new(),
+            &mut note,
+        )
+        .unwrap();
+        assert_eq!(text.as_deref(), Some("local words"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the turn is never dead");
+        let first = note.clone().expect("a bridge failure is reported");
+        assert!(first.starts_with("webspeech:"), "{first}");
+        assert!(first.contains("xdg-open"), "{first}");
+        assert!(first.contains("built-in wavo"), "{first}");
+
+        // A second failure keeps the one note.
+        transcribe_via(
+            &mut bridge,
+            "webspeech",
+            &mut local,
+            &[1, 2],
+            &CancelToken::new(),
+            &mut note,
+        )
+        .unwrap();
+        assert_eq!(
+            note.as_deref(),
+            Some(first.as_str()),
+            "one note per session"
+        );
+    }
+
+    #[test]
+    fn a_webspeech_cancel_is_not_a_failure_and_never_falls_back() {
+        struct NeverCalled;
+        impl crate::webspeech::WebSpeechTransport for NeverCalled {
+            fn transcribe(
+                &self,
+                _request: &crate::webspeech::WebSpeechRequest,
+                cancel: &CancelToken,
+            ) -> Result<Option<String>> {
+                cancel.check()?;
+                Ok(Some("never".into()))
+            }
+        }
+        let config = VoiceConfig {
+            stt_provider: "webspeech".into(),
+            ..Default::default()
+        };
+        let mut bridge = WebSpeechRecognizer::with_parts(&config, Box::new(NeverCalled));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut local = FakeRecognizer {
+            text: Some("local words".into()),
+            calls: calls.clone(),
+        };
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let mut note = None;
+        assert!(matches!(
+            transcribe_via(
+                &mut bridge,
+                "webspeech",
+                &mut local,
+                &[1],
+                &cancel,
+                &mut note
+            ),
+            Err(VoiceError::Cancelled)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(note.is_none());
     }
 
     #[test]

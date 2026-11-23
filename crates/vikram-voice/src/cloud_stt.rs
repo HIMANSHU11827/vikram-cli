@@ -236,12 +236,17 @@ fn endpoint_for(provider: SttProvider, base_url: &str) -> Result<String> {
         SttProvider::Local => Err(VoiceError::Config(
             "stt_provider is local; there is no cloud endpoint to call".into(),
         )),
+        SttProvider::WebSpeech => Err(VoiceError::Config(
+            "stt_provider is webspeech; the browser bridge serves a page on loopback, it does \
+             not call a cloud endpoint"
+                .into(),
+        )),
     }
 }
 
 fn model_for(provider: SttProvider, model: &str) -> String {
     match provider {
-        SttProvider::Local => String::new(),
+        SttProvider::Local | SttProvider::WebSpeech => String::new(),
         SttProvider::Google => model.to_owned(),
         SttProvider::OpenAi => {
             if model.is_empty() {
@@ -384,6 +389,11 @@ impl CloudRecognizer {
             SttProvider::OpenAi | SttProvider::Custom => self.compatible_request(pcm),
             SttProvider::Local => Err(VoiceError::Config(
                 "stt_provider is local; there is no cloud request to build".into(),
+            )),
+            SttProvider::WebSpeech => Err(VoiceError::Config(
+                "stt_provider is webspeech; the browser posts the transcript, this process does \
+                 not build an HTTP request"
+                    .into(),
             )),
         }
     }

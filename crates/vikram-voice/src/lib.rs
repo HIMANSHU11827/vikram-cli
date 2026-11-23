@@ -18,6 +18,7 @@ mod helpers;
 mod player;
 mod session;
 mod vad;
+mod webspeech;
 
 pub use asr::{
     AsrBackend, AsrEngine, DEFAULT_MODEL, VoxtypeRecognizer, WavoRecognizer, models_dir, probe_asr,
@@ -43,6 +44,10 @@ pub use session::{
 pub use vad::{detect_speech, is_silent, noise_floor, speech_gate, trim_silence};
 /// The download types the CLI needs to pull a model by name: `Hub` and its `Quant`.
 pub use wavo::hub::{Hub, Quant};
+pub use webspeech::{
+    LocalBrowserTransport, WebSpeechRecognizer, WebSpeechRequest, WebSpeechServer,
+    WebSpeechTransport, probe_webspeech,
+};
 
 use std::ffi::OsStr;
 use std::path::PathBuf;
@@ -79,6 +84,11 @@ pub enum VoiceError {
     /// the local engine and says so; this is never the end of a turn.
     #[error("cloud engine failed: {0}")]
     Cloud(String),
+    /// The optional browser bridge could not deliver a transcript: no `xdg-open`, no browser, a
+    /// browser-side speech error, or no words. The session falls back to the local engine and
+    /// says so; this is never the end of a turn.
+    #[error("browser speech bridge failed: {0}")]
+    WebSpeech(String),
 }
 
 /// Which synthesizer speaks a reply. `vikram` is the default and the only one that needs no key,
@@ -127,21 +137,26 @@ impl TtsProvider {
 }
 
 /// Which engine turns speech into text. `local` is the default: the built-in wavo model, no key,
-/// no network. The rest are opt-in cloud providers, and `custom` speaks the OpenAI-compatible
-/// shape against a `stt_base_url` the operator supplies.
+/// no network. `webspeech` is the optional free, keyless bridge to the browser's own Chrome
+/// speech engine (the audio goes to Google from the page, never from this process). The rest are
+/// opt-in cloud providers, and `custom` speaks the OpenAI-compatible shape against a
+/// `stt_base_url` the operator supplies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SttProvider {
     Local,
+    WebSpeech,
     Google,
     OpenAi,
     Custom,
 }
 
 impl SttProvider {
-    /// `local`, `google`, `openai` or `custom`; case and surrounding spaces don't matter.
+    /// `local`, `webspeech`, `google`, `openai` or `custom`; case and surrounding spaces don't
+    /// matter. `web-speech` is accepted as a spelling of `webspeech`.
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "local" => Some(Self::Local),
+            "webspeech" | "web-speech" => Some(Self::WebSpeech),
             "google" => Some(Self::Google),
             "openai" => Some(Self::OpenAi),
             "custom" => Some(Self::Custom),
@@ -153,6 +168,7 @@ impl SttProvider {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
+            Self::WebSpeech => "webspeech",
             Self::Google => "google",
             Self::OpenAi => "openai",
             Self::Custom => "custom",
@@ -160,11 +176,18 @@ impl SttProvider {
     }
 
     /// Every name `parse` accepts, for an error that tells the operator what to type.
-    pub const NAMES: &'static str = "local, google, openai, custom";
+    pub const NAMES: &'static str = "local, webspeech, google, openai, custom";
 
-    /// True for every provider that leaves this machine.
+    /// True for every provider whose audio is transcribed by a server this process talks to.
+    /// `webspeech` is not one of them: its audio leaves from the browser, so it needs the
+    /// bridge in [`crate::webspeech`], not the HTTP client in [`crate::cloud_stt`].
     pub fn is_cloud(self) -> bool {
-        !matches!(self, Self::Local)
+        matches!(self, Self::Google | Self::OpenAi | Self::Custom)
+    }
+
+    /// True for the optional keyless browser bridge.
+    pub fn is_webspeech(self) -> bool {
+        matches!(self, Self::WebSpeech)
     }
 
     /// `openai` and `custom` speak the same wire shape; `custom` only supplies its own base URL.
@@ -199,8 +222,9 @@ pub struct VoiceConfig {
     pub voxtype_fast_path: bool,
     pub asr_timeout_secs: u64,
     /// Which engine transcribes: `local` (the default — the built-in wavo model, no key, no
-    /// network) or a cloud provider: `google`, `openai`, `custom`. Any cloud failure falls back to
-    /// the local model with one note, never a dead turn.
+    /// network), `webspeech` (free and keyless: the browser's Chrome speech engine, with the
+    /// audio going to Google from the page), or a cloud provider: `google`, `openai`, `custom`.
+    /// Any failure falls back to the local model with one note, never a dead turn.
     #[serde(alias = "stt_backend")]
     pub stt_provider: String,
     /// The endpoint a cloud provider talks to. Empty means the preset's own endpoint; `custom`
@@ -214,9 +238,13 @@ pub struct VoiceConfig {
     /// `voice.json` and never printed; only this name is stored.
     pub stt_api_key_env: String,
     /// The language a cloud provider is told to expect: a BCP-47 tag for Google (`en-US`),
-    /// reduced to its ISO-639-1 subtag (`en`) for the OpenAI shape. Separate from `asr_language`,
-    /// which is wavo's own whisper field.
+    /// reduced to its ISO-639-1 subtag (`en`) for the OpenAI shape. `webspeech` passes it to the
+    /// page as `SpeechRecognition.lang`. Separate from `asr_language`, which is wavo's own
+    /// whisper field.
     pub stt_language: String,
+    /// How long `webspeech` waits for the browser to post a transcript, in milliseconds. The
+    /// listener is closed at the deadline and the local engine transcribes instead.
+    pub webspeech_timeout_ms: u64,
     pub tts_helper: String,
     pub tts_fallback: String,
     pub tts_voice: Option<PathBuf>,
@@ -285,6 +313,7 @@ impl Default for VoiceConfig {
             stt_model: String::new(),
             stt_api_key_env: "GOOGLE_API_KEY".into(),
             stt_language: "en-US".into(),
+            webspeech_timeout_ms: webspeech::DEFAULT_TIMEOUT_MS,
             tts_helper: "piper".into(),
             tts_fallback: "espeak-ng".into(),
             tts_voice: None,
@@ -318,6 +347,19 @@ impl VoiceConfig {
         if self.asr_timeout_secs == 0 {
             return Err(VoiceError::Config(
                 "asr_timeout_secs must be positive".into(),
+            ));
+        }
+        if self.webspeech_timeout_ms == 0 {
+            return Err(VoiceError::Config(
+                "webspeech_timeout_ms must be positive; the browser gets this long to answer"
+                    .into(),
+            ));
+        }
+        if self.webspeech_timeout_ms > 600_000 {
+            return Err(VoiceError::Config(
+                "webspeech_timeout_ms must be at most 600000 (ten minutes); a longer wait is a \
+                 stuck turn, not a slow one"
+                    .into(),
             ));
         }
         if !(0.0..=1.0).contains(&self.rms_threshold) {
@@ -835,9 +877,12 @@ mod tests {
         };
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("stt_provider"), "{err}");
-        assert!(err.contains("local, google, openai, custom"), "{err}");
+        assert!(
+            err.contains("local, webspeech, google, openai, custom"),
+            "{err}"
+        );
 
-        for provider in ["local", "google", "openai", "custom"] {
+        for provider in ["local", "webspeech", "google", "openai", "custom"] {
             let mut config = VoiceConfig {
                 stt_provider: provider.into(),
                 ..Default::default()
@@ -860,6 +905,10 @@ mod tests {
         assert_eq!(config.stt_language, "en-US");
         assert_eq!(config.stt_base_url, "");
         assert_eq!(config.stt_model, "");
+        assert_eq!(
+            config.webspeech_timeout_ms, 60_000,
+            "the browser gets a minute by default"
+        );
         assert_eq!(config.tts_provider, "vikram");
         assert_eq!(config.tts_base_url, "");
         config.validate().expect("the defaults are valid");
@@ -945,6 +994,65 @@ mod tests {
             !json.contains("\"stt_api_key\""),
             "the config file stores the variable name, never a key: {json}"
         );
+    }
+
+    #[test]
+    fn webspeech_is_an_optional_provider_and_never_a_cloud_one() {
+        assert_eq!(
+            SttProvider::parse("webspeech"),
+            Some(SttProvider::WebSpeech)
+        );
+        assert_eq!(
+            SttProvider::parse("  WEB-SPEECH "),
+            Some(SttProvider::WebSpeech),
+            "the kebab spelling is accepted"
+        );
+        assert_eq!(SttProvider::WebSpeech.as_str(), "webspeech");
+        assert!(SttProvider::WebSpeech.is_webspeech());
+        assert!(
+            !SttProvider::WebSpeech.is_cloud(),
+            "its audio leaves from the browser, not from this process"
+        );
+        assert!(SttProvider::Google.is_cloud());
+
+        let config = VoiceConfig {
+            stt_provider: "webspeech".into(),
+            ..Default::default()
+        };
+        config
+            .validate()
+            .expect("webspeech needs no key, no model and no base url");
+    }
+
+    #[test]
+    fn the_webspeech_timeout_is_positive_and_bounded() {
+        let zero = VoiceConfig {
+            webspeech_timeout_ms: 0,
+            ..Default::default()
+        };
+        let err = zero.validate().unwrap_err().to_string();
+        assert!(err.contains("webspeech_timeout_ms"), "{err}");
+        assert!(err.contains("positive"), "{err}");
+
+        let huge = VoiceConfig {
+            webspeech_timeout_ms: 600_001,
+            ..Default::default()
+        };
+        let err = huge.validate().unwrap_err().to_string();
+        assert!(err.contains("webspeech_timeout_ms"), "{err}");
+        assert!(err.contains("600000"), "{err}");
+
+        let fine = VoiceConfig {
+            webspeech_timeout_ms: 1_500,
+            ..Default::default()
+        };
+        fine.validate().expect("a short wait is legal");
+    }
+
+    #[test]
+    fn an_older_voice_json_gets_the_webspeech_default() {
+        let config: VoiceConfig = serde_json::from_str(r#"{"stt_provider": "local"}"#).unwrap();
+        assert_eq!(config.webspeech_timeout_ms, 60_000);
     }
 
     #[test]

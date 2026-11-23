@@ -42,8 +42,9 @@ pub enum VoiceAction {
         #[arg(long, value_name = "N", default_value_t = 1)]
         repeat: u32,
         /// Transcribe with this provider for this run only: `local` (the built-in model, the
-        /// default), `google`, `openai` or `custom`. Never saved — use
-        /// `voice config set stt_provider` to keep it.
+        /// default), `webspeech` (free and keyless: your browser's Chrome speech engine, which
+        /// records its own audio and ignores the file), `google`, `openai` or `custom`. Never
+        /// saved — use `voice config set stt_provider` to keep it.
         #[arg(long, value_name = "BACKEND")]
         backend: Option<String>,
     },
@@ -58,6 +59,12 @@ pub enum VoiceAction {
         /// Recording cap in milliseconds.
         #[arg(long, value_name = "MS")]
         max_record_ms: Option<u64>,
+        /// Transcribe with this provider for this run only: `local` (the built-in model, the
+        /// default), `webspeech` (free and keyless: your browser's Chrome speech engine),
+        /// `google`, `openai` or `custom`. Never saved — use
+        /// `voice config set stt_provider` to keep it.
+        #[arg(long, value_name = "BACKEND")]
+        backend: Option<String>,
         #[command(flatten)]
         overrides: OverrideArgs,
     },
@@ -717,9 +724,15 @@ fn tts_backend_line(config: &VoiceConfig) -> String {
 
 /// The same line for transcription, so both directions are discoverable in one place.
 fn stt_backend_line(config: &VoiceConfig) -> String {
-    const AVAILABLE: &str = "available: local | google | openai | custom";
+    const AVAILABLE: &str = "available: local | webspeech | google | openai | custom";
     match SttProvider::parse(&config.stt_provider) {
         Some(SttProvider::Local) => format!("stt backend: local ({AVAILABLE})"),
+        Some(SttProvider::WebSpeech) => format!(
+            "stt backend: webspeech ({AVAILABLE}) — {WEBSESPEECH_DESCRIPTION}, language {}, \
+             timeout {} ms",
+            config.stt_language.trim(),
+            config.webspeech_timeout_ms
+        ),
         Some(provider) => {
             let endpoint = stt_endpoint_of(config).unwrap_or_else(|err| err.to_string());
             let model = stt_model_of(config);
@@ -741,6 +754,21 @@ fn stt_backend_line(config: &VoiceConfig) -> String {
             SttProvider::NAMES
         ),
     }
+}
+
+/// The one-line description of the optional keyless path, so `voice status` names it without
+/// the operator having to read the docs first.
+const WEBSESPEECH_DESCRIPTION: &str = "free, keyless, uses your browser's Chrome speech engine";
+
+/// The line that names `webspeech` in every `voice status`: what it is, and where the audio goes.
+/// Selected or not, an operator who has never heard of it should be able to find it here.
+fn webspeech_line(config: &VoiceConfig) -> String {
+    let selected = SttProvider::parse(&config.stt_provider) == Some(SttProvider::WebSpeech);
+    let state = if selected { "selected" } else { "available" };
+    format!(
+        "webspeech: {state} — {WEBSESPEECH_DESCRIPTION}; needs Chrome or Edge with Google speech \
+         enabled, and the audio goes to Google from the browser (local never leaves the machine)"
+    )
 }
 
 fn render_path_line() -> String {
@@ -932,6 +960,7 @@ pub fn run(action: VoiceAction) -> Result<(), String> {
             }
             println!("{}", tts_backend_line(&config));
             println!("{}", stt_backend_line(&config));
+            println!("{}", webspeech_line(&config));
             if !status.enabled {
                 println!("voice I/O is off; pass --enable to `voice listen` or `voice say`");
             }
@@ -951,12 +980,29 @@ pub fn run(action: VoiceAction) -> Result<(), String> {
             apply_stt_backend(&mut config, backend.as_deref())?;
             config.enabled = true;
             config.validate().map_err(|err| err.to_string())?;
+            if SttProvider::parse(&config.stt_provider) == Some(SttProvider::WebSpeech) {
+                eprintln!(
+                    "voice: webspeech records in the browser; {} is read only to time the run \
+                     and is not sent anywhere",
+                    file.display()
+                );
+            }
             let bytes = std::fs::read(&file).map_err(|err| format!("{}: {err}", file.display()))?;
             let pcm = wav_pcm(&bytes)?;
             let mut engine = VoiceRecognizer::new(&config);
             for run in 1..=repeat.max(1) {
                 let started = std::time::Instant::now();
-                let text = engine.transcribe(&pcm).map_err(|err| err.to_string())?;
+                let text = match engine.transcribe(&pcm) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        // A bridge that fell back and a local model that then failed are two
+                        // different problems; the note explains the first before the error.
+                        for note in engine.notes() {
+                            eprintln!("voice: {note}");
+                        }
+                        return Err(err.to_string());
+                    }
+                };
                 let elapsed = started.elapsed();
                 match text {
                     Some(text) => println!("{text}"),
@@ -979,12 +1025,24 @@ pub fn run(action: VoiceAction) -> Result<(), String> {
             enable,
             asr_model,
             max_record_ms,
+            backend,
             overrides,
         } => {
             let base = VoiceConfig::load().map_err(|err| err.to_string())?;
-            let config = config(&base, enable, asr_model, None, max_record_ms, &overrides);
+            let mut config = config(&base, enable, asr_model, None, max_record_ms, &overrides);
+            apply_stt_backend(&mut config, backend.as_deref())?;
             config.validate().map_err(|err| err.to_string())?;
+            let webspeech =
+                SttProvider::parse(&config.stt_provider) == Some(SttProvider::WebSpeech);
             let mut session = VoiceSession::start(config).map_err(|err| err.to_string())?;
+            // Said after the session is up, so a disabled or deviceless run does not promise a
+            // browser it will never open.
+            if webspeech {
+                eprintln!(
+                    "voice: opening your browser — speak in the page, then pause; a failure \
+                     falls back to the built-in model"
+                );
+            }
             #[cfg(unix)]
             let guard = interrupt::Guard::install(session.cancel_token());
             let result = session.listen_once();
@@ -1006,7 +1064,11 @@ pub fn run(action: VoiceAction) -> Result<(), String> {
                     println!("voice: cancelled");
                     Ok(())
                 }
-                Err(err) => Err(err.to_string()),
+                Err(err) => {
+                    // The fallback's note is the reason this failed, so it is said first.
+                    report_notes(&mut session);
+                    Err(err.to_string())
+                }
             }
         }
         VoiceAction::Say {
@@ -1310,7 +1372,10 @@ mod tests {
         set("stt_backend", "google").expect("the old stt name is accepted");
         assert_eq!(VoiceConfig::load().unwrap().stt_provider, "google");
         let err = set("stt_provider", "azure").expect_err("an unknown provider is refused");
-        assert!(err.contains("local, google, openai, custom"), "{err}");
+        assert!(
+            err.contains("local, webspeech, google, openai, custom"),
+            "{err}"
+        );
         assert_eq!(VoiceConfig::load().unwrap().stt_provider, "google");
     }
 
@@ -1354,7 +1419,10 @@ mod tests {
         apply_stt_backend(&mut stt, Some("local")).expect("local is a provider name here");
         assert_eq!(stt.stt_provider, "local");
         let err = apply_stt_backend(&mut stt, Some("whisper")).unwrap_err();
-        assert!(err.contains("local, google, openai, custom"), "{err}");
+        assert!(
+            err.contains("local, webspeech, google, openai, custom"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1368,7 +1436,7 @@ mod tests {
         let line = stt_backend_line(&config);
         assert_eq!(
             line,
-            "stt backend: local (available: local | google | openai | custom)"
+            "stt backend: local (available: local | webspeech | google | openai | custom)"
         );
 
         let cloud = VoiceConfig {
@@ -1408,7 +1476,7 @@ mod tests {
             "{bad:?}"
         );
         assert!(
-            stt_backend_line(&bad).contains("local, google, openai, custom"),
+            stt_backend_line(&bad).contains("local, webspeech, google, openai, custom"),
             "{bad:?}"
         );
     }
@@ -1480,6 +1548,69 @@ mod tests {
         assert!(
             !default.contains("google"),
             "the default line names the built-in engine, not a cloud one: {default}"
+        );
+    }
+
+    #[test]
+    fn webspeech_is_named_in_status_with_a_one_line_description() {
+        let local = VoiceConfig::default();
+        let line = stt_backend_line(&local);
+        assert!(
+            line.contains("available: local | webspeech | google | openai | custom"),
+            "{line}"
+        );
+        let described = webspeech_line(&local);
+        assert!(described.contains("webspeech: available"), "{described}");
+        assert!(
+            described.contains("free, keyless, uses your browser's Chrome speech engine"),
+            "{described}"
+        );
+        assert!(
+            described.contains("Chrome or Edge"),
+            "the browser requirement is stated: {described}"
+        );
+        assert!(
+            described.contains("audio goes to Google"),
+            "where the audio goes is stated: {described}"
+        );
+        assert!(
+            described.contains("local never leaves the machine"),
+            "{described}"
+        );
+
+        let selected = VoiceConfig {
+            stt_provider: "webspeech".into(),
+            webspeech_timeout_ms: 45_000,
+            ..Default::default()
+        };
+        let line = stt_backend_line(&selected);
+        assert!(line.contains("stt backend: webspeech"), "{line}");
+        assert!(
+            line.contains("free, keyless, uses your browser's Chrome speech engine"),
+            "{line}"
+        );
+        assert!(line.contains("language en-US"), "{line}");
+        assert!(line.contains("timeout 45000 ms"), "{line}");
+        assert!(
+            !line.contains("key from $"),
+            "webspeech has no key to name: {line}"
+        );
+        assert!(webspeech_line(&selected).contains("webspeech: selected"));
+    }
+
+    #[test]
+    fn the_backend_override_accepts_webspeech_for_a_single_run() {
+        let mut config = VoiceConfig::default();
+        apply_stt_backend(&mut config, Some("webspeech")).expect("webspeech is a provider name");
+        assert_eq!(config.stt_provider, "webspeech");
+        config
+            .validate()
+            .expect("a one-run override needs no key and no base url");
+
+        let err = apply_stt_backend(&mut config, Some("whisper")).unwrap_err();
+        assert!(
+            err.contains("webspeech"),
+            "the error lists the choices: {err}"
         );
     }
 

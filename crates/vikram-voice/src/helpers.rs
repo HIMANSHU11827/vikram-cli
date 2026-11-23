@@ -52,7 +52,12 @@ pub fn first_available(names: &[&str]) -> Option<String> {
 }
 
 pub fn probe(config: &VoiceConfig) -> VoiceStatus {
-    let capture = if let Some(device) = crate::capture::probe_capture() {
+    // The browser bridge captures the microphone in the page, so a missing local input device is
+    // not a problem for it; saying so keeps `voice status` from calling a working setup broken.
+    let capture = if SttProvider::parse(&config.stt_provider).is_some_and(SttProvider::is_webspeech)
+    {
+        StageStatus::Ready("not used: webspeech records in the browser".into())
+    } else if let Some(device) = crate::capture::probe_capture() {
         StageStatus::Ready(format!("built-in cpal ({device})"))
     } else if let Some(helper) = first_available(&[
         config.capture_helper.as_str(),
@@ -68,6 +73,7 @@ pub fn probe(config: &VoiceConfig) -> VoiceStatus {
     // A cloud provider is reported as that provider, including the exact thing to fix when it
     // cannot run; the local chain is only probed when it is the one that will run.
     let asr = match SttProvider::parse(&config.stt_provider) {
+        Some(SttProvider::WebSpeech) => crate::webspeech::probe_webspeech(config),
         Some(provider) if provider.is_cloud() => crate::cloud_stt::probe_cloud_stt(config),
         _ => crate::asr::probe_asr(config),
     };

@@ -130,7 +130,8 @@ Every stage reports `ready` / `degraded` / `missing` / `disabled` with a reason;
 
 ```
 vikram voice status
-vikram voice listen [--enable] [flags]
+vikram voice listen [--enable] [--backend local|webspeech|google|openai|custom] [flags]
+vikram voice transcribe <WAV> [--backend local|webspeech|google|openai|custom]
 vikram voice say    [--enable] <text> [--voice PATH] [--backend vikram|elevenlabs|openai|custom]
 vikram voice chat   [--enable] [flags] [--voice PATH] [--fresh]
 vikram voice config show
@@ -151,6 +152,7 @@ Flags, and whether they outlive the run:
 | `listen` | `--max-record-ms MS` | recording cap for this run | no — use `config set max_record_ms` |
 | `say` | `--voice PATH` | piper `.onnx` voice for this run | no — use `config set tts_voice` |
 | `say` | `--backend NAME` | `vikram`, `elevenlabs`, `openai` or `custom` for this run | no — use `config set tts_provider` |
+| `listen`, `transcribe` | `--backend NAME` | `local`, `webspeech`, `google`, `openai` or `custom` for this run | no — use `config set stt_provider` |
 | `chat` | `--fresh` | start a new session instead of continuing the most recent | n/a (session state) |
 | `chat` | `--enable`, `--asr-model`, `--max-record-ms`, `--voice` | same as above, for the spoken turn | no |
 | `listen`, `chat` | `--language CODE` | ASR language; `auto` lets wavo detect it | **yes**, written back after a successful transcript |
@@ -297,6 +299,7 @@ itself is never written to `voice.json`, never printed, and never put in an erro
 | Direction | Provider | Endpoint | Model | Voice | Key from |
 |---|---|---|---|---|---|
 | STT | `local` (default) | built-in wavo | `whisper-base.en` Q8_0 | — | none |
+| STT | `webspeech` (optional) | one loopback page, then Google from the browser | Chrome/Edge speech engine (`stt_language`) | — | none |
 | STT | `google` (preset) | `https://speech.googleapis.com/v1/speech:recognize` | Google auto-selects; `stt_model` overrides | — | `$GOOGLE_API_KEY` |
 | STT | `openai` (preset) | `https://api.openai.com/v1/audio/transcriptions` | `whisper-1` | — | `$GOOGLE_API_KEY` until `stt_api_key_env` names another |
 | STT | `custom` | your `stt_base_url` + `/audio/transcriptions` | your `stt_model` (required) | — | your `stt_api_key_env` |
@@ -331,12 +334,60 @@ of the key variable — never the key:
 
 ```
 tts backend: vikram (available: vikram | elevenlabs | openai | custom)
-stt backend: local (available: local | google | openai | custom)
-stt backend: google (available: local | google | openai | custom) — https://speech.googleapis.com/v1/speech:recognize, model auto, language en-US, key from $GOOGLE_API_KEY
+stt backend: local (available: local | webspeech | google | openai | custom)
+webspeech: available — free, keyless, uses your browser's Chrome speech engine; needs Chrome or Edge with Google speech enabled, and the audio goes to Google from the browser (local never leaves the machine)
+stt backend: google (available: local | webspeech | google | openai | custom) — https://speech.googleapis.com/v1/speech:recognize, model auto, language en-US, key from $GOOGLE_API_KEY
 ```
 
 `voice transcribe --backend google` is the one-run override for transcription; `voice say
 --backend openai` is the same for speech. Neither writes to `voice.json`.
+
+### 3.8 Optional: `webspeech`, free keyless STT through your browser
+
+`stt_provider = webspeech` transcribes with the speech engine Chrome and Edge already ship. It
+needs **no key, no account and no model download**, and it is opt-in — `local` stays the default:
+
+```
+vikram voice listen --backend webspeech
+vikram voice transcribe clip.wav --backend webspeech
+vikram voice config set stt_provider webspeech      # keep it
+```
+
+Why there is a page involved: `webkitSpeechRecognition` only exists inside a document. So the
+recognizer binds a single-use listener on `127.0.0.1:<random port>` with a random token, serves
+one inline page (no external asset), opens it with `xdg-open`, and waits up to
+`webspeech_timeout_ms` (60 000 by default) for the page to POST `{"text": "…"}` to
+`/result?token=…`. The page starts recognition with `stt_language`, shows "listening", and posts
+the words when it stops. The listener is loopback only, accepts exactly one POST, refuses a wrong
+or missing token, and closes on success, timeout or cancel. The token is never logged, and a
+second POST cannot replace the first.
+
+What it needs:
+
+- a **Chrome-family browser** with Google's speech engine enabled: Chrome, Edge or Brave. Plain
+  Chromium builds usually ship without the API key and fail with `network` or `not-allowed`;
+  Firefox has no recognition API at all.
+- `xdg-open` and a desktop session: that is how the page is opened.
+- a microphone the browser can use. The browser asks for permission the first time.
+
+Where the audio goes: **the page sends it to Google's speech service**, the same endpoint Chrome
+dictation uses. That is why it is free and keyless, and it is also a third party. Vikram itself
+uploads nothing, and `local` never leaves the machine. If that trade is not acceptable, use
+`local`.
+
+`webspeech` ignores the local take, because the page records the microphone: `voice listen` opens
+no audio device of its own (a machine without a microphone can still dictate through the browser),
+and `voice transcribe` reads the file only to time the run. Every failure — no `xdg-open`, no
+browser, a browser-side speech error, an empty transcript, the timeout — is one note and the
+built-in wavo model transcribes instead. For `listen`, the local take is recorded at that point,
+so the fallback is real audio rather than silence. A cancel is not a failure and ends the turn.
+
+`voice status` names it either way, selected or not:
+
+```
+stt backend: local (available: local | webspeech | google | openai | custom)
+webspeech: available — free, keyless, uses your browser's Chrome speech engine; needs Chrome or Edge with Google speech enabled, and the audio goes to Google from the browser (local never leaves the machine)
+```
 
 ## 4. Phases and acceptance criteria
 
