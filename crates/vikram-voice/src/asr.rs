@@ -211,10 +211,16 @@ impl WavoRecognizer {
                     _ => self.download(name)?,
                 },
             };
-            // wavo's own choice: the GPU when the adapter it picks is a real one, the CPU when it
-            // would pick a software device. Leaving the choice here means the adapter wavo proves
-            // at load time is the one used, and the print below says which it was.
-            let model = wavo::Model::load(&path).map_err(wavo_error)?;
+            // Vulkan explicitly, as the operator asked: an integrated Intel part still runs these
+            // kernels several times faster than the CPU. A driver that cannot give a GPU adapter
+            // falls back to wavo's own choice and says so, so the status line never lies about it.
+            let model = match wavo::Model::load_with(&path, wavo::Backend::Gpu) {
+                Ok(model) => model,
+                Err(err) => {
+                    eprintln!("voice: no vulkan adapter ({err}); transcribing on the cpu");
+                    wavo::Model::load(&path).map_err(wavo_error)?
+                }
+            };
             let device = model.device();
             let label = format!("{} ({:?})", device.name, device.api);
             eprintln!("voice: asr on {label}");

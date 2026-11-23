@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 use vikram_runtime::config::Config;
-use vikram_voice::{VoiceConfig, VoiceError, VoiceSession, probe};
+use vikram_voice::{AsrEngine, Recognizer, VoiceConfig, VoiceError, VoiceSession, probe};
 
 use crate::chat;
 
@@ -21,6 +21,16 @@ pub enum VoiceAction {
     /// Report which local voice helpers and models are available.
     Status {
         /// Whisper model to check, in addition to VIKRAM_ASR_MODEL.
+        #[arg(long = "asr-model", value_name = "PATH")]
+        asr_model: Option<PathBuf>,
+    },
+    /// Transcribe a 16 kHz mono WAV file and print the text. No microphone involved: the same
+    /// engine the voice mode uses, so two models can be compared on one clip.
+    Transcribe {
+        /// WAV file to transcribe.
+        #[arg(value_name = "WAV")]
+        file: PathBuf,
+        /// Model to use. Defaults to the configured one.
         #[arg(long = "asr-model", value_name = "PATH")]
         asr_model: Option<PathBuf>,
     },
@@ -450,6 +460,11 @@ fn apply_setting(config: &mut VoiceConfig, key: &str, value: &str) -> Result<Str
             optional_text(value).map(PathBuf::from),
             render_optional_path,
         ),
+        "tts_language" => set_field(
+            &mut config.tts_language,
+            optional_text(value),
+            render_optional_text,
+        ),
         "player_helper" => set_field(&mut config.player_helper, required_text(key, value)?, |v| {
             v.clone()
         }),
@@ -668,6 +683,23 @@ pub fn run(action: VoiceAction) -> Result<(), String> {
             if !status.is_ready() && status.enabled {
                 println!("not all stages are ready; fix the lines above before using voice");
             }
+            Ok(())
+        }
+        VoiceAction::Transcribe { file, asr_model } => {
+            let base = VoiceConfig::load().map_err(|err| err.to_string())?;
+            let mut config = config(&base, true, asr_model, None, None, &OverrideArgs::default());
+            config.enabled = true;
+            let bytes = std::fs::read(&file).map_err(|err| format!("{}: {err}", file.display()))?;
+            let pcm = wav_pcm(&bytes)?;
+            let started = std::time::Instant::now();
+            let mut engine = AsrEngine::new(&config);
+            let text = engine.transcribe(&pcm).map_err(|err| err.to_string())?;
+            let elapsed = started.elapsed();
+            match text {
+                Some(text) => println!("{text}"),
+                None => println!("(no speech)"),
+            }
+            eprintln!("{} samples in {:.2}s", pcm.len(), elapsed.as_secs_f32());
             Ok(())
         }
         VoiceAction::Listen {
@@ -969,4 +1001,57 @@ mod tests {
         assert!(spoken.len() <= SPOKEN_MAX_BYTES);
         assert!(spoken.chars().all(|c| c == 'é'));
     }
+}
+
+/// The samples of a 16 kHz mono 16-bit WAV. Anything else is refused by name rather than silently
+/// resampled: comparing two models is only meaningful on identical audio.
+fn wav_pcm(bytes: &[u8]) -> Result<Vec<i16>, String> {
+    if bytes.len() < 44 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("not a RIFF/WAVE file".into());
+    }
+    let mut channels = 0u16;
+    let mut rate = 0u32;
+    let mut bits = 0u16;
+    let mut offset = 12usize;
+    while offset + 8 <= bytes.len() {
+        let id = &bytes[offset..offset + 4];
+        let size = u32::from_le_bytes(
+            bytes[offset + 4..offset + 8]
+                .try_into()
+                .map_err(|_| "truncated chunk header".to_owned())?,
+        ) as usize;
+        let body = offset + 8;
+        match id {
+            b"fmt " => {
+                if body + 16 > bytes.len() {
+                    return Err("truncated fmt chunk".into());
+                }
+                channels = u16::from_le_bytes([bytes[body + 2], bytes[body + 3]]);
+                rate = u32::from_le_bytes([
+                    bytes[body + 4],
+                    bytes[body + 5],
+                    bytes[body + 6],
+                    bytes[body + 7],
+                ]);
+                bits = u16::from_le_bytes([bytes[body + 14], bytes[body + 15]]);
+            }
+            b"data" => {
+                if channels != 1 || rate != 16_000 || bits != 16 {
+                    return Err(format!(
+                        "need 16 kHz mono 16-bit audio, got {rate} Hz, {channels} channel(s), {bits}-bit"
+                    ));
+                }
+                let end = (body + size).min(bytes.len());
+                return Ok(bytes[body..end]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| i16::from_le_bytes(*pair))
+                    .collect());
+            }
+            _ => {}
+        }
+        offset = body + size + (size & 1);
+    }
+    Err("no data chunk in the wav".into())
 }
