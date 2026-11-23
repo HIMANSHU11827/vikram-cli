@@ -13,6 +13,10 @@ serde.workspace = true
 serde_json.workspace = true
 cpal = { version = "0.18", features = ["pipewire"] }
 hound = "3.5"
+# The opt-in cloud voice. `ureq` is blocking by design and already compiled for wavo's `hub`
+# feature, so this adds no crate to the build; `reqwest`'s blocking client panics when built
+# inside an async runtime, and `voice chat` speaks from one.
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 # Pure Rust on wgpu: Vulkan on this machine, and it falls back to CPU by itself when no GPU
 # device exists. `hub` adds model downloads; the CLI features of the crate stay off.
 wavo = { path = "../../vendor/wavo", default-features = false, features = ["hub"] }

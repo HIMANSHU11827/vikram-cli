@@ -131,7 +131,7 @@ Every stage reports `ready` / `degraded` / `missing` / `disabled` with a reason;
 ```
 vikram voice status
 vikram voice listen [--enable] [flags]
-vikram voice say    [--enable] <text> [--voice PATH]
+vikram voice say    [--enable] <text> [--voice PATH] [--backend local|elevenlabs]
 vikram voice chat   [--enable] [flags] [--voice PATH] [--fresh]
 vikram voice config show
 vikram voice config path
@@ -150,6 +150,7 @@ Flags, and whether they outlive the run:
 | `listen` | `--asr-model PATH` | ASR model for this run (path or wavo hub name) | no — use `config set asr_model` to keep it |
 | `listen` | `--max-record-ms MS` | recording cap for this run | no — use `config set max_record_ms` |
 | `say` | `--voice PATH` | piper `.onnx` voice for this run | no — use `config set tts_voice` |
+| `say` | `--backend NAME` | `local` or `elevenlabs` for this run | no — use `config set tts_backend` |
 | `chat` | `--fresh` | start a new session instead of continuing the most recent | n/a (session state) |
 | `chat` | `--enable`, `--asr-model`, `--max-record-ms`, `--voice` | same as above, for the spoken turn | no |
 | `listen`, `chat` | `--language CODE` | ASR language; `auto` lets wavo detect it | **yes**, written back after a successful transcript |
@@ -246,6 +247,38 @@ is a normal outcome, not an error.
 Permissions: `voice.listen` and `voice.speak` are tool-permission strings in
 the existing deny-first system; the voice session refuses to open the mic or
 the speaker without them.
+
+### 3.6 Optional cloud voice (ElevenLabs) — opt-in, never the default
+
+The local piper voice stays the default and needs no key, no network and no
+billing: `tts_backend` is `local` out of the box, and an existing `voice.json`
+without the key keeps loading exactly as before. The cloud voice is opt-in:
+
+```
+vikram voice config set tts_backend elevenlabs
+vikram voice config set tts_voice_id <elevenlabs-voice-id>
+export ELEVENLABS_API_KEY=...        # env only; never written to voice.json
+vikram voice say --enable "status report"
+```
+
+- The key is read from the variable `tts_api_key_env` names (default
+  `ELEVENLABS_API_KEY`). It is never stored in the config file, never printed,
+  and never put in an error message.
+- `tts_voice_id` is empty by default on purpose: a baked-in voice id would bill
+  an operator who never picked one. `tts_model` defaults to
+  `eleven_turbo_v2_5`; ElevenLabs now lists Turbo as deprecated in favour of
+  `eleven_flash_v2_5`, so `config set tts_model eleven_flash_v2_5` switches
+  without a code change.
+- The request is `POST https://api.elevenlabs.io/v1/text-to-speech/{voice_id}`
+  with `output_format=pcm_16000`; the returned PCM is wrapped as WAV by the same
+  writer the local voice uses, so the player stage is unchanged.
+- **Any failure falls back to the local voice and says so once** — a missing key,
+  an HTTP error, a network failure, or an empty response costs one note
+  (`elevenlabs: … ; the local voice spoke instead`), never a silent turn and
+  never a dead one. `voice status` reports `tts: ready: elevenlabs (voice …,
+  model …)`, or `degraded:` naming the exact variable or field to fix.
+- `--backend` on `say` is a one-run override; the saved `tts_backend` is not
+  touched.
 
 ## 4. Phases and acceptance criteria
 

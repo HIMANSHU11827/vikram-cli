@@ -12,6 +12,7 @@
 mod asr;
 mod cancel;
 mod capture;
+mod cloud_tts;
 mod helpers;
 mod player;
 mod session;
@@ -23,11 +24,12 @@ pub use asr::{
 };
 pub use cancel::CancelToken;
 pub use capture::{CpalSource, DeviceSource, input_devices, probe_capture};
+pub use cloud_tts::{CloudRequest, CloudSynth, CloudTransport, HttpTransport, probe_cloud_tts};
 pub use helpers::{first_available, missing_tool_message, probe, which};
 pub use player::{CpalPlayer, DevicePlayer, output_devices, probe_playback};
 pub use session::{
     AudioSource, Captioner, HelperPlayer, HelperRecognizer, HelperSource, HelperSynth, Player,
-    Recognizer, Synthesizer, VoiceSession, pick_voice, piper_voices, spoken_text,
+    Recognizer, Synthesizer, VoiceSession, VoiceSynth, pick_voice, piper_voices, spoken_text,
 };
 pub use vad::{detect_speech, is_silent, noise_floor, speech_gate, trim_silence};
 /// The download types the CLI needs to pull a model by name: `Hub` and its `Quant`.
@@ -59,6 +61,44 @@ pub enum VoiceError {
     InvalidAudio(String),
     #[error("invalid voice configuration: {0}")]
     Config(String),
+    /// The cloud voice is selected but cannot run: no key, or no voice id. The session falls
+    /// back to the local voice and says so; this is never the end of a turn.
+    #[error("cloud tts is not configured: {0}")]
+    CloudUnconfigured(String),
+    /// The cloud voice ran and failed (network, HTTP, malformed audio). The session falls back to
+    /// the local voice and says so; this is never the end of a turn.
+    #[error("cloud tts failed: {0}")]
+    Cloud(String),
+}
+
+/// Which synthesizer speaks a reply. `local` is the default and the only one that needs no key,
+/// no network and no billing; `elevenlabs` is opt-in per operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TtsBackend {
+    Local,
+    ElevenLabs,
+}
+
+impl TtsBackend {
+    /// `local` or `elevenlabs`; case and surrounding spaces don't matter.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "local" => Some(Self::Local),
+            "elevenlabs" => Some(Self::ElevenLabs),
+            _ => None,
+        }
+    }
+
+    /// The name `parse` takes and `tts_backend` holds.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::ElevenLabs => "elevenlabs",
+        }
+    }
+
+    /// Every name `parse` accepts, for an error that tells the operator what to type.
+    pub const NAMES: &'static str = "local, elevenlabs";
 }
 
 /// The knob set an operator can set without recompiling. Defaults describe what is probed, not
@@ -92,6 +132,22 @@ pub struct VoiceConfig {
     /// Spoken language for synthesis (`en`, `en-gb`, `de`). None leaves the helper's own default,
     /// which on a fresh machine is whatever espeak-ng was built for.
     pub tts_language: Option<String>,
+    /// Which synthesizer speaks: `local` (the default — the piper voice on this machine,
+    /// `en_GB-jarvis-medium`, falling back to espeak-ng) or `elevenlabs` (opt-in cloud voice).
+    /// Local stays the default because it needs no key, no network and no billing.
+    pub tts_backend: String,
+    /// The environment variable the cloud key is read from. The key itself is never written to
+    /// `voice.json` and never printed; only this name is stored.
+    pub tts_api_key_env: String,
+    /// The ElevenLabs voice to speak with, for example `JBFqnCBsd6RMkjVDRZzb` (their published
+    /// sample voice). Empty by default on purpose: a built-in voice id would bill an operator who
+    /// never chose one. Set it with `vikram voice config set tts_voice_id <id>`.
+    pub tts_voice_id: String,
+    /// The ElevenLabs model id. `eleven_turbo_v2_5` is the low-latency default; their published
+    /// default is `eleven_multilingual_v2`, which is slower but speaks more languages.
+    /// ElevenLabs now lists Turbo as deprecated in favour of `eleven_flash_v2_5` (same voice,
+    /// lower latency); either id works here, so switching is `config set tts_model`.
+    pub tts_model: String,
     /// Speaking rate in words per minute (80..=450). 175 is espeak-ng's own default; piper gets
     /// the reciprocal as `--length_scale`.
     pub rate: u32,
@@ -131,6 +187,10 @@ impl Default for VoiceConfig {
             tts_fallback: "espeak-ng".into(),
             tts_voice: None,
             tts_language: None,
+            tts_backend: "local".into(),
+            tts_api_key_env: "ELEVENLABS_API_KEY".into(),
+            tts_voice_id: String::new(),
+            tts_model: "eleven_turbo_v2_5".into(),
             rate: 175,
             volume: 1.0,
             player_helper: "paplay".into(),
@@ -183,6 +243,23 @@ impl VoiceConfig {
         }
         if let Err(err) = Quant::parse(&self.asr_quant) {
             return Err(VoiceError::Config(format!("asr_quant: {err}")));
+        }
+        if TtsBackend::parse(&self.tts_backend).is_none() {
+            return Err(VoiceError::Config(format!(
+                "tts_backend `{}` is not one of: {}",
+                self.tts_backend.trim(),
+                TtsBackend::NAMES
+            )));
+        }
+        if self.tts_api_key_env.trim().is_empty() {
+            return Err(VoiceError::Config(
+                "tts_api_key_env is empty; name the environment variable that holds the key".into(),
+            ));
+        }
+        if self.tts_model.trim().is_empty() {
+            return Err(VoiceError::Config(
+                "tts_model is empty; name a model such as eleven_turbo_v2_5".into(),
+            ));
         }
         if AsrBackend::parse(&self.asr_backend).is_none() {
             return Err(VoiceError::Config(format!(
@@ -531,6 +608,74 @@ mod tests {
             ..Default::default()
         };
         assert!(no_minimum.validate().is_err());
+    }
+
+    #[test]
+    fn the_local_voice_is_the_default_and_needs_no_key() {
+        let config = VoiceConfig::default();
+        config.validate().expect("the defaults are valid");
+        assert_eq!(config.tts_backend, "local");
+        assert_eq!(
+            TtsBackend::parse(&config.tts_backend),
+            Some(TtsBackend::Local)
+        );
+        assert_eq!(config.tts_api_key_env, "ELEVENLABS_API_KEY");
+        assert!(
+            config.tts_voice_id.is_empty(),
+            "no voice id is baked in: a default would bill an operator who never chose one"
+        );
+        assert_eq!(config.tts_model, "eleven_turbo_v2_5");
+        assert_eq!(
+            TtsBackend::parse("ElevenLabs"),
+            Some(TtsBackend::ElevenLabs)
+        );
+        assert_eq!(TtsBackend::ElevenLabs.as_str(), "elevenlabs");
+    }
+
+    #[test]
+    fn an_unknown_tts_backend_is_refused_and_names_both() {
+        let config = VoiceConfig {
+            tts_backend: "azure".into(),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("tts_backend"), "{err}");
+        assert!(err.contains("local, elevenlabs"), "{err}");
+
+        let ok = VoiceConfig {
+            tts_backend: "elevenlabs".into(),
+            ..Default::default()
+        };
+        ok.validate().expect(
+            "selecting the cloud voice before configuring it is legal: status says what is missing",
+        );
+    }
+
+    #[test]
+    fn an_older_voice_json_keeps_the_local_voice() {
+        let config: VoiceConfig = serde_json::from_str(r#"{"tts_helper": "piper"}"#).unwrap();
+        assert_eq!(config.tts_backend, "local");
+        assert_eq!(config.tts_api_key_env, "ELEVENLABS_API_KEY");
+        assert_eq!(config.tts_model, "eleven_turbo_v2_5");
+        assert!(config.tts_voice_id.is_empty());
+    }
+
+    #[test]
+    fn the_key_is_named_never_stored() {
+        let config = VoiceConfig {
+            tts_backend: "elevenlabs".into(),
+            tts_voice_id: "abc".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        assert!(
+            json.contains("\"tts_api_key_env\": \"ELEVENLABS_API_KEY\""),
+            "{json}"
+        );
+        assert!(
+            !json.contains("xi-api-key") && !json.contains("\"tts_api_key\""),
+            "the config file stores the variable name, never a key: {json}"
+        );
     }
 
     #[test]

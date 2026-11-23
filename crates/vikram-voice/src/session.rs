@@ -1,12 +1,15 @@
 use crate::cancel::CancelToken;
 use crate::capture::DeviceSource;
+use crate::cloud_tts::CloudSynth;
 use crate::helpers::{
     Scratch, first_available, missing_tool_message, pcm_from_bytes, run_cancellable, which,
     write_wav,
 };
 use crate::player::DevicePlayer;
 use crate::vad::{detect_speech, is_loud};
-use crate::{AsrEngine, Result, StageStatus, VoiceConfig, VoiceError, VoiceStatus, probe};
+use crate::{
+    AsrEngine, Result, StageStatus, TtsBackend, VoiceConfig, VoiceError, VoiceStatus, probe,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, mpsc};
@@ -710,6 +713,87 @@ impl Synthesizer for HelperSynth {
     }
 }
 
+/// The synthesizer a session speaks through. `Local` is the built-in chain; `Cloud` is the opt-in
+/// cloud voice with a local synthesizer behind it, so a cloud failure costs one note and never the
+/// turn.
+pub enum VoiceSynth {
+    Local(HelperSynth),
+    Cloud {
+        cloud: CloudSynth,
+        local: Box<dyn Synthesizer + Send + Sync>,
+    },
+}
+
+impl VoiceSynth {
+    /// The backend the operator asked for. Anything but `elevenlabs` is the local voice, which is
+    /// also where an unreadable `tts_backend` lands after `validate` has refused it.
+    pub fn new(config: &VoiceConfig) -> Self {
+        let local = HelperSynth::new(config);
+        match TtsBackend::parse(&config.tts_backend) {
+            Some(TtsBackend::ElevenLabs) => Self::Cloud {
+                cloud: CloudSynth::new(config),
+                local: Box::new(local),
+            },
+            _ => Self::Local(local),
+        }
+    }
+
+    /// The pair built from parts: the seam the tests use to prove the fallback without a key, a
+    /// network, or a TTS helper on PATH.
+    #[cfg(test)]
+    pub(crate) fn with_parts(cloud: CloudSynth, local: Box<dyn Synthesizer + Send + Sync>) -> Self {
+        Self::Cloud { cloud, local }
+    }
+
+    /// True when the cloud voice is the one that speaks first.
+    pub fn is_cloud(&self) -> bool {
+        matches!(self, Self::Cloud { .. })
+    }
+
+    /// The cloud half, when the cloud backend is selected.
+    pub fn cloud(&self) -> Option<&CloudSynth> {
+        match self {
+            Self::Local(_) => None,
+            Self::Cloud { cloud, .. } => Some(cloud),
+        }
+    }
+}
+
+impl Synthesizer for VoiceSynth {
+    fn synthesize(&self, text: &str) -> Result<Vec<u8>> {
+        self.synthesize_cancellable(text, &CancelToken::new())
+    }
+
+    fn synthesize_cancellable(&self, text: &str, cancel: &CancelToken) -> Result<Vec<u8>> {
+        match self {
+            Self::Local(local) => local.synthesize_cancellable(text, cancel),
+            Self::Cloud { cloud, local } => match cloud.synthesize_cancellable(text, cancel) {
+                Ok(wav) => Ok(wav),
+                // A cancel is the operator's decision, not a cloud failure: it ends the turn.
+                Err(VoiceError::Cancelled) => Err(VoiceError::Cancelled),
+                Err(err) => {
+                    cloud.note_once(
+                        "elevenlabs",
+                        format!("elevenlabs: {err}; the local voice spoke instead"),
+                    );
+                    local.synthesize_cancellable(text, cancel)
+                }
+            },
+        }
+    }
+
+    fn notes(&mut self) -> Vec<String> {
+        match self {
+            Self::Local(local) => local.notes(),
+            Self::Cloud { cloud, local } => {
+                let mut notes = cloud.notes();
+                notes.extend(local.notes());
+                notes
+            }
+        }
+    }
+}
+
 pub struct HelperPlayer {
     helper: String,
     fallback: String,
@@ -764,7 +848,7 @@ fn samples_for(sample_rate: u16, ms: u64) -> usize {
 /// The default source is the built-in cpal engine, the default recognizer the built-in whisper
 /// chain, and the default player the built-in cpal output; helper binaries are only fallback
 /// tiers inside those engines.
-pub struct VoiceSession<S = DeviceSource, R = AsrEngine, Y = HelperSynth, P = DevicePlayer> {
+pub struct VoiceSession<S = DeviceSource, R = AsrEngine, Y = VoiceSynth, P = DevicePlayer> {
     config: VoiceConfig,
     cancel: CancelToken,
     phase: VoicePhase,
@@ -789,7 +873,7 @@ impl VoiceSession {
             config.clone(),
             DeviceSource::new(&config),
             AsrEngine::new(&config),
-            HelperSynth::new(&config),
+            VoiceSynth::new(&config),
             DevicePlayer::new(&config),
         ))
     }
@@ -2159,6 +2243,107 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A local stand-in that answers with fixed bytes, so the fallback is provable without a TTS
+    /// helper on PATH.
+    struct FixedSynth(Vec<u8>);
+
+    impl Synthesizer for FixedSynth {
+        fn synthesize(&self, _text: &str) -> Result<Vec<u8>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// A transport that never opens a socket and always fails the way a broken cloud call does.
+    struct OfflineTransport(String);
+
+    impl crate::cloud_tts::CloudTransport for OfflineTransport {
+        fn post(
+            &self,
+            _request: &crate::cloud_tts::CloudRequest,
+            _cancel: &CancelToken,
+        ) -> Result<Vec<u8>> {
+            Err(VoiceError::Cloud(self.0.clone()))
+        }
+    }
+
+    fn cloud_config() -> VoiceConfig {
+        VoiceConfig {
+            tts_backend: "elevenlabs".into(),
+            tts_voice_id: "abc".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_cloud_failure_speaks_through_the_local_voice_and_says_so_once() {
+        let cloud = CloudSynth::with_parts(
+            &cloud_config(),
+            Some("test-key".into()),
+            Box::new(OfflineTransport("HTTP 500: upstream".into())),
+        );
+        let mut synth = VoiceSynth::with_parts(cloud, Box::new(FixedSynth(b"RIFF-local".to_vec())));
+
+        let wav = synth
+            .synthesize("turn on the lights")
+            .expect("the local voice speaks when the cloud does not");
+        assert_eq!(wav, b"RIFF-local");
+
+        let notes = synth.notes();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("elevenlabs:"), "{notes:?}");
+        assert!(notes[0].contains("local voice"), "{notes:?}");
+
+        synth.synthesize("and again").expect("still speaks");
+        assert_eq!(
+            synth.notes().len(),
+            1,
+            "one note per session, not one per sentence"
+        );
+    }
+
+    #[test]
+    fn a_missing_cloud_key_falls_back_instead_of_failing_the_turn() {
+        let cloud = CloudSynth::with_parts(
+            &cloud_config(),
+            None,
+            Box::new(OfflineTransport("never reached".into())),
+        );
+        let mut synth = VoiceSynth::with_parts(cloud, Box::new(FixedSynth(b"RIFF-local".to_vec())));
+        assert_eq!(synth.synthesize("hi").unwrap(), b"RIFF-local");
+        let notes = synth.notes();
+        assert!(
+            notes[0].contains("ELEVENLABS_API_KEY"),
+            "the note names the variable to set: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_cancel_is_not_a_cloud_failure_and_never_falls_back() {
+        let cloud = CloudSynth::with_parts(
+            &cloud_config(),
+            Some("k".into()),
+            Box::new(OfflineTransport("never reached".into())),
+        );
+        let synth = VoiceSynth::with_parts(cloud, Box::new(FixedSynth(b"RIFF-local".to_vec())));
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            synth.synthesize_cancellable("hi", &cancel),
+            Err(VoiceError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn the_default_backend_is_the_local_synth() {
+        let local = VoiceSynth::new(&VoiceConfig::default());
+        assert!(!local.is_cloud());
+        assert!(local.cloud().is_none());
+
+        let cloud = VoiceSynth::new(&cloud_config());
+        assert!(cloud.is_cloud());
+        assert_eq!(cloud.cloud().map(CloudSynth::voice_id), Some("abc"));
     }
 
     #[test]

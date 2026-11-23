@@ -1,4 +1,4 @@
-use crate::{StageStatus, VoiceConfig, VoiceError, VoiceStatus};
+use crate::{StageStatus, TtsBackend, VoiceConfig, VoiceError, VoiceStatus};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -66,30 +66,36 @@ pub fn probe(config: &VoiceConfig) -> VoiceStatus {
         ))
     };
     let asr = crate::asr::probe_asr(config);
-    let voice = crate::session::pick_voice(config.tts_voice.as_deref());
-    let piper = which(&config.tts_helper).is_some();
-    let espeak = which(&config.tts_fallback).is_some();
-    let tts = match (piper, voice) {
-        (true, Some(voice)) => {
-            StageStatus::Ready(format!("{} with {}", config.tts_helper, voice.display()))
+    // A cloud backend is reported as the cloud backend, including the exact thing to fix when it
+    // cannot run; the local chain is only probed when it is the one that will speak.
+    let tts = if TtsBackend::parse(&config.tts_backend) == Some(TtsBackend::ElevenLabs) {
+        crate::cloud_tts::probe_cloud_tts(config)
+    } else {
+        let voice = crate::session::pick_voice(config.tts_voice.as_deref());
+        let piper = which(&config.tts_helper).is_some();
+        let espeak = which(&config.tts_fallback).is_some();
+        match (piper, voice) {
+            (true, Some(voice)) => {
+                StageStatus::Ready(format!("{} with {}", config.tts_helper, voice.display()))
+            }
+            (false, Some(_)) => StageStatus::Missing(missing_tool_message(&config.tts_helper)),
+            (true, None) if espeak => StageStatus::Degraded(format!(
+                "no {} voice model; robotic {} fallback",
+                config.tts_helper, config.tts_fallback
+            )),
+            (true, None) => StageStatus::Missing(format!(
+                "no {} voice model; {} not found",
+                config.tts_helper, config.tts_fallback
+            )),
+            (false, None) if espeak => StageStatus::Degraded(format!(
+                "{} and no voice model; robotic {} fallback",
+                config.tts_helper, config.tts_fallback
+            )),
+            (false, None) => StageStatus::Missing(format!(
+                "{} with a voice model, or {}, not found",
+                config.tts_helper, config.tts_fallback
+            )),
         }
-        (false, Some(_)) => StageStatus::Missing(missing_tool_message(&config.tts_helper)),
-        (true, None) if espeak => StageStatus::Degraded(format!(
-            "no {} voice model; robotic {} fallback",
-            config.tts_helper, config.tts_fallback
-        )),
-        (true, None) => StageStatus::Missing(format!(
-            "no {} voice model; {} not found",
-            config.tts_helper, config.tts_fallback
-        )),
-        (false, None) if espeak => StageStatus::Degraded(format!(
-            "{} and no voice model; robotic {} fallback",
-            config.tts_helper, config.tts_fallback
-        )),
-        (false, None) => StageStatus::Missing(format!(
-            "{} with a voice model, or {}, not found",
-            config.tts_helper, config.tts_fallback
-        )),
     };
     let playback = if let Some(device) = crate::player::probe_playback() {
         StageStatus::Ready(format!("built-in cpal output ({device})"))
@@ -218,6 +224,13 @@ pub(crate) fn pcm_from_bytes(bytes: &[u8]) -> Result<Vec<i16>, VoiceError> {
 }
 
 pub(crate) fn write_wav(path: &Path, pcm: &[i16], sample_rate: u16) -> Result<(), VoiceError> {
+    fs::write(path, wav_bytes(pcm, sample_rate))
+        .map_err(|err| VoiceError::Helper(format!("write {}: {err}", path.display())))
+}
+
+/// The same WAV `write_wav` puts on disk, in memory: a cloud reply arrives as raw PCM and has to
+/// become WAV bytes for the player without a scratch file in between.
+pub(crate) fn wav_bytes(pcm: &[i16], sample_rate: u16) -> Vec<u8> {
     let data_len = pcm.len() * 2;
     let mut bytes = Vec::with_capacity(44 + data_len);
     bytes.extend_from_slice(b"RIFF");
@@ -235,8 +248,7 @@ pub(crate) fn write_wav(path: &Path, pcm: &[i16], sample_rate: u16) -> Result<()
     for sample in pcm {
         bytes.extend_from_slice(&sample.to_le_bytes());
     }
-    fs::write(path, bytes)
-        .map_err(|err| VoiceError::Helper(format!("write {}: {err}", path.display())))
+    bytes
 }
 
 /// A scratch directory that is removed on drop, including on error paths.
