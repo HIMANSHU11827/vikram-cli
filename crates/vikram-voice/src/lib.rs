@@ -12,6 +12,7 @@
 mod asr;
 mod cancel;
 mod capture;
+mod cloud_stt;
 mod cloud_tts;
 mod helpers;
 mod player;
@@ -24,12 +25,20 @@ pub use asr::{
 };
 pub use cancel::CancelToken;
 pub use capture::{CpalSource, DeviceSource, input_devices, probe_capture};
-pub use cloud_tts::{CloudRequest, CloudSynth, CloudTransport, HttpTransport, probe_cloud_tts};
+pub use cloud_stt::{
+    CloudRecognizer, CloudSttRequest, GOOGLE_ENDPOINT, HttpSttTransport, SttTransport,
+    probe_cloud_stt, stt_endpoint_of, stt_model_of,
+};
+pub use cloud_tts::{
+    CloudAuth, CloudRequest, CloudSynth, CloudTransport, HttpTransport, OPENAI_PATH, OpenAiSynth,
+    probe_cloud_tts, probe_openai_tts, tts_base_of, tts_model_of, tts_voice_of,
+};
 pub use helpers::{first_available, missing_tool_message, probe, which};
 pub use player::{CpalPlayer, DevicePlayer, output_devices, probe_playback};
 pub use session::{
     AudioSource, Captioner, HelperPlayer, HelperRecognizer, HelperSource, HelperSynth, Player,
-    Recognizer, Synthesizer, VoiceSession, VoiceSynth, pick_voice, piper_voices, spoken_text,
+    Recognizer, Synthesizer, VoiceRecognizer, VoiceSession, VoiceSynth, pick_voice, piper_voices,
+    spoken_text,
 };
 pub use vad::{detect_speech, is_silent, noise_floor, speech_gate, trim_silence};
 /// The download types the CLI needs to pull a model by name: `Hub` and its `Quant`.
@@ -61,44 +70,107 @@ pub enum VoiceError {
     InvalidAudio(String),
     #[error("invalid voice configuration: {0}")]
     Config(String),
-    /// The cloud voice is selected but cannot run: no key, or no voice id. The session falls
-    /// back to the local voice and says so; this is never the end of a turn.
-    #[error("cloud tts is not configured: {0}")]
+    /// A cloud engine is selected but cannot run: no key, or no voice id. The session falls back
+    /// to the local engine and says so; this is never the end of a turn. Shared by both
+    /// directions, so the message names neither: the caller's note says which provider failed.
+    #[error("cloud engine is not configured: {0}")]
     CloudUnconfigured(String),
-    /// The cloud voice ran and failed (network, HTTP, malformed audio). The session falls back to
-    /// the local voice and says so; this is never the end of a turn.
-    #[error("cloud tts failed: {0}")]
+    /// A cloud engine ran and failed (network, HTTP, malformed audio). The session falls back to
+    /// the local engine and says so; this is never the end of a turn.
+    #[error("cloud engine failed: {0}")]
     Cloud(String),
 }
 
-/// Which synthesizer speaks a reply. `local` is the default and the only one that needs no key,
-/// no network and no billing; `elevenlabs` is opt-in per operator.
+/// Which synthesizer speaks a reply. `vikram` is the default and the only one that needs no key,
+/// no network and no billing: it is the Jarvis piper voice on this machine. `elevenlabs` and the
+/// OpenAI-compatible `openai`/`custom` shapes are opt-in per operator. `local` is still accepted
+/// as an alias for `vikram`, so a `voice.json` written before the rename keeps loading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TtsBackend {
-    Local,
+pub enum TtsProvider {
+    Vikram,
     ElevenLabs,
+    OpenAi,
+    Custom,
 }
 
-impl TtsBackend {
-    /// `local` or `elevenlabs`; case and surrounding spaces don't matter.
+impl TtsProvider {
+    /// `vikram` (or its older name `local`), `elevenlabs`, `openai` or `custom`; case and
+    /// surrounding spaces don't matter.
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "local" => Some(Self::Local),
+            "vikram" | "local" => Some(Self::Vikram),
             "elevenlabs" => Some(Self::ElevenLabs),
+            "openai" => Some(Self::OpenAi),
+            "custom" => Some(Self::Custom),
             _ => None,
         }
     }
 
-    /// The name `parse` takes and `tts_backend` holds.
+    /// The name `parse` takes and `tts_provider` holds. `local` parses to `vikram` but is never
+    /// written back.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Local => "local",
+            Self::Vikram => "vikram",
             Self::ElevenLabs => "elevenlabs",
+            Self::OpenAi => "openai",
+            Self::Custom => "custom",
         }
     }
 
     /// Every name `parse` accepts, for an error that tells the operator what to type.
-    pub const NAMES: &'static str = "local, elevenlabs";
+    pub const NAMES: &'static str = "vikram, elevenlabs, openai, custom";
+
+    /// `openai` and `custom` speak the same wire shape; `custom` only supplies its own base URL.
+    pub fn is_compatible(self) -> bool {
+        matches!(self, Self::OpenAi | Self::Custom)
+    }
+}
+
+/// Which engine turns speech into text. `local` is the default: the built-in wavo model, no key,
+/// no network. The rest are opt-in cloud providers, and `custom` speaks the OpenAI-compatible
+/// shape against a `stt_base_url` the operator supplies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SttProvider {
+    Local,
+    Google,
+    OpenAi,
+    Custom,
+}
+
+impl SttProvider {
+    /// `local`, `google`, `openai` or `custom`; case and surrounding spaces don't matter.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "local" => Some(Self::Local),
+            "google" => Some(Self::Google),
+            "openai" => Some(Self::OpenAi),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+
+    /// The name `parse` takes and `stt_provider` holds.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Google => "google",
+            Self::OpenAi => "openai",
+            Self::Custom => "custom",
+        }
+    }
+
+    /// Every name `parse` accepts, for an error that tells the operator what to type.
+    pub const NAMES: &'static str = "local, google, openai, custom";
+
+    /// True for every provider that leaves this machine.
+    pub fn is_cloud(self) -> bool {
+        !matches!(self, Self::Local)
+    }
+
+    /// `openai` and `custom` speak the same wire shape; `custom` only supplies its own base URL.
+    pub fn is_compatible(self) -> bool {
+        matches!(self, Self::OpenAi | Self::Custom)
+    }
 }
 
 /// The knob set an operator can set without recompiling. Defaults describe what is probed, not
@@ -126,16 +198,42 @@ pub struct VoiceConfig {
     /// built-in whisper engine is the primary path either way.
     pub voxtype_fast_path: bool,
     pub asr_timeout_secs: u64,
+    /// Which engine transcribes: `local` (the default — the built-in wavo model, no key, no
+    /// network) or a cloud provider: `google`, `openai`, `custom`. Any cloud failure falls back to
+    /// the local model with one note, never a dead turn.
+    #[serde(alias = "stt_backend")]
+    pub stt_provider: String,
+    /// The endpoint a cloud provider talks to. Empty means the preset's own endpoint; `custom`
+    /// has no preset, so it must be set. `google` takes the full `speech:recognize` URL,
+    /// `openai`/`custom` take the API base (`…/v1`), and `/audio/transcriptions` is appended.
+    pub stt_base_url: String,
+    /// The model a cloud provider names. Empty means the preset's default (`whisper-1` for
+    /// `openai`; Google auto-selects). Any name the endpoint accepts works.
+    pub stt_model: String,
+    /// The environment variable the cloud key is read from. The key itself is never written to
+    /// `voice.json` and never printed; only this name is stored.
+    pub stt_api_key_env: String,
+    /// The language a cloud provider is told to expect: a BCP-47 tag for Google (`en-US`),
+    /// reduced to its ISO-639-1 subtag (`en`) for the OpenAI shape. Separate from `asr_language`,
+    /// which is wavo's own whisper field.
+    pub stt_language: String,
     pub tts_helper: String,
     pub tts_fallback: String,
     pub tts_voice: Option<PathBuf>,
     /// Spoken language for synthesis (`en`, `en-gb`, `de`). None leaves the helper's own default,
     /// which on a fresh machine is whatever espeak-ng was built for.
     pub tts_language: Option<String>,
-    /// Which synthesizer speaks: `local` (the default — the piper voice on this machine,
-    /// `en_GB-jarvis-medium`, falling back to espeak-ng) or `elevenlabs` (opt-in cloud voice).
-    /// Local stays the default because it needs no key, no network and no billing.
-    pub tts_backend: String,
+    /// Which synthesizer speaks: `vikram` (the default — the Jarvis piper voice on this machine,
+    /// `en_GB-jarvis-medium`, falling back to espeak-ng), `elevenlabs`, or the OpenAI-compatible
+    /// `openai`/`custom`. `local` is still accepted as an alias for `vikram`, so an older
+    /// `voice.json` keeps loading. Vikram stays the default because it needs no key, no network
+    /// and no billing.
+    #[serde(alias = "tts_backend")]
+    pub tts_provider: String,
+    /// The endpoint a cloud synthesizer talks to. Empty means the preset's own endpoint;
+    /// `custom` must set it. `elevenlabs` takes the base before the voice id, `openai`/`custom`
+    /// take the API base (`…/v1`), and `/audio/speech` is appended.
+    pub tts_base_url: String,
     /// The environment variable the cloud key is read from. The key itself is never written to
     /// `voice.json` and never printed; only this name is stored.
     pub tts_api_key_env: String,
@@ -143,10 +241,9 @@ pub struct VoiceConfig {
     /// sample voice). Empty by default on purpose: a built-in voice id would bill an operator who
     /// never chose one. Set it with `vikram voice config set tts_voice_id <id>`.
     pub tts_voice_id: String,
-    /// The ElevenLabs model id. `eleven_turbo_v2_5` is the low-latency default; their published
-    /// default is `eleven_multilingual_v2`, which is slower but speaks more languages.
-    /// ElevenLabs now lists Turbo as deprecated in favour of `eleven_flash_v2_5` (same voice,
-    /// lower latency); either id works here, so switching is `config set tts_model`.
+    /// The cloud model id. Empty means the provider's default: `eleven_turbo_v2_5` for
+    /// ElevenLabs, `tts-1` for the OpenAI shape. Any id the endpoint accepts works, so
+    /// `eleven_flash_v2_5`, `gpt-4o-mini-tts` and the like are `config set tts_model`.
     pub tts_model: String,
     /// Speaking rate in words per minute (80..=450). 175 is espeak-ng's own default; piper gets
     /// the reciprocal as `--length_scale`.
@@ -183,14 +280,20 @@ impl Default for VoiceConfig {
             asr_language: None,
             voxtype_fast_path: true,
             asr_timeout_secs: 120,
+            stt_provider: "local".into(),
+            stt_base_url: String::new(),
+            stt_model: String::new(),
+            stt_api_key_env: "GOOGLE_API_KEY".into(),
+            stt_language: "en-US".into(),
             tts_helper: "piper".into(),
             tts_fallback: "espeak-ng".into(),
             tts_voice: None,
             tts_language: None,
-            tts_backend: "local".into(),
+            tts_provider: "vikram".into(),
+            tts_base_url: String::new(),
             tts_api_key_env: "ELEVENLABS_API_KEY".into(),
             tts_voice_id: String::new(),
-            tts_model: "eleven_turbo_v2_5".into(),
+            tts_model: String::new(),
             rate: 175,
             volume: 1.0,
             player_helper: "paplay".into(),
@@ -244,21 +347,72 @@ impl VoiceConfig {
         if let Err(err) = Quant::parse(&self.asr_quant) {
             return Err(VoiceError::Config(format!("asr_quant: {err}")));
         }
-        if TtsBackend::parse(&self.tts_backend).is_none() {
-            return Err(VoiceError::Config(format!(
-                "tts_backend `{}` is not one of: {}",
-                self.tts_backend.trim(),
-                TtsBackend::NAMES
-            )));
-        }
+        let tts_provider = TtsProvider::parse(&self.tts_provider).ok_or_else(|| {
+            VoiceError::Config(format!(
+                "tts_provider `{}` is not one of: {} (local is an alias for vikram)",
+                self.tts_provider.trim(),
+                TtsProvider::NAMES
+            ))
+        })?;
+        let stt_provider = SttProvider::parse(&self.stt_provider).ok_or_else(|| {
+            VoiceError::Config(format!(
+                "stt_provider `{}` is not one of: {}",
+                self.stt_provider.trim(),
+                SttProvider::NAMES
+            ))
+        })?;
         if self.tts_api_key_env.trim().is_empty() {
             return Err(VoiceError::Config(
                 "tts_api_key_env is empty; name the environment variable that holds the key".into(),
             ));
         }
-        if self.tts_model.trim().is_empty() {
+        if self.stt_api_key_env.trim().is_empty() {
             return Err(VoiceError::Config(
-                "tts_model is empty; name a model such as eleven_turbo_v2_5".into(),
+                "stt_api_key_env is empty; name the environment variable that holds the key".into(),
+            ));
+        }
+        let language = self.stt_language.trim();
+        if language.is_empty() {
+            return Err(VoiceError::Config(
+                "stt_language is empty; set a BCP-47 tag like en-US, or local".into(),
+            ));
+        }
+        if language.chars().any(char::is_whitespace) {
+            return Err(VoiceError::Config(format!(
+                "stt_language `{language}` contains whitespace; use a BCP-47 tag like en-US"
+            )));
+        }
+        for (name, url) in [
+            ("stt_base_url", &self.stt_base_url),
+            ("tts_base_url", &self.tts_base_url),
+        ] {
+            let url = url.trim();
+            if !url.is_empty() && !(url.starts_with("http://") || url.starts_with("https://")) {
+                return Err(VoiceError::Config(format!(
+                    "{name} `{url}` is not an http(s) URL; leave it empty for the preset's own \
+                     endpoint, or set one that starts with https://"
+                )));
+            }
+        }
+        if stt_provider == SttProvider::Custom && self.stt_base_url.trim().is_empty() {
+            return Err(VoiceError::Config(
+                "stt_provider is custom but stt_base_url is empty; custom has no preset endpoint, \
+                 so set one with `vikram voice config set stt_base_url https://host/v1`"
+                    .into(),
+            ));
+        }
+        if stt_provider == SttProvider::Custom && self.stt_model.trim().is_empty() {
+            return Err(VoiceError::Config(
+                "stt_provider is custom but stt_model is empty; name the model the endpoint \
+                 expects"
+                    .into(),
+            ));
+        }
+        if tts_provider == TtsProvider::Custom && self.tts_base_url.trim().is_empty() {
+            return Err(VoiceError::Config(
+                "tts_provider is custom but tts_base_url is empty; custom has no preset endpoint, \
+                 so set one with `vikram voice config set tts_base_url https://host/v1`"
+                    .into(),
             ));
         }
         if AsrBackend::parse(&self.asr_backend).is_none() {
@@ -611,39 +765,61 @@ mod tests {
     }
 
     #[test]
-    fn the_local_voice_is_the_default_and_needs_no_key() {
+    fn the_vikram_voice_is_the_default_and_needs_no_key() {
         let config = VoiceConfig::default();
         config.validate().expect("the defaults are valid");
-        assert_eq!(config.tts_backend, "local");
+        assert_eq!(config.tts_provider, "vikram");
         assert_eq!(
-            TtsBackend::parse(&config.tts_backend),
-            Some(TtsBackend::Local)
+            TtsProvider::parse(&config.tts_provider),
+            Some(TtsProvider::Vikram)
         );
         assert_eq!(config.tts_api_key_env, "ELEVENLABS_API_KEY");
         assert!(
             config.tts_voice_id.is_empty(),
             "no voice id is baked in: a default would bill an operator who never chose one"
         );
-        assert_eq!(config.tts_model, "eleven_turbo_v2_5");
         assert_eq!(
-            TtsBackend::parse("ElevenLabs"),
-            Some(TtsBackend::ElevenLabs)
+            config.tts_model, "",
+            "empty means the provider's own default, so a preset is not stuck with another's model"
         );
-        assert_eq!(TtsBackend::ElevenLabs.as_str(), "elevenlabs");
+        assert_eq!(
+            TtsProvider::parse("ElevenLabs"),
+            Some(TtsProvider::ElevenLabs)
+        );
+        assert_eq!(TtsProvider::ElevenLabs.as_str(), "elevenlabs");
+        assert_eq!(TtsProvider::OpenAi.as_str(), "openai");
+        assert_eq!(TtsProvider::Custom.as_str(), "custom");
     }
 
     #[test]
-    fn an_unknown_tts_backend_is_refused_and_names_both() {
+    fn the_local_voice_is_still_accepted_as_an_alias_for_vikram() {
+        let config: VoiceConfig = serde_json::from_str(r#"{"tts_backend": "local"}"#).unwrap();
+        assert_eq!(
+            config.tts_provider, "local",
+            "the file is read as it was written"
+        );
+        assert_eq!(
+            TtsProvider::parse(&config.tts_provider),
+            Some(TtsProvider::Vikram),
+            "and it means the vikram voice"
+        );
+        config.validate().expect("an older file stays valid");
+        assert_eq!(TtsProvider::parse("  LOCAL "), Some(TtsProvider::Vikram));
+        assert_eq!(TtsProvider::Vikram.as_str(), "vikram");
+    }
+
+    #[test]
+    fn an_unknown_tts_provider_is_refused_and_names_all_of_them() {
         let config = VoiceConfig {
-            tts_backend: "azure".into(),
+            tts_provider: "azure".into(),
             ..Default::default()
         };
         let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("tts_backend"), "{err}");
-        assert!(err.contains("local, elevenlabs"), "{err}");
+        assert!(err.contains("tts_provider"), "{err}");
+        assert!(err.contains("vikram, elevenlabs, openai, custom"), "{err}");
 
         let ok = VoiceConfig {
-            tts_backend: "elevenlabs".into(),
+            tts_provider: "elevenlabs".into(),
             ..Default::default()
         };
         ok.validate().expect(
@@ -652,19 +828,104 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_stt_provider_is_refused_and_names_both_choices() {
+        let config = VoiceConfig {
+            stt_provider: "azure".into(),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("stt_provider"), "{err}");
+        assert!(err.contains("local, google, openai, custom"), "{err}");
+
+        for provider in ["local", "google", "openai", "custom"] {
+            let mut config = VoiceConfig {
+                stt_provider: provider.into(),
+                ..Default::default()
+            };
+            if provider == "custom" {
+                config.stt_base_url = "https://speech.example.test/v1".into();
+                config.stt_model = "whisper-1".into();
+            }
+            config
+                .validate()
+                .unwrap_or_else(|err| panic!("{provider}: {err}"));
+        }
+    }
+
+    #[test]
+    fn local_is_the_default_in_both_directions() {
+        let config = VoiceConfig::default();
+        assert_eq!(config.stt_provider, "local");
+        assert_eq!(config.stt_api_key_env, "GOOGLE_API_KEY");
+        assert_eq!(config.stt_language, "en-US");
+        assert_eq!(config.stt_base_url, "");
+        assert_eq!(config.stt_model, "");
+        assert_eq!(config.tts_provider, "vikram");
+        assert_eq!(config.tts_base_url, "");
+        config.validate().expect("the defaults are valid");
+    }
+
+    #[test]
+    fn a_cloud_endpoint_must_be_http_or_empty() {
+        let bad = VoiceConfig {
+            stt_provider: "custom".into(),
+            stt_base_url: "file:///etc/passwd".into(),
+            ..Default::default()
+        };
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(err.contains("stt_base_url"), "{err}");
+        assert!(err.contains("http"), "{err}");
+
+        let no_url = VoiceConfig {
+            tts_provider: "custom".into(),
+            ..Default::default()
+        };
+        let err = no_url.validate().unwrap_err().to_string();
+        assert!(err.contains("tts_provider is custom"), "{err}");
+        assert!(err.contains("tts_base_url"), "{err}");
+    }
+
+    #[test]
+    fn a_spoken_stt_language_must_look_like_a_tag() {
+        let blank = VoiceConfig {
+            stt_language: "  ".into(),
+            ..Default::default()
+        };
+        assert!(blank.validate().is_err());
+        let spaced = VoiceConfig {
+            stt_language: "en US".into(),
+            ..Default::default()
+        };
+        assert!(spaced.validate().is_err());
+    }
+
+    #[test]
     fn an_older_voice_json_keeps_the_local_voice() {
         let config: VoiceConfig = serde_json::from_str(r#"{"tts_helper": "piper"}"#).unwrap();
-        assert_eq!(config.tts_backend, "local");
+        assert_eq!(config.tts_provider, "vikram");
         assert_eq!(config.tts_api_key_env, "ELEVENLABS_API_KEY");
-        assert_eq!(config.tts_model, "eleven_turbo_v2_5");
         assert!(config.tts_voice_id.is_empty());
+        assert_eq!(config.stt_provider, "local");
+        assert_eq!(config.stt_language, "en-US");
+        assert_eq!(config.stt_api_key_env, "GOOGLE_API_KEY");
+    }
+
+    #[test]
+    fn the_old_key_names_are_read_as_the_new_ones() {
+        let config: VoiceConfig =
+            serde_json::from_str(r#"{"stt_backend": "google", "tts_backend": "elevenlabs"}"#)
+                .unwrap();
+        assert_eq!(config.stt_provider, "google");
+        assert_eq!(config.tts_provider, "elevenlabs");
+        config.validate().expect("both names validate");
     }
 
     #[test]
     fn the_key_is_named_never_stored() {
         let config = VoiceConfig {
-            tts_backend: "elevenlabs".into(),
+            tts_provider: "elevenlabs".into(),
             tts_voice_id: "abc".into(),
+            stt_provider: "google".into(),
             ..Default::default()
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
@@ -673,7 +934,15 @@ mod tests {
             "{json}"
         );
         assert!(
+            json.contains("\"stt_api_key_env\": \"GOOGLE_API_KEY\""),
+            "{json}"
+        );
+        assert!(
             !json.contains("xi-api-key") && !json.contains("\"tts_api_key\""),
+            "the config file stores the variable name, never a key: {json}"
+        );
+        assert!(
+            !json.contains("\"stt_api_key\""),
             "the config file stores the variable name, never a key: {json}"
         );
     }

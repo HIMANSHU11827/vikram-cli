@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Subcommand};
 use vikram_runtime::config::Config;
 use vikram_voice::{
-    AsrBackend, AsrEngine, Hub, Quant, Recognizer, TtsBackend, VoiceConfig, VoiceError,
-    VoiceSession, probe,
+    AsrBackend, Hub, OPENAI_PATH, Quant, Recognizer, SttProvider, TtsProvider, VoiceConfig,
+    VoiceError, VoiceRecognizer, VoiceSession, probe, stt_endpoint_of, stt_model_of, tts_base_of,
+    tts_model_of, tts_voice_of,
 };
 
 use crate::chat;
@@ -40,6 +41,11 @@ pub enum VoiceAction {
         /// decode cost without the one-time model load.
         #[arg(long, value_name = "N", default_value_t = 1)]
         repeat: u32,
+        /// Transcribe with this provider for this run only: `local` (the built-in model, the
+        /// default), `google`, `openai` or `custom`. Never saved — use
+        /// `voice config set stt_provider` to keep it.
+        #[arg(long, value_name = "BACKEND")]
+        backend: Option<String>,
     },
     /// Record one utterance locally and print its transcript.
     Listen {
@@ -65,9 +71,9 @@ pub enum VoiceAction {
         /// Piper voice model. Defaults to VIKRAM_TTS_VOICE.
         #[arg(long, value_name = "PATH")]
         voice: Option<PathBuf>,
-        /// Speak with this backend for this run only: `local` (the piper voice, the default) or
-        /// `elevenlabs` (opt-in cloud voice; needs the key named by `tts_api_key_env`). Never
-        /// saved — use `voice config set tts_backend` to keep it.
+        /// Speak with this provider for this run only: `vikram` (the Jarvis piper voice, the
+        /// default), `elevenlabs`, `openai` or `custom` (needs the key named by
+        /// `tts_api_key_env`). Never saved — use `voice config set tts_provider` to keep it.
         #[arg(long, value_name = "BACKEND")]
         backend: Option<String>,
     },
@@ -510,17 +516,49 @@ fn apply_setting(config: &mut VoiceConfig, key: &str, value: &str) -> Result<Str
             optional_text(value),
             render_optional_text,
         ),
-        "tts_backend" => {
-            let backend = TtsBackend::parse(value).ok_or_else(|| {
+        "stt_provider" | "stt_backend" => {
+            let provider = SttProvider::parse(value).ok_or_else(|| {
                 format!(
-                    "tts_backend: expected one of {}, got {value:?}",
-                    TtsBackend::NAMES
+                    "stt_provider: expected one of {}, got {value:?}",
+                    SttProvider::NAMES
                 )
             })?;
-            set_field(&mut config.tts_backend, backend.as_str().to_string(), |v| {
-                v.clone()
-            })
+            set_field(
+                &mut config.stt_provider,
+                provider.as_str().to_string(),
+                |v| v.clone(),
+            )
         }
+        "stt_base_url" => set_field(&mut config.stt_base_url, value.trim().to_string(), |v| {
+            v.clone()
+        }),
+        "stt_model" => set_field(&mut config.stt_model, value.trim().to_string(), |v| {
+            v.clone()
+        }),
+        "stt_api_key_env" => set_field(
+            &mut config.stt_api_key_env,
+            required_text(key, value)?,
+            |v| v.clone(),
+        ),
+        "stt_language" => set_field(&mut config.stt_language, required_text(key, value)?, |v| {
+            v.clone()
+        }),
+        "tts_provider" | "tts_backend" => {
+            let provider = TtsProvider::parse(value).ok_or_else(|| {
+                format!(
+                    "tts_provider: expected one of {}, got {value:?}",
+                    TtsProvider::NAMES
+                )
+            })?;
+            set_field(
+                &mut config.tts_provider,
+                provider.as_str().to_string(),
+                |v| v.clone(),
+            )
+        }
+        "tts_base_url" => set_field(&mut config.tts_base_url, value.trim().to_string(), |v| {
+            v.clone()
+        }),
         "tts_api_key_env" => set_field(
             &mut config.tts_api_key_env,
             required_text(key, value)?,
@@ -620,30 +658,87 @@ fn set(key: &str, value: &str) -> Result<(), String> {
 }
 
 /// A one-run backend override: `--backend elevenlabs` for this invocation only. The saved
-/// `tts_backend` is never touched, because a voice someone is trying out is not a decision.
+/// `tts_provider` is never touched, because a voice someone is trying out is not a decision.
 fn apply_backend(config: &mut VoiceConfig, backend: Option<&str>) -> Result<(), String> {
     let Some(value) = backend else {
         return Ok(());
     };
-    let backend = TtsBackend::parse(value)
-        .ok_or_else(|| format!("--backend `{value}` is not one of: {}", TtsBackend::NAMES))?;
-    config.tts_backend = backend.as_str().to_string();
+    let backend = TtsProvider::parse(value)
+        .ok_or_else(|| format!("--backend `{value}` is not one of: {}", TtsProvider::NAMES))?;
+    config.tts_provider = backend.as_str().to_string();
     Ok(())
 }
 
-/// The line `voice status` prints so the choice is discoverable: which backend is live, and every
-/// backend the build offers.
-fn backend_line(config: &VoiceConfig) -> String {
-    match TtsBackend::parse(&config.tts_backend) {
-        Some(backend) => format!(
-            "tts backend: {} (available: local, no key needed | elevenlabs, opt-in, key from ${})",
-            backend.as_str(),
-            config.tts_api_key_env
-        ),
+/// The same one-run override for transcription: `voice transcribe --backend google` changes
+/// nothing on disk.
+fn apply_stt_backend(config: &mut VoiceConfig, backend: Option<&str>) -> Result<(), String> {
+    let Some(value) = backend else {
+        return Ok(());
+    };
+    let provider = SttProvider::parse(value)
+        .ok_or_else(|| format!("--backend `{value}` is not one of: {}", SttProvider::NAMES))?;
+    config.stt_provider = provider.as_str().to_string();
+    Ok(())
+}
+
+/// The line `voice status` prints for speech: which provider is live, every provider the build
+/// offers, and — for a cloud provider — the endpoint and model in use. The key itself is never
+/// printed, only the name of the variable that holds it.
+fn tts_backend_line(config: &VoiceConfig) -> String {
+    const AVAILABLE: &str = "available: vikram | elevenlabs | openai | custom";
+    match TtsProvider::parse(&config.tts_provider) {
+        Some(TtsProvider::Vikram) => format!("tts backend: vikram ({AVAILABLE})"),
+        Some(provider) => {
+            let base = tts_base_of(config).unwrap_or_else(|err| err.to_string());
+            let endpoint = match provider {
+                TtsProvider::ElevenLabs => format!("{}/<voice id>", base.trim_end_matches('/')),
+                _ => format!("{}{OPENAI_PATH}", base.trim_end_matches('/')),
+            };
+            let voice = tts_voice_of(config);
+            let voice = if voice.is_empty() {
+                "<voice id not set>".to_string()
+            } else {
+                voice
+            };
+            format!(
+                "tts backend: {} ({AVAILABLE}) — {endpoint}, model {}, voice {voice}, key from ${}",
+                provider.as_str(),
+                tts_model_of(config),
+                config.tts_api_key_env.trim()
+            )
+        }
         None => format!(
-            "tts backend: {} is not one of: {} — the local voice is used",
-            config.tts_backend.trim(),
-            TtsBackend::NAMES
+            "tts backend: {} is not one of: {} — the vikram voice is used",
+            config.tts_provider.trim(),
+            TtsProvider::NAMES
+        ),
+    }
+}
+
+/// The same line for transcription, so both directions are discoverable in one place.
+fn stt_backend_line(config: &VoiceConfig) -> String {
+    const AVAILABLE: &str = "available: local | google | openai | custom";
+    match SttProvider::parse(&config.stt_provider) {
+        Some(SttProvider::Local) => format!("stt backend: local ({AVAILABLE})"),
+        Some(provider) => {
+            let endpoint = stt_endpoint_of(config).unwrap_or_else(|err| err.to_string());
+            let model = stt_model_of(config);
+            let model = if model.is_empty() {
+                "auto".to_string()
+            } else {
+                model
+            };
+            format!(
+                "stt backend: {} ({AVAILABLE}) — {endpoint}, model {model}, language {}, key from ${}",
+                provider.as_str(),
+                config.stt_language.trim(),
+                config.stt_api_key_env.trim()
+            )
+        }
+        None => format!(
+            "stt backend: {} is not one of: {} — the built-in model is used",
+            config.stt_provider.trim(),
+            SttProvider::NAMES
         ),
     }
 }
@@ -835,7 +930,8 @@ pub fn run(action: VoiceAction) -> Result<(), String> {
             for line in status.lines() {
                 println!("{line}");
             }
-            println!("{}", backend_line(&config));
+            println!("{}", tts_backend_line(&config));
+            println!("{}", stt_backend_line(&config));
             if !status.enabled {
                 println!("voice I/O is off; pass --enable to `voice listen` or `voice say`");
             }
@@ -848,14 +944,16 @@ pub fn run(action: VoiceAction) -> Result<(), String> {
             file,
             asr_model,
             repeat,
+            backend,
         } => {
             let base = VoiceConfig::load().map_err(|err| err.to_string())?;
             let mut config = config(&base, true, asr_model, None, None, &OverrideArgs::default());
+            apply_stt_backend(&mut config, backend.as_deref())?;
             config.enabled = true;
             config.validate().map_err(|err| err.to_string())?;
             let bytes = std::fs::read(&file).map_err(|err| format!("{}: {err}", file.display()))?;
             let pcm = wav_pcm(&bytes)?;
-            let mut engine = AsrEngine::new(&config);
+            let mut engine = VoiceRecognizer::new(&config);
             for run in 1..=repeat.max(1) {
                 let started = std::time::Instant::now();
                 let text = engine.transcribe(&pcm).map_err(|err| err.to_string())?;
@@ -869,6 +967,11 @@ pub fn run(action: VoiceAction) -> Result<(), String> {
                     pcm.len(),
                     elapsed.as_secs_f64() * 1000.0
                 );
+            }
+            // A cloud failure fell back to the local model; say so once, the way the session
+            // does, instead of swallowing the reason.
+            for note in engine.notes() {
+                eprintln!("voice: {note}");
             }
             Ok(())
         }
@@ -1113,7 +1216,10 @@ mod tests {
             _ => match key {
                 "asr_quant" => "q4_k_m".to_string(),
                 "asr_backend" => "cpu".to_string(),
-                "tts_backend" => "elevenlabs".to_string(),
+                "stt_provider" => "google".to_string(),
+                "tts_provider" => "elevenlabs".to_string(),
+                "stt_base_url" | "tts_base_url" => "https://example.test/v1".to_string(),
+                "stt_language" => "en-US".to_string(),
                 _ => "/tmp/x".to_string(),
             },
         };
@@ -1182,26 +1288,36 @@ mod tests {
     }
 
     #[test]
-    fn a_backend_can_be_set_and_an_unknown_one_is_refused() {
+    fn a_provider_can_be_set_and_an_unknown_one_is_refused() {
         let (_home, _guard) = temp_home();
-        set("tts_backend", "elevenlabs").expect("a known backend saves");
-        assert_eq!(VoiceConfig::load().unwrap().tts_backend, "elevenlabs");
-        set("tts-backend", "local").expect("the kebab spelling is accepted");
-        assert_eq!(VoiceConfig::load().unwrap().tts_backend, "local");
-
-        let err = set("tts_backend", "azure").expect_err("an unknown backend is refused");
-        assert!(err.contains("local, elevenlabs"), "{err}");
+        set("tts_provider", "elevenlabs").expect("a known provider saves");
+        assert_eq!(VoiceConfig::load().unwrap().tts_provider, "elevenlabs");
+        set("tts-backend", "local").expect("the old name and kebab spelling are accepted");
         assert_eq!(
-            VoiceConfig::load().unwrap().tts_backend,
-            "local",
+            VoiceConfig::load().unwrap().tts_provider,
+            "vikram",
+            "the alias normalises to the name the status line prints"
+        );
+
+        let err = set("tts_provider", "azure").expect_err("an unknown provider is refused");
+        assert!(err.contains("vikram, elevenlabs, openai, custom"), "{err}");
+        assert_eq!(
+            VoiceConfig::load().unwrap().tts_provider,
+            "vikram",
             "a refused value writes nothing"
         );
+
+        set("stt_backend", "google").expect("the old stt name is accepted");
+        assert_eq!(VoiceConfig::load().unwrap().stt_provider, "google");
+        let err = set("stt_provider", "azure").expect_err("an unknown provider is refused");
+        assert!(err.contains("local, google, openai, custom"), "{err}");
+        assert_eq!(VoiceConfig::load().unwrap().stt_provider, "google");
     }
 
     #[test]
     fn the_cloud_voice_is_configured_without_storing_a_key() {
         let (_home, _guard) = temp_home();
-        set("tts_backend", "elevenlabs").expect("select it");
+        set("tts_provider", "elevenlabs").expect("select it");
         set("tts_voice_id", "JBFqnCBsd6RMkjVDRZzb").expect("name a voice");
         set("tts_api_key_env", "MY_ELEVEN_KEY").expect("name the variable");
         let loaded = VoiceConfig::load().unwrap();
@@ -1217,45 +1333,117 @@ mod tests {
         let saved = VoiceConfig::default();
         let mut run = saved.clone();
         apply_backend(&mut run, Some("ElevenLabs")).expect("case does not matter");
-        assert_eq!(run.tts_backend, "elevenlabs");
-        assert_eq!(saved.tts_backend, "local", "the saved config is untouched");
+        assert_eq!(run.tts_provider, "elevenlabs");
+        assert_eq!(
+            saved.tts_provider, "vikram",
+            "the saved config is untouched"
+        );
 
         apply_backend(&mut run, None).expect("no flag is not an error");
         assert_eq!(
-            run.tts_backend, "elevenlabs",
+            run.tts_provider, "elevenlabs",
             "no flag leaves the run alone"
         );
 
         let err = apply_backend(&mut run, Some("azure")).unwrap_err();
-        assert!(err.contains("local, elevenlabs"), "{err}");
+        assert!(err.contains("vikram, elevenlabs, openai, custom"), "{err}");
+
+        let mut stt = VoiceConfig::default();
+        apply_stt_backend(&mut stt, Some("Google")).expect("case does not matter");
+        assert_eq!(stt.stt_provider, "google");
+        apply_stt_backend(&mut stt, Some("local")).expect("local is a provider name here");
+        assert_eq!(stt.stt_provider, "local");
+        let err = apply_stt_backend(&mut stt, Some("whisper")).unwrap_err();
+        assert!(err.contains("local, google, openai, custom"), "{err}");
     }
 
     #[test]
-    fn status_names_the_live_backend_and_what_is_available() {
-        let line = backend_line(&VoiceConfig::default());
-        assert!(line.contains("tts backend: local"), "{line}");
-        assert!(line.contains("elevenlabs"), "{line}");
-        assert!(line.contains("ELEVENLABS_API_KEY"), "{line}");
+    fn status_names_both_directions_and_what_is_available() {
+        let config = VoiceConfig::default();
+        let line = tts_backend_line(&config);
+        assert_eq!(
+            line,
+            "tts backend: vikram (available: vikram | elevenlabs | openai | custom)"
+        );
+        let line = stt_backend_line(&config);
+        assert_eq!(
+            line,
+            "stt backend: local (available: local | google | openai | custom)"
+        );
 
         let cloud = VoiceConfig {
-            tts_backend: "elevenlabs".into(),
+            tts_provider: "elevenlabs".into(),
+            tts_voice_id: "abc".into(),
             ..Default::default()
         };
-        let line = backend_line(&cloud);
+        let line = tts_backend_line(&cloud);
         assert!(line.contains("tts backend: elevenlabs"), "{line}");
+        assert!(
+            line.contains("https://api.elevenlabs.io/v1/text-to-speech/<voice id>"),
+            "{line}"
+        );
+        assert!(line.contains("model eleven_turbo_v2_5"), "{line}");
+        assert!(line.contains("ELEVENLABS_API_KEY"), "{line}");
+
+        let google = VoiceConfig {
+            stt_provider: "google".into(),
+            ..Default::default()
+        };
+        let line = stt_backend_line(&google);
+        assert!(line.contains("stt backend: google"), "{line}");
+        assert!(
+            line.contains("https://speech.googleapis.com/v1/speech:recognize"),
+            "{line}"
+        );
+        assert!(line.contains("language en-US"), "{line}");
+        assert!(line.contains("GOOGLE_API_KEY"), "{line}");
 
         let bad = VoiceConfig {
-            tts_backend: "azure".into(),
+            tts_provider: "azure".into(),
+            stt_provider: "azure".into(),
             ..Default::default()
         };
-        let line = backend_line(&bad);
-        assert!(line.contains("local, elevenlabs"), "{line}");
+        assert!(
+            tts_backend_line(&bad).contains("vikram, elevenlabs, openai, custom"),
+            "{bad:?}"
+        );
+        assert!(
+            stt_backend_line(&bad).contains("local, google, openai, custom"),
+            "{bad:?}"
+        );
+    }
+
+    #[test]
+    fn a_selected_provider_prints_its_endpoint_and_model_but_never_a_key() {
+        let config = VoiceConfig {
+            stt_provider: "openai".into(),
+            stt_api_key_env: "MY_ASR_KEY".into(),
+            tts_provider: "custom".into(),
+            tts_base_url: "https://tts.example.test/v1".into(),
+            tts_model: "my-voice-model".into(),
+            tts_api_key_env: "MY_TTS_KEY".into(),
+            ..Default::default()
+        };
+        let stt = stt_backend_line(&config);
+        assert!(
+            stt.contains("https://api.openai.com/v1/audio/transcriptions"),
+            "{stt}"
+        );
+        assert!(stt.contains("model whisper-1"), "{stt}");
+        assert!(stt.contains("$MY_ASR_KEY"), "the variable is named: {stt}");
+        let tts = tts_backend_line(&config);
+        assert!(
+            tts.contains("https://tts.example.test/v1/audio/speech"),
+            "{tts}"
+        );
+        assert!(tts.contains("model my-voice-model"), "{tts}");
+        assert!(tts.contains("$MY_TTS_KEY"), "{tts}");
     }
 
     #[test]
     fn a_cloud_backend_without_a_key_is_reported_as_degraded() {
         let config = VoiceConfig {
-            tts_backend: "elevenlabs".into(),
+            tts_provider: "elevenlabs".into(),
             tts_voice_id: "abc".into(),
             tts_api_key_env: "VIKRAM_TEST_UNSET_KEY_NAME".into(),
             ..Default::default()
@@ -1264,6 +1452,35 @@ mod tests {
         assert!(label.starts_with("degraded:"), "{label}");
         assert!(label.contains("VIKRAM_TEST_UNSET_KEY_NAME"), "{label}");
         assert!(label.contains("local voice"), "{label}");
+    }
+
+    #[test]
+    fn a_google_stt_without_a_key_is_degraded_and_names_the_variable() {
+        let config = VoiceConfig {
+            stt_provider: "google".into(),
+            stt_api_key_env: "VIKRAM_TEST_UNSET_KEY_NAME".into(),
+            ..Default::default()
+        };
+        let label = probe(&config).asr.label();
+        assert!(label.starts_with("degraded:"), "{label}");
+        assert!(label.contains("VIKRAM_TEST_UNSET_KEY_NAME"), "{label}");
+        assert!(label.contains("built-in wavo"), "{label}");
+    }
+
+    #[test]
+    fn a_google_stt_with_a_key_reports_the_language_and_the_endpoint() {
+        // `PATH` stands in for "a variable exists"; nothing is sent anywhere.
+        let config = VoiceConfig {
+            stt_provider: "google".into(),
+            stt_api_key_env: "PATH".into(),
+            ..Default::default()
+        };
+        assert_eq!(probe(&config).asr.label(), "ready: google (en-US)");
+        let default = probe(&VoiceConfig::default()).asr.label();
+        assert!(
+            !default.contains("google"),
+            "the default line names the built-in engine, not a cloud one: {default}"
+        );
     }
 
     #[test]

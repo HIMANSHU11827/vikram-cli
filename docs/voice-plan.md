@@ -131,7 +131,7 @@ Every stage reports `ready` / `degraded` / `missing` / `disabled` with a reason;
 ```
 vikram voice status
 vikram voice listen [--enable] [flags]
-vikram voice say    [--enable] <text> [--voice PATH] [--backend local|elevenlabs]
+vikram voice say    [--enable] <text> [--voice PATH] [--backend vikram|elevenlabs|openai|custom]
 vikram voice chat   [--enable] [flags] [--voice PATH] [--fresh]
 vikram voice config show
 vikram voice config path
@@ -150,7 +150,7 @@ Flags, and whether they outlive the run:
 | `listen` | `--asr-model PATH` | ASR model for this run (path or wavo hub name) | no — use `config set asr_model` to keep it |
 | `listen` | `--max-record-ms MS` | recording cap for this run | no — use `config set max_record_ms` |
 | `say` | `--voice PATH` | piper `.onnx` voice for this run | no — use `config set tts_voice` |
-| `say` | `--backend NAME` | `local` or `elevenlabs` for this run | no — use `config set tts_backend` |
+| `say` | `--backend NAME` | `vikram`, `elevenlabs`, `openai` or `custom` for this run | no — use `config set tts_provider` |
 | `chat` | `--fresh` | start a new session instead of continuing the most recent | n/a (session state) |
 | `chat` | `--enable`, `--asr-model`, `--max-record-ms`, `--voice` | same as above, for the spoken turn | no |
 | `listen`, `chat` | `--language CODE` | ASR language; `auto` lets wavo detect it | **yes**, written back after a successful transcript |
@@ -279,6 +279,64 @@ vikram voice say --enable "status report"
   model …)`, or `degraded:` naming the exact variable or field to fix.
 - `--backend` on `say` is a one-run override; the saved `tts_backend` is not
   touched.
+
+### 3.7 STT and TTS providers: local by default, presets, bring your own
+
+Local is the default in both directions, and nothing about that path changed:
+`stt_provider = local` transcribes with the built-in wavo model (`whisper-base.en`, Q8_0,
+Vulkan), and `tts_provider = vikram` speaks with the Jarvis piper voice
+(`en_GB-jarvis-medium`, espeak-ng only when the voice model is missing). Neither needs a key, a
+network or a billing account.
+
+A cloud provider is opt-in, one `config set` away, and **every cloud failure falls back to the
+local engine with one note** — `google: HTTP 503 …; transcribing with the built-in wavo model` —
+never a dead turn and never silence. A cancel is not a failure and ends the turn as a cancel.
+Keys come from the environment variable named in `stt_api_key_env` / `tts_api_key_env`; the key
+itself is never written to `voice.json`, never printed, and never put in an error message.
+
+| Direction | Provider | Endpoint | Model | Voice | Key from |
+|---|---|---|---|---|---|
+| STT | `local` (default) | built-in wavo | `whisper-base.en` Q8_0 | — | none |
+| STT | `google` (preset) | `https://speech.googleapis.com/v1/speech:recognize` | Google auto-selects; `stt_model` overrides | — | `$GOOGLE_API_KEY` |
+| STT | `openai` (preset) | `https://api.openai.com/v1/audio/transcriptions` | `whisper-1` | — | `$GOOGLE_API_KEY` until `stt_api_key_env` names another |
+| STT | `custom` | your `stt_base_url` + `/audio/transcriptions` | your `stt_model` (required) | — | your `stt_api_key_env` |
+| TTS | `vikram` (default) | built-in piper | — | `en_GB-jarvis-medium` | none |
+| TTS | `elevenlabs` (preset) | `https://api.elevenlabs.io/v1/text-to-speech/<voice id>` | `eleven_turbo_v2_5` | your `tts_voice_id` (required) | `$ELEVENLABS_API_KEY` |
+| TTS | `openai` (preset) | `https://api.openai.com/v1/audio/speech` | `tts-1` | `alloy` | `$ELEVENLABS_API_KEY` until `tts_api_key_env` names another |
+| TTS | `custom` | your `tts_base_url` + `/audio/speech` | your `tts_model`, else `tts-1` | your `tts_voice_id`, else `alloy` | your `tts_api_key_env` |
+
+A preset fills in the endpoint and the default model; an explicit `stt_base_url` / `stt_model` or
+`tts_base_url` / `tts_model` / `tts_voice_id` overrides it. `custom` is the same
+OpenAI-compatible shape against a base URL you supply, which is why "any provider" works: it is
+the de-facto standard audio API. The four shapes, read off the published references
+(2026-11-23):
+
+- **STT, OpenAI-compatible** (`openai`, `custom`) — `POST {base}/audio/transcriptions`,
+  `Authorization: Bearer <key>`, `multipart/form-data` with `file` (a 16 kHz mono WAV), `model`,
+  and `language` in ISO-639-1, so `stt_language = en-US` is sent as `en`; the reply is
+  `{"text": "…"}`.
+- **STT, Google v1** (`google`) — `POST …/v1/speech:recognize?key=<key>` with
+  `{"config":{"encoding":"LINEAR16","sampleRateHertz":16000,"languageCode":"en-US",
+  "enableAutomaticPunctuation":true},"audio":{"content":"<base64 pcm16>"}}`; the reply is
+  `results[0].alternatives[0].transcript`. Google prefers the `X-goog-api-key` header and
+  documents `?key=` as the fallback that exposes the key in the URL, so the URL is never logged
+  and every error has the key redacted.
+- **TTS, OpenAI-compatible** (`openai`, `custom`) — `POST {base}/audio/speech`,
+  `Authorization: Bearer <key>`, `{"model", "input", "voice", "response_format": "wav"}`; a WAV
+  body is played as it arrives, a raw PCM body is wrapped the way §3.6 describes.
+- **TTS, ElevenLabs** (`elevenlabs`) — unchanged from §3.6.
+
+`voice status` prints both directions, and for a cloud provider the endpoint, model and the name
+of the key variable — never the key:
+
+```
+tts backend: vikram (available: vikram | elevenlabs | openai | custom)
+stt backend: local (available: local | google | openai | custom)
+stt backend: google (available: local | google | openai | custom) — https://speech.googleapis.com/v1/speech:recognize, model auto, language en-US, key from $GOOGLE_API_KEY
+```
+
+`voice transcribe --backend google` is the one-run override for transcription; `voice say
+--backend openai` is the same for speech. Neither writes to `voice.json`.
 
 ## 4. Phases and acceptance criteria
 

@@ -1,4 +1,4 @@
-use crate::{StageStatus, TtsBackend, VoiceConfig, VoiceError, VoiceStatus};
+use crate::{StageStatus, SttProvider, TtsProvider, VoiceConfig, VoiceError, VoiceStatus};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -65,37 +65,18 @@ pub fn probe(config: &VoiceConfig) -> VoiceStatus {
             config.capture_helper, config.capture_fallback
         ))
     };
-    let asr = crate::asr::probe_asr(config);
-    // A cloud backend is reported as the cloud backend, including the exact thing to fix when it
-    // cannot run; the local chain is only probed when it is the one that will speak.
-    let tts = if TtsBackend::parse(&config.tts_backend) == Some(TtsBackend::ElevenLabs) {
-        crate::cloud_tts::probe_cloud_tts(config)
-    } else {
-        let voice = crate::session::pick_voice(config.tts_voice.as_deref());
-        let piper = which(&config.tts_helper).is_some();
-        let espeak = which(&config.tts_fallback).is_some();
-        match (piper, voice) {
-            (true, Some(voice)) => {
-                StageStatus::Ready(format!("{} with {}", config.tts_helper, voice.display()))
-            }
-            (false, Some(_)) => StageStatus::Missing(missing_tool_message(&config.tts_helper)),
-            (true, None) if espeak => StageStatus::Degraded(format!(
-                "no {} voice model; robotic {} fallback",
-                config.tts_helper, config.tts_fallback
-            )),
-            (true, None) => StageStatus::Missing(format!(
-                "no {} voice model; {} not found",
-                config.tts_helper, config.tts_fallback
-            )),
-            (false, None) if espeak => StageStatus::Degraded(format!(
-                "{} and no voice model; robotic {} fallback",
-                config.tts_helper, config.tts_fallback
-            )),
-            (false, None) => StageStatus::Missing(format!(
-                "{} with a voice model, or {}, not found",
-                config.tts_helper, config.tts_fallback
-            )),
+    // A cloud provider is reported as that provider, including the exact thing to fix when it
+    // cannot run; the local chain is only probed when it is the one that will run.
+    let asr = match SttProvider::parse(&config.stt_provider) {
+        Some(provider) if provider.is_cloud() => crate::cloud_stt::probe_cloud_stt(config),
+        _ => crate::asr::probe_asr(config),
+    };
+    let tts = match TtsProvider::parse(&config.tts_provider) {
+        Some(TtsProvider::ElevenLabs) => crate::cloud_tts::probe_cloud_tts(config),
+        Some(TtsProvider::OpenAi | TtsProvider::Custom) => {
+            crate::cloud_tts::probe_openai_tts(config)
         }
+        _ => probe_local_tts(config),
     };
     let playback = if let Some(device) = crate::player::probe_playback() {
         StageStatus::Ready(format!("built-in cpal output ({device})"))
@@ -121,6 +102,36 @@ pub fn probe(config: &VoiceConfig) -> VoiceStatus {
         tts,
         playback,
         notes: Vec::new(),
+    }
+}
+
+/// The vikram voice, probed: piper with a voice model when both are there, espeak-ng when the
+/// voice model is missing, and a line naming what to install when neither is.
+pub(crate) fn probe_local_tts(config: &VoiceConfig) -> StageStatus {
+    let voice = crate::session::pick_voice(config.tts_voice.as_deref());
+    let piper = which(&config.tts_helper).is_some();
+    let espeak = which(&config.tts_fallback).is_some();
+    match (piper, voice) {
+        (true, Some(voice)) => {
+            StageStatus::Ready(format!("{} with {}", config.tts_helper, voice.display()))
+        }
+        (false, Some(_)) => StageStatus::Missing(missing_tool_message(&config.tts_helper)),
+        (true, None) if espeak => StageStatus::Degraded(format!(
+            "no {} voice model; robotic {} fallback",
+            config.tts_helper, config.tts_fallback
+        )),
+        (true, None) => StageStatus::Missing(format!(
+            "no {} voice model; {} not found",
+            config.tts_helper, config.tts_fallback
+        )),
+        (false, None) if espeak => StageStatus::Degraded(format!(
+            "{} and no voice model; robotic {} fallback",
+            config.tts_helper, config.tts_fallback
+        )),
+        (false, None) => StageStatus::Missing(format!(
+            "{} with a voice model, or {}, not found",
+            config.tts_helper, config.tts_fallback
+        )),
     }
 }
 

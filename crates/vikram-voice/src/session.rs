@@ -1,6 +1,7 @@
 use crate::cancel::CancelToken;
 use crate::capture::DeviceSource;
-use crate::cloud_tts::CloudSynth;
+use crate::cloud_stt::CloudRecognizer;
+use crate::cloud_tts::{CloudSynth, OpenAiSynth};
 use crate::helpers::{
     Scratch, first_available, missing_tool_message, pcm_from_bytes, run_cancellable, which,
     write_wav,
@@ -8,7 +9,8 @@ use crate::helpers::{
 use crate::player::DevicePlayer;
 use crate::vad::{detect_speech, is_loud};
 use crate::{
-    AsrEngine, Result, StageStatus, TtsBackend, VoiceConfig, VoiceError, VoiceStatus, probe,
+    AsrEngine, Result, StageStatus, SttProvider, TtsProvider, VoiceConfig, VoiceError, VoiceStatus,
+    probe,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -713,13 +715,17 @@ impl Synthesizer for HelperSynth {
     }
 }
 
-/// The synthesizer a session speaks through. `Local` is the built-in chain; `Cloud` is the opt-in
-/// cloud voice with a local synthesizer behind it, so a cloud failure costs one note and never the
-/// turn.
+/// The synthesizer a session speaks through. `Local` is the built-in vikram voice; `Cloud` is
+/// ElevenLabs and `Compatible` the OpenAI-compatible shape, each with a local synthesizer behind
+/// it, so a cloud failure costs one note and never the turn.
 pub enum VoiceSynth {
     Local(HelperSynth),
     Cloud {
         cloud: CloudSynth,
+        local: Box<dyn Synthesizer + Send + Sync>,
+    },
+    Compatible {
+        cloud: OpenAiSynth,
         local: Box<dyn Synthesizer + Send + Sync>,
     },
 }
@@ -729,9 +735,13 @@ impl VoiceSynth {
     /// also where an unreadable `tts_backend` lands after `validate` has refused it.
     pub fn new(config: &VoiceConfig) -> Self {
         let local = HelperSynth::new(config);
-        match TtsBackend::parse(&config.tts_backend) {
-            Some(TtsBackend::ElevenLabs) => Self::Cloud {
+        match TtsProvider::parse(&config.tts_provider) {
+            Some(TtsProvider::ElevenLabs) => Self::Cloud {
                 cloud: CloudSynth::new(config),
+                local: Box::new(local),
+            },
+            Some(provider) if provider.is_compatible() => Self::Compatible {
+                cloud: OpenAiSynth::new(config),
                 local: Box::new(local),
             },
             _ => Self::Local(local),
@@ -745,16 +755,33 @@ impl VoiceSynth {
         Self::Cloud { cloud, local }
     }
 
-    /// True when the cloud voice is the one that speaks first.
-    pub fn is_cloud(&self) -> bool {
-        matches!(self, Self::Cloud { .. })
+    /// The OpenAI-compatible pair built from parts, for the fallback test.
+    #[cfg(test)]
+    pub(crate) fn with_compatible_parts(
+        cloud: OpenAiSynth,
+        local: Box<dyn Synthesizer + Send + Sync>,
+    ) -> Self {
+        Self::Compatible { cloud, local }
     }
 
-    /// The cloud half, when the cloud backend is selected.
+    /// True when a cloud voice is the one that speaks first.
+    pub fn is_cloud(&self) -> bool {
+        matches!(self, Self::Cloud { .. } | Self::Compatible { .. })
+    }
+
+    /// The ElevenLabs half, when that is the provider selected.
     pub fn cloud(&self) -> Option<&CloudSynth> {
         match self {
-            Self::Local(_) => None,
             Self::Cloud { cloud, .. } => Some(cloud),
+            _ => None,
+        }
+    }
+
+    /// The OpenAI-compatible half, when that is the provider selected.
+    pub fn compatible(&self) -> Option<&OpenAiSynth> {
+        match self {
+            Self::Compatible { cloud, .. } => Some(cloud),
+            _ => None,
         }
     }
 }
@@ -774,11 +801,25 @@ impl Synthesizer for VoiceSynth {
                 Err(err) => {
                     cloud.note_once(
                         "elevenlabs",
-                        format!("elevenlabs: {err}; the local voice spoke instead"),
+                        format!("elevenlabs: {err}; the vikram voice spoke instead"),
                     );
                     local.synthesize_cancellable(text, cancel)
                 }
             },
+            Self::Compatible { cloud, local } => {
+                let label = cloud.provider().as_str();
+                match cloud.synthesize_cancellable(text, cancel) {
+                    Ok(wav) => Ok(wav),
+                    Err(VoiceError::Cancelled) => Err(VoiceError::Cancelled),
+                    Err(err) => {
+                        cloud.note_once(
+                            label,
+                            format!("{label}: {err}; the vikram voice spoke instead"),
+                        );
+                        local.synthesize_cancellable(text, cancel)
+                    }
+                }
+            }
         }
     }
 
@@ -790,7 +831,130 @@ impl Synthesizer for VoiceSynth {
                 notes.extend(local.notes());
                 notes
             }
+            Self::Compatible { cloud, local } => {
+                let mut notes = cloud.notes();
+                notes.extend(local.notes());
+                notes
+            }
         }
+    }
+}
+
+/// The recognizer a session listens through. `Local` is the built-in wavo chain; `Cloud` is the
+/// opt-in cloud recognizer with the local chain behind it, so a cloud failure costs one note and
+/// never the turn. Captions always come from the local chain: a cloud call every 400 ms of speech
+/// would bill the operator for a guess, and a caption is a guess by design.
+pub enum VoiceRecognizer {
+    Local(AsrEngine),
+    Cloud {
+        cloud: CloudRecognizer,
+        local: AsrEngine,
+        /// The one degrade note a cloud failure leaves behind. Taken by `notes`, like the rest of
+        /// the recognizer chain.
+        note: Option<String>,
+    },
+}
+
+impl VoiceRecognizer {
+    /// The provider the operator asked for. Anything but a cloud provider is the local model,
+    /// which is also where an unreadable `stt_provider` lands after `validate` has refused it.
+    pub fn new(config: &VoiceConfig) -> Self {
+        let local = AsrEngine::new(config);
+        match SttProvider::parse(&config.stt_provider) {
+            Some(provider) if provider.is_cloud() => Self::Cloud {
+                cloud: CloudRecognizer::new(config),
+                local,
+                note: None,
+            },
+            _ => Self::Local(local),
+        }
+    }
+
+    /// True when a cloud provider transcribes first.
+    pub fn is_cloud(&self) -> bool {
+        matches!(self, Self::Cloud { .. })
+    }
+
+    /// The cloud half, when a cloud provider is selected.
+    pub fn cloud(&self) -> Option<&CloudRecognizer> {
+        match self {
+            Self::Local(_) => None,
+            Self::Cloud { cloud, .. } => Some(cloud),
+        }
+    }
+
+    fn local_mut(&mut self) -> &mut AsrEngine {
+        match self {
+            Self::Local(local) => local,
+            Self::Cloud { local, .. } => local,
+        }
+    }
+}
+
+/// Cloud first, local second: any cloud failure except a cancel leaves one note and hands the take
+/// to the local chain, so the turn is never dead and never silent.
+fn transcribe_via_cloud(
+    cloud: &mut CloudRecognizer,
+    local: &mut dyn Recognizer,
+    pcm: &[i16],
+    cancel: &CancelToken,
+    note: &mut Option<String>,
+) -> Result<Option<String>> {
+    match cloud.transcribe_cancellable(pcm, cancel) {
+        Ok(text) => Ok(text),
+        Err(VoiceError::Cancelled) => Err(VoiceError::Cancelled),
+        Err(err) => {
+            if note.is_none() {
+                *note = Some(format!(
+                    "{}: {err}; transcribing with the built-in wavo model",
+                    cloud.provider().as_str()
+                ));
+            }
+            local.transcribe_cancellable(pcm, cancel)
+        }
+    }
+}
+
+impl Recognizer for VoiceRecognizer {
+    fn transcribe(&mut self, pcm: &[i16]) -> Result<Option<String>> {
+        self.transcribe_cancellable(pcm, &CancelToken::new())
+    }
+
+    fn transcribe_cancellable(
+        &mut self,
+        pcm: &[i16],
+        cancel: &CancelToken,
+    ) -> Result<Option<String>> {
+        match self {
+            Self::Local(local) => local.transcribe_cancellable(pcm, cancel),
+            Self::Cloud { cloud, local, note } => {
+                transcribe_via_cloud(cloud, local, pcm, cancel, note)
+            }
+        }
+    }
+
+    fn notes(&mut self) -> Vec<String> {
+        match self {
+            Self::Local(local) => local.notes(),
+            Self::Cloud { local, note, .. } => {
+                let mut notes = local.notes();
+                if let Some(note) = note.take() {
+                    notes.push(note);
+                }
+                notes
+            }
+        }
+    }
+}
+
+impl Captioner for VoiceRecognizer {
+    fn transcribe_partial(&mut self, pcm: &[i16]) -> Result<String> {
+        // The inherent method wins over the trait one: captions are the local model's job.
+        self.local_mut().transcribe_partial(pcm)
+    }
+
+    fn warm(&mut self) -> Result<()> {
+        self.local_mut().warm()
     }
 }
 
@@ -848,7 +1012,7 @@ fn samples_for(sample_rate: u16, ms: u64) -> usize {
 /// The default source is the built-in cpal engine, the default recognizer the built-in whisper
 /// chain, and the default player the built-in cpal output; helper binaries are only fallback
 /// tiers inside those engines.
-pub struct VoiceSession<S = DeviceSource, R = AsrEngine, Y = VoiceSynth, P = DevicePlayer> {
+pub struct VoiceSession<S = DeviceSource, R = VoiceRecognizer, Y = VoiceSynth, P = DevicePlayer> {
     config: VoiceConfig,
     cancel: CancelToken,
     phase: VoicePhase,
@@ -872,7 +1036,7 @@ impl VoiceSession {
         Ok(Self::with_parts(
             config.clone(),
             DeviceSource::new(&config),
-            AsrEngine::new(&config),
+            VoiceRecognizer::new(&config),
             VoiceSynth::new(&config),
             DevicePlayer::new(&config),
         ))
@@ -2270,7 +2434,7 @@ mod tests {
 
     fn cloud_config() -> VoiceConfig {
         VoiceConfig {
-            tts_backend: "elevenlabs".into(),
+            tts_provider: "elevenlabs".into(),
             tts_voice_id: "abc".into(),
             ..Default::default()
         }
@@ -2293,7 +2457,7 @@ mod tests {
         let notes = synth.notes();
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].starts_with("elevenlabs:"), "{notes:?}");
-        assert!(notes[0].contains("local voice"), "{notes:?}");
+        assert!(notes[0].contains("vikram voice"), "{notes:?}");
 
         synth.synthesize("and again").expect("still speaks");
         assert_eq!(
@@ -2344,6 +2508,191 @@ mod tests {
         let cloud = VoiceSynth::new(&cloud_config());
         assert!(cloud.is_cloud());
         assert_eq!(cloud.cloud().map(CloudSynth::voice_id), Some("abc"));
+    }
+
+    /// A transport that never opens a socket and always answers with a fixed transcript.
+    struct OfflineStt(String);
+
+    impl crate::cloud_stt::SttTransport for OfflineStt {
+        fn post(
+            &self,
+            _request: &crate::cloud_stt::CloudSttRequest,
+            _cancel: &CancelToken,
+        ) -> Result<Vec<u8>> {
+            Ok(self.0.clone().into_bytes())
+        }
+    }
+
+    /// A transport that always fails the way a broken cloud call does.
+    struct BrokenStt(String);
+
+    impl crate::cloud_stt::SttTransport for BrokenStt {
+        fn post(
+            &self,
+            _request: &crate::cloud_stt::CloudSttRequest,
+            _cancel: &CancelToken,
+        ) -> Result<Vec<u8>> {
+            Err(VoiceError::Cloud(self.0.clone()))
+        }
+    }
+
+    fn google_config() -> VoiceConfig {
+        VoiceConfig {
+            stt_provider: "google".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_cloud_transcript_is_used_as_it_arrives() {
+        let mut cloud = CloudRecognizer::with_parts(
+            &google_config(),
+            Some("k".into()),
+            Box::new(OfflineStt(
+                r#"{"results":[{"alternatives":[{"transcript":"hello from google"}]}]}"#.into(),
+            )),
+        );
+        let mut local = FakeRecognizer {
+            text: Some("local words".into()),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut note = None;
+        let text = transcribe_via_cloud(
+            &mut cloud,
+            &mut local,
+            &[1, 2],
+            &CancelToken::new(),
+            &mut note,
+        )
+        .unwrap();
+        assert_eq!(text.as_deref(), Some("hello from google"));
+        assert_eq!(
+            local.calls.load(Ordering::SeqCst),
+            0,
+            "local was not needed"
+        );
+        assert!(note.is_none(), "a healthy cloud call leaves no note");
+    }
+
+    #[test]
+    fn a_cloud_failure_transcribes_locally_and_leaves_one_note() {
+        let mut cloud = CloudRecognizer::with_parts(
+            &google_config(),
+            Some("k".into()),
+            Box::new(BrokenStt("HTTP 503: unavailable".into())),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut local = FakeRecognizer {
+            text: Some("local words".into()),
+            calls: calls.clone(),
+        };
+        let mut note = None;
+        let text = transcribe_via_cloud(
+            &mut cloud,
+            &mut local,
+            &[1, 2],
+            &CancelToken::new(),
+            &mut note,
+        )
+        .unwrap();
+        assert_eq!(text.as_deref(), Some("local words"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the turn is never dead");
+        let first = note.clone().expect("a failure is reported");
+        assert!(first.starts_with("google:"), "{first}");
+        assert!(first.contains("503"), "{first}");
+        assert!(first.contains("built-in wavo"), "{first}");
+
+        // A second failure keeps the one note: one per session, not one per utterance.
+        transcribe_via_cloud(
+            &mut cloud,
+            &mut local,
+            &[1, 2],
+            &CancelToken::new(),
+            &mut note,
+        )
+        .unwrap();
+        assert_eq!(
+            note.as_deref(),
+            Some(first.as_str()),
+            "one note per session"
+        );
+    }
+
+    #[test]
+    fn a_cloud_cancel_is_not_a_failure_and_never_falls_back() {
+        let mut cloud = CloudRecognizer::with_parts(
+            &google_config(),
+            Some("k".into()),
+            Box::new(OfflineStt("{}".into())),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut local = FakeRecognizer {
+            text: Some("local words".into()),
+            calls: calls.clone(),
+        };
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let mut note = None;
+        assert!(matches!(
+            transcribe_via_cloud(&mut cloud, &mut local, &[1], &cancel, &mut note),
+            Err(VoiceError::Cancelled)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn a_missing_cloud_key_is_a_note_not_a_dead_turn() {
+        let mut cloud =
+            CloudRecognizer::with_parts(&google_config(), None, Box::new(OfflineStt("{}".into())));
+        let mut local = FakeRecognizer {
+            text: Some("local words".into()),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut note = None;
+        let text =
+            transcribe_via_cloud(&mut cloud, &mut local, &[1], &CancelToken::new(), &mut note)
+                .unwrap();
+        assert_eq!(text.as_deref(), Some("local words"));
+        assert!(
+            note.expect("the missing key is reported")
+                .contains("GOOGLE_API_KEY"),
+            "the note names the variable to set"
+        );
+    }
+
+    #[test]
+    fn the_default_recognizer_is_the_local_chain() {
+        let local = VoiceRecognizer::new(&VoiceConfig::default());
+        assert!(!local.is_cloud());
+        assert!(local.cloud().is_none());
+
+        let cloud = VoiceRecognizer::new(&google_config());
+        assert!(cloud.is_cloud());
+        assert_eq!(
+            cloud.cloud().map(CloudRecognizer::provider),
+            Some(SttProvider::Google)
+        );
+    }
+
+    #[test]
+    fn the_compatible_voice_falls_back_to_vikram_once() {
+        let config = VoiceConfig {
+            tts_provider: "openai".into(),
+            ..Default::default()
+        };
+        let cloud = OpenAiSynth::with_parts(
+            &config,
+            Some("k".into()),
+            Box::new(OfflineTransport("HTTP 502: bad gateway".into())),
+        );
+        let mut synth =
+            VoiceSynth::with_compatible_parts(cloud, Box::new(FixedSynth(b"RIFF-vikram".to_vec())));
+        assert_eq!(synth.synthesize("hi").unwrap(), b"RIFF-vikram");
+        let notes = synth.notes();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("openai:"), "{notes:?}");
+        assert!(notes[0].contains("vikram voice"), "{notes:?}");
     }
 
     #[test]
