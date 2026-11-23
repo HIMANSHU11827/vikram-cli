@@ -1,0 +1,162 @@
+name: main
+
+# Never pull_request_target or issue_comment: they run PR code with the base branch's rights.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Main runs queue instead, so a dev release is never cut off; a release commit gets its own group.
+concurrency:
+  group: ${{ github.workflow }}-${{ startsWith(github.event.head_commit.message, 'release:') && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: macos-latest # the only GitHub runners with a GPU: the tests run models on Metal
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+          save-if: ${{ github.event_name != 'pull_request' }}
+      # The smoke models' Hugging Face cache, keyed by their names. Only main saves it: a PR's cache
+      # would serve that PR alone and count against the repo's quota.
+      - id: models
+        run: echo "key=hf-$(sed -n 's/^MODELS := //p' Makefile | tr ' ' '+')" >> "$GITHUB_OUTPUT"
+      - id: hf
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/huggingface/hub
+          key: ${{ steps.models.outputs.key }}
+      - run: rustup toolchain install nightly --profile minimal --component rustfmt
+      - run: make build
+      - run: make models > "$RUNNER_TEMP/models.log" 2>&1 & # downloads in the background
+      - run: make check
+      - run: make samples
+      - run: make models # waits for those downloads, or retries a failed one
+      - if: github.ref == 'refs/heads/main' && steps.hf.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/huggingface/hub
+          key: ${{ steps.models.outputs.key }}
+      - run: make test
+      - run: make test-portable
+
+  # A slowdown only warns; a broken build or a failing model fails the job.
+  bench:
+    if: github.event_name == 'pull_request'
+    runs-on: macos-latest # a GPU, as for `test`
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2 # the parent commit too, to see whether src/ changed
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+          save-if: false
+      - run: make bench-compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  # The shared release steps: `build` builds the archives read-only (beside `test`); on main `publish`
+  # puts the archives up as the `dev` pre-release, and a `release: vX.Y.Z (#N)` commit publishes
+  # the crate and the same archives as the version. `publish` never compiles. Users check an
+  # archive with `gh attestation verify FILE -R vladkens/wavo`.
+  build:
+    if: "github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' || startsWith(github.event.pull_request.title, 'release: v')"
+    runs-on: macos-latest # the macOS binary needs a Mac; Linux and Windows cross-compile
+    steps:
+      - uses: actions/checkout@v7
+      - uses: vladkens/actions/rust-build@v1
+        with:
+          targets: aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-gnu
+          profile: dist
+          dev: true
+
+  publish:
+    if: github.ref == 'refs/heads/main' # write rights only for main's own workflow
+    needs: [test, build]
+    runs-on: ubuntu-latest # no build here, and Linux runners start faster
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write # crates.io Trusted Publishing and attestations
+    steps:
+      - uses: actions/checkout@v7
+      - id: release
+        uses: vladkens/actions/rust-publish@v1
+
+      - uses: vladkens/actions/homebrew-bump@v1
+        with:
+          tag: ${{ steps.release.outputs.tag }}
+          file: ${{ steps.release.outputs.files }}
+          tap: vladkens/homebrew-tap
+          token: ${{ secrets.HOMEBREW_REPO_TOKEN }}
+
+  # The Docker image from `build`'s Linux binaries, so Docker never compiles: built wherever `build`
+  # runs, pushed on main as `main`, and on a release also as X.Y.Z and `latest`.
+  docker:
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - id: commit
+        uses: vladkens/actions/release-commit@v1
+      - id: check
+        if: steps.commit.outputs.release == 'true' && github.ref == 'refs/heads/main'
+        uses: vladkens/actions/release-check@v1
+        with:
+          releasers: ${{ github.repository_owner }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: ${{ runner.temp }}/release
+      - env:
+          DIR: ${{ runner.temp }}/release
+        run: |
+          mkdir -p dist/amd64 dist/arm64
+          tar -xzf "$DIR/wavo-dev-x86_64-unknown-linux-gnu.tar.gz" -C dist/amd64 wavo
+          tar -xzf "$DIR/wavo-dev-aarch64-unknown-linux-gnu.tar.gz" -C dist/arm64 wavo
+
+      - uses: docker/setup-qemu-action@v4 # arm64's apt-get
+      - uses: docker/setup-buildx-action@v4
+      - if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: tags
+        env:
+          TAG: ${{ steps.check.outputs.tag }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY}"
+          {
+            echo "tags<<EOF"
+            echo "${image}:main"
+            if [ -n "$TAG" ]; then
+              echo "${image}:${TAG#v}"
+              echo "${image}:latest"
+            fi
+
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: ${{ github.ref == 'refs/heads/main' }}
+          platforms: linux/amd64,linux/arm64
+          provenance: false
+          tags: ${{ steps.tags.outputs.tags }}

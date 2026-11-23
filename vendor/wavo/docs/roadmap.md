@@ -1,0 +1,93 @@
+<!-- For agents, not for people. -->
+
+# Roadmap
+
+Priority models: GigaAM v3 e2e-rnnt (Russian) and Parakeet TDT V2 (English). Work on one model
+at a time: port it, match the reference exactly, make it fast, move on. Tick a phase when done.
+
+- [x] **1. GigaAM v3 e2e-rnnt, correct.** [Plan](plans/completed/20261009-gigaam-e2e-rnnt.md)
+- [x] **2. GigaAM v3 e2e-rnnt, fast.** [Plan](plans/completed/20261009-gigaam-fast.md)
+- [x] **3. Other GigaAM v3 variants:** `e2e-ctc`, `rnnt`, `ctc`. [Plan](plans/completed/20261009-gigaam-variants.md)
+- [x] **4. Parakeet TDT V2, correct.** [Plan](plans/completed/20261009-parakeet-tdt-v2.md)
+- [x] **5. Parakeet TDT V2, fast.** [Plan](plans/completed/20261010-parakeet-fast.md)
+- [x] **6. Parakeet TDT V3.** [Plan](plans/completed/20261010-parakeet-tdt-v3.md)
+- [x] **7. Ollama-like CLI** (#2). [Plan](plans/completed/20261010-cli.md)
+- [x] **8. Linux and Windows** through Vulkan, working and tested (#5, #7, #12).
+      [Linux](plans/20261010-linux.md), [Windows](plans/completed/20261010-windows.md)
+- [x] **9. Long audio,** split at pauses (#3). [Plan](plans/completed/20261010-long-audio.md)
+- [x] **10. Real recordings vs transcribe.cpp** (#6). [Plan](plans/completed/20261010-real-recordings.md)
+- [x] **11. Whisper large-v3-turbo, correct** (#8). [Plan](plans/completed/20261010-whisper.md)
+- [x] **12. Whisper large-v3-turbo, fast** (#8).
+- [x] **13. Other Whisper variants** and Breeze-ASR-25 (#20).
+- [x] **14. Model downloads in the library:** `wavo::hub` behind the `hub` feature (#21).
+- [x] **15. Moonshine tiny and base, correct** (#30). [Plan](plans/20261011-moonshine.md)
+- [x] **Hebrew:** ivrit.ai's Whisper turbo and Yakov Kolani's Parakeet v3 fine-tunes, converted
+      and published under `vladkens` on Hugging Face (#64).
+- [x] **GigaAM Multilingual:** Sber's Large CTC for Russian, English, Kazakh, Kyrgyz and Uzbek,
+      converted by `scripts/convert.py` with the converter of transcribe.cpp's unmerged
+      [PR #251](https://github.com/handy-computer/transcribe.cpp/pull/251) and published under
+      `vladkens` (#97).
+- [x] **Ukrainian:** Yurii Ihnatov's Parakeet v3 fine-tune, converted by `scripts/convert.py` and
+      published under `vladkens` (#98).
+- [x] **Server:** `wavo serve`, OpenAI's transcription API on `std::net`.
+- [x] **19. Parakeet Ultra** on the Parakeet family, correct and faster than transcribe.cpp:
+      `jfk` on an M2 in 145 vs 203 ms (best of 20).
+- [x] **20. Neural Engine backend** on macOS: Parakeet and GigaAM encoders through Core ML,
+      1.8–2.5× faster than the GPU on 11 s of audio on an M2, a sixth of the energy (#37).
+      [Plan](plans/completed/20261011-ane.md)
+- [x] **Spoken language:** `Model::detect_language`, `Transcript::language` and Bazarr's
+      `POST /detect-language`; for Parakeet v3 and ultra, the language of Parakeet's text
+      (whatlang) (#77).
+- [x] **CPU backend** for servers without a GPU: every family on the CPU, text as on the GPU;
+      30 s of Russian in 5.3 s with GigaAM and 7.7 s with Parakeet V3 on two N100 cores (#104).
+      [Plan](plans/completed/20261114-cpu.md)
+
+- [x] **21. Speaker diarization:** NVIDIA's Nemotron 3 Diarization (8 speakers), `wavo::Diarizer`
+      and `wavo run --diarize` on the GPU or the CPU, 1.5× parakeet.cpp's speed on Metal on an M5
+      (#100); OpenAI's `diarized_json` in `wavo serve`.
+      [Plan](plans/completed/20261110-diarization.md)
+- [x] **Docker image** `ghcr.io/vladkens/wavo`, x86_64 and arm64, pushed on main and on release:
+      Intel and AMD GPUs through `/dev/dri` on x86_64, else the CPU; on an N100 as fast as outside
+      it (#116).
+
+Open:
+
+- **Moonshine:** fast (phase 16), the language fine-tunes (17), the streaming variants one-shot
+  (18, optional). [Plan](plans/20261011-moonshine.md)
+- **Fast kernels beyond Apple.** The GEMM on F16 16×16 cooperative matrices runs on NVIDIA
+  (#28, [plan](plans/completed/20261011-nvidia-fast.md)): 10–40% faster on an RTX 4060, Parakeet ahead of
+  transcribe.cpp; flash attention on them and a portable one (#36) put Whisper ahead too, and the
+  first call after load on a discrete GPU within a few ms of later ones. Open: the
+  rest of the [speed plan](plans/20261012-speed.md), the tier on AMD and Intel Arc, and the Linux
+  plan's portable-encoder items. On Apple M5 and newer the GEMM runs on the Metal 4 tensor API:
+  GigaAM, Parakeet and Whisper 1.5–1.9× faster there, ahead of transcribe.cpp on every model.
+- **Server, more:** the Wyoming protocol (Home Assistant).
+- **Diarization, more:** the low-latency streaming presets, the Neural Engine (fixed shapes).
+- **Fast build.** The in-house FFT replaced `rustfft` (#15); left: wgpu features per target.
+  [Plan](plans/20261010-fast-build.md)
+- **Other engines.** Measure wavo against the other ways to run the same models on a Mac, not
+  only transcribe.cpp. [Plan](plans/20261010-other-engines.md)
+- **GPU headroom on Parakeet.** Core ML on the same M2 GPU takes 8–15% less time end to end
+  (FluidAudio GPU 134 vs wavo 145 ms on jfk, 372 vs 437 ms on dots). Profile our encoder against
+  it and close the gap.
+- **Auto language** (#31): `wavo run`, `serve` and wavo-app pick the downloaded model for the
+  spoken language. [Plan](plans/20261116-auto-language.md)
+- **Subtitles for Bazarr, Plex and Jellyfin.** [Plan](plans/20261116-subtitles.md)
+- **GigaAM on the Neural Engine** in overlapping windows with one decode, as Parakeet (#78):
+  its 15 s pieces break sentences too.
+- **Other kinds of models,** each its own type beside `Model` and `Diarizer`, not a mode of a
+  speech model; `ModelInfo` gains the kind later, additively (`diarization()` stays):
+  - translation (#83): a separate model from the text, for every speech model; candidates
+    NLLB, MADLAD-400, small LLMs, to research;
+  - text cleanup, text to text: punctuation, numbers as digits (#78; wavo-app's Russian rules),
+    filler words;
+  - speaker names: a voice-print model and a sample per person, as OpenAI's
+    `known_speaker_names` and `known_speaker_references`; then names in SRT and WebVTT `<v>`.
+
+Later research: **accuracy against the originals.** Plan: [docs/plans/20261011-accuracy.md](plans/20261011-accuracy.md).
+
+Later, only on request: streaming, slowing fast speech down before recognition
+(pitch-keeping time-stretch such as WSOLA; first measure WER on samples sped up with ffmpeg
+`atempo`, with and without slowing them back down). `parakeet-unified-en-0.6b` comes with
+streaming: its value is one model for offline and low-latency streaming; it was tried in #65
+(branch history).

@@ -15,7 +15,7 @@ cpal = { version = "0.18", features = ["pipewire"] }
 hound = "3.5"
 # Pure Rust on wgpu: Vulkan on this machine, and it falls back to CPU by itself when no GPU
 # device exists. `hub` adds model downloads; the CLI features of the crate stay off.
-wavo = { version = "0.6", default-features = false, features = ["hub"] }
+wavo = { path = "../../vendor/wavo", default-features = false, features = ["hub"] }
 
 [dev-dependencies]
 tempfile.workspace = true
