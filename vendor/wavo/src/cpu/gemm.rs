@@ -33,7 +33,8 @@ enum Weights {
   F32(Vec<f32>),
 }
 
-/// A linear layer `y = x·Wᵀ + b`, W `[n][k]` in its GGUF type (Q8_0, F16 or F32).
+/// A linear layer `y = x·Wᵀ + b`, W `[n][k]` in its GGUF type (Q8_0, F16, F32, or a K-quant
+/// dequantized to f32).
 pub struct Linear {
   pub n: usize,
   pub k: usize,

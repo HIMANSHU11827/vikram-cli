@@ -821,6 +821,17 @@ impl Gpu {
         }
         (2, self.filled(dv), Some(self.filled(sv)))
       }
+      // The K-quants are dequantized to f32 at load, as the padded path above does.
+      _ => {
+        let mut f = self.fill(n * k * 4, rows * k * 4)?;
+        let mut at = 0;
+        for w in weights {
+          let w = w.to_f32()?;
+          f.slice(at..at + w.len() * 4).copy_from_slice(bytemuck::cast_slice(&w));
+          at += w.len() * 4;
+        }
+        (0, self.filled(f), None)
+      }
     };
     let dual = bias.len().saturating_sub(rows);
     if !bias.is_empty() && bias.len() < rows || dual > rows {

@@ -191,8 +191,8 @@ fn tile<const R: usize, const F: usize>(w: &[f32], z: &[f32], k: usize) -> [[f32
   std::array::from_fn(|f| std::array::from_fn(|r| dot(&w[r * k..][..k], &z[f * k..][..k])))
 }
 
-/// Weights `[rows][k]` for `matvecs`, kept as Q8_0 or, from an F32 or F16 tensor, as f32 (exact,
-/// as the reference reads them).
+/// Weights `[rows][k]` for `matvecs`, kept as Q8_0 or, from any other type, as f32 (exact, as the
+/// reference reads them; the K-quants are dequantized).
 pub enum Matrix {
   Q8(Q8),
   F32 { k: usize, w: Vec<f32> },
@@ -202,8 +202,8 @@ impl Matrix {
   pub fn new(t: &Tensor) -> Result<Self> {
     let k = t.dims[0];
     Ok(match t.ty {
-      Type::F32 | Type::F16 => Self::F32 { k, w: t.to_f32()? },
       Type::Q8_0 => Self::Q8(Q8::new(&[t])?),
+      _ => Self::F32 { k, w: t.to_f32()? },
     })
   }
 
