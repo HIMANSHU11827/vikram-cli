@@ -119,6 +119,12 @@ pub const COMMANDS: &[Command] = &[
         outcome: Outcome::Picker(PickerKind::HiveRoster),
     },
     Command {
+        name: "workers",
+        aliases: &[],
+        description: "Delegated workers, including the ones the last run left unfinished",
+        outcome: Outcome::Action,
+    },
+    Command {
         name: "skills",
         aliases: &[],
         description: "Skills discovered on this machine",
@@ -206,6 +212,30 @@ pub const COMMANDS: &[Command] = &[
         name: "build",
         aliases: &[],
         description: "Build the workspace",
+        outcome: Outcome::Action,
+    },
+    Command {
+        name: "presence",
+        aliases: &["liveness"],
+        description: "Whether the assistant is awake, dozing or asleep",
+        outcome: Outcome::Action,
+    },
+    Command {
+        name: "sleep",
+        aliases: &[],
+        description: "Start no new work and hold back routine reports",
+        outcome: Outcome::Action,
+    },
+    Command {
+        name: "doze",
+        aliases: &[],
+        description: "Keep working but only speak up for what matters",
+        outcome: Outcome::Action,
+    },
+    Command {
+        name: "wake",
+        aliases: &[],
+        description: "Work and speak normally again",
         outcome: Outcome::Action,
     },
     Command {

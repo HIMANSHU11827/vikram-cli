@@ -156,6 +156,38 @@ impl ReflectionEngine {
         Ok(job)
     }
 
+    /// Reflect on one experience in the caller's turn, keeping a durable record of the attempt:
+    /// a `done` job on success, a `failed` one carrying the error otherwise. A failed job is the
+    /// only thing [`Self::process_pending`] and MAPE-K can retry, so a reflection that could not
+    /// run is not lost with the process that tried it.
+    pub fn reflect_now(
+        &self,
+        experience_id: &str,
+        agent_id: &str,
+        auto_apply_memory: bool,
+    ) -> Result<Vec<LearningProposal>> {
+        let mut job = self.enqueue(experience_id, agent_id)?;
+        job.status = ReflectionJobStatus::Running;
+        job.attempts += 1;
+        job.updated_ms = now_ms();
+        self.store.save_job(&job)?;
+        match self.run_reflection(experience_id, auto_apply_memory) {
+            Ok(proposals) => {
+                job.status = ReflectionJobStatus::Done;
+                job.updated_ms = now_ms();
+                self.store.save_job(&job)?;
+                Ok(proposals)
+            }
+            Err(e) => {
+                job.status = ReflectionJobStatus::Failed;
+                job.error = Some(e.to_string());
+                job.updated_ms = now_ms();
+                self.store.save_job(&job)?;
+                Err(e)
+            }
+        }
+    }
+
     /// Run reflection for one experience, producing proposals and applying low-risk ones.
     /// `auto_apply_memory` gates the unconditional `AddMemory` writes below — the caller's learning
     /// policy decides; `false` still records proposals but never touches the memory layer.
@@ -238,6 +270,11 @@ impl ReflectionEngine {
     }
 
     /// Process pending jobs (simple synchronous drain for tests/background).
+    ///
+    /// The drain reflects without applying memory. It runs outside a turn, where the operator's
+    /// policy is not in hand — applying here would write past the gate the turn path honours, and
+    /// a night job must not decide what the operator keeps. Proposals are still recorded, so the
+    /// work is not lost, only left for the runtime to judge.
     pub fn process_pending(&self) -> Result<usize> {
         let jobs = self.store.list_pending_jobs()?;
         let mut done = 0usize;
@@ -246,7 +283,7 @@ impl ReflectionEngine {
             j.attempts += 1;
             j.updated_ms = now_ms();
             self.store.save_job(&j)?;
-            match self.run_reflection(&j.experience_id, true) {
+            match self.run_reflection(&j.experience_id, false) {
                 Ok(_) => {
                     j.status = ReflectionJobStatus::Done;
                     j.updated_ms = now_ms();

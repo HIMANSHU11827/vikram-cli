@@ -64,6 +64,15 @@ impl TrustPolicy {
         }
         match scope {
             Scope::Builtin => TrustLevel::Builtin,
+            // A persona's skills live under `$VIKRAM_HOME` like user skills, so they inherit the
+            // same level: the user owns the directory, the layout convention still matters.
+            Scope::Persona => {
+                if compat == Compat::Native {
+                    TrustLevel::UserTrusted
+                } else {
+                    TrustLevel::Community
+                }
+            }
             // The user put it there; the layout convention does not lower that. A third-party
             // layout does, because nobody verified who wrote it.
             Scope::User => {
@@ -228,6 +237,27 @@ mod tests {
         assert_eq!(
             policy.level_for(Scope::User, Compat::Native, Path::new("/u/x")),
             TrustLevel::UserTrusted
+        );
+    }
+
+    #[test]
+    fn persona_skills_inherit_the_user_level() {
+        let policy = TrustPolicy::default();
+        assert_eq!(
+            policy.level_for(
+                Scope::Persona,
+                Compat::Native,
+                Path::new("/h/agents/a/skills/x")
+            ),
+            TrustLevel::UserTrusted
+        );
+        assert_eq!(
+            policy.level_for(
+                Scope::Persona,
+                Compat::Claude,
+                Path::new("/h/agents/a/skills/x")
+            ),
+            TrustLevel::Community
         );
     }
 

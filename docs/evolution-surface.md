@@ -35,6 +35,15 @@ NL parsing (store-backed answers including free-form `Ask`), `autonomy`
 pending approvals, and `self_recovery` restart recovery + drift detection
 are all reachable.
 
+Read-only except one verb: `vikram learning forget <id> [--dry-run]` deletes a single
+layered-memory row by primary key, prints what it removed, and records a `memory_forgotten`
+event. The runtime's own memory store is a different database, reached through
+`vikram memory list|search|forget|count|snapshot`.
+
+The evolution loop also runs with no session at all: a daemon job created with
+`--job-mode maintenance` drains the reflection queue and runs one MAPE-K cycle against
+`$VIKRAM_HOME/evolution.db` on its schedule.
+
 ## Operator-gated via `vikram evolution` CLI (mutating, confirmed)
 
 `cycle`, `benchmark`, `approve`, `reject` each require `--yes` or an
@@ -73,7 +82,7 @@ documents exactly what is real vs. recorded intent.
 | Subsystem | Persisted (namespace) | What is real today | Honest gap |
 |---|---|---|---|
 | `self_awareness` | `SelfModel` (`self_awareness.*`) | `inspect_runtime` persists a real model: store-derived aggregates (experience/proposal/reflection tallies, live memory counts per layer, recorded skill versions, config-shaped signals producers wrote) plus compiled-surface declarations (crates/modules/subsystems this workspace contains) | dormant — nothing calls it; provider status is `Unknown`, not probed; config signals are recorded intent, not verified live config |
-| `self_config` | every `ConfigChange` (`self_config.change`) | durable change history across restart | `applied` can never become `true` — the engine has no live config surface; application stays operator-side |
+| `self_config` | every `ConfigChange` (`self_config.change`) | durable change history across restart | `applied` becomes `true` only when a host attaches a `ConfigSurface` and the write succeeds. The runtime attaches one that accepts exactly `context:memory_budget_tokens`, `runtime:learning_memory_policy`, `runtime:learning_skill_policy` — so the pipeline can change how it learns, never what the assistant is allowed to do. The daemon and the CLI attach nothing, so there every apply stays honest intent. `rollback_change` restores the value read before the write and flips the record back to `applied=false` |
 | `self_adaptation` | `AdaptationResult` history (`self_adaptation.result`) | detection reads real store metrics (`recent_performance`); exactly one action is real — `ConsolidateMemory` runs `LayeredMemory::consolidate` over the store; every other action errors with a reason and becomes a persisted `record_issue` proposal | dormant — no caller; `applied` is `true` only for actions actually carried out |
 | `self_development` | projects, plans, comparisons (`self_development.project|plan|comparison`) | per-stage honesty over the store: `Research`/`Inspection` report recorded tallies, `Planning` persists a plan artifact, `Implementation` writes real `SkillVersion` rows for skill targets, test stages review recorded experience evidence (no test execution — the crate runs no build tooling), `Comparison` snapshots before/after, `Integration`/`IndependentReview`/`Recording`/`RollbackPath` document the durable record. **Skill projects can reach `Completed`** when recorded evidence supports every gate | dormant — no caller; change types with no store representation (and non-skill `Implementation`) still record `success:false`; executor ceiling = store evidence, not real builds |
 | `self_recovery` | snapshots + state fingerprints (`self_recovery.snapshot`) | drift detection live via `vikram evolution recover`; boot recovery drain runs in `Runtime::start` | rollback ops still record intent; in-session op queue stays process-local; real restore (skills/memory/config) is future work gated on snapshot coverage |

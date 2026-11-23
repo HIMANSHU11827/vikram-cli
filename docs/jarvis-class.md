@@ -178,29 +178,34 @@ this repository. The nine above are the acceptance criteria.
 | Personality continuity | `SOUL.md` / `INSTRUCTIONS.md` context files (`crates/vikram-runtime/src/context.rs`, `config.rs`) | **built (files); measured (`vikram bench personality`, deterministic local consistency scoring — `crates/vikram-bench/src/personality.rs`, landed `196f731`)** |
 | Hands | `crates/vikram-skills`, `crates/vikram-mcp`, runtime tool exec, browser + computer use | **built** |
 | Safety | `crates/vikram-policy` — deny-first, non-widenable floor; sandbox crate | **built (stronger than film)** |
-| Presence | `crates/vikram-gateway` — 28 platform modules | **built** |
+| Presence | `crates/vikram-daemon/src/presence.rs` — awake / dozing / asleep, audited, `/sleep` `/wake` in the CLI and TUI; `crates/vikram-gateway` for reach across 28 platforms | **built (liveness + reach)** |
 | Proactivity | `crates/vikram-daemon` — cron jobs **+ event triggers** (`on <trigger>` schedules, EventBus, quiet hours, audit) | **built (scheduled + event-driven, landed `196f731`)** |
 | Self-evaluation / improvement | `crates/vikram-evolution` — experience → reflection → gated proposals → verify | **partial: operator-gated, no semantic verification** |
-| Voice | `crates/vikram-voice` transport scaffold — `vikram voice status\|listen\|say`, helper-driven, no `cpal`/`whisper-rs` yet | **transport committed (`5a12d42`), audio engines missing** |
-| Always-on / wake-free | none | **missing** |
+| Voice | `crates/vikram-voice` — `cpal` 0.18 capture, `wavo` 0.6 (GGUF whisper on wgpu), piper/espeak-ng synthesis, live captions, sentence streaming, `tts_language` | **built (not interruptible: the mic is closed while speaking)** |
+| Always-on / wake-free | `/voice` hands-free mode, `Ctrl+G` dictation; no wake word | **partial (a mode, not a listening presence)** |
 | Speaker identification | none | **missing** |
 | Environment awareness (screen, apps, time, place) | computer-use + code index, on demand only | **partial** |
-| Relationship model (your people, your projects, your mood) | memory rows only; no first-class model | **missing** |
+| Relationship model (your people, your projects, your mood) | `relations` / `relation_facts` / `projects` in `vikram-store`, injected as `known_relations`; `USER.md` and the dialectic store for preferences | **built (no mood model)** |
 
-The honest summary: **VIKRAM already has the hard half** — memory, policy, tools, gateway,
-evolution. The missing half is the *human-facing* half: voice, always-on presence, and a real
-relationship model.
+The honest summary: **VIKRAM has both halves now in some form** — memory, policy, tools,
+gateway, evolution on the backbone side; voice I/O, liveness and a relationship model on the
+human-facing side. What separates it from the filmed assistant is not a missing organ but
+unfinished ones: voice that cannot be interrupted, presence without a wake word or a speaker
+model, and an improvement loop whose self-editing is still operator-gated.
 
 ---
 
 ## 6. What is missing, in build order
 
-1. **Voice I/O.** ASR in, TTS out, interruptible. Without it this is a CLI, not a presence.
-   New crate: `vikram-voice`. No existing dependency in the workspace.
-   *(Update 2026-11-22: the crate now exists — transport scaffold landed at `5a12d42`;
-   the audio engines beneath it are still missing, see §5.)*
+1. **Interruptible voice.** ASR in, TTS out, and the mic stays open while it speaks so a
+   word stops it. Without that it is a CLI with a speaker.
+   *(Update 2026-11-23: the crate is real — `cpal` capture, `wavo` GGUF whisper, piper/espeak
+   synthesis, live captions, sentence streaming, `tts_language`. Interruption is the piece still
+   missing; the mic is closed during playback.)*
 2. **Relationship model.** People, projects, preferences, mood — first-class rows, not free-text
    memories. Feeds context assembly before every turn.
+   *(Built — `relations` / `relation_facts` / `projects` in `vikram-store`, injected by
+   `known_relations` in `crates/vikram-runtime/src/runtime.rs`. Mood is still missing.)*
 3. **Event-driven proactivity.** Extend `vikram-daemon` from cron to triggers (file change, calendar
    proximity, inbox arrival, long-job completion) with a silence policy: when *not* to speak.
    *(Built — `on <trigger>` schedules, EventBus, quiet hours, audit trail landed in `196f731`.)*

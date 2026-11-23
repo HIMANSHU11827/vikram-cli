@@ -238,6 +238,7 @@ workspace root.
 | `<ws>/.claude/skills` | Project | Claude |
 | `<ws>/.opencode/skills` | Project | OpenCode |
 | `<ws>/.hermes/skills` | Project | Hermes |
+| `<home>/{main-agents,agents,bots}/<slug>/skills` | Persona | Native |
 | embedded `builtin/` in the crate, via `include_str!` | Builtin | Native |
 
 A compat root is only scanned when `DiscoveryOptions::include_compat` is true, which is the default.
@@ -249,11 +250,17 @@ Precedence, highest first (CONTRACT, `skill.rs`):
 
 | Scope | `precedence()` |
 | - | - |
+| Persona | 60 |
 | Builtin | 50 |
 | User | 40 |
 | Project | 30 |
 | Imported | 20 |
 | External | 10 |
+
+The persona root is scanned only when a persona is selected, and it is scanned first, so an agent
+carries the skills the operator gave *it* without every other agent inheriting them
+(VERIFIED-IN-SOURCE, `crates/vikram-skills/src/paths.rs` `persona_skill_dirs`). As with every other
+scope, one name resolves to one skill: a persona skill of the same name shadows the user one.
 
 One name resolves to one skill: the candidate with the highest precedence wins, and a duplicate is
 counted and listed by `Catalog::conflicts()` rather than dropped. Two consequences worth knowing

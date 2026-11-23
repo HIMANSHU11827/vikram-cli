@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use crate::discovery::{Diagnostic, DiagnosticLevel};
 use crate::error::{Result, SkillError};
 use crate::frontmatter::{self, Frontmatter, Yaml};
+use crate::lint::Severity;
+use crate::loader::Budget;
 use crate::metadata::{DESCRIPTION_MAX, SkillMetadata};
 use crate::paths;
 use crate::skill::SkillId;
@@ -354,6 +356,25 @@ impl Manager {
                         &source.file,
                         format!("declared test `{missing}` does not exist"),
                     ));
+                }
+                let mut resources = Vec::new();
+                if let Err(err) = crate::loader::walk_resources(dir, dir, 0, &mut resources) {
+                    out.push(Diagnostic::new(
+                        DiagnosticLevel::Warning,
+                        &source.file,
+                        format!("could not inventory resources: {err}"),
+                    ));
+                }
+                resources.sort_by(|a, b| a.rel.cmp(&b.rel));
+                let budget = Budget::default();
+                for issue in
+                    crate::lint::lint_parts(&metadata.description, &fm.body, &resources, &budget)
+                {
+                    let level = match issue.severity() {
+                        Severity::Error => DiagnosticLevel::Error,
+                        Severity::Warning => DiagnosticLevel::Warning,
+                    };
+                    out.push(Diagnostic::new(level, &source.file, issue.describe()));
                 }
             }
             Err(err) => out.push(Diagnostic::new(
@@ -910,6 +931,23 @@ mod tests {
             diagnostics.iter().any(
                 |d| d.level == DiagnosticLevel::Warning && d.message.contains("does not match")
             )
+        );
+    }
+
+    #[test]
+    fn validate_reports_a_body_the_loader_would_cut_as_an_error() {
+        let (tmp, manager) = temp_manager();
+        let dir = tmp.path().join("skills/bulky");
+        write_skill(
+            &tmp.path().join("skills"),
+            "bulky",
+            &doc("bulky", "desc", &"x".repeat(30_000)),
+        );
+        let diagnostics = manager.validate(&dir).expect("validate");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.level == DiagnosticLevel::Error && d.message.contains("will be cut"))
         );
     }
 

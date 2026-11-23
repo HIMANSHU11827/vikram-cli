@@ -311,6 +311,22 @@ pub enum NoticeLevel {
     Error,
 }
 
+/// One delegated worker as an interface sees it. The brief's boundary and allowlists are left out on
+/// purpose: a HUD shows who is working and where each one got to, not a copy of its instructions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerSnapshot {
+    pub id: String,
+    pub session: String,
+    pub parent: String,
+    /// `running`, `partial`, `done` or `degraded` — the durable spelling, not a display label.
+    pub status: String,
+    pub attempts: u32,
+    /// The worker's objective, trimmed for a one-line row.
+    pub objective: String,
+    pub artifact: Option<String>,
+    pub notes_waiting: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct StateSnapshot {
     pub status: RuntimeStatus,
@@ -319,6 +335,9 @@ pub struct StateSnapshot {
     pub bots: Vec<BotSnapshot>,
     pub rosters: Vec<HiveRosterSnapshot>,
     pub tasks: Vec<BackgroundTask>,
+    /// Delegated workers, in the order they were created. A restored worker appears here before
+    /// anything resumes it, so an interface can show what the last run left unfinished.
+    pub workers: Vec<WorkerSnapshot>,
     pub approvals: Vec<ApprovalPrompt>,
     /// Skill names discovered from the configured roots (metadata only).
     pub skills: Vec<String>,

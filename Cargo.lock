@@ -4355,6 +4355,7 @@ dependencies = [
  "vikram-daemon",
  "vikram-evolution",
  "vikram-gateway",
+ "vikram-link",
  "vikram-mcp",
  "vikram-policy",
  "vikram-runtime",
@@ -4449,6 +4450,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "vikram-link"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tungstenite",
+ "vikram-contracts",
+ "vikram-runtime",
+]
+
+[[package]]
 name = "vikram-mcp"
 version = "0.1.0"
 dependencies = [
@@ -4494,6 +4510,7 @@ dependencies = [
  "vikram-sandbox",
  "vikram-skills",
  "vikram-store",
+ "vikram-terminals",
  "wasmi",
  "wat",
  "webpki-roots 1.0.11",

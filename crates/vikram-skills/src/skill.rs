@@ -68,6 +68,7 @@ impl TryFrom<&str> for SkillId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
+    Persona,
     Builtin,
     User,
     Project,
@@ -78,6 +79,7 @@ pub enum Scope {
 impl Scope {
     pub fn precedence(self) -> u8 {
         match self {
+            Scope::Persona => 60,
             Scope::Builtin => 50,
             Scope::User => 40,
             Scope::Project => 30,
@@ -88,11 +90,85 @@ impl Scope {
 
     pub fn label(self) -> &'static str {
         match self {
+            Scope::Persona => "persona",
             Scope::Builtin => "builtin",
             Scope::User => "user",
             Scope::Project => "project",
             Scope::Imported => "imported",
             Scope::External => "external",
+        }
+    }
+}
+
+/// Which of the three AI-entity directories a persona lives under. Mirrors
+/// `vikram-store::EntityKind`; duplicated rather than imported because this crate must not depend
+/// on the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonaKind {
+    MainAgent,
+    Agent,
+    Bot,
+}
+
+impl PersonaKind {
+    pub fn folder(self) -> &'static str {
+        match self {
+            PersonaKind::MainAgent => "main-agents",
+            PersonaKind::Agent => "agents",
+            PersonaKind::Bot => "bots",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PersonaKind::MainAgent => "main_agent",
+            PersonaKind::Agent => "agent",
+            PersonaKind::Bot => "bot",
+        }
+    }
+}
+
+/// The origin of a discovered skill, including which persona supplied it. `Scope` answers the
+/// precedence question; this answers "where did it come from" for the operator.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillSource {
+    Builtin,
+    User,
+    Project,
+    Imported,
+    External,
+    Persona { kind: PersonaKind, slug: String },
+}
+
+impl SkillSource {
+    pub fn scope(&self) -> Scope {
+        match self {
+            SkillSource::Builtin => Scope::Builtin,
+            SkillSource::User => Scope::User,
+            SkillSource::Project => Scope::Project,
+            SkillSource::Imported => Scope::Imported,
+            SkillSource::External => Scope::External,
+            SkillSource::Persona { .. } => Scope::Persona,
+        }
+    }
+
+    pub fn persona(&self) -> Option<(PersonaKind, &str)> {
+        match self {
+            SkillSource::Persona { kind, slug } => Some((*kind, slug.as_str())),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for SkillSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SkillSource::Persona { kind, slug } => {
+                write!(f, "persona:{}/{}", kind.folder(), slug)
+            }
+            other => f.write_str(other.scope().label()),
         }
     }
 }
@@ -175,6 +251,7 @@ pub struct SkillSummary {
     pub version: Option<String>,
     pub categories: Vec<String>,
     pub tags: Vec<String>,
+    pub source: SkillSource,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -264,12 +341,36 @@ mod tests {
 
     #[test]
     fn scope_precedence_matches_the_contract() {
+        assert_eq!(Scope::Persona.precedence(), 60);
         assert_eq!(Scope::Builtin.precedence(), 50);
         assert_eq!(Scope::User.precedence(), 40);
         assert_eq!(Scope::Project.precedence(), 30);
         assert_eq!(Scope::Imported.precedence(), 20);
         assert_eq!(Scope::External.precedence(), 10);
+        assert!(Scope::Persona.precedence() > Scope::Builtin.precedence());
         assert!(Scope::Builtin.precedence() > Scope::Project.precedence());
+    }
+
+    #[test]
+    fn a_persona_source_carries_its_kind_and_slug() {
+        let source = SkillSource::Persona {
+            kind: PersonaKind::MainAgent,
+            slug: "reviewer".to_string(),
+        };
+        assert_eq!(source.scope(), Scope::Persona);
+        assert_eq!(source.persona(), Some((PersonaKind::MainAgent, "reviewer")));
+        assert_eq!(source.to_string(), "persona:main-agents/reviewer");
+        assert_eq!(SkillSource::User.scope(), Scope::User);
+        assert_eq!(SkillSource::User.persona(), None);
+        assert_eq!(SkillSource::User.to_string(), "user");
+    }
+
+    #[test]
+    fn persona_kinds_map_onto_the_entity_folders() {
+        assert_eq!(PersonaKind::MainAgent.folder(), "main-agents");
+        assert_eq!(PersonaKind::Agent.folder(), "agents");
+        assert_eq!(PersonaKind::Bot.folder(), "bots");
+        assert_eq!(PersonaKind::MainAgent.label(), "main_agent");
     }
 
     #[test]

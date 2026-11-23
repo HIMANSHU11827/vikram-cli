@@ -100,6 +100,13 @@ const EVOLUTION_CYCLE_ID: &str = "last";
 /// `self_evaluation::BENCHMARK_NAMESPACE` the CLI reads the same way).
 const BENCHMARK_NAMESPACE: &str = "self_evaluation.benchmark";
 const HOUR_MS: u64 = 60 * 60 * 1000;
+/// How long the append-only side tables (`hive_messages`, `ticket_events`, `usage`,
+/// `file_changes`) and orphaned journal rows stay. Nothing that reads them looks that far back,
+/// and the journal's compaction-covered prefix is pruned regardless of age.
+const RETAIN_SIDE_TABLES_MS: u64 = 30 * 24 * HOUR_MS;
+/// How much of a compaction summary is kept as a cross-session recap. Enough to remember what the
+/// work was, short enough that a hundred of them do not crowd out the memory budget.
+const RECAP_CHARS: usize = 600;
 /// How many of a hive's most recent lessons ride along in each participant's
 /// system context on `hive_run`.
 const HIVE_LESSON_CONTEXT: usize = 3;
@@ -1057,6 +1064,80 @@ impl RuntimeInner {
             .clone()
     }
 
+    /// The model the selected main agent declares for itself, if it declares one. A persona that
+    /// names a model runs on it; a machine with no persona selected keeps the global setting.
+    pub fn persona_model(&self) -> Option<String> {
+        let identity = self.store.get_active_identity().ok()?;
+        let entity = self
+            .store
+            .get_entity(identity.main_agent.as_ref()?)
+            .ok()??;
+        let model = entity.model?;
+        let model = model.trim();
+        if model.is_empty() {
+            None
+        } else {
+            Some(model.to_owned())
+        }
+    }
+
+    /// The selected persona as a skill folder: its slug and which family it belongs to, so the
+    /// turn can look in `<home>/agents/<slug>/skills` as well as the shared directories.
+    pub fn active_persona_skills(&self) -> Option<(String, vikram_skills::PersonaKind)> {
+        let identity = self.store.get_active_identity().ok()?;
+        let entity = self
+            .store
+            .get_entity(identity.main_agent.as_ref()?)
+            .ok()??;
+        let kind = match entity.kind {
+            vikram_store::EntityKind::MainAgent => vikram_skills::PersonaKind::MainAgent,
+            vikram_store::EntityKind::Agent => vikram_skills::PersonaKind::Agent,
+            vikram_store::EntityKind::Bot => vikram_skills::PersonaKind::Bot,
+        };
+        let slug = entity.slug.trim();
+        if slug.is_empty() {
+            return None;
+        }
+        Some((slug.to_owned(), kind))
+    }
+
+    /// The model a session starts on: the selected persona's own model when it declares one, and
+    /// the global setting otherwise. Resolved once, at creation, so a persona selected mid-session
+    /// never rewrites the endpoint a live conversation is already talking to.
+    pub fn default_model(&self) -> String {
+        self.persona_model().unwrap_or_else(|| self.model())
+    }
+
+    /// The next job the daemon has scheduled, as one line, when its tables exist.
+    ///
+    /// The scheduler lives in another process and shares this database; a machine that never
+    /// scheduled anything has no table at all, which is not worth reporting. Best-effort throughout:
+    /// a lookahead is a courtesy, and losing it must never make opening a session look like a fault.
+    pub fn next_scheduled_job(&self) -> Option<String> {
+        let path = crate::config::database_path();
+        if !path.exists() {
+            return None;
+        }
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .ok()?;
+        let (name, next): (String, i64) = conn
+            .query_row(
+                "SELECT name, next_run_ms FROM daemon_jobs \
+                 WHERE enabled = 1 AND next_run_ms IS NOT NULL \
+                 ORDER BY next_run_ms ASC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok()?;
+        Some(format!(
+            "{name} {}",
+            relative_time(next.max(0) as u64, now_ms())
+        ))
+    }
+
     /// The whole decision for one request, in one place: the evaluator answers what the rules say,
     /// then the posture in force decides what to do with a prompt. Both entry points — the turn
     /// loop and the kernel dispatch — go through this, so a view cannot invent its own gate.
@@ -1128,11 +1209,28 @@ impl RuntimeInner {
     }
 
     pub fn journal(&self, session: &SessionId, kind: RecordKind, payload: serde_json::Value) {
+        // Committed conversation text is mirrored into the FTS index so `session.search` can find
+        // what was said, not just what a session was titled. Tool, status and compaction records
+        // stay out: they are noise in a prose search.
+        let transcript = if kind == RecordKind::Message {
+            payload
+                .get("message")
+                .and_then(|raw| serde_json::from_value::<Message>(raw.clone()).ok())
+                .map(|message| message.text_body())
+                .filter(|text| !text.trim().is_empty())
+        } else {
+            None
+        };
         let record = vikram_contracts::NewRecord::new(session.clone(), kind, payload).at(now_ms());
-        if let Err(err) = self.store.journal().append(&record) {
-            self.emit(RuntimeEvent::Error {
+        match self.store.journal().append(&record) {
+            Ok(_) => {
+                if let Some(text) = transcript {
+                    let _ = self.store.index_session_text(session, &text);
+                }
+            }
+            Err(err) => self.emit(RuntimeEvent::Error {
                 text: format!("journal append failed: {err}"),
-            });
+            }),
         }
     }
 
@@ -1288,6 +1386,40 @@ impl RuntimeInner {
         self.dialectic.supplement()
     }
 
+    /// The operator's durable memory files (MEMORY.md + USER.md) as one labelled block, or
+    /// nothing when both are empty. Captured once per process by [`MemoryFile::snapshot`], so
+    /// the prefix stays byte-stable across turns and a provider's prompt cache survives.
+    pub fn memory_snapshot(&self) -> Option<String> {
+        let block = self.memory_providers().build_system_prompt();
+        if block.trim().is_empty() {
+            None
+        } else {
+            Some(block)
+        }
+    }
+
+    /// One line about the machine this runs on, read from the host profile the evolution probes
+    /// keep. Frozen for the life of the process: the figures move slowly, and a line that changed
+    /// every turn would spend the prompt cache for nothing.
+    pub fn machine_line(&self) -> Option<String> {
+        static LINE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        LINE.get_or_init(|| {
+            let engine = self
+                .learning
+                .evolution
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let profile = engine.mapek.host_profile().ok()?;
+            vikram_evolution::mapek::describe_host_profile(&profile)
+        })
+        .clone()
+    }
+
+    /// Let the next prompt pick up a memory-file write made after the process started.
+    pub fn refresh_memory_snapshot(&self) {
+        self.memory_providers().refresh_snapshots();
+    }
+
     /// Observe the just-finished user turn for the dialectic user model and persist any new
     /// insights. Runs on the configured cadence; local and deterministic, so it costs no
     /// model tokens.
@@ -1295,7 +1427,14 @@ impl RuntimeInner {
         if self.dialectic.observe_turn(user_text).is_empty() {
             return;
         }
-        let _ = self.dialectic.persist_to(&self.memory);
+        let identity = self.store.get_active_identity().unwrap_or_else(|e| {
+            self.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!("identity unreadable, keeping the shared user model: {e}"),
+            });
+            Default::default()
+        });
+        let _ = self.dialectic.persist_for_identity(&self.memory, &identity);
     }
 
     /// Relevant long-term memory for this turn, inside the configured budget, or nothing at all.
@@ -1346,10 +1485,15 @@ impl RuntimeInner {
                 let home = crate::config::vikram_home();
                 let mf = crate::memory_files::memory_file(&home);
                 let uf = crate::memory_files::user_file(&home);
+                // Entries already carried by the frozen snapshot are not repeated: the block is
+                // in every prompt, so a keyword match on it would only spend budget twice.
+                let snapshot = self.memory_snapshot().unwrap_or_default();
                 for (scope, e) in [("memory", mf), ("user", uf)] {
                     for entry in e.load() {
                         let lower = entry.to_lowercase();
-                        if terms.iter().any(|t| lower.contains(&t.to_lowercase())) {
+                        if terms.iter().any(|t| lower.contains(&t.to_lowercase()))
+                            && !snapshot.contains(entry.trim())
+                        {
                             entries.push((scope.to_owned(), scope.to_owned(), entry));
                         }
                     }
@@ -1875,6 +2019,41 @@ impl RuntimeInner {
                 text: format!("could not record the compaction prune point: {err}"),
             });
         }
+        self.remember_session_recap(session, summary);
+    }
+
+    /// Keep the fold's summary in long-term memory, so the next session is not born blank.
+    ///
+    /// One recallable line per session, overwritten on every later fold of that session rather than
+    /// accumulating. Best-effort by design: the fold is already durable, and losing a recap must not
+    /// make a compaction look like it failed.
+    fn remember_session_recap(&self, session: &SessionId, summary: &Message) {
+        let body = summary.text_body();
+        let body = body.trim();
+        if body.is_empty() {
+            return;
+        }
+        let title = self
+            .session(session)
+            .map(|live| live.title())
+            .unwrap_or_default();
+        let title = title.trim();
+        let recap: String = body.chars().take(RECAP_CHARS).collect();
+        let value = if title.is_empty() {
+            recap
+        } else {
+            format!("{title} — {recap}")
+        };
+        let key = format!("session recap {session}");
+        if let Err(err) = self
+            .memory
+            .save_with_embedding(&key, &value, "global", 0.6, None)
+        {
+            self.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!("could not keep the session recap: {err}"),
+            });
+        }
     }
 
     /// The live context figure for the interface: the busiest session, with the provenance of both
@@ -2087,7 +2266,7 @@ impl RuntimeInner {
         let title = supplied
             .clone()
             .unwrap_or_else(|| titling::NEW_SESSION.to_owned());
-        let model = self.model();
+        let model = self.default_model();
         let mut row = self
             .store
             .create_session(
@@ -2207,6 +2386,21 @@ impl RuntimeInner {
                 })
                 .collect(),
             tasks: self.tasks.list(),
+            workers: self
+                .workers
+                .list()
+                .into_iter()
+                .map(|record| crate::types::WorkerSnapshot {
+                    id: record.id.as_str().to_owned(),
+                    session: record.session.as_str().to_owned(),
+                    parent: record.parent.as_str().to_owned(),
+                    status: record.status.as_str().to_owned(),
+                    attempts: record.attempts,
+                    objective: record.brief.objective.trim().chars().take(120).collect(),
+                    artifact: record.artifact.clone(),
+                    notes_waiting: record.notes.len(),
+                })
+                .collect(),
             approvals: self
                 .approvals
                 .lock()
@@ -2432,9 +2626,12 @@ impl RuntimeInner {
         Ok(Some(text))
     }
 
-    /// One self-check: `mapek.monitor()` + `mapek.analyze()` are read-only probes
-    /// over the store and `self_improvement.identify_improvement_opportunities()`
-    /// is a scan that stores nothing — it only reports. The mutating
+    /// One self-check: `mapek.monitor()` + `mapek.analyze()` probe the store and the host,
+    /// and `self_improvement.identify_improvement_opportunities()` is a scan that stores
+    /// nothing — neither acts on what it finds. The monitor does persist a baseline row per
+    /// host reading it can take (the default route, the mounted filesystem's fill, the count
+    /// of failed services), so a later change can be reported as a transition rather than a
+    /// state; those rows are telemetry, not a remedy. The mutating
     /// `plan`/`execute`/`run_cycle` half of MAPE-K is deliberately not run on a
     /// timer. All of it is synchronous store work, so it runs on the blocking
     /// pool like the boot recovery drain.
@@ -2535,6 +2732,22 @@ impl RuntimeInner {
             } else {
                 None
             };
+            // Housekeeping the append-only tables need a clock for: side-table retention and the
+            // journal's safe prune (orphans past the floor plus every compaction-covered prefix).
+            // The hourly tick is the only clock this process has, so a session that never restarts
+            // is no longer the case where these tables grow without bound.
+            let now = vikram_evolution::now_ms();
+            let housekeeping = (|| {
+                let side = worker
+                    .store
+                    .prune_retention(now, RETAIN_SIDE_TABLES_MS)?;
+                let journal = worker.store.prune_journal(now, RETAIN_SIDE_TABLES_MS)?;
+                Ok::<_, vikram_store::StoreError>((side, journal))
+            })();
+            // The curator ages what was learned but never used again. It runs on the same hourly
+            // tick so a memory that stopped earning its place leaves the prompt without the operator
+            // having to remember to prune anything.
+            let curated = engine.curator.sweep(now, None);
             // A durable trail for `vikram evolution`; telemetry must not fail the check.
             let _ = engine.store.save_event(&vikram_evolution::LearningEvent {
                 id: vikram_evolution::gen_id("selfcheck"),
@@ -2556,6 +2769,22 @@ impl RuntimeInner {
                         .collect::<Vec<_>>(),
                     "opportunities": opportunities.len(),
                     "improvement_executions": improvement_executions,
+                    "housekeeping": match &housekeeping {
+                        Ok((side, journal)) => serde_json::json!({
+                            "side_table_rows": side,
+                            "journal_rows": journal.deleted,
+                            "journal_kept_sessions": journal.kept_sessions,
+                        }),
+                        Err(e) => serde_json::json!({"error": e.to_string()}),
+                    },
+                    "curator": match &curated {
+                        Ok(sweep) => serde_json::json!({
+                            "staled": sweep.staled,
+                            "archived": sweep.archived,
+                            "reactivated": sweep.reactivated,
+                        }),
+                        Err(e) => serde_json::json!({"error": e.to_string()}),
+                    },
                 }),
             });
             Ok(SelfCheckReport {
@@ -3058,7 +3287,7 @@ impl Runtime {
             },
             dialectic,
             bus: EventBus::new(),
-            tools: ToolRegistry::with_builtins(),
+            tools: ToolRegistry::with_plugins(&workspace_root),
             provider: std::sync::RwLock::new(provider),
             sessions: Mutex::new(Vec::new()),
             bots,
@@ -3098,6 +3327,19 @@ impl Runtime {
             });
         }
 
+        // The learning engines may change how they learn, and nothing else: this is the only live
+        // configuration surface they are given, and it refuses every other key.
+        {
+            let mut engine = inner
+                .learning
+                .evolution
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            engine.self_config.attach_surface(Arc::new(
+                crate::config_surface::RuntimeConfigSurface::new(inner.clone()),
+            ));
+        }
+
         // Plugins declaring `components.stages` become stage handlers, competing with native
         // registrations by manifest priority; each still wraps the builtin default.
         for rejection in inner.reload_plugin_stages() {
@@ -3110,9 +3352,26 @@ impl Runtime {
             });
         }
 
-        // Reload previously derived dialectic insights so the user model survives restarts.
+        // Reload previously derived dialectic insights so the user model survives restarts —
+        // scoped to the account this interface left selected, never the whole machine's.
         // Best-effort: a fresh store simply means an empty model.
-        let _ = inner.dialectic.load_from(&inner.memory);
+        let identity = inner.store.get_active_identity().unwrap_or_default();
+        let _ = inner.dialectic.load_for_identity(&inner.memory, &identity);
+
+        // Workers that were mid-flight when the process died come back as records, not as running
+        // turns. Without this a delegated task is silently lost; with it the parent can see what was
+        // interrupted and resume the ones that stalled at a partial result.
+        match inner.load_workers() {
+            Ok(0) => {}
+            Ok(count) => inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Info,
+                text: format!("{count} delegated worker(s) restored from the last run"),
+            }),
+            Err(err) => inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!("could not restore delegated workers: {err}"),
+            }),
+        }
 
         // Rehydrate durable sessions. Journal replay restores the conversation without re-applying
         // any effect: the journal is a record, not a queue.
@@ -4108,6 +4367,33 @@ impl RuntimeHandle {
     pub fn create_session(&self, title: Option<String>) -> Result<SessionId> {
         let session = self.inner.create_session(title)?;
         self.inner.publish_metrics();
+        // Whoever opened the session is about to be told what happens next, so a scheduled job does
+        // not have to be remembered by the person who set it.
+        if let Some(next) = self.inner.next_scheduled_job() {
+            self.inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Info,
+                text: format!("next scheduled: {next}"),
+            });
+        }
+        // What the agent's own recorded turns did next, when they agree often enough to say it.
+        let agent_id = session
+            .bot()
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "main".to_owned());
+        if let Some(text) = crate::learning::likely_next_step_notice(&self.inner, &agent_id) {
+            self.inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Info,
+                text,
+            });
+        }
+        // Where the last piece of work actually stopped, so a new session opens on the thread the
+        // operator left dangling instead of on a blank page.
+        if let Some(text) = crate::learning::where_we_left_off_notice(&self.inner, &agent_id) {
+            self.inner.emit(RuntimeEvent::Notice {
+                level: NoticeLevel::Info,
+                text,
+            });
+        }
         Ok(session.id.clone())
     }
 
@@ -4442,45 +4728,9 @@ impl RuntimeHandle {
             .expect("sessions lock")
             .push(Arc::clone(&live));
         // A fork continues the source's conversation, so it resolves the same shared memory
-        // shelves. `learning::on_turn_end` rebinds every turn, but that leaves the fork's first
-        // turn recalling without `user:`/`project:` scope expansion — bind now, mirroring
-        // `learning::shared_memory_scopes`/`project_memory_scope` exactly.
-        fn fnv1a(bytes: &[u8]) -> u64 {
-            let mut h = 0xcbf29ce484222325u64;
-            for b in bytes {
-                h ^= *b as u64;
-                h = h.wrapping_mul(0x100000001b3);
-            }
-            h
-        }
-        let user_scope = self
-            .inner
-            .store
-            .get_active_identity()
-            .ok()
-            .and_then(|identity| identity.user)
-            .and_then(|id| crate::memory::user_scope(id.as_str()));
-        let project_scope = match live.project_id() {
-            Some(id) => crate::memory::project_scope(id.as_str()),
-            None => {
-                let cwd = live.cwd().to_string_lossy().into_owned();
-                if cwd.trim().is_empty() {
-                    None
-                } else {
-                    crate::memory::project_scope(&format!("ws-{:016x}", fnv1a(cwd.as_bytes())))
-                }
-            }
-        };
-        if let Err(err) = self.inner.memory.bind_session_scopes(
-            live.id.as_str(),
-            user_scope.as_deref(),
-            project_scope.as_deref(),
-        ) {
-            self.inner.emit(RuntimeEvent::Notice {
-                level: NoticeLevel::Warn,
-                text: format!("could not bind memory scopes for the fork: {err}"),
-            });
-        }
+        // shelves. Binding happens on every recall anyway; doing it here as well means the fork
+        // is already scoped before anything can read it.
+        crate::learning::bind_session_memory_scopes(&self.inner, &live);
         self.inner
             .emit(RuntimeEvent::SessionCreated(live.snapshot()));
         // Stage: session_lifecycle — a fork is a create the operator named differently; the
@@ -6273,6 +6523,28 @@ async fn collect_completion(
     }
 }
 
+/// A wait in words, rounded to the unit that matters at that distance: a job three hours away is not
+/// more informative for being expressed in minutes.
+fn relative_time(at: u64, now: u64) -> String {
+    if at <= now {
+        return "is due now".to_owned();
+    }
+    let minutes = (at - now).div_ceil(60_000);
+    match minutes {
+        0..=1 => "in a minute".to_owned(),
+        2..=59 => format!("in {minutes} minutes"),
+        _ => {
+            let hours = minutes / 60;
+            if hours < 24 {
+                format!("in {hours} hour{}", if hours == 1 { "" } else { "s" })
+            } else {
+                let days = hours / 24;
+                format!("in {days} day{}", if days == 1 { "" } else { "s" })
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::await_holding_lock,
@@ -6375,6 +6647,160 @@ mod tests {
                 .is_err()
         );
         assert_eq!(handle.config().base_url, before);
+    }
+
+    #[tokio::test]
+    async fn a_session_start_names_the_next_scheduled_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let mut events = handle.events();
+
+        let next = now_ms() + 3 * 60 * 60 * 1000;
+        let conn = rusqlite::Connection::open(crate::config::database_path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS daemon_jobs (
+                 id TEXT PRIMARY KEY, name TEXT NOT NULL, schedule TEXT NOT NULL,
+                 enabled INTEGER NOT NULL, next_run_ms INTEGER);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO daemon_jobs (id, name, schedule, enabled, next_run_ms)
+                 VALUES ('job-1', 'nightly-learning', 'every 24h', 1, ?1)",
+            [next as i64],
+        )
+        .unwrap();
+        drop(conn);
+
+        handle.create_session(Some("Lookahead".into())).unwrap();
+        let mut said = String::new();
+        while let Ok(event) = events.try_recv() {
+            if let RuntimeEvent::Notice { text, .. } = event {
+                said.push_str(&text);
+            }
+        }
+        assert!(
+            said.contains("nightly-learning"),
+            "the job is named: {said}"
+        );
+        assert!(
+            said.contains("hour"),
+            "and its distance is in words: {said}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_start_names_the_likely_next_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+
+        fn completed_turn(
+            category: &str,
+            tools: &[&str],
+            timestamp_ms: u64,
+        ) -> vikram_evolution::Experience {
+            vikram_evolution::Experience {
+                id: String::new(),
+                timestamp_ms,
+                agent_id: "main".to_owned(),
+                project_id: Some("project-1".to_owned()),
+                task_category: category.to_owned(),
+                user_request: format!("{category} turn"),
+                outcome: vikram_evolution::ExperienceOutcome::Success,
+                tools_used: tools.iter().map(|tool| (*tool).to_owned()).collect(),
+                errors: Vec::new(),
+                corrections: Vec::new(),
+                feedback: None,
+                reusable: true,
+                sensitivity: vikram_evolution::Sensitivity::Private,
+                metadata: serde_json::json!({}),
+            }
+        }
+
+        {
+            let engine = handle.evolution();
+            let base = now_ms();
+            for index in 0..3u64 {
+                engine
+                    .experience
+                    .record(completed_turn("edit", &["edit"], base + index * 10))
+                    .expect("experience records");
+                engine
+                    .experience
+                    .record(completed_turn("test", &["verify"], base + index * 10 + 1))
+                    .expect("experience records");
+            }
+            engine
+                .experience
+                .record(completed_turn("edit", &["edit"], base + 100))
+                .expect("experience records");
+        }
+
+        let mut events = handle.events();
+        handle.create_session(Some("Lookahead".into())).unwrap();
+        let mut said = String::new();
+        while let Ok(event) = events.try_recv() {
+            if let RuntimeEvent::Notice { text, .. } = event {
+                said.push_str(&text);
+            }
+        }
+        assert!(said.contains("likely next step"), "{said}");
+        assert!(said.contains("`verify`"), "the tool is named: {said}");
+        assert!(
+            said.contains("3 of the last 3"),
+            "the occasions behind it are counted: {said}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_start_names_where_the_last_work_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+
+        let unfinished = vikram_evolution::Experience {
+            id: "exp-unfinished".to_owned(),
+            timestamp_ms: now_ms(),
+            agent_id: "main".to_owned(),
+            project_id: Some("project-1".to_owned()),
+            task_category: "edit".to_owned(),
+            user_request: "port the exporter to the new schema".to_owned(),
+            outcome: vikram_evolution::ExperienceOutcome::Failure,
+            tools_used: vec!["edit".to_owned()],
+            errors: vec!["the build refused the schema".to_owned()],
+            corrections: Vec::new(),
+            feedback: None,
+            reusable: false,
+            sensitivity: vikram_evolution::Sensitivity::Private,
+            metadata: serde_json::json!({}),
+        };
+        handle
+            .evolution()
+            .experience
+            .record(unfinished)
+            .expect("experience records");
+
+        let mut events = handle.events();
+        handle.create_session(Some("Pick up".into())).unwrap();
+        let mut said = String::new();
+        while let Ok(event) = events.try_recv() {
+            if let RuntimeEvent::Notice { text, .. } = event {
+                said.push_str(&text);
+            }
+        }
+        assert!(said.contains("last time:"), "{said}");
+        assert!(
+            said.contains("port the exporter"),
+            "the topic is named: {said}"
+        );
+        assert!(
+            said.contains("ended with an error"),
+            "how it stopped is named: {said}"
+        );
     }
 
     #[tokio::test]
@@ -8397,6 +8823,62 @@ mod tests {
         assert!(!block.contains("Eve"), "{block}");
     }
 
+    #[tokio::test]
+    async fn a_committed_message_becomes_searchable_by_its_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let (id, _session) = seeded_session(&handle, "morning, what is on today");
+        handle.inner.journal(
+            &id,
+            RecordKind::Message,
+            serde_json::json!({
+                "message": Message::user("the harbour crane is rated for four tonnes")
+            }),
+        );
+        handle.inner.journal(
+            &id,
+            RecordKind::Status,
+            serde_json::json!({"text": "harbour thinking"}),
+        );
+
+        let store = vikram_store::Store::open(&database_path()).unwrap();
+        let hits = store.search_session_text("harbour", 10).unwrap();
+        let found: Vec<String> = hits.iter().map(|(s, _)| s.to_string()).collect();
+        assert_eq!(found, vec![id.to_string()], "{hits:?}");
+        let status_hits = store.search_session_text("thinking", 10).unwrap();
+        assert!(status_hits.is_empty(), "{status_hits:?}");
+    }
+
+    #[tokio::test]
+    async fn a_fold_leaves_a_recap_that_outlives_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = isolated_home(dir.path());
+        let runtime = Runtime::start(config_for(dir.path())).await.unwrap();
+        let handle = runtime.handle();
+        let id = handle.snapshot().sessions[0].id.clone();
+        let session = handle.inner.session(&id).expect("session is live");
+        for i in 0..40_u64 {
+            session.push_message(
+                Message::user(format!(
+                    "step {i}: rerun the harbour crane calibration and verify the load charts"
+                )),
+                i + 1,
+            );
+        }
+        handle.compact_now(&id).expect("a long transcript folds");
+
+        let key = format!("session recap {id}");
+        let recap = handle
+            .inner
+            .memory
+            .get(&key, "global")
+            .unwrap()
+            .expect("the fold is remembered outside the session");
+        assert!(recap.contains("VIKRAM context summary"), "{recap}");
+    }
+
     fn failing_experience(i: usize) -> vikram_evolution::Experience {
         vikram_evolution::Experience {
             id: String::new(),
@@ -8579,7 +9061,7 @@ mod tests {
         .unwrap();
         let handle = runtime.handle();
 
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
         while handle.inner.self_check_ticks.load(Ordering::SeqCst) < 3 {
             if tokio::time::Instant::now() >= deadline {
                 panic!("the self-check interval never fired");
@@ -8594,7 +9076,7 @@ mod tests {
         );
 
         // The durable trail proves a tick actually ran the store probes, not just the counter.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
             let events = handle
                 .evolution()
@@ -8658,7 +9140,10 @@ mod tests {
     }
 
     async fn wait_for_ticks(handle: &RuntimeHandle, ticks: u64) {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        // A tick now probes the host (routing table, a connect to the gateway, df, systemctl), so one
+        // tick can take seconds. The deadline is generous on purpose: this asserts that ticks happen,
+        // not how fast the host answers.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
         while handle.inner.self_check_ticks.load(Ordering::SeqCst) < ticks {
             if tokio::time::Instant::now() >= deadline {
                 panic!("the self-check interval never fired");

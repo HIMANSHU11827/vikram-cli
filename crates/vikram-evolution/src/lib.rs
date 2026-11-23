@@ -29,6 +29,8 @@
 //!   hive's recent lessons back into participant context.
 //! - **Live via `vikram evolution` CLI (read-only)**: `dashboard.snapshot`,
 //!   plus store listings of experiences, proposals, memory, skills, events.
+//!   One mutating verb sits here too: `vikram learning forget <id>` deletes a
+//!   single layered-memory row and records a `memory_forgotten` event.
 //! - **Operator-gated via `vikram evolution` CLI**: `cycle` (one bounded
 //!   `mapek.run_cycle`), `benchmark` (`self_evaluation.run_benchmark`),
 //!   `approve`/`reject` (`autonomy` decisions) — each requires `--yes` or
@@ -41,19 +43,27 @@
 //!   proposals from the learning pipeline create approval requests (visible
 //!   under `vikram evolution approvals`), and `approve`/`reject` persist the
 //!   decision; the learning proposal stays the gate that performs the write.
-//! - **Durable but dormant**: `self_evaluation` (benchmarks/results/metric
-//!   history — CLI can now run benchmarks), `mapek`'s mutating half
-//!   (`KnowledgeBase` and `cycle_count` — CLI `cycle` runs one bounded
-//!   cycle), and `self_improvement`'s `execute_improvement` lifecycle
-//!   (`track_improvement` is wired — see above).
-//! - **Still process-local**: `self_awareness`, `self_config`,
-//!   `self_adaptation`, `self_development`, and bookkeeping that is
-//!   derived-and-rebuilt (`self_improvement`'s `opportunities`,
-//!   `autonomy`'s `action_history` — executed actions already emit
-//!   `action_executed` learning events) or intentionally ephemeral
-//!   (`conversational` command history, `self_recovery`'s in-session
-//!   operation queue). Persisting intent-only state would fake
-//!   durability, so it stays in memory and documented.
+//! - **Durable and scheduled**: `self_evaluation` (benchmarks, results and a
+//!   metric history that survives restarts; `run_benchmark` records each run),
+//!   `reflection` (a turn closes its own job via `reflect_now`, and boot
+//!   drains what a crash left behind), `mapek`'s mutating half
+//!   (`KnowledgeBase` and `cycle_count`), `self_improvement`'s
+//!   `execute_improvement` lifecycle, and `curator` — `sweep` runs on the
+//!   runtime's hourly self-check and in the daemon's `maintenance` job, and
+//!   every transition is ledgered and reversible.
+//! - **Live with a host surface**: `self_config` — `apply_change` and
+//!   `rollback_change` become real when a host attaches a [`self_config::ConfigSurface`];
+//!   the runtime attaches one that accepts `context:memory_budget_tokens`,
+//!   `runtime:learning_memory_policy` and `runtime:learning_skill_policy` and
+//!   refuses everything else.
+//! - **Derived-and-rebuilt**, by design: `self_improvement`'s `opportunities`,
+//!   `autonomy`'s `action_history` (executed actions already emit
+//!   `action_executed` learning events), `conversational`'s command history,
+//!   and `self_recovery`'s in-session operation queue (the durable half of
+//!   `self_recovery` is the fingerprint/operation record in `engine_records`).
+//! - **Still without a production caller**: `skill_evolution` and
+//!   `optimization` — live skill writes go through `vikram_skills::Manager`,
+//!   so these two remain scaffolding.
 //!
 //! # Concurrency model
 //!
@@ -92,6 +102,7 @@
 
 pub mod autonomy;
 pub mod conversational;
+pub mod curator;
 pub mod dashboard;
 pub mod error;
 pub mod experience;
@@ -109,12 +120,14 @@ pub mod self_development;
 pub mod self_evaluation;
 pub mod self_improvement;
 pub mod self_recovery;
+pub mod self_trial;
 pub mod skills;
 pub mod store;
 pub mod types;
 
 pub use autonomy::{ActionType, AutonomyLevel, AutonomyManager};
 pub use conversational::{CommandResponse, ConversationalCommand, ConversationalControl};
+pub use curator::{Curator, CuratorLedgerEntry, CuratorSweep};
 pub use dashboard::{Dashboard, LearningDashboard};
 pub use error::{EvolutionError, Result};
 pub use experience::ExperienceCollector;
@@ -136,8 +149,10 @@ pub use self_development::{DevelopmentProject, ProjectStatus, SelfDevelopmentEng
 pub use self_evaluation::{EvaluationBenchmark, PerformanceMetrics, SelfEvaluationEngine};
 pub use self_improvement::{ExecutionStatus, ImprovementExecution, SelfImprovementEngine};
 pub use self_recovery::{RecoveryOperation, RecoveryType, SelfRecoveryEngine};
+pub use self_trial::{TrialOutcome, trial_change, trial_history};
 pub use skills::SkillEvolution;
 pub use store::EvolutionStore;
+pub use store::MemoryLifecycleRow;
 pub use types::*;
 
 use std::path::PathBuf;
@@ -169,6 +184,7 @@ pub struct EvolutionEngine {
     pub mapek: MapekLoop,
     pub autonomy: AutonomyManager,
     pub conversational: ConversationalControl,
+    pub curator: Curator,
 }
 
 impl EvolutionEngine {
@@ -199,6 +215,7 @@ impl EvolutionEngine {
         let mapek = MapekLoop::new(store.clone())?;
         let autonomy = AutonomyManager::new(store.clone())?;
         let conversational = ConversationalControl::new(store.clone());
+        let curator = Curator::new(store.clone());
         Ok(Self {
             store,
             experience,
@@ -218,6 +235,7 @@ impl EvolutionEngine {
             mapek,
             autonomy,
             conversational,
+            curator,
         })
     }
 

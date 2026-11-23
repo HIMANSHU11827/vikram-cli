@@ -10,11 +10,15 @@
 //! honestly report "state changed while away" by diffing the newest
 //! persisted fingerprint against the live store.
 //!
-//! Still process-local: `failed_changes` and `recovery_operations` are
-//! in-memory `Vec`s — they record intent within a session but are not
-//! persisted, and no rollback actually restores prior state (operations
-//! are recorded as `Pending`, never executed). Drift detection reports;
-//! it does not remediate.
+//! Durable history too: every [`FailedChange`] and [`RecoveryOperation`] is
+//! written as one `engine_records` row at creation and at every status
+//! transition, under [`FAILED_CHANGE_NAMESPACE`] and
+//! [`OPERATION_NAMESPACE`], and reloaded by
+//! [`SelfRecoveryEngine::hydrate`]. So
+//! [`SelfRecoveryEngine::recover_after_restart`] reports the operations
+//! recorded before a restart instead of an empty list. No rollback actually
+//! restores prior state (operations are recorded as `Pending` and never
+//! executed). Drift detection reports; it does not remediate.
 
 use crate::error::{EvolutionError, Result};
 use crate::metrics::{ProposalStats, ReflectionStats};
@@ -25,6 +29,10 @@ use std::collections::HashMap;
 
 /// `engine_records` namespace holding every persisted [`SystemSnapshot`].
 const SNAPSHOT_NAMESPACE: &str = "self_recovery.snapshot";
+/// `engine_records` namespace holding every persisted [`RecoveryOperation`].
+const OPERATION_NAMESPACE: &str = "self_recovery.operation";
+/// `engine_records` namespace holding every persisted [`FailedChange`].
+const FAILED_CHANGE_NAMESPACE: &str = "self_recovery.failed_change";
 
 /// Store-derived state captured at snapshot time. Every field is a count or
 /// version read back from the [`EvolutionStore`]; the fingerprint exists so
@@ -120,7 +128,8 @@ pub struct SelfRecoveryEngine {
     /// Set by [`SelfRecoveryEngine::recover_after_restart`]; the drift found
     /// between the newest persisted snapshot and the live store, if any.
     last_drift: Option<StateDrift>,
-    /// Whether `snapshots` has been hydrated from `engine_records`.
+    /// Whether `snapshots`, `recovery_operations`, and `failed_changes` have
+    /// been hydrated from `engine_records`.
     hydrated: bool,
 }
 
@@ -141,9 +150,10 @@ impl SelfRecoveryEngine {
         &self.store
     }
 
-    /// Load persisted snapshots into memory once. Mutating entry points call
-    /// this first so post-restart callers see the durable history; a corrupt
-    /// payload is an error, not a silently-empty list.
+    /// Load persisted snapshots, recovery operations, and failed changes into
+    /// memory once. Mutating entry points call this first so post-restart
+    /// callers see the durable history; a corrupt payload is an error, not a
+    /// silently-empty list.
     fn hydrate(&mut self) -> Result<()> {
         if self.hydrated {
             return Ok(());
@@ -156,9 +166,42 @@ impl SelfRecoveryEngine {
             }
             snapshots.push(snapshot);
         }
+        let recovery_operations = self.load_operations()?;
+        let failed_changes = self.load_failed_changes()?;
         self.snapshots = snapshots;
+        self.recovery_operations = recovery_operations;
+        self.failed_changes = failed_changes;
         self.hydrated = true;
         Ok(())
+    }
+
+    fn load_operations(&self) -> Result<Vec<RecoveryOperation>> {
+        self.store
+            .list_engine_records(OPERATION_NAMESPACE)?
+            .into_iter()
+            .map(|(_, payload)| from_json_value(payload))
+            .collect()
+    }
+
+    fn load_failed_changes(&self) -> Result<Vec<FailedChange>> {
+        self.store
+            .list_engine_records(FAILED_CHANGE_NAMESPACE)?
+            .into_iter()
+            .map(|(_, payload)| from_json_value(payload))
+            .collect()
+    }
+
+    fn persist_operation(&self, operation: &RecoveryOperation) -> Result<()> {
+        self.store.save_engine_record(
+            OPERATION_NAMESPACE,
+            &operation.id,
+            &to_json_value(operation)?,
+        )
+    }
+
+    fn persist_failed_change(&self, change: &FailedChange) -> Result<()> {
+        self.store
+            .save_engine_record(FAILED_CHANGE_NAMESPACE, &change.id, &to_json_value(change)?)
     }
 
     /// Fingerprint the store as it stands right now.
@@ -246,6 +289,7 @@ impl SelfRecoveryEngine {
         reason: &str,
         auto_rollback_eligible: bool,
     ) -> Result<FailedChange> {
+        self.hydrate()?;
         let failed = FailedChange {
             id: gen_id("failed"),
             change_id: change_id.to_string(),
@@ -255,6 +299,10 @@ impl SelfRecoveryEngine {
         };
 
         self.failed_changes.push(failed.clone());
+        if let Err(e) = self.persist_failed_change(&failed) {
+            self.failed_changes.pop();
+            return Err(e);
+        }
         Ok(failed)
     }
 
@@ -278,18 +326,22 @@ impl SelfRecoveryEngine {
         };
 
         self.recovery_operations.push(operation.clone());
+        if let Err(e) = self.persist_operation(&operation) {
+            self.recovery_operations.pop();
+            return Err(e);
+        }
         Ok(operation)
     }
 
     /// Recover after a restart.
     ///
-    /// Two honest halves: persisted snapshots are reloaded and diffed
-    /// against the live store ([`SelfRecoveryEngine::last_drift_report`]
-    /// exposes the result), and session-local `failed_changes` marked
-    /// auto-rollback-eligible get `Pending` recovery operations — intent is
-    /// recorded, nothing is restored. After a real restart `failed_changes`
-    /// is empty, so the returned list is empty unless changes were detected
-    /// within this process.
+    /// Persisted snapshots, failed changes, and recovery operations are
+    /// reloaded first; snapshots are diffed against the live store
+    /// ([`SelfRecoveryEngine::last_drift_report`] exposes the result) and
+    /// every reloaded failed change marked auto-rollback-eligible gets a
+    /// `Pending` recovery operation — intent is recorded, nothing is
+    /// restored. Returns the persisted recovery history plus whatever this
+    /// pass queued; it is empty only when nothing was ever recorded.
     pub fn recover_after_restart(&mut self) -> Result<Vec<RecoveryOperation>> {
         self.last_drift = self.detect_state_drift()?;
 
@@ -300,23 +352,29 @@ impl SelfRecoveryEngine {
             .map(|f| f.change_id.clone())
             .collect();
 
-        let mut operations = Vec::new();
         for change_id in eligible_changes {
-            let op = self.rollback_change(&change_id)?;
-            operations.push(op);
+            self.rollback_change(&change_id)?;
         }
 
-        Ok(operations)
+        Ok(self.recovery_operations.clone())
     }
 
     /// Resume an interrupted operation.
     pub fn resume_interrupted_operation(&mut self, operation_id: &str) -> Result<()> {
-        if let Some(op) = self
+        self.hydrate()?;
+        let Some(index) = self
             .recovery_operations
-            .iter_mut()
-            .find(|o| o.id == operation_id)
-        {
-            op.status = RecoveryStatus::InProgress;
+            .iter()
+            .position(|o| o.id == operation_id)
+        else {
+            return Ok(());
+        };
+        let previous = self.recovery_operations[index].status.clone();
+        self.recovery_operations[index].status = RecoveryStatus::InProgress;
+        let updated = self.recovery_operations[index].clone();
+        if let Err(e) = self.persist_operation(&updated) {
+            self.recovery_operations[index].status = previous;
+            return Err(e);
         }
         Ok(())
     }
@@ -354,12 +412,17 @@ impl SelfRecoveryEngine {
             completed_ms: None,
         };
 
-        self.recovery_operations.push(operation);
+        self.recovery_operations.push(operation.clone());
+        if let Err(e) = self.persist_operation(&operation) {
+            self.recovery_operations.pop();
+            return Err(e);
+        }
         Ok(())
     }
 
     /// Rollback skill to specific version.
     pub fn rollback_skill_version(&mut self, skill_name: &str, version: u32) -> Result<()> {
+        self.hydrate()?;
         let operation = RecoveryOperation {
             id: gen_id("recovery"),
             recovery_type: RecoveryType::SkillVersionRollback,
@@ -371,7 +434,11 @@ impl SelfRecoveryEngine {
             completed_ms: None,
         };
 
-        self.recovery_operations.push(operation);
+        self.recovery_operations.push(operation.clone());
+        if let Err(e) = self.persist_operation(&operation) {
+            self.recovery_operations.pop();
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -605,5 +672,85 @@ mod tests {
     fn drift_is_none_without_any_snapshot() {
         let (mut engine, _) = engine();
         assert!(engine.detect_state_drift().unwrap().is_none());
+    }
+
+    #[test]
+    fn recovery_operations_survive_a_store_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("evolution.db");
+        let operation_id;
+
+        {
+            let store = EvolutionStore::open(&path).unwrap();
+            let mut engine = SelfRecoveryEngine::new(store);
+            engine.create_snapshot().unwrap();
+            operation_id = engine.rollback_change("change-1").unwrap().id;
+        }
+
+        let store = EvolutionStore::open(&path).unwrap();
+        let mut engine = SelfRecoveryEngine::new(store);
+        assert!(engine.get_recovery_history().is_empty(), "not hydrated yet");
+        let operations = engine.recover_after_restart().unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].id, operation_id);
+        assert_eq!(operations[0].status, RecoveryStatus::Pending);
+        assert_eq!(engine.get_recovery_history().len(), 1);
+    }
+
+    #[test]
+    fn failed_changes_survive_a_store_reopen_and_queue_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("evolution.db");
+        let failed_id;
+
+        {
+            let store = EvolutionStore::open(&path).unwrap();
+            let mut engine = SelfRecoveryEngine::new(store);
+            engine.create_snapshot().unwrap();
+            failed_id = engine
+                .detect_failed_change("change-2", "boom", true)
+                .unwrap()
+                .id;
+        }
+
+        let store = EvolutionStore::open(&path).unwrap();
+        let mut engine = SelfRecoveryEngine::new(store);
+        assert!(engine.get_failed_changes().is_empty(), "not hydrated yet");
+        let operations = engine.recover_after_restart().unwrap();
+        assert_eq!(engine.get_failed_changes().len(), 1);
+        assert_eq!(engine.get_failed_changes()[0].id, failed_id);
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].target, "change-2");
+        assert_eq!(operations[0].status, RecoveryStatus::Pending);
+    }
+
+    #[test]
+    fn resumed_operation_status_survives_a_store_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("evolution.db");
+        let operation_id;
+
+        {
+            let store = EvolutionStore::open(&path).unwrap();
+            let mut engine = SelfRecoveryEngine::new(store);
+            engine.create_snapshot().unwrap();
+            operation_id = engine.rollback_change("change-3").unwrap().id;
+            engine.resume_interrupted_operation(&operation_id).unwrap();
+        }
+
+        let store = EvolutionStore::open(&path).unwrap();
+        let mut engine = SelfRecoveryEngine::new(store);
+        let operations = engine.recover_after_restart().unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].id, operation_id);
+        assert_eq!(operations[0].status, RecoveryStatus::InProgress);
+    }
+
+    #[test]
+    fn a_fresh_store_recovers_no_operations() {
+        let (mut engine, _) = engine();
+        assert!(engine.get_failed_changes().is_empty());
+        assert!(engine.recover_after_restart().unwrap().is_empty());
+        assert!(engine.get_recovery_history().is_empty());
     }
 }

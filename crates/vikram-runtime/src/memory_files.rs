@@ -63,6 +63,16 @@ impl MemoryFile {
         self.snapshot.clone().unwrap_or_default()
     }
 
+    /// Drop the cached snapshot so the next [`MemoryFile::snapshot`] reads the file again.
+    ///
+    /// The snapshot is frozen for the life of a process so the prompt prefix stays byte-stable.
+    /// That is right for reading, wrong for the moment the runtime itself writes a correction the
+    /// operator just made: without this the turn that learned it would still be talking to the old
+    /// prefix. Deliberate calls only, never on a timer.
+    pub fn refresh(&mut self) {
+        self.snapshot = None;
+    }
+
     pub fn char_count(&self) -> usize {
         Self::entries_len(&self.load())
     }
@@ -207,5 +217,23 @@ mod tests {
         f.remove("first").unwrap();
         assert_eq!(f.snapshot(), snap);
         assert_eq!(f.load().len(), 1);
+    }
+    #[test]
+    fn refresh_reads_an_entry_written_by_another_handle() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let mut live = memory_file(home);
+        live.add("first").unwrap();
+        let before = live.snapshot();
+        assert!(!before.contains("written elsewhere"));
+
+        let mut writer = memory_file(home);
+        writer.add("written elsewhere").unwrap();
+        assert_eq!(live.snapshot(), before);
+
+        live.refresh();
+        let after = live.snapshot();
+        assert!(after.contains("written elsewhere"), "{after}");
+        assert!(after.contains("first"), "{after}");
     }
 }

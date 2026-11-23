@@ -15,6 +15,7 @@ use crate::daemon::{Daemon, Lock, LockError, owner};
 use crate::heartbeat::{Beat, BeatKind, Heartbeat, Policy};
 use crate::jobs::{JobManager, NewJob};
 use crate::notify;
+use crate::presence::{Liveness, Presence};
 use crate::runner::HiveRosterOrder;
 use crate::service;
 use crate::store::{Delivery, JobMode, Run, RunStatus, ScheduleStore};
@@ -472,6 +473,14 @@ impl Draft {
         if job.mode == JobMode::Workflow && job.agent.trim().is_empty() {
             return Err("a workflow job needs a hive: add --agent <hive>".into());
         }
+        // A maintenance job is the evolution loop itself; a prompt or a command would be silently
+        // discarded, so say so now rather than after the first slot comes and goes.
+        if job.mode == JobMode::Maintenance && !job.payload.trim().is_empty() {
+            return Err(
+                "a maintenance job takes no payload: it drains reflection and runs one MAPE-K cycle"
+                    .into(),
+            );
+        }
         Ok(job)
     }
 }
@@ -801,6 +810,58 @@ pub fn quiet_off() -> Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
+// presence
+// ---------------------------------------------------------------------------
+
+/// What the assistant is doing right now, and what each state holds back.
+pub fn presence_status() -> Result<String, String> {
+    let store = store()?;
+    let presence = Presence::load(&store).map_err(|err| err.to_string())?;
+    Ok(format!(
+        "presence: {}\nawake   starts work and speaks\ndozing  keeps working, holds back reports below priority {URGENT_PRIORITY}\nasleep  starts no new work and holds back reports below priority {URGENT_PRIORITY}\nmove it with `vikram daemon sleep`, `doze` or `wake`",
+        presence.describe()
+    ))
+}
+
+fn set_presence(state: Liveness) -> Result<String, String> {
+    let store = store()?;
+    let now = now_ms();
+    let presence = Presence::load(&store)
+        .map_err(|err| err.to_string())?
+        .moved(state, now);
+    presence.apply(&store, now).map_err(|err| err.to_string())?;
+    Presence::clear_reason(&store).map_err(|err| err.to_string())?;
+    audit(&home(), &format!("presence {}", presence.describe()));
+    Ok(format!(
+        "presence: {}\nthe running daemon picks it up on its next tick",
+        presence.describe()
+    ))
+}
+
+/// Stop starting work and only deliver urgent reports.
+pub fn sleep() -> Result<String, String> {
+    set_presence(Liveness::Asleep)
+}
+
+/// Keep working but hold back non-urgent reports.
+pub fn doze() -> Result<String, String> {
+    set_presence(Liveness::Dozing)
+}
+
+/// Start working and speaking again.
+pub fn wake() -> Result<String, String> {
+    set_presence(Liveness::Awake)
+}
+
+/// The standing state on its own, for a caller that draws it rather than reads it out.
+pub fn liveness() -> Result<Liveness, String> {
+    let store = store()?;
+    Presence::load(&store)
+        .map(|presence| presence.state)
+        .map_err(|err| err.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // jobs
 // ---------------------------------------------------------------------------
 
@@ -954,7 +1015,7 @@ pub fn finish_cancelled(store: &ScheduleStore, run_id: &str, output: &str) -> Re
 /// The task class a job is dispatched as — exposed so the CLI can explain a queue refusal.
 pub fn class_of(mode: JobMode) -> TaskClass {
     match mode {
-        JobMode::Script => TaskClass::Script,
+        JobMode::Script | JobMode::Maintenance => TaskClass::Script,
         JobMode::Agent | JobMode::Delegate => TaskClass::Agent,
         JobMode::Workflow => TaskClass::Workflow,
     }
@@ -1034,6 +1095,58 @@ mod tests {
     }
 
     #[test]
+    fn sleep_doze_and_wake_flip_the_state_through_the_cli_and_are_audited() {
+        let _guard = crate::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = TempDir::new().unwrap();
+        unsafe { std::env::set_var("VIKRAM_HOME", dir.path()) };
+        let home = home();
+
+        let slept = sleep().unwrap();
+        assert!(slept.contains("asleep"), "{slept}");
+        assert!(
+            slept.contains("next tick"),
+            "the operator is told when it takes effect: {slept}"
+        );
+        let store = open(&home.join("vikram.db")).unwrap();
+        let asleep = Presence::load(&store).unwrap();
+        assert_eq!(asleep.state, Liveness::Asleep);
+        assert!(asleep.since > 0, "the transition is stamped");
+
+        let shown = presence_status().unwrap();
+        assert!(shown.contains("presence: asleep"), "{shown}");
+        assert!(shown.contains("awake"), "every state is explained: {shown}");
+        assert!(
+            shown.contains(&URGENT_PRIORITY.to_string()),
+            "the urgent floor is named: {shown}"
+        );
+
+        let dozed = doze().unwrap();
+        assert!(dozed.contains("dozing"), "{dozed}");
+        assert_eq!(Presence::load(&store).unwrap().state, Liveness::Dozing);
+
+        let woke = wake().unwrap();
+        assert!(woke.contains("awake"), "{woke}");
+        assert_eq!(Presence::load(&store).unwrap().state, Liveness::Awake);
+
+        let trail = store.audit_trail(10).unwrap();
+        assert_eq!(
+            trail
+                .iter()
+                .filter(|row| row.kind == "presence.set")
+                .count(),
+            3,
+            "every change is on the record: {trail:?}"
+        );
+
+        let log = std::fs::read_to_string(audit_path(&home)).unwrap();
+        for expected in ["presence asleep", "presence dozing", "presence awake"] {
+            assert!(log.contains(expected), "{log}");
+        }
+    }
+
+    #[test]
     fn a_new_job_is_listed_with_the_time_it_will_run() {
         let (_dir, store) = fixture();
         let manager = JobManager::new(store.clone());
@@ -1092,6 +1205,31 @@ mod tests {
         assert_eq!(class_of(JobMode::Agent), TaskClass::Agent);
         assert_eq!(class_of(JobMode::Delegate), TaskClass::Agent);
         assert_eq!(class_of(JobMode::Workflow), TaskClass::Workflow);
+        assert_eq!(class_of(JobMode::Maintenance), TaskClass::Script);
+    }
+
+    #[test]
+    fn a_maintenance_job_is_accepted_without_a_payload() {
+        let job = Draft {
+            mode: Some(JobMode::Maintenance),
+            ..Draft::default()
+        }
+        .apply(NewJob::new("nightly learning", "every 24h"))
+        .unwrap();
+        assert_eq!(job.mode, JobMode::Maintenance);
+        assert!(job.payload.is_empty());
+    }
+
+    #[test]
+    fn a_maintenance_job_with_a_prompt_is_refused_while_it_is_being_typed() {
+        let err = Draft {
+            mode: Some(JobMode::Maintenance),
+            payload: Some("summarise the week".into()),
+            ..Draft::default()
+        }
+        .apply(NewJob::new("x", "every 24h"))
+        .unwrap_err();
+        assert!(err.contains("no payload"), "{err}");
     }
 
     #[test]

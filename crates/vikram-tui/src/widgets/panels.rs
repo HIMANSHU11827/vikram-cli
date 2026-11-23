@@ -523,6 +523,43 @@ pub fn status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ));
     }
 
+    // Sleep is drawn for the same reason and for a sharper one: a quiet assistant and a broken one
+    // look identical from the outside, so the bar has to say which of the two this is. Awake draws
+    // nothing — the absence of the segment is the normal state, not a missing signal.
+    if let Some(state) = app.presence.as_deref() {
+        let (glyph, word) = match state {
+            "asleep" if theme.ascii => ("zzz", "asleep"),
+            "asleep" => ("◌", "asleep"),
+            "dozing" if theme.ascii => ("nap", "dozing"),
+            "dozing" => ("◐", "dozing"),
+            _ => ("", ""),
+        };
+        if !glyph.is_empty() {
+            left.push(Span::raw(sep.to_owned()));
+            left.push(Span::styled(
+                format!("{glyph} {word}"),
+                theme.status_style(StatusSegment::Label),
+            ));
+        }
+    }
+
+    // A worker still holding work is the one thing the bar must show: its turn can end and its
+    // report arrive later, so the panel is not where an operator would notice it first. Finished
+    // workers draw nothing.
+    let busy_workers = app
+        .workers
+        .iter()
+        .filter(|worker| worker.status == "running" || worker.status == "partial")
+        .count();
+    if busy_workers > 0 {
+        let glyph = if theme.ascii { "w" } else { "⚙" };
+        left.push(Span::raw(sep.to_owned()));
+        left.push(Span::styled(
+            format!("{glyph} {busy_workers} worker"),
+            theme.status_style(StatusSegment::Label),
+        ));
+    }
+
     // ctx — the boxed meter is drawn in every state, because the shape is what an operator reads at
     // a glance: how full, and how close to full. What changes behind it is the figure. A window the
     // provider reported gets a percentage; a window nobody reported gets the measured count instead,

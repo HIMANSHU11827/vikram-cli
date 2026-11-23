@@ -6,8 +6,11 @@ permission request, run. Built-ins plus MCP-provided tools are registered in
 
 ## Built-ins
 
-Filesystem (read/write/edit), shell, web fetch/search, git, browser, computer, PTY,
-LSP, MCP, skills, memory, and agent delegation.
+Filesystem (`fs.*`), shell (`shell.run`), web (`web.search`), browser (`browser.fetch`,
+`browser.open`, `browser.dom`, `browser.click`, …), documents (`doc.read`), system
+(`system.status`, `system.threats`), databases (`db.backup`), deployment (`deploy.run`),
+research (`research`, `cross_check`), git, computer, PTY, terminals (`terminal.*`), LSP, MCP,
+plugins, skills, memory, and agent delegation (`worker.note`, `worker.notes`).
 
 ## Execution
 
@@ -16,7 +19,7 @@ Tool calls are gated by policy + posture. Results are journalled (ToolCall/ToolR
 
 ## Files
 
-- `crates/vikram-runtime/src/tools.rs`
+- `crates/vikram-runtime/src/tools/` (one module per tool family; `mod.rs` registers them)
 
 ## Notes
 

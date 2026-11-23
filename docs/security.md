@@ -22,13 +22,13 @@ network access, browser security, database access, untrusted model outputs, supp
 - No taint tracking on observations.
 - Floor only vetoes Write (not Execute/Network) outside root.
 - No at-rest encryption for SQLite.
-- No secret scanning in runtime.
+- Secrets are redacted from journaled tool arguments and results (`crates/vikram-runtime/src/redact.rs`, applied in `turn.rs`), not from the model's live context.
 - No dependency vulnerability scanning in CI.
-- MCP serve is a stub; MCP auth_required not enforced.
+- MCP serve is a real JSON-RPC stdio server (`crates/vikram-mcp/src/server.rs`) that enforces `auth_required`; it has no per-tool scopes, so every connected client can call every exposed tool.
 - No output validation before context entry.
 
 ## References
 
 - `docs/research/security/agent-security-and-permissions.md`
 - `crates/vikram-policy/src/lib.rs`
-- `crates/vikram-runtime/src/sandbox.rs`
+- `crates/vikram-sandbox/src/lib.rs`

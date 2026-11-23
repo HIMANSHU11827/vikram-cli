@@ -46,6 +46,9 @@ pub async fn run(config: Config) -> Result<(), String> {
     let mut app = App::new(ascii);
     app.theme_bg = theme_bg;
     app.theme_accent = theme_accent;
+    app.presence = vikram_daemon::cli::liveness()
+        .ok()
+        .map(|state| state.as_str().to_owned());
     app.sync_snapshot(handle.snapshot());
 
     let mut terminal = setup_terminal()?;
@@ -144,6 +147,11 @@ async fn event_loop(
             if matches!(command, UiCommand::VoiceToggle) {
                 toggle_voice_mode(app, &voice_mode_tx, &mut voice_mode);
                 continue;
+            }
+            // A new turn is the operator talking over the answer. Stop the speaker first so the
+            // microphone is free by the time the next reply is ready to be read.
+            if matches!(command, UiCommand::Submit { .. }) {
+                hush(&mut voice_mode);
             }
             execute(handle, app, command);
         }
@@ -440,6 +448,8 @@ enum VoiceEvent {
     Failed(String),
     /// Worth telling the operator, but the mode keeps running.
     Note(String),
+    /// The worker's cancellation handle, so the host can stop a reply that is already playing.
+    Ready(vikram_voice::CancelToken),
 }
 
 /// The host's half of voice mode: how to reach the worker, and which turn the operator is still
@@ -454,6 +464,8 @@ struct VoiceMode {
     /// Whether any of this turn's answer has already been spoken, so the end of the turn does not
     /// read the whole reply a second time.
     spoke: bool,
+    /// How to stop the reply that is playing now, once the worker has handed its handle over.
+    speaking: Option<vikram_voice::CancelToken>,
 }
 
 /// Turn hands-free voice mode on or off. The worker owns the microphone and the model for the whole
@@ -540,8 +552,15 @@ fn voice_worker(jobs: Receiver<VoiceJob>, events: Sender<VoiceEvent>) {
             return;
         }
     };
+    let stop = session.cancel_token();
+    if events.send(VoiceEvent::Ready(stop.clone())).is_err() {
+        vdebug("worker: host gone before the handle was handed over");
+        return;
+    }
     loop {
         vdebug("worker: listening");
+        // A cancel from the previous turn must not silence the one about to start.
+        stop.reset();
         let heard = session.listen_live(|text| {
             let _ = events.send(VoiceEvent::Partial(text.to_owned()));
         });
@@ -567,12 +586,20 @@ fn voice_worker(jobs: Receiver<VoiceJob>, events: Sender<VoiceEvent>) {
         }
         // A turn can speak several sentences as they stream, so wait for the host to say the turn
         // is over instead of treating the first sentence as the whole answer.
+        let mut hushed = false;
         loop {
             match jobs.recv() {
                 Ok(VoiceJob::Speak(text)) => {
+                    // The rest of an interrupted answer is not read out sentence by sentence: the
+                    // operator has already moved on to the next turn.
+                    if hushed {
+                        continue;
+                    }
                     vdebug(&format!("worker: speaking {} bytes", text.len()));
+                    stop.reset();
                     let spoken = session.speak(&text);
                     vdebug(&format!("worker: spoke {spoken:?}"));
+                    hushed = matches!(spoken, Err(vikram_voice::VoiceError::Cancelled));
                 }
                 Ok(VoiceJob::Done) => {
                     vdebug("worker: turn done");
@@ -588,6 +615,14 @@ fn voice_worker(jobs: Receiver<VoiceJob>, events: Sender<VoiceEvent>) {
                 }
             }
         }
+    }
+}
+
+/// Stop the reply that is playing, if any. The worker keeps its place: the next sentence it is told
+/// to speak resets the flag, so this only silences what the operator has already heard enough of.
+fn hush(mode: &mut VoiceMode) {
+    if let Some(stop) = mode.speaking.as_ref() {
+        stop.cancel();
     }
 }
 
@@ -640,8 +675,12 @@ fn drain_voice_mode(app: &mut App, rx: &Receiver<VoiceEvent>, mode: &mut VoiceMo
             VoiceEvent::Failed(err) => {
                 mode.jobs = None;
                 mode.awaiting = None;
+                mode.speaking = None;
                 app.voice_mode = false;
                 app.push_notice(NoticeLevel::Warn, format!("voice: {err}"));
+            }
+            VoiceEvent::Ready(stop) => {
+                mode.speaking = Some(stop);
             }
         }
     }
@@ -3091,7 +3130,35 @@ fn run_action(app: &mut App, session: &SessionId, name: &str) {
         "diff" => run_shell(app, session, "git diff"),
         "test" => run_shell(app, session, "cargo test"),
         "build" => run_shell(app, session, "cargo build"),
+        "presence" => match vikram_daemon::cli::presence_status() {
+            Ok(report) => app.push_notice(NoticeLevel::Info, report),
+            Err(err) => app.push_notice(NoticeLevel::Warn, err),
+        },
+        "sleep" | "doze" | "wake" => set_presence(app, name),
+        "workers" => {
+            let lines = app.worker_lines().join("\n");
+            app.push_notice(NoticeLevel::Info, lines);
+        }
         other => app.push_notice(NoticeLevel::Warn, format!("`/{other}` has no action")),
+    }
+}
+
+/// Move the assistant's standing state. The daemon owns presence and audits every move, so the
+/// interface asks it rather than keeping a second opinion that could drift from the real one.
+fn set_presence(app: &mut App, command: &str) {
+    let outcome = match command {
+        "sleep" => vikram_daemon::cli::sleep(),
+        "doze" => vikram_daemon::cli::doze(),
+        _ => vikram_daemon::cli::wake(),
+    };
+    match outcome {
+        Ok(report) => {
+            app.presence = vikram_daemon::cli::liveness()
+                .ok()
+                .map(|state| state.as_str().to_owned());
+            app.push_notice(NoticeLevel::Info, report);
+        }
+        Err(err) => app.push_notice(NoticeLevel::Warn, err),
     }
 }
 
@@ -3221,6 +3288,17 @@ mod tests {
             .draw(|frame| ui::draw(frame, app))
             .expect("the frame draws");
         terminal
+    }
+
+    #[test]
+    fn an_interrupted_reply_stops_the_token_that_is_speaking() {
+        let mut mode = VoiceMode::default();
+        hush(&mut mode);
+        let stop = vikram_voice::CancelToken::new();
+        mode.speaking = Some(stop.clone());
+        assert!(!stop.is_cancelled());
+        hush(&mut mode);
+        assert!(stop.is_cancelled());
     }
 
     #[test]

@@ -1,15 +1,18 @@
 //! Vikram-native dialectic user modelling.
 //!
 //! A deterministic, heuristic, fully local layer that derives structured insights about the
-//! user — preferences, habits and goals — from conversation turns, stores them as structured
-//! entries, and injects them as a second context layer (the *dialectic supplement*) alongside
-//! the base context (retrieved memory / project instructions) in `turn.rs`.
+//! user — preferences, habits, goals and explicitly stated mood — from conversation turns,
+//! stores them as structured entries, and injects them as a second context layer (the
+//! *dialectic supplement*) alongside the base context (retrieved memory / project
+//! instructions) in `turn.rs`.
 //!
 //! Design notes:
 //! - No external API, no model call, no randomness: the same transcript always yields the
 //!   same insights, in the same order.
 //! - Extraction is pattern-based over user turns only. Anything not matching a known
-//!   self-description pattern is ignored, so idle chat does not pollute the model.
+//!   self-description pattern is ignored, so idle chat does not pollute the model. Tone is the
+//!   same kind of pattern: an explicit first-person feeling statement, never punctuation or
+//!   shouting.
 //! - Insights are merged by `(kind, key)`: repeated evidence raises confidence
 //!   deterministically instead of duplicating entries.
 //! - Insights decay: an insight not re-evidenced for `decay_after_turns` user
@@ -40,7 +43,22 @@ use vikram_contracts::TokenMeter;
 use crate::memory::MemoryStore;
 
 /// Host-controlled memory scope for dialectic entries. Never caller/model-chosen.
+///
+/// This is the legacy, account-independent scope. New writes go to
+/// [`scope_for_identity`] so two accounts on one machine never share a user model.
 pub const DIALECTIC_SCOPE: &str = "dialectic";
+
+/// The scope one account's dialectic entries live under: what the host learned about *this*
+/// user on *this* profile is never injected into anybody else's prompt.
+pub fn scope_for_identity(identity: &vikram_store::ActiveIdentity) -> String {
+    let user = identity.user.as_ref().map(|id| id.as_str()).unwrap_or("-");
+    let profile = identity
+        .profile
+        .as_ref()
+        .map(|id| id.as_str())
+        .unwrap_or("-");
+    format!("{DIALECTIC_SCOPE}:{user}:{profile}")
+}
 
 /// Config knobs for the dialectic layer: cadence, depth and budget.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +112,8 @@ pub enum InsightKind {
     Goal,
     /// A recurring request pattern worth surfacing as a candidate procedure.
     Suggestion,
+    /// A feeling the operator stated about themselves in their own words.
+    Tone,
 }
 
 impl InsightKind {
@@ -103,6 +123,7 @@ impl InsightKind {
             Self::Habit => "habit",
             Self::Goal => "goal",
             Self::Suggestion => "suggestion",
+            Self::Tone => "tone",
         }
     }
 }
@@ -245,10 +266,239 @@ fn capture_after(text: &str, marker: &str) -> Option<String> {
     Some(clipped.trim().to_owned())
 }
 
+/// How the operator says they feel, in their own words.
+///
+/// Deliberately small and non-inferential: this is not sentiment analysis. It fires only
+/// when the operator makes an explicit first-person statement ("i'm exhausted"), never on
+/// volume, casing or punctuation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Tone {
+    Frustrated,
+    Tired,
+    Pleased,
+    Urgent,
+}
+
+impl Tone {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Frustrated => "frustrated",
+            Self::Tired => "tired",
+            Self::Pleased => "pleased",
+            Self::Urgent => "urgent",
+        }
+    }
+}
+
+/// Feeling phrases, each mapped to the tone it states. All lowercase; matched
+/// case-insensitively as whole words.
+const TONE_PHRASES: &[(Tone, &str)] = &[
+    (Tone::Frustrated, "frustrated"),
+    (Tone::Frustrated, "annoyed"),
+    (Tone::Frustrated, "fed up"),
+    (Tone::Frustrated, "driving me mad"),
+    (Tone::Frustrated, "driving me crazy"),
+    (Tone::Frustrated, "at my wit's end"),
+    (Tone::Tired, "tired"),
+    (Tone::Tired, "exhausted"),
+    (Tone::Tired, "drained"),
+    (Tone::Tired, "worn out"),
+    (Tone::Tired, "burnt out"),
+    (Tone::Tired, "burned out"),
+    (Tone::Pleased, "pleased"),
+    (Tone::Pleased, "happy"),
+    (Tone::Pleased, "glad"),
+    (Tone::Pleased, "delighted"),
+    (Tone::Pleased, "relieved"),
+    (Tone::Urgent, "in a hurry"),
+    (Tone::Urgent, "in a rush"),
+    (Tone::Urgent, "pressed for time"),
+    (Tone::Urgent, "running out of time"),
+    (Tone::Urgent, "up against a deadline"),
+];
+
+/// Markers that make a feeling phrase a statement about the operator.
+const FIRST_PERSON_MARKERS: &[&str] = &[
+    "i'm",
+    "im",
+    "i am",
+    "i feel",
+    "i've been",
+    "i have been",
+    "i was",
+    "i've",
+];
+
+/// Words that may sit between the first-person marker and the feeling without
+/// changing whose feeling it is ("i'm *really quite* tired"). Anything else means
+/// the phrase is about somebody or something else, so it is not the operator's tone.
+const TONE_FILLERS: &[&str] = &[
+    "a",
+    "absolutely",
+    "actually",
+    "also",
+    "already",
+    "am",
+    "awfully",
+    "been",
+    "beginning",
+    "bit",
+    "completely",
+    "currently",
+    "definitely",
+    "entirely",
+    "especially",
+    "extremely",
+    "fairly",
+    "feel",
+    "feeling",
+    "feels",
+    "getting",
+    "honestly",
+    "incredibly",
+    "just",
+    "kind",
+    "kinda",
+    "little",
+    "more",
+    "now",
+    "of",
+    "pretty",
+    "quite",
+    "rather",
+    "really",
+    "right",
+    "so",
+    "somewhat",
+    "sort",
+    "starting",
+    "still",
+    "super",
+    "today",
+    "too",
+    "totally",
+    "utterly",
+    "very",
+    "way",
+    "wildly",
+];
+
+/// How far before a feeling phrase a first-person marker may sit.
+const TONE_MARKER_WINDOW: usize = 48;
+/// How far before a self-referential phrase ("driving me mad") a negation may sit.
+const TONE_NEGATION_WINDOW: usize = 24;
+
+/// The tone the operator names in `text`, if any. Pure and deterministic.
+///
+/// Only an explicit first-person feeling statement qualifies: the marker must stand
+/// directly in front of the phrase, separated at most by filler words. When several
+/// tones are stated, the earliest one wins.
+pub fn explicit_tone(text: &str) -> Option<Tone> {
+    let mut earliest: Option<(usize, Tone)> = None;
+    for (tone, phrase) in TONE_PHRASES {
+        let mut from = 0;
+        while let Some(start) = whole_word_at_or_after(text, phrase, from) {
+            if stated_in_first_person(text, phrase, start) {
+                if earliest.is_none_or(|(position, _)| start < position) {
+                    earliest = Some((start, *tone));
+                }
+                break;
+            }
+            from = start + 1;
+        }
+    }
+    earliest.map(|(_, tone)| tone)
+}
+
+fn stated_in_first_person(text: &str, phrase: &str, start: usize) -> bool {
+    let preceding = preceding_text(text, start, TONE_MARKER_WINDOW);
+    if phrase.contains(" me ") || phrase.contains(" my ") {
+        let tail = preceding_text(preceding, preceding.len(), TONE_NEGATION_WINDOW);
+        return !is_negated(tail);
+    }
+    let Some(marker_end) = last_first_person_marker(preceding) else {
+        return false;
+    };
+    only_filler_words(&preceding[marker_end..])
+}
+
+fn preceding_text(text: &str, end: usize, window: usize) -> &str {
+    let mut start = end.saturating_sub(window);
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    &text[start..end]
+}
+
+/// End byte offset of the last first-person marker in `text`, if any.
+fn last_first_person_marker(text: &str) -> Option<usize> {
+    let mut last: Option<(usize, usize)> = None;
+    for marker in FIRST_PERSON_MARKERS {
+        let mut from = 0;
+        while let Some(start) = whole_word_at_or_after(text, marker, from) {
+            let end = start + marker.len();
+            if last.is_none_or(|(current, _)| start > current) {
+                last = Some((start, end));
+            }
+            from = end;
+        }
+    }
+    last.map(|(_, end)| end)
+}
+
+fn whole_word_at_or_after(text: &str, needle: &str, from: usize) -> Option<usize> {
+    let mut offset = from;
+    while offset < text.len() {
+        let start = offset + find_marker(&text[offset..], needle)?;
+        let end = start + needle.len();
+        let before_is_word = text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric());
+        let after_is_word = text[end..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric());
+        if !before_is_word && !after_is_word {
+            return Some(start);
+        }
+        offset = start + 1;
+    }
+    None
+}
+
+fn only_filler_words(segment: &str) -> bool {
+    segment
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .all(|word| TONE_FILLERS.contains(&word))
+}
+
+fn is_negated(segment: &str) -> bool {
+    let lower = segment.to_lowercase();
+    lower.contains("n't")
+        || lower.contains("no longer")
+        || lower
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|word| word == "not" || word == "never")
+}
+
 /// Extract insights from a single user turn. Pure and deterministic.
 pub fn extract_insights(user_text: &str) -> Vec<Insight> {
     let source: String = user_text.chars().take(120).collect();
     let mut out = Vec::new();
+
+    // Affect: only a feeling the operator states in the first person, in words.
+    // Punctuation, casing and shouting carry no signal on their own.
+    if let Some(tone) = explicit_tone(user_text) {
+        out.push(Insight::new(
+            InsightKind::Tone,
+            format!("tone:{}", tone.as_str()),
+            format!("operator described feeling {}", tone.as_str()),
+            source.clone(),
+        ));
+    }
 
     // Preferences: explicit likes / dislikes / preferences.
     for marker in [
@@ -855,6 +1105,31 @@ impl DialecticEngine {
     /// Returns how many insight/correction entries were written.
     /// Errors are reported, never panicked on.
     pub fn persist_to(&self, store: &MemoryStore) -> usize {
+        self.persist_to_scope(store, DIALECTIC_SCOPE)
+    }
+
+    /// Persist into one account's scope, and retire the legacy un-scoped entries once the
+    /// account's own scope holds the model. The retirement is what makes the move a migration
+    /// rather than a copy: an old model must not keep being read after the new one exists.
+    pub fn persist_for_identity(
+        &self,
+        store: &MemoryStore,
+        identity: &vikram_store::ActiveIdentity,
+    ) -> usize {
+        let scope = scope_for_identity(identity);
+        let written = self.persist_to_scope(store, &scope);
+        if written > 0
+            && let Ok(legacy) = store.list(DIALECTIC_SCOPE)
+        {
+            for (key, _) in legacy {
+                let _ = store.delete(&key, DIALECTIC_SCOPE);
+            }
+        }
+        written
+    }
+
+    /// [`Self::persist_to`] against an explicit scope.
+    pub fn persist_to_scope(&self, store: &MemoryStore, scope: &str) -> usize {
         let mut written_keys = BTreeSet::new();
         let mut written = 0usize;
         let (insights, corrections, turn_count) = {
@@ -873,7 +1148,7 @@ impl DialecticEngine {
             }
             let key = format!("{}:{}", insight.kind.as_str(), insight.key);
             if let Ok(value) = serde_json::to_string(insight)
-                && store.save(&key, &value, DIALECTIC_SCOPE).is_ok()
+                && store.save(&key, &value, scope).is_ok()
             {
                 written += 1;
                 written_keys.insert(key);
@@ -882,25 +1157,22 @@ impl DialecticEngine {
         for stat in &corrections {
             let key = format!("correction:{}", stat.topic);
             if let Ok(value) = serde_json::to_string(stat)
-                && store.save(&key, &value, DIALECTIC_SCOPE).is_ok()
+                && store.save(&key, &value, scope).is_ok()
             {
                 written += 1;
                 written_keys.insert(key);
             }
         }
         let meta_key = "meta:turn-count";
-        if store
-            .save(meta_key, turn_count.to_string(), DIALECTIC_SCOPE)
-            .is_ok()
-        {
+        if store.save(meta_key, turn_count.to_string(), scope).is_ok() {
             written_keys.insert(meta_key.to_owned());
         }
         // Remove stale entries (evicted insights, renamed keys) so storage
         // mirrors the in-memory model.
-        if let Ok(entries) = store.list(DIALECTIC_SCOPE) {
+        if let Ok(entries) = store.list(scope) {
             for (key, _) in entries {
                 if !written_keys.contains(&key) {
-                    let _ = store.delete(&key, DIALECTIC_SCOPE);
+                    let _ = store.delete(&key, scope);
                 }
             }
         }
@@ -910,7 +1182,26 @@ impl DialecticEngine {
     /// Load previously persisted insights, correction stats and the turn
     /// counter (e.g. at boot). Returns how many entries were loaded.
     pub fn load_from(&self, store: &MemoryStore) -> usize {
-        let Ok(entries) = store.list(DIALECTIC_SCOPE) else {
+        self.load_from_scope(store, DIALECTIC_SCOPE)
+    }
+
+    /// Load the model that belongs to one account, falling back to the legacy un-scoped entries
+    /// the first time an updated build runs against an older store.
+    pub fn load_for_identity(
+        &self,
+        store: &MemoryStore,
+        identity: &vikram_store::ActiveIdentity,
+    ) -> usize {
+        let loaded = self.load_from_scope(store, &scope_for_identity(identity));
+        if loaded > 0 {
+            return loaded;
+        }
+        self.load_from_scope(store, DIALECTIC_SCOPE)
+    }
+
+    /// [`Self::load_from`] against an explicit scope.
+    pub fn load_from_scope(&self, store: &MemoryStore, scope: &str) -> usize {
+        let Ok(entries) = store.list(scope) else {
             return 0;
         };
         let mut state = self.lock();
@@ -960,6 +1251,14 @@ mod tests {
             user_file_path: Some(dir.join("USER.md")),
             ..DialecticConfig::default()
         })
+    }
+
+    fn identity(user: &str, profile: &str) -> vikram_store::ActiveIdentity {
+        vikram_store::ActiveIdentity {
+            user: Some(vikram_contracts::UserId::new(user)),
+            profile: Some(vikram_contracts::ProfileId::new(profile)),
+            main_agent: None,
+        }
     }
 
     #[test]
@@ -1125,6 +1424,55 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(serde_json::from_str::<Insight>(&raw).is_ok());
+    }
+
+    #[test]
+    fn one_accounts_user_model_is_never_loaded_for_another() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let alice = engine();
+        alice.observe_turn_forced("I prefer tabs");
+        let alice_id = identity("user-a", "prof-1");
+        assert_eq!(alice.persist_for_identity(&store, &alice_id), 1);
+
+        let scoped = scope_for_identity(&alice_id);
+        assert!(store.get("preference:tabs", &scoped).unwrap().is_some());
+        assert!(
+            store
+                .get("preference:tabs", DIALECTIC_SCOPE)
+                .unwrap()
+                .is_none()
+        );
+
+        let bob = DialecticEngine::new(DialecticConfig::default());
+        assert_eq!(
+            bob.load_for_identity(&store, &identity("user-b", "prof-2")),
+            0
+        );
+        assert!(bob.insights().is_empty());
+
+        let alice_again = DialecticEngine::new(DialecticConfig::default());
+        assert_eq!(alice_again.load_for_identity(&store, &alice_id), 1);
+        assert!(alice_again.insights().iter().any(|i| i.key == "tabs"));
+    }
+
+    #[test]
+    fn the_legacy_shared_model_migrates_into_the_accounts_scope() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let engine = engine();
+        engine.observe_turn_forced("I prefer tabs");
+        assert_eq!(engine.persist_to(&store), 1);
+
+        let account = identity("user-a", "prof-1");
+        let reloaded = DialecticEngine::new(DialecticConfig::default());
+        assert_eq!(reloaded.load_for_identity(&store, &account), 1);
+        assert_eq!(reloaded.persist_for_identity(&store, &account), 1);
+        assert!(
+            store
+                .get("preference:tabs", scope_for_identity(&account))
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.list(DIALECTIC_SCOPE).unwrap().is_empty());
     }
 
     #[test]
@@ -1355,6 +1703,113 @@ mod tests {
         assert_eq!(
             correction_topic("no, use pnpm not npm"),
             Some("pnpm-npm".into())
+        );
+    }
+
+    #[test]
+    fn explicit_tone_phrases_are_recognised() {
+        assert_eq!(
+            explicit_tone("i'm frustrated with the parser"),
+            Some(Tone::Frustrated)
+        );
+        assert_eq!(explicit_tone("I am exhausted"), Some(Tone::Tired));
+        assert_eq!(
+            explicit_tone("i've been really tired lately"),
+            Some(Tone::Tired)
+        );
+        assert_eq!(explicit_tone("im happy with that"), Some(Tone::Pleased));
+        assert_eq!(
+            explicit_tone("i feel quite pleased with the result"),
+            Some(Tone::Pleased)
+        );
+        assert_eq!(explicit_tone("i'm in a hurry"), Some(Tone::Urgent));
+        assert_eq!(
+            explicit_tone("this is driving me mad"),
+            Some(Tone::Frustrated)
+        );
+    }
+
+    #[test]
+    fn punctuation_does_not_create_a_tone_signal() {
+        for text in [
+            "WHY IS THIS STILL BROKEN?!",
+            "!!!!",
+            "......",
+            "😡😡😡",
+            "this is a disaster!!!",
+            "what the hell?!?!",
+            "SO TIRED OF THIS",
+            "frustrated!!!!",
+            "THIS IS UNACCEPTABLE 😤",
+        ] {
+            assert_eq!(explicit_tone(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_third_person_feeling_is_not_the_operators_tone() {
+        for text in [
+            "she said she was tired",
+            "he is frustrated with the vendor",
+            "they were exhausted after the migration",
+            "the team sounded pleased with the result",
+        ] {
+            assert_eq!(explicit_tone(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_negated_feeling_is_not_a_tone() {
+        assert_eq!(explicit_tone("i'm not frustrated at all"), None);
+        assert_eq!(explicit_tone("i am not tired"), None);
+        assert_eq!(explicit_tone("i'm not really happy with that"), None);
+        assert_eq!(explicit_tone("i'm never exhausted"), None);
+    }
+
+    #[test]
+    fn an_explicit_tone_note_changes_the_next_turn() {
+        let engine = DialecticEngine::new(DialecticConfig {
+            cadence_turns: 1,
+            decay_after_turns: 1,
+            user_file_path: Some(PathBuf::from("/nonexistent/vikram-dialectic-test/USER.md")),
+            ..DialecticConfig::default()
+        });
+        let first = engine.observe_turn_forced("i'm frustrated, the build keeps failing");
+        let note = first
+            .iter()
+            .find(|i| i.kind == InsightKind::Tone)
+            .expect("an explicit statement yields a tone insight");
+        assert_eq!(note.key, "tone:frustrated");
+        assert!(note.value.contains("frustrated"));
+        let supplement = engine.supplement().expect("the next turn sees the note");
+        assert!(supplement.contains("frustrated"), "{supplement}");
+
+        // A neutral follow-up is not evidence for the tone, so the note does not
+        // grow — it decays on the same schedule as every other insight.
+        let second = engine.observe_turn_forced("what does the parser do with nested tuples");
+        assert!(!second.iter().any(|i| i.kind == InsightKind::Tone));
+        let stored = engine
+            .insights()
+            .into_iter()
+            .find(|i| i.kind == InsightKind::Tone)
+            .expect("the note is still held until it decays");
+        assert_eq!(stored.evidence, 1, "a neutral turn is not tone evidence");
+
+        for text in [
+            "how do the migrations run",
+            "which config key sets the log level",
+            "explain the retry policy briefly",
+            "where are the integration fixtures",
+            "summarise the scheduler loop",
+        ] {
+            engine.observe_turn_forced(text);
+        }
+        assert!(
+            !engine
+                .decayed_insights()
+                .iter()
+                .any(|i| i.kind == InsightKind::Tone),
+            "an un-re-evidenced tone is forgotten with the rest of the model"
         );
     }
 }

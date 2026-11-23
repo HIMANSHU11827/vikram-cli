@@ -263,11 +263,7 @@ impl Tool for Simple {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `VIKRAM_HOME` is process-global, so the scheduling tests have to take turns: without this
-    /// lock one test's temporary home replaces another's between `schedule.add` and `schedule.list`,
-    /// and a job that was created looks missing.
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::HOME_LOCK;
 
     struct Fixture {
         _dir: tempfile::TempDir,

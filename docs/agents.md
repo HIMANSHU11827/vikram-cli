@@ -50,8 +50,8 @@ types through one engine.
 
 ## Files
 
-- `crates/vikram-runtime/src/agents.rs`
-- `crates/vikram-runtime/src/teams.rs`
+- `crates/vikram-runtime/src/orchestrator.rs` (workers, delegation, resume)
+- `crates/vikram-runtime/src/tools/hive_roster.rs` (hive membership and delegation tools)
 - `crates/vikram-runtime/src/hive_chat.rs`
 - `crates/vikram-runtime/src/tickets.rs`
 - `crates/vikram-store/src/lib.rs` (agents, teams, hives, tickets tables)

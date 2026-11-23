@@ -13,10 +13,11 @@ hologram claim.
 > Superseded by §3 for anything about the shipped code. Kept because the
 > starting point is what justifies the order of the phases.
 
-- No audio dependency anywhere in the workspace (verified: `grep -r 'cpal\|rodio\|whisper\|tts' Cargo.toml crates/*/Cargo.toml` — zero hits).
+- Audio is in-tree: `crates/vikram-voice` depends on `cpal` 0.18 (feature `pipewire`), `hound`, and `wavo` 0.6 (pure-Rust GGUF whisper on wgpu). TTS still shells out to `piper`/`espeak-ng`; capture falls back to `parecord`/`arecord` only when cpal sees no device.
 - `computer.*` helpers already shell out to host binaries (`wl-paste`, `xclip`, `notify-send`) with graceful missing-helper degradation — the established pattern this plan reuses.
 - Runtime is text-in/text-out: `RuntimeHandle::send`, `Block::Text/Image`, the gateway delivers text + ledgered verbs.
-- `vikram-terminals` + ACP PTY exists; the daemon's event-trigger work has
+- `vikram-terminals` (SSH + Docker backends) and the ACP PTY exist in-tree and are
+  reachable through the `terminal.exec` tool; the daemon's event-trigger work has
   landed (`on <trigger>` schedules, quiet hours — `196f731`).
 
 ## 1. The pipeline (mirroring the Alexa-class stages from jarvis-class.md §1.4)
@@ -117,10 +118,10 @@ identity the text persona uses, not a second personality.
 |---|---|---|
 | Capture | built-in `cpal` 0.18 with the `pipewire` feature; `parecord`/`arecord` only when cpal sees no device | one stream opened per utterance, not kept warm |
 | VAD | energy gate: 10 ms RMS frames, noise floor = 10th percentile of the take, gate = whichever is higher of `noise_floor × floor_ratio` (2.5) and `rms_threshold`, `min_speech_ms` 250, hangover 200 ms | energy only — a door slam or music can open the gate; it cannot separate speech from loud non-steady noise |
-| ASR | **wavo 0.6**, pure Rust, GGUF on wgpu. Default hub model `whisper-base.en` (Q8_0, ~80 MB), downloaded once into `<home>/.vikram/models` on the **first utterance** | batch only: no partials, no confidence, no word timestamps used |
+| ASR | **wavo 0.6**, pure Rust, GGUF on wgpu. Default hub model `whisper-base.en` (Q8_0, ~80 MB), downloaded once into `<home>/.vikram/models` on the **first utterance** | batch transcription underneath: no confidence, no word timestamps. Live captions exist (`listen_live` re-transcribes a trailing window every ~400 ms) but the final text is still one batch pass |
 | ASR fast path | `voxtype` CLI, used only when it is already on PATH **and** `voxtype_fast_path` is true | optional accelerator; never required, and its absence changes nothing |
 | ASR last resort | `whisper-cli` helper on a temp WAV | needs whisper.cpp installed; no accuracy gain over wavo |
-| TTS | `piper` when a voice `.onnx` is configured or discovered, otherwise **espeak-ng** — the honest fallback, robotic, and reported as `degraded` in `voice status` | whole file synthesized before a single sample plays; no streaming |
+| TTS | `piper` when a voice `.onnx` is configured or discovered, otherwise **espeak-ng** — the honest fallback, robotic, and reported as `degraded` in `voice status`. `tts_language` picks the espeak voice tag and the piper voice whose file name carries it | whole file synthesized before a single sample plays; no streaming |
 | Playback | built-in `cpal` output; `paplay`/`aplay` only as fallback | abort only — no duck, no resume |
 
 Every stage reports `ready` / `degraded` / `missing` / `disabled` with a reason;
@@ -196,6 +197,7 @@ Keys that matter day to day:
 | `asr_language` | none (auto-detect) | pin the spoken language |
 | `voxtype_fast_path` | `true` | use the `voxtype` CLI when it is installed |
 | `tts_voice` | none → espeak-ng | piper `.onnx` voice |
+| `tts_language` | none → the helper's default | espeak voice tag (`en`, `en-gb`, `de`); also picks the piper voice whose file name carries the tag |
 | `rate` | 175 | words per minute, 80–450; piper gets `175/rate` as `--length_scale` |
 | `volume` | 1.0 | output amplitude, 0–1 |
 | `input_device`, `output_device` | none → system default | exact or case-insensitive device name |
@@ -246,9 +248,10 @@ VoiceSession::status() -> VoiceStatus                   // each stage: Ready/Deg
 `listen_once` returning `Option` (not `Result<String>`) is deliberate: silence
 is a normal outcome, not an error.
 
-Permissions: `voice.listen` and `voice.speak` are tool-permission strings in
-the existing deny-first system; the voice session refuses to open the mic or
-the speaker without them.
+Permissions: the voice session refuses to open the mic or the speaker unless voice I/O is
+enabled, and the CLI keeps it opt-in behind `--enable` / `/voice`. It is not yet part of
+the deny-first tool-policy system: `crates/vikram-contracts/src/policy.rs` has no voice
+`ActionKind`, so a policy cannot veto the mic the way it can veto a shell command.
 
 ### 3.6 Optional cloud voice (ElevenLabs) — opt-in, never the default
 
@@ -268,9 +271,7 @@ vikram voice say --enable "status report"
   and never put in an error message.
 - `tts_voice_id` is empty by default on purpose: a baked-in voice id would bill
   an operator who never picked one. `tts_model` defaults to
-  `eleven_turbo_v2_5`; ElevenLabs now lists Turbo as deprecated in favour of
-  `eleven_flash_v2_5`, so `config set tts_model eleven_flash_v2_5` switches
-  without a code change.
+  `eleven_turbo_v2_5`.
 - The request is `POST https://api.elevenlabs.io/v1/text-to-speech/{voice_id}`
   with `output_format=pcm_16000`; the returned PCM is wrapped as WAV by the same
   writer the local voice uses, so the player stage is unchanged.

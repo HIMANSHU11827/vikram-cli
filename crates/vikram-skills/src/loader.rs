@@ -270,7 +270,12 @@ fn relative(root: &Path, path: &Path) -> String {
         .join("/")
 }
 
-fn walk_resources(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Resource>) -> Result<()> {
+pub(crate) fn walk_resources(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<Resource>,
+) -> Result<()> {
     for path in paths::sorted_entries(dir)? {
         let file = match path.file_name() {
             Some(name) => name.to_string_lossy().into_owned(),
@@ -346,6 +351,7 @@ mod tests {
             version: None,
             categories: Vec::new(),
             tags: Vec::new(),
+            source: crate::skill::SkillSource::User,
         }
     }
 
@@ -617,6 +623,7 @@ mod tests {
             version: None,
             categories: Vec::new(),
             tags: Vec::new(),
+            source: crate::skill::SkillSource::Builtin,
         };
         let loaded = loader.load(&builtin).expect("builtin");
         assert!(loaded.instructions.contains("# Skill author"));

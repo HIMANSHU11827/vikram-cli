@@ -15,7 +15,7 @@ use vikram_contracts::{
 use vikram_runtime::types::{
     ApprovalPrompt, BackgroundTask, BotSnapshot, BotState, ContextMeter, HiveRosterSnapshot,
     Metrics, NoticeLevel, PlanView, RuntimeEvent, RuntimeStatus, SessionSnapshot, StateSnapshot,
-    TaskState, TurnState, now_ms,
+    TaskState, TurnState, WorkerSnapshot, now_ms,
 };
 
 #[derive(Clone, Debug)]
@@ -957,6 +957,8 @@ pub struct App {
     pub rosters: Vec<HiveRosterSnapshot>,
     pub selected_bot: Option<BotId>,
     pub tasks: Vec<BackgroundTask>,
+    /// Delegated workers the runtime reports, including any restored from the last run.
+    pub workers: Vec<WorkerSnapshot>,
     pub approvals: Vec<ApprovalPrompt>,
     pub status: RuntimeStatus,
     pub metrics: Metrics,
@@ -977,6 +979,9 @@ pub struct App {
     pub should_quit: bool,
     /// Hands-free voice mode is on: kept by the host, shown here so the bar says so.
     pub voice_mode: bool,
+    /// The assistant's standing state (`awake`, `dozing`, `asleep`) when the daemon reports one.
+    /// The host owns it — the interface never infers it, because only the daemon knows.
+    pub presence: Option<String>,
     /// Hit regions for session tabs and their close buttons, recomputed each draw.
     pub tab_hits: Vec<TabHit>,
     /// X range (start, end) of the "+ New" control, if rendered.
@@ -1057,6 +1062,7 @@ impl App {
             rosters: Vec::new(),
             selected_bot: None,
             tasks: Vec::new(),
+            workers: Vec::new(),
             approvals: Vec::new(),
             status: RuntimeStatus::Initializing,
             metrics: Metrics::default(),
@@ -1072,6 +1078,7 @@ impl App {
             show_bots: true,
             should_quit: false,
             voice_mode: false,
+            presence: None,
             tab_hits: Vec::new(),
             new_session_x: None,
             suggestions: None,
@@ -1549,6 +1556,7 @@ impl App {
         self.workspace_root = snapshot.workspace_root;
         self.mode = snapshot.mode;
         self.tasks = snapshot.tasks;
+        self.workers = snapshot.workers;
         self.approvals = snapshot.approvals;
 
         let live: Vec<SessionId> = snapshot.sessions.iter().map(|r| r.id.clone()).collect();
@@ -2051,6 +2059,29 @@ impl App {
         frames[(self.tick as usize / 2) % frames.len()]
     }
 
+    /// Delegated workers, one row each. A restored worker is listed before anything resumes it, so
+    /// the operator can see what the last run left unfinished instead of guessing.
+    pub fn worker_lines(&self) -> Vec<String> {
+        if self.workers.is_empty() {
+            return vec!["no delegated workers".to_owned()];
+        }
+        let mut lines = vec![format!("{} delegated worker(s)", self.workers.len())];
+        for worker in &self.workers {
+            let mut row = format!("{}  {}  {}", worker.id, worker.status, worker.objective);
+            if worker.attempts > 1 {
+                row.push_str(&format!("  attempt {}", worker.attempts));
+            }
+            if worker.notes_waiting > 0 {
+                row.push_str(&format!("  {} note(s) waiting", worker.notes_waiting));
+            }
+            if let Some(artifact) = worker.artifact.as_deref() {
+                row.push_str(&format!("  -> {artifact}"));
+            }
+            lines.push(row);
+        }
+        lines
+    }
+
     pub fn active_task_count(&self) -> usize {
         self.tasks
             .iter()
@@ -2143,6 +2174,30 @@ impl App {
 mod tests {
     use super::*;
     use vikram_runtime::types::{PlanStepView, SessionSnapshot};
+
+    #[test]
+    fn the_hud_lists_a_restored_worker() {
+        let mut app = App::new(true);
+        assert_eq!(app.worker_lines(), vec!["no delegated workers".to_owned()]);
+
+        app.workers = vec![WorkerSnapshot {
+            id: "worker-7".into(),
+            session: "sess-9".into(),
+            parent: "sess-1".into(),
+            status: "partial".into(),
+            attempts: 2,
+            objective: "port the exporter to the new schema".into(),
+            artifact: None,
+            notes_waiting: 1,
+        }];
+
+        let lines = app.worker_lines();
+        assert_eq!(lines[0], "1 delegated worker(s)");
+        assert!(lines[1].contains("worker-7"), "the row names the worker");
+        assert!(lines[1].contains("partial"), "the row carries its state");
+        assert!(lines[1].contains("attempt 2"), "a retried worker says so");
+        assert!(lines[1].contains("1 note(s) waiting"));
+    }
 
     #[test]
     fn a_reloaded_transcript_rebuilds_its_tool_rows() {

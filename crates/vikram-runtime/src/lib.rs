@@ -25,6 +25,7 @@ pub mod bus;
 pub mod compaction;
 pub mod computer;
 pub mod config;
+pub(crate) mod config_surface;
 pub mod consolidation;
 pub mod context;
 pub mod context_engine;
@@ -59,6 +60,7 @@ pub mod tools;
 pub mod turn;
 pub mod types;
 pub mod verification;
+pub(crate) mod worker_store;
 pub mod workspace;
 
 pub use bots::{BotManager, ManagedBot, TaskManager};

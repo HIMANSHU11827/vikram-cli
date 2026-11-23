@@ -30,6 +30,8 @@ pub enum JobMode {
     Workflow,
     /// Hand the job to a bot or subagent rather than the main agent.
     Delegate,
+    /// One pass of the evolution loop: reflection, then a MAPE-K cycle. No model, no session.
+    Maintenance,
 }
 
 impl JobMode {
@@ -39,6 +41,7 @@ impl JobMode {
             Self::Script => "script",
             Self::Workflow => "workflow",
             Self::Delegate => "delegate",
+            Self::Maintenance => "maintenance",
         }
     }
 
@@ -48,6 +51,7 @@ impl JobMode {
             "script" | "shell" | "command" | "cmd" => Some(Self::Script),
             "workflow" => Some(Self::Workflow),
             "delegate" | "bot" | "subagent" => Some(Self::Delegate),
+            "maintenance" | "learn" | "cycle" => Some(Self::Maintenance),
             _ => None,
         }
     }

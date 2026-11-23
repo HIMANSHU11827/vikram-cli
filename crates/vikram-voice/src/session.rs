@@ -315,6 +315,42 @@ fn pick_voice_in(configured: Option<&Path>, discovered: Vec<PathBuf>) -> Option<
         .or_else(|| discovered.into_iter().next())
 }
 
+/// The voice to speak with, preferring a discovered voice whose file name carries the configured
+/// language tag (`en_US-lessac-medium.onnx` for `en`), so a machine holding several voices speaks
+/// the one the operator asked for instead of whichever sorts first.
+pub fn pick_voice_for(configured: Option<&Path>, language: Option<&str>) -> Option<PathBuf> {
+    pick_voice_for_in(configured, language, piper_voices())
+}
+
+fn pick_voice_for_in(
+    configured: Option<&Path>,
+    language: Option<&str>,
+    discovered: Vec<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(path) = configured.filter(|path| path.is_file()) {
+        return Some(path.to_path_buf());
+    }
+    if let Some(tag) = language.map(str::trim).filter(|tag| !tag.is_empty()) {
+        let tag = tag.to_lowercase().replace('-', "_");
+        let base = tag.split('_').next().unwrap_or(&tag).to_owned();
+        for wanted in [&tag, &base] {
+            if let Some(found) = discovered
+                .iter()
+                .find(|path| voice_language(path).starts_with(wanted.as_str()))
+            {
+                return Some(found.clone());
+            }
+        }
+    }
+    discovered.into_iter().next()
+}
+
+fn voice_language(path: &Path) -> String {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
 /// The most one synthesized chunk may carry. Mirrors the CLI's spoken budget (`voice.rs`'s
 /// `SPOKEN_MAX_BYTES`): a sentence longer than this is a paragraph read aloud, and splitting it
 /// is what keeps the first sound from waiting on the whole reply.
@@ -629,6 +665,7 @@ pub struct HelperSynth {
     helper: String,
     fallback: String,
     voice: Option<PathBuf>,
+    language: Option<String>,
     rate: u32,
     volume: f32,
     notes: Mutex<Vec<String>>,
@@ -636,7 +673,13 @@ pub struct HelperSynth {
 
 impl HelperSynth {
     pub fn new(config: &VoiceConfig) -> Self {
-        let voice = pick_voice(config.tts_voice.as_deref());
+        let language = config
+            .tts_language
+            .as_deref()
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_owned);
+        let voice = pick_voice_for(config.tts_voice.as_deref(), language.as_deref());
         let notes = voice_note(config.tts_voice.as_deref(), voice.as_deref())
             .into_iter()
             .collect();
@@ -644,6 +687,7 @@ impl HelperSynth {
             helper: config.tts_helper.clone(),
             fallback: config.tts_fallback.clone(),
             voice,
+            language,
             rate: config.rate,
             volume: config.volume,
             notes: Mutex::new(notes),
@@ -706,16 +750,15 @@ impl Synthesizer for HelperSynth {
             self.note(degrade_note(piper));
             let rate = self.rate.to_string();
             let amplitude = self.espeak_amplitude();
-            let args = [
-                "-s",
-                &rate,
-                "-a",
-                &amplitude,
-                "-w",
-                &output_name,
-                "--",
-                text,
-            ];
+            let mut args = vec!["-s", &rate, "-a", &amplitude];
+            if let Some(language) = self.language.as_deref() {
+                args.push("-v");
+                args.push(language);
+            }
+            args.push("-w");
+            args.push(&output_name);
+            args.push("--");
+            args.push(text);
             run_cancellable(&self.fallback, &args, None, 60, cancel)?;
         } else {
             return Err(VoiceError::MissingHelper(missing_tool_message(
@@ -1973,6 +2016,41 @@ mod tests {
             Some(discovered)
         );
         assert_eq!(pick_voice_in(None, Vec::new()), None);
+    }
+
+    #[test]
+    fn a_language_tag_picks_the_voice_that_speaks_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let german = dir.path().join("de_DE-thorsten-medium.onnx");
+        let english = dir.path().join("en_US-lessac-medium.onnx");
+        fs::write(&german, b"x").unwrap();
+        fs::write(&english, b"x").unwrap();
+        let discovered = vec![english.clone(), german.clone()];
+        assert_eq!(
+            pick_voice_for_in(None, Some("de"), discovered.clone()),
+            Some(german.clone())
+        );
+        assert_eq!(
+            pick_voice_for_in(None, Some("en-GB"), discovered.clone()),
+            Some(english.clone())
+        );
+        assert_eq!(
+            pick_voice_for_in(None, Some("fr"), discovered),
+            Some(english)
+        );
+    }
+
+    #[test]
+    fn a_configured_voice_beats_the_language_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured = dir.path().join("chosen.onnx");
+        let german = dir.path().join("de_DE-thorsten-medium.onnx");
+        fs::write(&configured, b"x").unwrap();
+        fs::write(&german, b"x").unwrap();
+        assert_eq!(
+            pick_voice_for_in(Some(configured.as_path()), Some("de"), vec![german.clone()]),
+            Some(configured)
+        );
     }
 
     #[test]

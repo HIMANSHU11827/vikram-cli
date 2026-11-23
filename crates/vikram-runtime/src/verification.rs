@@ -755,7 +755,10 @@ pub struct ExpectationPolicy {
 const EXPECTATION_STEP: &str = "expectations";
 
 /// The loop. `repair` is called with the failing step and its output, and is expected to edit
-/// the workspace in place. Each attempt runs its own steps so double-counting successes is
+/// the workspace in place — or, when the edit happens in the caller's model turn, to return the
+/// paths a repair has to touch: a non-empty return buys another attempt, while `None` or an empty
+/// list says the hook has no way to change the next result and ends the loop. Timeouts are never
+/// retried. Each attempt runs its own steps so double-counting successes is
 /// impossible: the loop stops at the first fully green attempt. `expectations` declares what
 /// the change must prove; `ChangeReport` compares the declarations against git evidence, as
 /// warnings or — under `strict` — as the verdict itself.

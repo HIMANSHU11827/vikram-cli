@@ -100,6 +100,39 @@ impl KnowledgeStatus {
     }
 }
 
+/// How recently a memory entry was used. Independent of
+/// [`KnowledgeStatus`] (which says how the fact is known) and of
+/// `superseded_by` (which says whether a newer entry replaced it).
+///
+/// `Archived` rows stay readable through `get_memory` / `list_memory_all`
+/// but every live listing, search, and count excludes them, so they are
+/// never offered to a prompt as current.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryLifecycle {
+    Active,
+    Stale,
+    Archived,
+}
+
+impl MemoryLifecycle {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Stale => "stale",
+            Self::Archived => "archived",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(Self::Active),
+            "stale" => Some(Self::Stale),
+            "archived" => Some(Self::Archived),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExperienceOutcome {

@@ -10,6 +10,7 @@
 //! 3. A worker that runs out of turns or fails never ends the team: it is marked partial and
 //!    resumable, or retried once and reassigned, and the rest keep running.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,7 +26,7 @@ use crate::tools::*;
 use crate::types::{NoticeLevel, RuntimeEvent, TurnState, now_ms};
 
 /// Unique identity of one spawned worker, stable for the life of the record.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkerId(String);
 
 impl WorkerId {
@@ -52,7 +53,7 @@ impl std::fmt::Display for WorkerId {
 
 /// What an orchestrator hands a worker. Typed, not prose: the runtime routes on it, the policy
 /// narrows it, and the worker is told it verbatim.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerBrief {
     pub objective: String,
     pub output_format: String,
@@ -127,7 +128,8 @@ fn opt_str(args: &Value, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkerStatus {
     Running,
     /// Hit its turn budget with work left; the session is kept so a resume continues it.
@@ -138,10 +140,36 @@ pub enum WorkerStatus {
     Degraded,
 }
 
-#[derive(Clone, Debug)]
+impl WorkerStatus {
+    /// The durable spelling, used as the queryable `workers.status` column.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Partial => "partial",
+            Self::Done => "done",
+            Self::Degraded => "degraded",
+        }
+    }
+}
+
+/// One note a worker left for a sibling. Notes live on the recipient's durable row, so a restart
+/// hands them back, and reading drains them: a worker reads each note once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerNote {
+    pub from_worker: WorkerId,
+    pub to_worker: WorkerId,
+    pub text: String,
+    pub at_ms: u64,
+}
+
+/// Longest note a worker may leave. A note is a pointer to work, not a report.
+pub const WORKER_NOTE_MAX_CHARS: usize = 2_000;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerRecord {
     pub id: WorkerId,
     pub brief: WorkerBrief,
+    #[serde(with = "crate::worker_store::scope_serde")]
     pub scope: CapabilityScope,
     pub session: SessionId,
     pub parent: SessionId,
@@ -151,6 +179,10 @@ pub struct WorkerRecord {
     pub attempts: u32,
     pub max_turns: Option<u64>,
     pub artifact: Option<String>,
+    /// Notes addressed to this worker, oldest first. Present only while unread; `take_notes`
+    /// drains them and the row is rewritten.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<WorkerNote>,
 }
 
 /// What a failed attempt earns: the one retry, or the reassign-or-degrade decision.
@@ -160,9 +192,18 @@ pub enum AttemptOutcome {
     Reassign,
 }
 
+/// Where a record is mirrored once the registry has been wired to a runtime's store. Absent in a
+/// registry that is only ever read (a test, a snapshot), which is why every write tolerates it.
+#[derive(Clone, Debug)]
+struct WorkerPersistence {
+    store: vikram_store::Store,
+    bus: crate::bus::EventBus,
+}
+
 #[derive(Debug, Default)]
 pub struct WorkerRegistry {
     workers: std::sync::Mutex<Vec<WorkerRecord>>,
+    persistence: std::sync::Mutex<Option<WorkerPersistence>>,
 }
 
 impl WorkerRegistry {
@@ -170,8 +211,62 @@ impl WorkerRegistry {
         Self::default()
     }
 
+    /// Mirror this registry's writes into `store`, reporting a failed write on `bus`. Re-attaching
+    /// replaces the handle; the in-memory records are untouched either way.
+    pub(crate) fn attach(&self, store: vikram_store::Store, bus: crate::bus::EventBus) {
+        *self.persistence.lock().expect("workers persistence lock") =
+            Some(WorkerPersistence { store, bus });
+    }
+
+    /// Persist one record, after the in-memory copy is already updated: a store that refuses the
+    /// write loses durability, never the worker. The failure reaches the operator on the same bus
+    /// every other non-fatal write failure uses.
+    fn persist(&self, record: &WorkerRecord) {
+        let persistence = self
+            .persistence
+            .lock()
+            .expect("workers persistence lock")
+            .clone();
+        let Some(persistence) = persistence else {
+            return;
+        };
+        if let Err(err) = crate::worker_store::save(&persistence.store, record) {
+            persistence.bus.publish(RuntimeEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!("worker {} could not be persisted: {err}", record.id),
+            });
+        }
+    }
+
     pub fn insert(&self, record: WorkerRecord) {
-        self.workers.lock().expect("workers lock").push(record);
+        {
+            let mut workers = self.workers.lock().expect("workers lock");
+            if let Some(existing) = workers.iter_mut().find(|existing| existing.id == record.id) {
+                *existing = record.clone();
+            } else {
+                workers.push(record.clone());
+            }
+        }
+        self.persist(&record);
+    }
+
+    /// Repopulate the registry from durable records. A record already held in memory wins: the
+    /// live copy is newer than any row this process did not write, and a second load is a no-op.
+    /// Returns how many records the store held.
+    #[allow(
+        dead_code,
+        reason = "reachable from RuntimeInner::load_workers, wired to boot in runtime.rs"
+    )]
+    pub(crate) fn load_from(&self, store: &vikram_store::Store) -> Result<usize> {
+        let records = crate::worker_store::load(store)?;
+        let loaded = records.len();
+        let mut workers = self.workers.lock().expect("workers lock");
+        for record in records {
+            if workers.iter().all(|existing| existing.id != record.id) {
+                workers.push(record);
+            }
+        }
+        Ok(loaded)
     }
 
     pub fn list(&self) -> Vec<WorkerRecord> {
@@ -197,51 +292,138 @@ impl WorkerRegistry {
     }
 
     pub fn mark_partial(&self, session: &SessionId) {
-        let mut workers = self.workers.lock().expect("workers lock");
-        if let Some(record) = workers
-            .iter_mut()
-            .find(|record| record.session == *session && record.status == WorkerStatus::Running)
-        {
+        let changed = {
+            let mut workers = self.workers.lock().expect("workers lock");
+            let Some(record) = workers.iter_mut().find(|record| {
+                record.session == *session && record.status == WorkerStatus::Running
+            }) else {
+                return;
+            };
             record.status = WorkerStatus::Partial;
-        }
+            record.clone()
+        };
+        self.persist(&changed);
     }
 
     pub fn set_running(&self, session: &SessionId) {
-        let mut workers = self.workers.lock().expect("workers lock");
-        if let Some(record) = workers.iter_mut().find(|record| record.session == *session) {
+        let changed = {
+            let mut workers = self.workers.lock().expect("workers lock");
+            let Some(record) = workers.iter_mut().find(|record| record.session == *session) else {
+                return;
+            };
             record.status = WorkerStatus::Running;
-        }
+            record.clone()
+        };
+        self.persist(&changed);
     }
 
     pub fn complete(&self, session: &SessionId, artifact: String) {
-        let mut workers = self.workers.lock().expect("workers lock");
-        if let Some(record) = workers.iter_mut().find(|record| record.session == *session) {
+        let changed = {
+            let mut workers = self.workers.lock().expect("workers lock");
+            let Some(record) = workers.iter_mut().find(|record| record.session == *session) else {
+                return;
+            };
             record.status = WorkerStatus::Done;
             record.artifact = Some(artifact);
-        }
+            record.clone()
+        };
+        self.persist(&changed);
     }
 
     pub fn degrade(&self, id: &WorkerId) {
-        let mut workers = self.workers.lock().expect("workers lock");
-        if let Some(record) = workers.iter_mut().find(|record| record.id == *id) {
+        let changed = {
+            let mut workers = self.workers.lock().expect("workers lock");
+            let Some(record) = workers.iter_mut().find(|record| record.id == *id) else {
+                return;
+            };
             record.status = WorkerStatus::Degraded;
-        }
+            record.clone()
+        };
+        self.persist(&changed);
     }
 
     /// Record one failed attempt. The first failure earns the single retry; the second failure
     /// is the reassign-or-degrade decision, never a third run of the same worker.
     pub fn attempt_failed(&self, session: &SessionId) -> AttemptOutcome {
-        let mut workers = self.workers.lock().expect("workers lock");
-        let Some(record) = workers.iter_mut().find(|record| record.session == *session) else {
-            return AttemptOutcome::Reassign;
-        };
-        match record.attempts {
-            1 => {
-                record.attempts = 2;
-                AttemptOutcome::Retry
+        let retried = {
+            let mut workers = self.workers.lock().expect("workers lock");
+            let Some(record) = workers.iter_mut().find(|record| record.session == *session) else {
+                return AttemptOutcome::Reassign;
+            };
+            if record.attempts != 1 {
+                return AttemptOutcome::Reassign;
             }
-            _ => AttemptOutcome::Reassign,
+            record.attempts = 2;
+            record.clone()
+        };
+        self.persist(&retried);
+        AttemptOutcome::Retry
+    }
+
+    /// Leave a note for another worker. Refused with a plain message when either worker is
+    /// unknown, when the recipient is the sender, when the text is empty, or when it is longer
+    /// than [`WORKER_NOTE_MAX_CHARS`].
+    pub fn post_note(&self, from: &WorkerId, to: &WorkerId, text: &str) -> Result<WorkerNote> {
+        if from == to {
+            return Err(RuntimeError::InvalidState(format!(
+                "worker {from} cannot leave a note for itself"
+            )));
         }
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(RuntimeError::InvalidState(
+                "a note needs some text; an empty note is not sent".into(),
+            ));
+        }
+        let length = text.chars().count();
+        if length > WORKER_NOTE_MAX_CHARS {
+            return Err(RuntimeError::InvalidState(format!(
+                "note is {length} characters; the limit is {WORKER_NOTE_MAX_CHARS}"
+            )));
+        }
+        let note = WorkerNote {
+            from_worker: from.clone(),
+            to_worker: to.clone(),
+            text: text.to_owned(),
+            at_ms: now_ms(),
+        };
+        let recipient = {
+            let mut workers = self.workers.lock().expect("workers lock");
+            if workers.iter().all(|record| record.id != *from) {
+                return Err(RuntimeError::InvalidState(format!(
+                    "no worker named `{from}`"
+                )));
+            }
+            let Some(recipient) = workers.iter_mut().find(|record| record.id == *to) else {
+                return Err(RuntimeError::InvalidState(format!(
+                    "no worker named `{to}` — a note goes to a worker that exists"
+                )));
+            };
+            recipient.notes.push(note.clone());
+            recipient.clone()
+        };
+        self.persist(&recipient);
+        Ok(note)
+    }
+
+    /// Drain the notes addressed to `to`: each note leaves the mailbox when it is taken, so a
+    /// second take returns nothing, and an unread note stays on the row until it is taken.
+    pub fn take_notes(&self, to: &WorkerId) -> Result<Vec<WorkerNote>> {
+        let (notes, emptied) = {
+            let mut workers = self.workers.lock().expect("workers lock");
+            let Some(record) = workers.iter_mut().find(|record| record.id == *to) else {
+                return Err(RuntimeError::InvalidState(format!(
+                    "no worker named `{to}`"
+                )));
+            };
+            if record.notes.is_empty() {
+                return Ok(Vec::new());
+            }
+            let notes = std::mem::take(&mut record.notes);
+            (notes, record.clone())
+        };
+        self.persist(&emptied);
+        Ok(notes)
     }
 }
 
@@ -323,6 +505,13 @@ impl Tool for WorkerCollect {
 }
 
 impl RuntimeInner {
+    /// Restore the workers a previous process persisted. Loading is idempotent and a record
+    /// already live in memory wins, so a boot that loads late cannot regress a running worker.
+    pub fn load_workers(&self) -> Result<usize> {
+        self.workers.attach(self.store.clone(), self.bus.clone());
+        self.workers.load_from(&self.store)
+    }
+
     /// What a worker's finished turn owes its orchestrator: an artifact in the store and a
     /// reference in the parent's transcript — never the child transcript itself. The worker
     /// session is one-shot like a delegation: its work is done and its result is durable.
@@ -600,6 +789,9 @@ impl RuntimeHandle {
         );
 
         let id = WorkerId::generate();
+        self.inner
+            .workers
+            .attach(self.inner.store.clone(), self.inner.bus.clone());
         self.inner.workers.insert(WorkerRecord {
             id: id.clone(),
             brief: brief.clone(),
@@ -611,6 +803,7 @@ impl RuntimeHandle {
             attempts: 1,
             max_turns,
             artifact: None,
+            notes: Vec::new(),
         });
         // The spawn belongs to the orchestrator's audit trail: without this row the parent's
         // transcript shows worker ids it never learned about.
@@ -871,6 +1064,243 @@ mod tests {
             model: None,
             effort: None,
         }
+    }
+
+    fn sample_worker(dir: &std::path::Path) -> WorkerRecord {
+        let scope = dir.join("scope").to_string_lossy().into_owned();
+        WorkerRecord {
+            id: WorkerId::new("wrk-test-1"),
+            brief: WorkerBrief {
+                objective: "audit the policy crate".into(),
+                output_format: "a markdown findings report".into(),
+                tool_allowlist: vec!["fs.read".into()],
+                file_scope: vec![scope.clone()],
+                boundary: "never edit a file outside the scope".into(),
+                model: Some("test-model".into()),
+                effort: Some("high".into()),
+            },
+            scope: CapabilityScope {
+                tools: Some(vec!["fs.read".into()]),
+                file_scope: Some(vec![scope]),
+            },
+            session: SessionId::new("ses-worker-store-1"),
+            parent: SessionId::new("ses-parent-store-1"),
+            depth: 1,
+            status: WorkerStatus::Running,
+            attempts: 1,
+            max_turns: Some(3),
+            artifact: None,
+            notes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_worker_record_survives_a_reopen_and_loads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vikram.db");
+        let record = sample_worker(dir.path());
+        {
+            let store = vikram_store::Store::open(&path).unwrap();
+            let registry = WorkerRegistry::new();
+            registry.attach(store, crate::bus::EventBus::new());
+            registry.insert(record.clone());
+        }
+
+        let reopened = vikram_store::Store::open(&path).unwrap();
+        let reloaded = WorkerRegistry::new();
+        assert_eq!(reloaded.load_from(&reopened).unwrap(), 1);
+
+        let restored = reloaded.by_id(&record.id).expect("the worker came back");
+        assert_eq!(restored.status, WorkerStatus::Running);
+        assert_eq!(restored.brief, record.brief);
+        assert_eq!(restored.scope, record.scope);
+        assert_eq!(restored.session, record.session);
+        assert_eq!(restored.parent, record.parent);
+        assert_eq!(restored.depth, record.depth);
+        assert_eq!(restored.attempts, 1);
+        assert_eq!(restored.max_turns, Some(3));
+        assert_eq!(restored.artifact, None);
+    }
+
+    #[test]
+    fn loading_workers_twice_does_not_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vikram.db");
+        let store = vikram_store::Store::open(&path).unwrap();
+        let registry = WorkerRegistry::new();
+        registry.attach(store.clone(), crate::bus::EventBus::new());
+        registry.insert(sample_worker(dir.path()));
+
+        let reloaded = WorkerRegistry::new();
+        assert_eq!(reloaded.load_from(&store).unwrap(), 1);
+        assert_eq!(reloaded.load_from(&store).unwrap(), 1);
+        assert_eq!(reloaded.list().len(), 1, "a second load is a no-op");
+    }
+
+    #[test]
+    fn a_status_change_overwrites_the_worker_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vikram.db");
+        let session;
+        {
+            let store = vikram_store::Store::open(&path).unwrap();
+            let registry = WorkerRegistry::new();
+            registry.attach(store.clone(), crate::bus::EventBus::new());
+            let record = sample_worker(dir.path());
+            session = record.session.clone();
+            registry.insert(record);
+            registry.mark_partial(&session);
+            assert_eq!(
+                store.list_workers().unwrap().len(),
+                1,
+                "running → partial replaces the row instead of adding one"
+            );
+        }
+
+        let reopened = vikram_store::Store::open(&path).unwrap();
+        let reloaded = WorkerRegistry::new();
+        reloaded.load_from(&reopened).unwrap();
+        let restored = reloaded
+            .by_session(&session)
+            .expect("the partial worker is listable after a restart");
+        assert_eq!(restored.status, WorkerStatus::Partial);
+    }
+
+    /// Two durable workers in one registry, both writable, sharing a store under `dir`.
+    fn mailbox(dir: &std::path::Path) -> (WorkerRegistry, WorkerRecord, WorkerRecord) {
+        let store = vikram_store::Store::open(&dir.join("vikram.db")).unwrap();
+        let registry = WorkerRegistry::new();
+        registry.attach(store, crate::bus::EventBus::new());
+        let author = sample_worker(dir);
+        let mut reader = sample_worker(dir);
+        reader.id = WorkerId::new("wrk-test-2");
+        reader.session = SessionId::new("ses-worker-store-2");
+        registry.insert(author.clone());
+        registry.insert(reader.clone());
+        (registry, author, reader)
+    }
+
+    #[test]
+    fn a_worker_reads_a_note_from_a_sibling_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, author, reader) = mailbox(dir.path());
+
+        registry
+            .post_note(
+                &author.id,
+                &reader.id,
+                "the policy crate already has the fixture you need",
+            )
+            .expect("the note is accepted");
+        let notes = registry.take_notes(&reader.id).expect("the mailbox opens");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].from_worker, author.id);
+        assert_eq!(notes[0].to_worker, reader.id);
+        assert_eq!(
+            notes[0].text,
+            "the policy crate already has the fixture you need"
+        );
+        assert!(notes[0].at_ms > 0);
+
+        assert!(
+            registry.take_notes(&reader.id).unwrap().is_empty(),
+            "a note is read exactly once"
+        );
+        assert!(
+            registry.take_notes(&author.id).unwrap().is_empty(),
+            "the note was addressed to the reader, not the sender"
+        );
+    }
+
+    #[test]
+    fn a_note_to_an_unknown_worker_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, author, _) = mailbox(dir.path());
+
+        let err = registry
+            .post_note(&author.id, &WorkerId::new("wrk-ghost"), "anyone there?")
+            .expect_err("an unknown recipient is refused");
+        assert!(
+            err.to_string().contains("no worker named `wrk-ghost`"),
+            "{err}"
+        );
+        assert!(
+            registry.take_notes(&author.id).unwrap().is_empty(),
+            "a refused note is not stored anywhere"
+        );
+    }
+
+    #[test]
+    fn notes_survive_a_reopen_of_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vikram.db");
+        let author;
+        let reader;
+        {
+            let (registry, from, to) = mailbox(dir.path());
+            registry
+                .post_note(&from.id, &to.id, "the spill report is in artifacts/")
+                .expect("the note is accepted");
+            author = from.id;
+            reader = to.id;
+        }
+
+        let reopened = vikram_store::Store::open(&path).unwrap();
+        let reloaded = WorkerRegistry::new();
+        assert_eq!(reloaded.load_from(&reopened).unwrap(), 2);
+        assert_eq!(reloaded.load_from(&reopened).unwrap(), 2);
+
+        let notes = reloaded.take_notes(&reader).expect("the mailbox opens");
+        assert_eq!(notes.len(), 1, "a second load does not duplicate the note");
+        assert_eq!(notes[0].from_worker, author);
+        assert_eq!(notes[0].text, "the spill report is in artifacts/");
+        assert!(reloaded.take_notes(&reader).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_worker_cannot_leave_a_note_for_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, author, _) = mailbox(dir.path());
+
+        let err = registry
+            .post_note(&author.id, &author.id, "note to self")
+            .expect_err("a self-addressed note is refused");
+        assert!(
+            err.to_string().contains("cannot leave a note for itself"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_empty_note_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, author, reader) = mailbox(dir.path());
+
+        let err = registry
+            .post_note(&author.id, &reader.id, "   \n ")
+            .expect_err("an empty note is refused");
+        assert!(err.to_string().contains("needs some text"), "{err}");
+        assert!(registry.take_notes(&reader.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_note_past_the_length_limit_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, author, reader) = mailbox(dir.path());
+
+        let long = "x".repeat(WORKER_NOTE_MAX_CHARS + 1);
+        let err = registry
+            .post_note(&author.id, &reader.id, &long)
+            .expect_err("an over-long note is refused");
+        assert!(
+            err.to_string()
+                .contains(&format!("the limit is {WORKER_NOTE_MAX_CHARS}")),
+            "the refusal names the limit: {err}"
+        );
+        assert!(registry.take_notes(&reader.id).unwrap().is_empty());
+        registry
+            .post_note(&author.id, &reader.id, &"y".repeat(WORKER_NOTE_MAX_CHARS))
+            .expect("a note at the limit is accepted");
     }
 
     #[tokio::test]

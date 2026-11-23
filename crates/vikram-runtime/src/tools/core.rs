@@ -251,6 +251,7 @@ fn gate_for(name: &str) -> Option<ToolGate> {
         // Reads and searches: every posture, including plan.
         "fs.read"
         | "fs.list"
+        | "doc.read"
         | "search.text"
         | "session.search"
         | "output.read"
@@ -292,7 +293,9 @@ fn gate_for(name: &str) -> Option<ToolGate> {
         | "computer.status"
         | "computer.ocr"
         | "computer.read_screen"
-        | "computer.clipboard_read" => gate(ActionKind::Read, false, false),
+        | "computer.clipboard_read"
+        | "system.status"
+        | "system.threats" => gate(ActionKind::Read, false, false),
 
         // The plan is how a read-only posture says what it intends to do, so it stays everywhere.
         "update_plan" => gate(ActionKind::Read, false, false),
@@ -304,11 +307,14 @@ fn gate_for(name: &str) -> Option<ToolGate> {
 
         // Network reads: allowed wherever the posture is not read-only.
         "web.search" | "browser.fetch" | "browser.dom" | "browser.links" | "browser.open"
-        | "browser.screenshot" => gate(ActionKind::Network, false, false),
+        | "browser.screenshot" | "research" | "cross_check" => {
+            gate(ActionKind::Network, false, false)
+        }
 
         // Writes inside the workspace or the runtime's own state.
         "fs.write"
         | "fs.edit"
+        | "db.backup"
         | "memory.save"
         | "memory.note"
         | "memory.consolidate"
@@ -324,6 +330,8 @@ fn gate_for(name: &str) -> Option<ToolGate> {
         // Runs something: a command, a build, a browser page, a virtual keyboard.
         "shell.run"
         | "terminal"
+        | "terminal.exec"
+        | "deploy.run"
         | "build.run"
         | "test.run"
         | "verify"
@@ -349,11 +357,33 @@ fn gate_for(name: &str) -> Option<ToolGate> {
         | "computer.scroll"
         | "computer.notify" => gate(ActionKind::Execute, false, false),
 
-        "hive.delegate" | "spawn_worker" => gate(ActionKind::Delegate, false, false),
+        "hive.delegate" | "spawn_worker" | "worker.note" | "worker.notes" | "worker.resume" => {
+            gate(ActionKind::Delegate, false, false)
+        }
 
         // Irreversible: only where the policy can already let it run.
         "fs.delete" | "memory.delete" | "hive.delete" | "relation" | "plugin.install"
         | "plugin.uninstall" => gate(ActionKind::Write, true, false),
+
+        // A callable a plugin declared for itself. Every one of them runs the plugin's entry, so it
+        // gates like `plugin.execute`. The read-only plugin verbs keep the Read gate they get from
+        // the default arm, which is why they are named here as exceptions.
+        name if name.starts_with("plugin.")
+            && !matches!(
+                name,
+                "plugin.list"
+                    | "plugin.validate"
+                    | "plugin.inspect"
+                    | "plugin.deps"
+                    | "plugin.execute"
+                    | "plugin.enable"
+                    | "plugin.disable"
+                    | "plugin.install"
+                    | "plugin.uninstall"
+            ) =>
+        {
+            gate(ActionKind::Execute, false, false)
+        }
 
         _ => return None,
     })
@@ -423,15 +453,47 @@ impl ToolRegistry {
 
     /// The default set. Registering a tool is the only way to make it callable; there is no
     /// dynamic loading from model output.
+    /// Built-ins plus one callable per tool a plugin declares in its manifest.
+    ///
+    /// A plugin that declares nothing changes nothing: the long tail of installed plugins keeps the
+    /// single generic `plugin.execute` door. Only installed and loaded plugins contribute, because a
+    /// plugin discovered in a cloned workspace must not gain a model-visible tool for free.
+    pub fn with_plugins(workspace: &std::path::Path) -> Self {
+        let registry = Self::with_builtins();
+        for plugin in crate::PluginRegistry::for_workspace(workspace).plugins() {
+            if !plugin.installed || !plugin.loaded {
+                continue;
+            }
+            let Ok(manifest) = crate::plugins::PluginManifest::from_dir(&plugin.path) else {
+                continue;
+            };
+            for tool in manifest.tools {
+                let name = format!("plugin.{}", tool.name);
+                if registry.get(&name).is_some() {
+                    continue;
+                }
+                registry.register(Box::new(crate::tools::plugins::PluginToolCall::new(
+                    plugin.id(),
+                    tool,
+                )));
+            }
+        }
+        registry
+    }
+
     pub fn with_builtins() -> Self {
         let registry = Self::new();
         registry.register(Box::new(ReadFile));
         registry.register(Box::new(ListDir));
+        registry.register(Box::new(DocRead));
+        registry.register(Box::new(DbBackup));
+        registry.register(Box::new(DeployRun));
         registry.register(Box::new(WriteFile));
         registry.register(Box::new(EditFile));
         registry.register(Box::new(DeleteFile));
         registry.register(Box::new(SearchText));
         registry.register(Box::new(RunShell));
+        registry.register(Box::new(TerminalExec));
         registry.register(Box::new(Git));
         registry.register(Box::new(GitStatus));
         registry.register(Box::new(GitDiff));
@@ -459,6 +521,8 @@ impl ToolRegistry {
         registry.register(Box::new(Relation));
         registry.register(Box::new(SessionSearch));
         registry.register(Box::new(WebSearch));
+        registry.register(Box::new(Research));
+        registry.register(Box::new(CrossCheck));
         registry.register(Box::new(HiveCreate));
         registry.register(Box::new(HiveList));
         registry.register(Box::new(HiveShow));
@@ -466,6 +530,9 @@ impl ToolRegistry {
         registry.register(Box::new(HiveDelete));
         registry.register(Box::new(crate::orchestrator::SpawnWorker));
         registry.register(Box::new(crate::orchestrator::WorkerCollect));
+        registry.register(Box::new(WorkerNote));
+        registry.register(Box::new(WorkerNotes));
+        registry.register(Box::new(WorkerResume));
         registry.register(Box::new(BotList));
         registry.register(Box::new(BotShow));
         registry.register(Box::new(BotCreate));
@@ -476,6 +543,8 @@ impl ToolRegistry {
         registry.register(Box::new(SkillSearch));
         registry.register(Box::new(SkillRead));
         registry.register(Box::new(Diagnostics));
+        registry.register(Box::new(SystemStatus));
+        registry.register(Box::new(SystemThreats));
         registry.register(Box::new(Process));
         registry.register(Box::new(Task));
         registry.register(Box::new(UpdatePlan));
@@ -692,11 +761,74 @@ mod gate_tests {
         names.iter().any(|n| n == name)
     }
 
+    fn with_a_declared_plugin_tool() -> ToolRegistry {
+        let registry = ToolRegistry::with_builtins();
+        registry.register(Box::new(crate::tools::plugins::PluginToolCall::new(
+            "demo",
+            crate::plugins::PluginTool {
+                name: "send".into(),
+                description: "Send a message into a channel".into(),
+                params: [("channel".to_owned(), "Where the message goes".to_owned())]
+                    .into_iter()
+                    .collect(),
+                required: vec!["channel".into()],
+            },
+        )));
+        registry
+    }
+
+    #[test]
+    fn a_declared_plugin_tool_is_advertised_under_its_own_name() {
+        let registry = with_a_declared_plugin_tool();
+        let spec = registry
+            .get("plugin.send")
+            .expect("the declared tool is registered")
+            .spec();
+
+        assert_eq!(spec.name, "plugin.send");
+        assert_eq!(spec.schema["required"][0], "channel");
+        assert_eq!(spec.schema["properties"]["channel"]["type"], "string");
+        assert_eq!(
+            spec.schema["properties"]["channel"]["description"],
+            "Where the message goes"
+        );
+    }
+
+    #[test]
+    fn a_declared_plugin_tool_is_hidden_in_plan_and_offered_unattended() {
+        let registry = with_a_declared_plugin_tool();
+        let all: Vec<ToolSpec> = registry.all().into_iter().map(|tool| tool.spec()).collect();
+        let plan: Vec<String> =
+            schemas_for_mode(vikram_contracts::PermissionMode::Plan, all.clone())
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect();
+        let unattended: Vec<String> =
+            schemas_for_mode(vikram_contracts::PermissionMode::Unattended, all)
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect();
+
+        assert!(!has(&plan, "plugin.send"));
+        assert!(has(&unattended, "plugin.send"));
+        assert!(
+            has(&plan, "plugin.list"),
+            "the read-only plugin verbs stay visible in plan"
+        );
+    }
+
     #[test]
     fn read_only_mode_omits_write_and_execute_tools() {
         let names = names_in(vikram_contracts::PermissionMode::Plan);
 
-        for hidden in ["fs.write", "fs.edit", "fs.delete", "shell.run", "terminal"] {
+        for hidden in [
+            "fs.write",
+            "fs.edit",
+            "fs.delete",
+            "shell.run",
+            "terminal",
+            "terminal.exec",
+        ] {
             assert!(
                 !has(&names, hidden),
                 "plan mode must not advertise `{hidden}`"
@@ -801,13 +933,13 @@ mod gate_tests {
         assert_eq!(
             counts,
             vec![
-                ("ask", 103),
-                ("edit-ok", 103),
-                ("allow-list", 103),
-                ("smart", 103),
-                ("unattended", 92),
-                ("yolo", 103),
-                ("plan", 50),
+                ("ask", 114),
+                ("edit-ok", 114),
+                ("allow-list", 114),
+                ("smart", 114),
+                ("unattended", 103),
+                ("yolo", 114),
+                ("plan", 53),
             ]
         );
     }
@@ -822,7 +954,7 @@ mod gate_tests {
         assert!(unknown.is_empty(), "unclassified tools: {unknown:?}");
         assert_eq!(
             names.len(),
-            103,
+            114,
             "the builtin tool surface changed; classify the new tool in `gate_for` and update this \
              number only when the change is deliberate"
         );

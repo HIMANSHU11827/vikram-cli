@@ -45,6 +45,27 @@ pub struct PluginManifest {
     /// and reversible with `vikram transforms rollback`. An absent or empty list means the plugin
     /// declares no transforms.
     pub transforms: Vec<TransformOp>,
+    /// Tools the plugin offers to the model, each callable as `plugin.<name>`.
+    ///
+    /// A plugin that declares none keeps the single generic `plugin.execute` door it has always
+    /// had, so old manifests change behaviour in no way.
+    pub tools: Vec<PluginTool>,
+}
+
+/// One tool a plugin offers, described well enough for the model to call it.
+///
+/// Parameters are typed as strings on purpose: a manifest is operator-authored JSON, and a
+/// free-form schema there is one typo away from a tool the model can never fill in correctly.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginTool {
+    /// The name after the `plugin.` prefix.
+    pub name: String,
+    pub description: String,
+    /// Parameter name → what it is for.
+    pub params: std::collections::BTreeMap<String, String>,
+    /// Parameters the model must supply.
+    pub required: Vec<String>,
 }
 
 /// One file a plugin asks to place under a managed transform root.
@@ -82,6 +103,7 @@ impl Default for PluginManifest {
             priority: 0,
             hook_rules: Vec::new(),
             transforms: Vec::new(),
+            tools: Vec::new(),
         }
     }
 }
@@ -162,3 +184,38 @@ impl PluginState {
 }
 
 use crate::plugins::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_old_manifest_still_parses_without_tools() {
+        let raw = r#"{"name":"demo","version":"1.0.0","entry":"main.wasm"}"#;
+        let manifest = PluginManifest::parse(raw).expect("a minimal manifest parses");
+        assert!(manifest.tools.is_empty());
+    }
+
+    #[test]
+    fn a_declared_tool_keeps_its_parameters() {
+        let raw = r#"{
+            "name": "demo",
+            "version": "1.0.0",
+            "entry": "main.wasm",
+            "tools": [{
+                "name": "send",
+                "description": "Post a message.",
+                "params": {"channel": "Where it goes."},
+                "required": ["channel"]
+            }]
+        }"#;
+        let manifest = PluginManifest::parse(raw).expect("a manifest with tools parses");
+        assert_eq!(manifest.tools.len(), 1);
+        assert_eq!(manifest.tools[0].name, "send");
+        assert_eq!(
+            manifest.tools[0].params.get("channel").map(String::as_str),
+            Some("Where it goes.")
+        );
+        assert_eq!(manifest.tools[0].required, vec!["channel".to_owned()]);
+    }
+}

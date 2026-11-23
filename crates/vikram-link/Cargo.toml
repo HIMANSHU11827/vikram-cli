@@ -1,0 +1,25 @@
+[package]
+name = "vikram-link"
+description = "Remote access for VIKRAM: an HTTP + WebSocket server where every linked device carries its own tier, and every remote action is audited."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+vikram-contracts.workspace = true
+vikram-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The event bus is tokio's `broadcast` channel; matching its `try_recv` needs the crate in scope.
+tokio.workspace = true
+# The WebSocket server is tungstenite's own state machine over a plain socket: the runtime and the
+# gateway already link it, so the handshake and framing are not re-implemented here.
+tungstenite = "0.28"
+rustls.workspace = true
+# Token secrets come from the OS CSPRNG. `getrandom` is already in the lockfile via the gateway.
+getrandom = "0.3"
+
+[dev-dependencies]
+tempfile.workspace = true

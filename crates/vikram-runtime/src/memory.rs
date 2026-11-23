@@ -355,6 +355,30 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// The shared shelves a session was bound to, so a writer that only holds a session id (the
+    /// CLI approval path, a bench) can land a memory where recall will look for it later instead of
+    /// in a session scope that dies with the session.
+    pub fn session_scopes(&self, session: &str) -> Result<(Option<String>, Option<String>)> {
+        let session = session.trim();
+        if session.is_empty() {
+            return Ok((None, None));
+        }
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT user_scope, project_scope FROM memory_scopes WHERE session = ?1",
+            params![session],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| RuntimeError::Store(e.to_string()))
+        .map(|row| row.unwrap_or((None, None)))
+    }
+
     /// Ranked recall for the context builder, restricted to the scopes the caller is allowed to see.
     ///
     /// Delegate to `hybrid_recall` with default weights so the two entry points never drift apart
@@ -1768,6 +1792,26 @@ mod tests {
         assert!(
             !scopes.contains(&"hive:h2"),
             "another hive's shelf must not leak: {hive:?}"
+        );
+    }
+
+    #[test]
+    fn a_session_reports_the_shelves_it_was_bound_to() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        assert_eq!(store.session_scopes("ses-a").unwrap(), (None, None));
+        assert_eq!(store.session_scopes("  ").unwrap(), (None, None));
+        store
+            .bind_session_scopes("ses-a", Some("user:u1"), Some("project:p1"))
+            .unwrap();
+        assert_eq!(
+            store.session_scopes("ses-a").unwrap(),
+            (Some("user:u1".to_owned()), Some("project:p1".to_owned()))
+        );
+        store.bind_session_scopes("ses-a", None, None).unwrap();
+        assert_eq!(
+            store.session_scopes("ses-a").unwrap(),
+            (None, None),
+            "a cleared binding reports nothing rather than a stale shelf"
         );
     }
 

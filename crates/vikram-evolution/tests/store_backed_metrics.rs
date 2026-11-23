@@ -569,6 +569,38 @@ fn benchmark_metrics_are_computed_from_recorded_experiences() {
     assert_eq!(result.actual_metrics.skill_effectiveness, 0.0);
 }
 
+#[test]
+fn a_run_benchmark_records_the_metrics_it_measured() {
+    let mut engine = engine();
+    for i in 0..5 {
+        save_success(&engine, &format!("c{i}"));
+    }
+    let benchmark = engine
+        .self_evaluation
+        .create_benchmark(
+            "coding bench",
+            "does coding work?",
+            "coding",
+            expected_metrics(),
+        )
+        .unwrap();
+
+    let first = engine.self_evaluation.run_benchmark(&benchmark.id).unwrap();
+    assert!(first.sufficient_data);
+    let recorded = engine
+        .store
+        .list_engine_records("self_evaluation.metric")
+        .unwrap();
+    assert_eq!(recorded.len(), 1);
+
+    engine.self_evaluation.run_benchmark(&benchmark.id).unwrap();
+    let recorded = engine
+        .store
+        .list_engine_records("self_evaluation.metric")
+        .unwrap();
+    assert_eq!(recorded.len(), 2);
+}
+
 // ---------- self-improvement ----------
 
 #[test]

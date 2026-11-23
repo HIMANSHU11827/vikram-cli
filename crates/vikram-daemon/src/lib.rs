@@ -23,6 +23,7 @@ pub mod heartbeat;
 pub mod jobs;
 pub mod notify;
 pub mod postbox;
+pub mod presence;
 pub mod runner;
 pub mod service;
 pub mod store;
@@ -30,3 +31,7 @@ pub mod time;
 pub mod tools;
 pub mod triggers;
 pub mod worker;
+
+/// `VIKRAM_HOME` is process-wide, so the tests that move it take this lock first.
+#[cfg(test)]
+pub(crate) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

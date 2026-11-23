@@ -11,6 +11,8 @@ mod doctor;
 mod evolution;
 mod gateway;
 mod gateway_config;
+mod link;
+mod memory_cmd;
 mod module_sdk;
 mod modules;
 mod plugins;
@@ -210,6 +212,11 @@ enum Command {
         #[command(subcommand)]
         action: Option<evolution::EvolutionAction>,
     },
+    /// List, search, and forget long-term memory entries.
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
     /// Run and supervise the background daemon.
     Daemon {
         #[command(subcommand)]
@@ -234,6 +241,11 @@ enum Command {
     Gateway {
         #[command(subcommand)]
         action: Option<gateway_config::GatewayAction>,
+    },
+    /// Serve the link API for remote devices, and mint the tokens that reach it.
+    Link {
+        #[command(subcommand)]
+        action: link::LinkAction,
     },
     /// Run benchmark suites (deterministic, offline).
     Bench {
@@ -289,8 +301,13 @@ enum ProfilesAction {
 
 #[derive(Debug, Subcommand)]
 enum EntitiesAction {
-    /// List entities (optionally by kind).
-    List { kind: Option<String> },
+    /// List entities (optionally by kind, or as one profile sees them).
+    List {
+        kind: Option<String>,
+        /// Include the entities this profile owns plus the machine-wide ones.
+        #[arg(long)]
+        profile: Option<String>,
+    },
     /// Create an entity.
     New {
         kind: String,
@@ -304,6 +321,9 @@ enum EntitiesAction {
         specialization: String,
         #[arg(default_value = "")]
         description: String,
+        /// Scope the entity to one profile instead of the machine.
+        #[arg(long)]
+        profile: Option<String>,
     },
     /// Install an agent-pack directory (or its `.tar.gz`) as an entity.
     InstallPack { path: PathBuf },
@@ -362,11 +382,55 @@ enum LearningAction {
     Approve { id: String },
     /// Reject a proposal.
     Reject { id: String },
+    /// Reverse an auto-applied memory write by proposal id.
+    Undo { id: String },
     /// Show audit history.
     History,
     /// Set a policy: memory|skill <auto|approval|suggest|disabled>.
     SetPolicy { kind: String, policy: String },
+    /// Forget one learned evolution memory by id (see `vikram evolution memory`).
+    Forget {
+        /// Memory id.
+        id: String,
+        /// Show what would be deleted without deleting it.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
+
+#[derive(Debug, Subcommand)]
+enum MemoryAction {
+    /// List memory entries, optionally in one scope.
+    List {
+        /// Only entries in this scope.
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    /// Search keys and values, case-insensitively.
+    Search {
+        /// Text to match against keys and values.
+        query: String,
+        /// Only entries in this scope.
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    /// Delete one entry by key.
+    Forget {
+        /// Key to delete.
+        key: String,
+        /// Scope the key lives in, required when the key is ambiguous.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Show what would be deleted without deleting it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Total entries and a per-scope breakdown.
+    Count,
+    /// The MEMORY.md and USER.md block exactly as it is injected into every prompt.
+    Snapshot,
+}
+
 #[derive(Debug, Subcommand)]
 enum DaemonAction {
     /// Start the daemon in the background (or in this terminal with --foreground).
@@ -403,6 +467,14 @@ enum DaemonAction {
         #[arg(long)]
         off: bool,
     },
+    /// Show whether the assistant is awake, dozing or asleep.
+    Presence,
+    /// Stop starting work and only deliver urgent reports.
+    Sleep,
+    /// Start working and speaking again.
+    Wake,
+    /// Keep working but hold back non-urgent reports.
+    Doze,
 }
 
 #[derive(Debug, Subcommand)]
@@ -472,7 +544,7 @@ struct JobArgs {
     schedule: String,
     /// The instruction to an agent, or the command to a script.
     payload: String,
-    /// How it runs: agent, script, workflow, or delegate. Named `--job-mode` because `--mode`
+    /// How it runs: agent, script, workflow, delegate, or maintenance. Named `--job-mode` because `--mode`
     /// already means this process's approval posture.
     #[arg(long = "job-mode")]
     job_mode: Option<String>,
@@ -520,7 +592,7 @@ struct JobChanges {
     /// The instruction or command.
     #[arg(long)]
     payload: Option<String>,
-    /// agent, script, workflow, or delegate. Named `--job-mode` because `--mode` already means
+    /// agent, script, workflow, delegate, or maintenance. Named `--job-mode` because `--mode` already means
     /// this process's approval posture.
     #[arg(long = "job-mode")]
     job_mode: Option<String>,
@@ -973,6 +1045,7 @@ fn main() -> std::process::ExitCode {
         Command::Hive { action } => run_async(hive(action)),
         Command::Learning { action } => learning(action),
         Command::Evolution { action } => exit(evolution::run(action)),
+        Command::Memory { action } => exit(memory_cmd::run(action, &database_path())),
         Command::Tickets { action } => tickets(action),
         Command::Daemon { action } => daemon(action.unwrap_or(DaemonAction::Status)),
         Command::Heartbeat { action } => heartbeat(action.unwrap_or(HeartbeatAction::Status)),
@@ -982,6 +1055,7 @@ fn main() -> std::process::ExitCode {
             Some(action) => exit(gateway_config::run(action)),
             None => run_async(gateway::run(config)),
         },
+        Command::Link { action } => exit(link::run(config, action)),
         Command::Bench { action } => exit(bench::run(action)),
         Command::Dist { action } => exit(dist::run(action)),
     }
@@ -1627,13 +1701,34 @@ fn entities(action: EntitiesAction) -> std::process::ExitCode {
     let result = (|| -> Result<(), String> {
         let store = open_store()?;
         match action {
-            EntitiesAction::List { kind } => {
-                let rows = match kind {
-                    Some(k) => {
-                        let ek = vikram_store::EntityKind::parse(&k).map_err(|e| e.to_string())?;
-                        store.list_entities_by_kind(ek).map_err(|e| e.to_string())?
+            EntitiesAction::List { kind, profile } => {
+                let kind = kind
+                    .as_deref()
+                    .map(vikram_store::EntityKind::parse)
+                    .transpose()
+                    .map_err(|e| e.to_string())?;
+                let rows = match profile {
+                    Some(id) => {
+                        let pid = vikram_contracts::ProfileId::new(id);
+                        if store
+                            .get_profile(&pid)
+                            .map_err(|e| e.to_string())?
+                            .is_none()
+                        {
+                            return Err(format!("profile {pid} not found"));
+                        }
+                        let rows = store
+                            .list_entities_for_profile(&pid)
+                            .map_err(|e| e.to_string())?;
+                        match kind {
+                            Some(ek) => rows.into_iter().filter(|row| row.kind == ek).collect(),
+                            None => rows,
+                        }
                     }
-                    None => store.list_entities().map_err(|e| e.to_string())?,
+                    None => match kind {
+                        Some(ek) => store.list_entities_by_kind(ek).map_err(|e| e.to_string())?,
+                        None => store.list_entities().map_err(|e| e.to_string())?,
+                    },
                 };
                 if rows.is_empty() {
                     println!("no entities");
@@ -1653,9 +1748,37 @@ fn entities(action: EntitiesAction) -> std::process::ExitCode {
                 role,
                 specialization,
                 description,
+                profile,
             } => {
                 use vikram_store::EntityKind;
                 let ek = EntityKind::parse(&kind).map_err(|e| e.to_string())?;
+                let profile_id = match profile {
+                    Some(id) => {
+                        let pid = vikram_contracts::ProfileId::new(id);
+                        if store
+                            .get_profile(&pid)
+                            .map_err(|e| e.to_string())?
+                            .is_none()
+                        {
+                            return Err(format!("profile {pid} not found"));
+                        }
+                        // A second entity with the same kind and slug would scaffold into the
+                        // same directory, so the profile's own rows are checked first.
+                        let already = store
+                            .list_entities_owned_by_profile(&pid)
+                            .map_err(|e| e.to_string())?
+                            .iter()
+                            .any(|row| row.kind == ek && row.slug == slug);
+                        if already {
+                            return Err(format!(
+                                "entity `{slug}` ({}) already exists for profile {pid}",
+                                ek.as_str()
+                            ));
+                        }
+                        Some(pid)
+                    }
+                    None => None,
+                };
                 let now = vikram_runtime::types::now_ms();
                 let row = vikram_store::EntityRow {
                     id: vikram_contracts::EntityId::generate(),
@@ -1681,7 +1804,7 @@ fn entities(action: EntitiesAction) -> std::process::ExitCode {
                     },
                     icon: None,
                     model: None,
-                    profile_id: None,
+                    profile_id,
                     status: "active".to_owned(),
                     created_ms: now,
                     updated_ms: now,
@@ -2261,15 +2384,22 @@ fn learning(action: LearningAction) -> std::process::ExitCode {
                             vikram_runtime::config::database_path(),
                         )
                         .map_err(|e| e.to_string())?;
-                        // Same scope rule auto-apply uses: recall only reads `global` +
-                        // the proposal's session id, so a literal `user`/`memory` scope
-                        // would write a memory nothing can ever retrieve.
-                        mem.save(
-                            &p.key,
-                            &p.content,
-                            vikram_runtime::learning::scope_of(&p.target, &p.session),
-                        )
-                        .map_err(|e| e.to_string())?;
+                        // Where the runtime would have written it: the session's shared
+                        // `user:`/`project:` shelves when it was bound to them, else the session
+                        // scope. An approval must not land somewhere a later session cannot read.
+                        let (user, project) = mem
+                            .session_scopes(p.session.as_str())
+                            .map_err(|e| e.to_string())?;
+                        let scope = match p.target.as_str() {
+                            "user" => user,
+                            "project" => project,
+                            _ => None,
+                        }
+                        .unwrap_or_else(|| {
+                            vikram_runtime::learning::scope_of(&p.target, &p.session)
+                        });
+                        mem.save(&p.key, &p.content, &scope)
+                            .map_err(|e| e.to_string())?;
                     } else if p.kind == "skill" {
                         // Same gate the auto-apply path runs: `skill_proposal_gate` in
                         // config.json, on by default and on when the config cannot be read.
@@ -2328,6 +2458,15 @@ fn learning(action: LearningAction) -> std::process::ExitCode {
                 mgr.save();
                 println!("rejected {id}");
             }
+            LearningAction::Undo { id } => {
+                let mem =
+                    vikram_runtime::MemoryStore::open(vikram_runtime::config::database_path())
+                        .map_err(|e| e.to_string())?;
+                println!(
+                    "{}",
+                    vikram_runtime::learning::undo_applied(&mgr, &mem, &id)?
+                );
+            }
             LearningAction::History => {
                 let entries = mgr.audit_log();
                 if entries.is_empty() {
@@ -2349,6 +2488,11 @@ fn learning(action: LearningAction) -> std::process::ExitCode {
                 }
                 mgr.save();
                 println!("set {kind} policy to {}", pol.as_str());
+            }
+            LearningAction::Forget { id, dry_run } => {
+                for line in evolution::forget(&id, dry_run)? {
+                    println!("{line}");
+                }
             }
         }
         Ok(())
@@ -3206,6 +3350,10 @@ fn daemon(action: DaemonAction) -> std::process::ExitCode {
                 "usage: vikram daemon quiet [<start> <end>] [--off]".to_string()
             )),
         },
+        DaemonAction::Presence => report(cli::presence_status()),
+        DaemonAction::Sleep => report(cli::sleep()),
+        DaemonAction::Wake => report(cli::wake()),
+        DaemonAction::Doze => report(cli::doze()),
     }
 }
 
@@ -3409,6 +3557,18 @@ mod tests {
     }
 
     #[test]
+    fn learning_undo_parses_the_proposal_id() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["vikram", "learning", "undo", "lrn-1"]).unwrap();
+        match cli.command {
+            Some(Command::Learning {
+                action: LearningAction::Undo { id },
+            }) => assert_eq!(id, "lrn-1"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn install_entity_pack_registers_the_entity_and_its_files() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = vikram_runtime::config::lock_security_env();
@@ -3494,6 +3654,54 @@ mod tests {
         let store = open_test_store(&home);
         let err = install_entity_pack(&store, &dir).unwrap_err();
         assert!(err.contains("not a module directory"), "{err}");
+    }
+
+    #[test]
+    fn entities_list_and_new_take_an_optional_profile() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["vikram", "entities", "list"]).unwrap();
+        match cli.command {
+            Some(Command::Entities {
+                action: EntitiesAction::List { kind, profile },
+            }) => {
+                assert_eq!(kind, None);
+                assert_eq!(profile, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["vikram", "entities", "list", "--profile", "prof-1"]).unwrap();
+        match cli.command {
+            Some(Command::Entities {
+                action: EntitiesAction::List { kind, profile },
+            }) => {
+                assert_eq!(kind, None);
+                assert_eq!(profile.as_deref(), Some("prof-1"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vikram",
+            "entities",
+            "new",
+            "agent",
+            "Rudra",
+            "rudra",
+            "--profile",
+            "prof-1",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Entities {
+                action: EntitiesAction::New { slug, profile, .. },
+            }) => {
+                assert_eq!(slug, "rudra");
+                assert_eq!(profile.as_deref(), Some("prof-1"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

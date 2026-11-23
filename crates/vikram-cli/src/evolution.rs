@@ -15,8 +15,8 @@ use std::path::Path;
 
 use clap::Subcommand;
 use vikram_evolution::{
-    EvaluationBenchmark, EvolutionEngine, ExperienceOutcome, ProposalStatus,
-    autonomy::ApprovalStatus, metrics::DEFAULT_WINDOW_MS, now_ms,
+    EvaluationBenchmark, EvolutionEngine, ExperienceOutcome, LearningEvent, ProposalStatus,
+    autonomy::ApprovalStatus, gen_id, metrics::DEFAULT_WINDOW_MS, now_ms,
 };
 
 #[derive(Debug, Subcommand)]
@@ -78,6 +78,21 @@ pub enum EvolutionAction {
         #[arg(long)]
         yes: bool,
     },
+    /// Age what stopped being used, or undo one ageing step.
+    ///
+    /// Shows the curator ledger by default. `--sweep` moves entries that have gone
+    /// unused past 14 days to stale and past 30 days to archived; nothing is deleted.
+    Curator {
+        /// Run a sweep now instead of only showing the ledger.
+        #[arg(long)]
+        sweep: bool,
+        /// How many ledger entries to show.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Undo one ledger transition by id.
+        #[arg(long)]
+        rollback: Option<String>,
+    },
     /// Run a self-evaluation benchmark, or list available benchmarks.
     ///
     /// A run records an `EvaluationResult` in the store; listing is read-only.
@@ -87,6 +102,19 @@ pub enum EvolutionAction {
         /// Skip the confirmation prompt.
         #[arg(long)]
         yes: bool,
+    },
+    /// Try one setting, measure it with a benchmark, and keep it only if nothing got worse.
+    ///
+    /// This is a regression gate, not proof: the benchmark scores recorded work, so a kept change
+    /// means "no regression measured", never "this helped". Only `context:memory_budget_tokens` is
+    /// writable here, because that is the one allowlisted key the config file holds.
+    Trial {
+        /// Surface key, e.g. `context:memory_budget_tokens`.
+        key: String,
+        /// The value to try.
+        value: String,
+        /// Benchmark id or name to measure with.
+        benchmark: String,
     },
     /// Approve a pending autonomy request (durable decision).
     Approve {
@@ -113,17 +141,21 @@ pub fn run(action: Option<EvolutionAction>) -> Result<(), String> {
 }
 
 fn run_at(action: EvolutionAction, db: &Path, skills_root: &Path) -> Result<(), String> {
+    let mut engine = open_existing_engine(db, skills_root)?;
+    for line in dispatch(&mut engine, &action)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn open_existing_engine(db: &Path, skills_root: &Path) -> Result<EvolutionEngine, String> {
     if !db.exists() {
         return Err(format!(
             "no evolution store at {} — the engine has not recorded anything yet",
             db.display()
         ));
     }
-    let mut engine = open_engine(db, skills_root)?;
-    for line in dispatch(&mut engine, &action)? {
-        println!("{line}");
-    }
-    Ok(())
+    open_engine(db, skills_root)
 }
 
 fn open_engine(db: &Path, skills_root: &Path) -> Result<EvolutionEngine, String> {
@@ -146,14 +178,24 @@ fn dispatch(engine: &mut EvolutionEngine, action: &EvolutionAction) -> Result<Ve
         EvolutionAction::Ask { text } => ask_lines(engine, text),
         EvolutionAction::Approvals => approvals_lines(engine),
         EvolutionAction::Recover => recover_lines(engine),
+        EvolutionAction::Curator {
+            sweep,
+            limit,
+            rollback,
+        } => curator_lines(engine, *sweep, *limit, rollback.as_deref()),
         EvolutionAction::Cycle { yes } => cycle_lines(engine, *yes),
         EvolutionAction::Benchmark { name, yes } => benchmark_lines(engine, name.as_deref(), *yes),
+        EvolutionAction::Trial {
+            key,
+            value,
+            benchmark,
+        } => trial_lines(engine, key, value, benchmark),
         EvolutionAction::Approve { id, yes } => approval_decision_lines(engine, id, true, *yes),
         EvolutionAction::Reject { id, yes } => approval_decision_lines(engine, id, false, *yes),
     }
 }
 
-fn truncate(text: &str, max: usize) -> String {
+pub(crate) fn truncate(text: &str, max: usize) -> String {
     let text = text.replace('\n', " ");
     if text.chars().count() <= max {
         return text;
@@ -359,6 +401,87 @@ fn memory_lines(
     Ok(out)
 }
 
+pub fn forget(id: &str, dry_run: bool) -> Result<Vec<String>, String> {
+    let home = vikram_runtime::config::vikram_home();
+    forget_at(
+        id,
+        dry_run,
+        &home.join("evolution.db"),
+        &home.join("skills"),
+    )
+}
+
+fn forget_at(
+    id: &str,
+    dry_run: bool,
+    db: &Path,
+    skills_root: &Path,
+) -> Result<Vec<String>, String> {
+    let engine = open_existing_engine(db, skills_root)?;
+    forget_lines(&engine, id, dry_run)
+}
+
+fn forget_lines(engine: &EvolutionEngine, id: &str, dry_run: bool) -> Result<Vec<String>, String> {
+    let entries = engine.memory.list_all(None).map_err(|e| e.to_string())?;
+    let Some(entry) = entries.into_iter().find(|m| m.id == id) else {
+        return Ok(vec![format!("no live memory with id `{id}`")]);
+    };
+    let now = now_ms();
+    let flags = if entry.is_superseded() {
+        " [superseded]"
+    } else if entry.is_expired(now) {
+        " [expired]"
+    } else {
+        ""
+    };
+    let what = format!(
+        "{}  {}/{}  {}{}  {}",
+        entry.id,
+        entry.layer.as_str(),
+        entry.scope,
+        entry.key,
+        flags,
+        truncate(&entry.value, 80)
+    );
+    if dry_run {
+        return Ok(vec![
+            format!("would forget {what}"),
+            "dry run: nothing deleted".to_string(),
+        ]);
+    }
+    if !engine.memory.forget(id).map_err(|e| e.to_string())? {
+        return Ok(vec![format!("no live memory with id `{id}`")]);
+    }
+    engine
+        .store
+        .save_event(&LearningEvent {
+            id: gen_id("evt"),
+            timestamp_ms: now,
+            agent_id: "system".to_string(),
+            kind: "memory_forgotten".to_string(),
+            summary: format!(
+                "forgot memory {} ({}/{}/{})",
+                entry.id,
+                entry.layer.as_str(),
+                entry.scope,
+                entry.key
+            ),
+            payload: serde_json::json!({
+                "action": "forget",
+                "id": entry.id,
+                "layer": entry.layer.as_str(),
+                "scope": entry.scope,
+                "key": entry.key,
+            }),
+        })
+        .map_err(|e| e.to_string())?;
+    let remaining = engine.memory.count().map_err(|e| e.to_string())?;
+    Ok(vec![
+        format!("forgot {what}"),
+        format!("state: live memory entries now {remaining}"),
+    ])
+}
+
 fn skills_lines(engine: &EvolutionEngine, name: Option<&str>) -> Result<Vec<String>, String> {
     match name {
         Some(name) => {
@@ -542,6 +665,135 @@ fn approvals_lines(engine: &EvolutionEngine) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// The config file as a surface, limited to the one allowlisted key it actually holds. The learning
+/// policies live in the running runtime rather than on disk, so they are refused here instead of
+/// being written somewhere that would take effect only on the next start.
+struct ConfigFileSurface;
+
+impl vikram_evolution::self_config::ConfigSurface for ConfigFileSurface {
+    fn read(&self, key: &str) -> Option<String> {
+        let config = vikram_runtime::config::Config::load().ok()?;
+        match key {
+            "context:memory_budget_tokens" => Some(config.context.memory_budget_tokens.to_string()),
+            _ => None,
+        }
+    }
+
+    fn write(&self, key: &str, value: &str) -> Result<(), String> {
+        let mut config = vikram_runtime::config::Config::load().map_err(|e| e.to_string())?;
+        match key {
+            "context:memory_budget_tokens" => {
+                let budget: u64 = value
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("`{value}` is not a token count"))?;
+                config.context.memory_budget_tokens = budget;
+            }
+            other => return Err(format!("the config file holds no `{other}`")),
+        }
+        config.save().map_err(|e| e.to_string())
+    }
+
+    fn writable(&self, key: &str) -> bool {
+        key == "context:memory_budget_tokens"
+    }
+}
+
+fn metric_line(metrics: &vikram_evolution::PerformanceMetrics) -> String {
+    format!(
+        "correctness {:.2}, completion {:.2}, tools {:.2}, failure {:.2}, tokens {}",
+        metrics.task_correctness,
+        metrics.task_completion_rate,
+        metrics.tool_success_rate,
+        metrics.failure_rate,
+        metrics.token_consumption
+    )
+}
+
+fn trial_lines(
+    engine: &mut EvolutionEngine,
+    key: &str,
+    value: &str,
+    benchmark: &str,
+) -> Result<Vec<String>, String> {
+    let target = vikram_evolution::self_config::ConfigTarget::parse(key).ok_or_else(|| {
+        format!("`{key}` is not a configuration key; expected something like context:memory_budget_tokens")
+    })?;
+    engine
+        .self_config
+        .attach_surface(std::sync::Arc::new(ConfigFileSurface));
+    let outcome = vikram_evolution::self_trial::trial_change(
+        &mut engine.self_config,
+        &mut engine.self_evaluation,
+        target,
+        value,
+        benchmark,
+    )
+    .map_err(|e| e.to_string())?;
+    let mut lines = vec![format!("trial {} on {}", outcome.change_id, outcome.target)];
+    lines.push(if outcome.applied {
+        format!("kept: {}", outcome.reason)
+    } else if outcome.rolled_back {
+        format!("rolled back: {}", outcome.reason)
+    } else {
+        format!("not applied: {}", outcome.reason)
+    });
+    if let Some(before) = outcome.before.as_ref() {
+        lines.push(format!("before: {}", metric_line(before)));
+    }
+    if let Some(after) = outcome.after.as_ref() {
+        lines.push(format!("after: {}", metric_line(after)));
+    }
+    Ok(lines)
+}
+
+fn curator_lines(
+    engine: &mut EvolutionEngine,
+    sweep: bool,
+    limit: usize,
+    rollback: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    if let Some(id) = rollback {
+        engine.curator.rollback(id).map_err(|e| e.to_string())?;
+        out.push(format!("reverted {id}: the entry is back where it was"));
+    }
+    if sweep {
+        let swept = engine
+            .curator
+            .sweep(vikram_evolution::now_ms(), None)
+            .map_err(|e| e.to_string())?;
+        out.push(format!(
+            "swept: {} staled, {} archived, {} reactivated",
+            swept.staled, swept.archived, swept.reactivated
+        ));
+    }
+    let entries = engine.curator.ledger(limit).map_err(|e| e.to_string())?;
+    if entries.is_empty() {
+        out.push("curator ledger: nothing has aged yet".to_string());
+        return Ok(out);
+    }
+    out.push(format!(
+        "curator ledger: {} transition(s), newest first",
+        entries.len()
+    ));
+    for entry in entries {
+        out.push(format!(
+            "{}  {} ({})  {} -> {}{}",
+            entry.id,
+            entry.memory_key,
+            entry.memory_scope,
+            entry.from_state.as_str(),
+            entry.to_state.as_str(),
+            match &entry.reverted_by {
+                Some(by) => format!("  [reverted by {by}]"),
+                None => String::new(),
+            }
+        ));
+    }
+    Ok(out)
+}
+
 fn recover_lines(engine: &mut EvolutionEngine) -> Result<Vec<String>, String> {
     let mut out = vec![
         "note: self-recovery snapshots and state fingerprints persist in \
@@ -552,15 +804,37 @@ fn recover_lines(engine: &mut EvolutionEngine) -> Result<Vec<String>, String> {
         .self_recovery
         .recover_after_restart()
         .map_err(|e| e.to_string())?;
-    out.push(format!(
-        "restart recovery pass: {} operation(s) queued",
-        operations.len()
-    ));
+    match engine.self_recovery.last_drift_report() {
+        Some(drift) if drift.changes.is_empty() => out.push(format!(
+            "drift against snapshot {}: none",
+            drift.snapshot_id
+        )),
+        Some(drift) => {
+            out.push(format!(
+                "drift against snapshot {} ({} change(s)):",
+                drift.snapshot_id,
+                drift.changes.len()
+            ));
+            for change in &drift.changes {
+                out.push(format!("  {change}"));
+            }
+        }
+        None => out.push("drift: no fingerprint to compare against yet".to_string()),
+    }
+    if operations.is_empty() {
+        out.push("restart recovery pass: nothing was ever recorded".to_string());
+    } else {
+        out.push(format!(
+            "restart recovery pass: {} operation(s) on record, oldest first",
+            operations.len()
+        ));
+    }
     for op in &operations {
         out.push(format!(
-            "  {}  {:?}  target={}  {}",
+            "  {}  {:?}  {:?}  target={}  {}",
             op.id,
             op.recovery_type,
+            op.status,
             op.target,
             truncate(&op.reason, 70)
         ));
@@ -804,7 +1078,8 @@ fn approval_decision_lines(
 mod tests {
     use super::*;
     use vikram_evolution::types::{
-        Experience, KnowledgeStatus, LearningProposal, MemoryLayer, ProposalKind, Sensitivity,
+        Experience, KnowledgeStatus, LearningProposal, MemoryEntry, MemoryLayer, ProposalKind,
+        Sensitivity,
     };
 
     fn engine_at(tmp: &tempfile::TempDir) -> EvolutionEngine {
@@ -1041,6 +1316,88 @@ mod tests {
         )
         .unwrap();
         assert!(scoped[0].contains("no live memory entries"), "{scoped:?}");
+    }
+
+    #[test]
+    fn forget_deletes_only_the_named_memory_and_records_an_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = engine_at(&tmp);
+        let doomed = engine
+            .memory
+            .remember(
+                MemoryLayer::Semantic,
+                "global",
+                "pref",
+                "likes rust",
+                KnowledgeStatus::Confirmed,
+                0.9,
+                None,
+                "test",
+            )
+            .unwrap();
+        let kept = engine
+            .memory
+            .remember(
+                MemoryLayer::Project,
+                "global",
+                "stack",
+                "sqlite",
+                KnowledgeStatus::Observed,
+                0.7,
+                None,
+                "test",
+            )
+            .unwrap();
+
+        let planned = forget_lines(&engine, &doomed.id, true).unwrap();
+        assert!(
+            planned
+                .iter()
+                .any(|l| l.contains("would forget") && l.contains(&doomed.id)),
+            "{planned:?}"
+        );
+        assert!(
+            planned.iter().any(|l| l == "dry run: nothing deleted"),
+            "{planned:?}"
+        );
+        assert_eq!(engine.memory.list(None).unwrap().len(), 2);
+        assert!(
+            engine.store.list_events(None, 10).unwrap().is_empty(),
+            "dry run must not record an event"
+        );
+
+        let lines = forget_lines(&engine, &doomed.id, false).unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("forgot")
+                && l.contains(&doomed.id)
+                && l.contains("semantic/global")
+                && l.contains("pref")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("live memory entries now 1")),
+            "{lines:?}"
+        );
+        assert!(engine.memory.get_by_id(&doomed.id).unwrap().is_none());
+        let live = engine.memory.list(None).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, kept.id);
+
+        let events = engine.store.list_events(None, 10).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == "memory_forgotten" && e.summary.contains(&doomed.id)),
+            "{events:?}"
+        );
+
+        let absent = forget_lines(&engine, "mem-missing", false).unwrap();
+        assert_eq!(
+            absent,
+            vec!["no live memory with id `mem-missing`".to_string()]
+        );
     }
 
     #[test]
@@ -1508,7 +1865,7 @@ mod tests {
     }
 
     #[test]
-    fn recover_reports_process_local_state_and_empty_pass() {
+    fn recover_reports_persisted_state_and_an_empty_first_pass() {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = engine_at(&tmp);
         let lines = dispatch(&mut engine, &EvolutionAction::Recover).unwrap();
@@ -1519,7 +1876,13 @@ mod tests {
             "{lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains("0 operation(s) queued")),
+            lines.iter().any(|l| l.contains("drift: no fingerprint")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("nothing was ever recorded")),
             "{lines:?}"
         );
         assert!(
@@ -1528,5 +1891,140 @@ mod tests {
                 .any(|l| l.contains("0 snapshot(s)") && l.contains("0 failed change(s)")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn recover_says_on_record_when_a_pass_has_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_at(&tmp);
+        engine
+            .self_recovery
+            .rollback_skill_version("demo", 1)
+            .unwrap();
+        let lines = dispatch(&mut engine, &EvolutionAction::Recover).unwrap();
+        let pass = lines
+            .iter()
+            .find(|l| l.contains("restart recovery pass"))
+            .unwrap_or_else(|| panic!("{lines:?}"));
+        assert!(pass.contains("1 operation(s) on record"), "{pass}");
+        assert!(pass.contains("oldest first"), "{pass}");
+    }
+
+    fn seed_memory(engine: &EvolutionEngine, id: &str, key: &str, value: &str, updated_ms: u64) {
+        engine
+            .store
+            .save_memory(&MemoryEntry {
+                id: id.to_string(),
+                layer: MemoryLayer::Semantic,
+                scope: "global".to_string(),
+                key: key.to_string(),
+                value: value.to_string(),
+                status: KnowledgeStatus::Observed,
+                confidence: 0.8,
+                source_experience: None,
+                provenance: "cli-test".to_string(),
+                created_ms: updated_ms,
+                updated_ms,
+                expires_ms: None,
+                superseded_by: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn curator_says_so_when_nothing_has_aged_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_at(&tmp);
+        let lines = dispatch(
+            &mut engine,
+            &EvolutionAction::Curator {
+                sweep: false,
+                limit: 20,
+                rollback: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("curator ledger: nothing has aged yet")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_sweep_ages_an_unused_entry_and_rollback_undoes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_at(&tmp);
+        let day_ms: u64 = 24 * 60 * 60 * 1000;
+        seed_memory(&engine, "mem-old", "db", "postgres", now_ms() - 15 * day_ms);
+
+        let lines = dispatch(
+            &mut engine,
+            &EvolutionAction::Curator {
+                sweep: true,
+                limit: 20,
+                rollback: None,
+            },
+        )
+        .unwrap();
+        let swept = lines
+            .iter()
+            .find(|l| l.contains("swept:"))
+            .unwrap_or_else(|| panic!("{lines:?}"));
+        assert_eq!(swept, "swept: 1 staled, 0 archived, 0 reactivated");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("db (global)") && l.contains("active -> stale")),
+            "{lines:?}"
+        );
+
+        let id = engine.curator.ledger(1).unwrap()[0].id.clone();
+        let reverted = dispatch(
+            &mut engine,
+            &EvolutionAction::Curator {
+                sweep: false,
+                limit: 20,
+                rollback: Some(id.clone()),
+            },
+        )
+        .unwrap();
+        assert!(
+            reverted
+                .iter()
+                .any(|l| l.contains(&format!("reverted {id}: the entry is back where it was"))),
+            "{reverted:?}"
+        );
+        assert_eq!(
+            engine.store.memory_lifecycle("mem-old").unwrap(),
+            Some(vikram_evolution::MemoryLifecycle::Active)
+        );
+    }
+
+    #[test]
+    fn a_trial_of_a_key_the_file_cannot_hold_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_at(&tmp);
+        let err = trial_lines(
+            &mut engine,
+            "runtime:learning_memory_policy",
+            "auto",
+            "coding",
+        )
+        .expect_err("a learning policy is not a file setting");
+        assert!(
+            err.contains("refuses runtime:learning_memory_policy"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_trial_of_a_made_up_key_wants_a_real_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_at(&tmp);
+        let err = trial_lines(&mut engine, "nonsense", "1", "coding")
+            .expect_err("nonsense is not a configuration key");
+        assert!(err.contains("context:memory_budget_tokens"), "{err}");
     }
 }

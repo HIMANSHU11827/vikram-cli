@@ -39,13 +39,18 @@ The autonomous system follows the MAPE-K feedback loop:
 
 **Plan**: Generate possible solutions, compare benefits and costs, estimate risks, choose the most suitable action, and define success criteria.
 
-**Execute**: Change configurations, adapt workflows, improve skills, develop capabilities, and execute approved source modifications.
+**Execute**: Change configurations through the host's `ConfigSurface`, adapt workflows, improve
+skills, and re-queue reflection that failed. What it may change is deliberately narrow: the
+runtime accepts three keys (`context:memory_budget_tokens`, `runtime:learning_memory_policy`,
+`runtime:learning_skill_policy`) and refuses everything else, and source modification reached
+through the choke point every edit already passes — the sandbox and the policy floor — not
+through the evolution engine itself.
 
 **Knowledge**: Store decisions, outcomes, maintain the self-model, maintain learning history, and preserve useful operational knowledge.
 
 ## Autonomy Levels
 
-**Level 1 - Automatic**: Allow appropriate reversible operations without asking the user (model routing, low-risk runtime settings, context optimization, internal workflows, verified learning records, diagnostics, skill drafts).
+**Level 1 - Automatic**: Allow appropriate reversible operations without asking the user (low-risk runtime settings, context optimization, internal workflows, verified learning records, diagnostics, skill drafts). *Model routing is listed here as a goal, not a shipped behaviour: `select_model_for_task` (`crates/vikram-evolution/src/self_config.rs`) has no production caller and picks by substring over a caller-supplied list, so it is not wired.*
 
 **Level 2 - Controlled Development**: Allow autonomous development in an isolated environment (create tools, modify skills, develop integrations, change workflows, modify source code, run tests, review changes, prepare validated updates). Require approval before merging consequential changes.
 

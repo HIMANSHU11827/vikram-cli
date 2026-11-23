@@ -18,6 +18,7 @@ members = [
     "crates/vikram-terminals",
     "crates/vikram-gateway",
     "crates/vikram-voice",
+    "crates/vikram-link",
 ]
 
 [workspace.package]
@@ -36,12 +37,14 @@ vikram-tui = { path = "crates/vikram-tui" }
 vikram-skills = { path = "crates/vikram-skills" }
 vikram-mcp = { path = "crates/vikram-mcp" }
 vikram-daemon = { path = "crates/vikram-daemon" }
+vikram-evolution = { path = "crates/vikram-evolution" }
 vikram-sandbox = { path = "crates/vikram-sandbox" }
 vikram-codeindex = { path = "crates/vikram-codeindex" }
 vikram-acp = { path = "crates/vikram-acp" }
 vikram-terminals = { path = "crates/vikram-terminals" }
 vikram-gateway = { path = "crates/vikram-gateway" }
 vikram-voice = { path = "crates/vikram-voice" }
+vikram-link = { path = "crates/vikram-link" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

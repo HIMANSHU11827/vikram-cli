@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Result, SkillError};
-use crate::skill::{Compat, Scope};
+use crate::skill::{Compat, PersonaKind, Scope};
 
 pub const HOME_ENV: &str = "VIKRAM_HOME";
 
@@ -42,12 +42,22 @@ pub fn user_skills_dir() -> PathBuf {
     home().join("skills")
 }
 
+/// [`user_skills_dir`] for an explicit home, so tests and multi-home callers never read the
+/// environment.
+pub(crate) fn user_skills_dir_at(home: &Path) -> PathBuf {
+    home.join("skills")
+}
+
 pub fn bundles_dir() -> PathBuf {
     home().join("bundles")
 }
 
 pub fn state_dir() -> PathBuf {
-    user_skills_dir().join(".vikram")
+    state_dir_at(&home())
+}
+
+pub(crate) fn state_dir_at(home: &Path) -> PathBuf {
+    user_skills_dir_at(home).join(".vikram")
 }
 
 pub fn disabled_path() -> PathBuf {
@@ -65,7 +75,11 @@ pub fn provenance_path() -> PathBuf {
 /// User-level roots in preference order. Compatibility directories are only scanned when the
 /// caller asks for them; when it does not, their contents are not silently adopted either.
 pub fn user_skill_dirs() -> Vec<(Scope, Compat, PathBuf)> {
-    let root = user_skills_dir();
+    user_skill_dirs_at(&home())
+}
+
+pub(crate) fn user_skill_dirs_at(home: &Path) -> Vec<(Scope, Compat, PathBuf)> {
+    let root = user_skills_dir_at(home);
     vec![
         (Scope::User, Compat::Native, root.clone()),
         (Scope::User, Compat::AgentsSkills, root.join("agents")),
@@ -73,6 +87,20 @@ pub fn user_skill_dirs() -> Vec<(Scope, Compat, PathBuf)> {
         (Scope::User, Compat::OpenCode, root.join("opencode")),
         (Scope::User, Compat::Hermes, root.join("hermes")),
     ]
+}
+
+/// A persona's own skills root: `<home>/{main-agents,agents,bots}/<slug>/skills`. It is the
+/// highest-precedence root, so a persona can shadow a shared skill by name.
+pub fn persona_skill_dirs(
+    home: &Path,
+    slug: &str,
+    kind: PersonaKind,
+) -> Vec<(Scope, Compat, PathBuf)> {
+    vec![(
+        Scope::Persona,
+        Compat::Native,
+        home.join(kind.folder()).join(slug).join("skills"),
+    )]
 }
 
 /// Project-level roots in preference order.
@@ -367,6 +395,34 @@ mod tests {
         assert_eq!(dirs[0].1, Compat::Native);
         assert_eq!(dirs[1].2, user_skills_dir().join("agents"));
         assert_eq!(dirs[4].2, user_skills_dir().join("hermes"));
+    }
+
+    #[test]
+    fn a_persona_root_lives_under_its_entity_folder() {
+        let home = Path::new("/home/u/.vikram");
+        let dirs = persona_skill_dirs(home, "reviewer", PersonaKind::Agent);
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0].0, Scope::Persona);
+        assert_eq!(dirs[0].1, Compat::Native);
+        assert_eq!(dirs[0].2, home.join("agents/reviewer/skills"));
+
+        assert_eq!(
+            persona_skill_dirs(home, "lead", PersonaKind::MainAgent)[0].2,
+            home.join("main-agents/lead/skills")
+        );
+        assert_eq!(
+            persona_skill_dirs(home, "helper", PersonaKind::Bot)[0].2,
+            home.join("bots/helper/skills")
+        );
+    }
+
+    #[test]
+    fn explicit_home_roots_match_the_environment_roots() {
+        let home = Path::new("/home/u/.vikram");
+        let at = user_skill_dirs_at(home);
+        assert_eq!(at.len(), 5);
+        assert_eq!(at[0].2, home.join("skills"));
+        assert_eq!(state_dir_at(home), home.join("skills/.vikram"));
     }
 
     #[test]

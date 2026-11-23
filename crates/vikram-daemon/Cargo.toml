@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 vikram-contracts.workspace = true
+vikram-evolution.workspace = true
 vikram-runtime.workspace = true
 vikram-store.workspace = true
 serde.workspace = true

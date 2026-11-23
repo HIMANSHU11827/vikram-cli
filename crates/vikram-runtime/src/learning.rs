@@ -88,12 +88,28 @@ pub struct LearningAuditEntry {
     pub detail: String,
 }
 
+/// One memory write the `Auto` policy applied without asking, recorded with enough detail to
+/// reverse it: the key, the shelf it landed on, and what was there before. `reverted` is the
+/// tombstone a second undo reads, so undo never claims to have done something twice.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LearningApplication {
+    pub id: String,
+    pub key: String,
+    pub scope: String,
+    pub previous: Option<String>,
+    #[serde(default)]
+    pub reverted: bool,
+    pub applied_ms: u64,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct LearningState {
     #[serde(default)]
     pub proposals: Vec<LearningProposal>,
     #[serde(default)]
     pub audit: Vec<LearningAuditEntry>,
+    #[serde(default)]
+    pub applied: Vec<LearningApplication>,
     #[serde(default = "default_policy_str")]
     pub policy_memory: String,
     #[serde(default = "default_policy_str")]
@@ -126,6 +142,7 @@ impl<T> RecoverPoisoned<T> for std::sync::LockResult<T> {
 pub struct LearningManager {
     proposals: Mutex<Vec<LearningProposal>>,
     audit: Mutex<Vec<LearningAuditEntry>>,
+    applied: Mutex<Vec<LearningApplication>>,
     /// Skills viewed during a session (read-before-write guard).
     viewed_skills: Mutex<HashMap<SessionId, HashSet<String>>>,
     policy_memory: Mutex<LearningPolicy>,
@@ -138,6 +155,10 @@ pub struct LearningManager {
     /// Non-empty when the state file could not be read/parsed, so the failure is visible to
     /// callers that check `load_error` instead of silently starting from scratch.
     load_error: Mutex<Option<String>>,
+    /// The pending count the operator was last told about, so a growing queue produces one notice
+    /// per new proposal rather than a reminder on every turn. Not persisted: this bounds noise
+    /// in one run, not knowledge across runs.
+    nudged: Mutex<usize>,
 }
 
 impl Default for LearningManager {
@@ -155,6 +176,7 @@ impl LearningManager {
         let mgr = Self {
             proposals: Mutex::new(Vec::new()),
             audit: Mutex::new(Vec::new()),
+            applied: Mutex::new(Vec::new()),
             viewed_skills: Mutex::new(HashMap::new()),
             policy_memory: Mutex::new(LearningPolicy::ApprovalRequired),
             policy_skill: Mutex::new(LearningPolicy::ApprovalRequired),
@@ -163,6 +185,7 @@ impl LearningManager {
             path: Mutex::new(path),
             turns: Mutex::new(HashMap::new()),
             load_error: Mutex::new(None),
+            nudged: Mutex::new(0),
         };
         if let Some(p) = mgr.path.lock().recover().clone() {
             match std::fs::read_to_string(&p) {
@@ -170,6 +193,7 @@ impl LearningManager {
                     Ok(state) => {
                         *mgr.proposals.lock().recover() = state.proposals;
                         *mgr.audit.lock().recover() = state.audit;
+                        *mgr.applied.lock().recover() = state.applied;
                         *mgr.policy_memory.lock().recover() =
                             LearningPolicy::parse(&state.policy_memory);
                         *mgr.policy_skill.lock().recover() =
@@ -218,6 +242,7 @@ impl LearningManager {
         let state = LearningState {
             proposals: self.proposals.lock().recover().clone(),
             audit: self.audit.lock().recover().clone(),
+            applied: self.applied.lock().recover().clone(),
             policy_memory: self.policy_memory.lock().recover().as_str().to_owned(),
             policy_skill: self.policy_skill.lock().recover().as_str().to_owned(),
             policy_instruction: self.policy_instruction.lock().recover().as_str().to_owned(),
@@ -284,7 +309,18 @@ impl LearningManager {
     }
 
     pub fn stage_proposal(&self, proposal: LearningProposal) {
-        self.proposals.lock().recover().push(proposal);
+        let mut proposals = self.proposals.lock().recover();
+        // The same proposal can be staged again on a later turn (the same correction noticed
+        // twice). Replacing the pending copy keeps one decision per change instead of asking the
+        // operator to approve the same thing twice.
+        if let Some(existing) = proposals
+            .iter_mut()
+            .find(|p| p.id == proposal.id && p.status == "pending")
+        {
+            *existing = proposal;
+            return;
+        }
+        proposals.push(proposal);
     }
 
     pub fn pending_proposals(&self) -> Vec<LearningProposal> {
@@ -295,6 +331,27 @@ impl LearningManager {
             .filter(|p| p.status == "pending")
             .cloned()
             .collect()
+    }
+
+    /// The pending count when this run has not yet told the operator about that many, else `None`.
+    ///
+    /// A staged proposal is the whole point of the approval policy, and an operator who is never
+    /// told the queue grew experiences it as "it never learns". One notice per new proposal keeps
+    /// that visible without turning every turn into a reminder.
+    fn pending_grew(&self) -> Option<usize> {
+        let pending = self
+            .proposals
+            .lock()
+            .recover()
+            .iter()
+            .filter(|p| p.status == "pending")
+            .count();
+        let mut nudged = self.nudged.lock().recover();
+        if pending > *nudged {
+            *nudged = pending;
+            return Some(pending);
+        }
+        None
     }
 
     pub fn all_proposals(&self) -> Vec<LearningProposal> {
@@ -324,6 +381,37 @@ impl LearningManager {
 
     pub fn audit(&self, entry: LearningAuditEntry) {
         self.audit.lock().recover().push(entry);
+    }
+
+    /// Record an auto-applied change by proposal id. A proposal applied again on a later turn
+    /// replaces its earlier record instead of stacking two truths about the same write.
+    pub fn record_applied(&self, application: LearningApplication) {
+        let mut applied = self.applied.lock().recover();
+        if let Some(existing) = applied.iter_mut().find(|a| a.id == application.id) {
+            *existing = application;
+            return;
+        }
+        applied.push(application);
+    }
+
+    pub fn find_applied(&self, id: &str) -> Option<LearningApplication> {
+        self.applied
+            .lock()
+            .recover()
+            .iter()
+            .find(|a| a.id == id)
+            .cloned()
+    }
+
+    pub fn mark_applied_reverted(&self, id: &str) -> bool {
+        let mut applied = self.applied.lock().recover();
+        match applied.iter_mut().find(|a| a.id == id) {
+            Some(record) => {
+                record.reverted = true;
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn audit_log(&self) -> Vec<LearningAuditEntry> {
@@ -813,11 +901,15 @@ fn record_and_reflect(
         let Ok(recorded) = engine.experience.record(experience) else {
             return;
         };
-        let auto_memory = inner.learning.surface.policy_memory() != LearningPolicy::Disabled;
-        let proposals = match engine.reflection.run_reflection(&recorded.id, auto_memory) {
-            Ok(proposals) => proposals,
-            Err(_) => return,
-        };
+        let auto_memory = writes_without_approval(inner.learning.surface.policy_memory());
+        let proposals =
+            match engine
+                .reflection
+                .reflect_now(&recorded.id, &recorded.agent_id, auto_memory)
+            {
+                Ok(proposals) => proposals,
+                Err(_) => return,
+            };
         // The signature is read back from the *stored* metadata, so it is compared against
         // past rows in exactly the form they were sanitized into.
         let repeated = metadata_verify_signature(&recorded.metadata)
@@ -1454,6 +1546,225 @@ fn experience_reusable(growth: &TurnGrowth, outcome: crate::types::TurnState) ->
         && (growth.tools.len() >= 2 || (verified && !growth.tools.is_empty()))
 }
 
+/// How many recorded occasions a next-step pattern needs before it is worth saying out loud.
+pub(crate) const LIKELY_NEXT_STEP_MIN_OCCASIONS: usize = 3;
+
+/// How far back the session-start scan looks, in the agent's most recent experiences.
+const LIKELY_NEXT_STEP_SCAN: usize = 50;
+
+/// A tool the recorded history repeatedly reached for after a turn in one category.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Suggestion {
+    pub category: String,
+    pub tool: String,
+    pub occasions: usize,
+    pub considered: usize,
+    pub last_seen_ms: u64,
+}
+
+/// The tool a completed turn in `category` has most often been followed by, counted only within
+/// one agent/workspace sequence. A predecessor must have succeeded; the pair is the immediately
+/// following experience for the same agent and project, so a pattern never reaches across another
+/// agent's or another workspace's record. `None` until
+/// [`LIKELY_NEXT_STEP_MIN_OCCASIONS`] pairs in one sequence agree: a thin history says nothing
+/// rather than guessing, and a pattern in history is evidence of what followed, never a prediction
+/// of intent.
+pub(crate) fn likely_next_step(
+    experiences: &[vikram_evolution::Experience],
+    category: &str,
+) -> Option<Suggestion> {
+    use vikram_evolution::ExperienceOutcome;
+    type Sequence = (String, Option<String>);
+    // The store lists newest first; count chronologically so "following" means later.
+    let mut ordered: Vec<&vikram_evolution::Experience> = experiences.iter().collect();
+    ordered.sort_by(|a, b| {
+        a.timestamp_ms
+            .cmp(&b.timestamp_ms)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let mut considered: HashMap<Sequence, usize> = HashMap::new();
+    let mut counts: HashMap<(Sequence, &str), (usize, u64)> = HashMap::new();
+    for (index, earlier) in ordered.iter().enumerate() {
+        if earlier.task_category != category || earlier.outcome != ExperienceOutcome::Success {
+            continue;
+        }
+        let Some(next) = ordered.iter().skip(index + 1).find(|later| {
+            later.agent_id == earlier.agent_id && later.project_id == earlier.project_id
+        }) else {
+            continue;
+        };
+        let sequence = (earlier.agent_id.clone(), earlier.project_id.clone());
+        *considered.entry(sequence.clone()).or_insert(0) += 1;
+        let Some(tool) = next.tools_used.first() else {
+            continue;
+        };
+        let entry = counts.entry((sequence, tool.as_str())).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 = entry.1.max(next.timestamp_ms);
+    }
+    let mut best: Option<(usize, u64, &str, usize)> = None;
+    for ((sequence, tool), (occasions, last_seen_ms)) in &counts {
+        if *occasions < LIKELY_NEXT_STEP_MIN_OCCASIONS {
+            continue;
+        }
+        let pairs = considered.get(sequence).copied().unwrap_or(0);
+        let stronger = match best {
+            None => true,
+            Some((best_occasions, best_seen, best_tool, _)) => {
+                *occasions > best_occasions
+                    || (*occasions == best_occasions && *last_seen_ms > best_seen)
+                    || (*occasions == best_occasions
+                        && *last_seen_ms == best_seen
+                        && *tool < best_tool)
+            }
+        };
+        if stronger {
+            best = Some((*occasions, *last_seen_ms, tool, pairs));
+        }
+    }
+    let (occasions, last_seen_ms, tool, considered) = best?;
+    Some(Suggestion {
+        category: category.to_owned(),
+        tool: tool.to_owned(),
+        occasions,
+        considered,
+        last_seen_ms,
+    })
+}
+
+/// The session-start line this agent's own history supports, or `None` when it supports nothing.
+/// It reads the last recorded category and one bounded page of that agent's experiences; nothing
+/// is written, cached, or acted on.
+pub(crate) fn likely_next_step_notice(
+    inner: &Arc<crate::runtime::RuntimeInner>,
+    agent_id: &str,
+) -> Option<String> {
+    let experiences = {
+        let engine = inner.learning.evolution.lock().recover();
+        engine
+            .experience
+            .list(Some(agent_id), LIKELY_NEXT_STEP_SCAN)
+            .ok()?
+    };
+    let category = experiences.first()?.task_category.clone();
+    let suggestion = likely_next_step(&experiences, &category)?;
+    Some(format!(
+        "likely next step: `{}` — after {} of the last {} completed `{}` turns for this agent were followed by it",
+        suggestion.tool, suggestion.occasions, suggestion.considered, suggestion.category
+    ))
+}
+
+/// How far back the session-start "where we left off" scan looks, in the agent's most recent
+/// experiences.
+const WHERE_WE_LEFT_OFF_SCAN: usize = 10;
+
+/// How much of the recorded request the notice quotes.
+const WHERE_WE_LEFT_OFF_TOPIC_MAX: usize = 40;
+
+/// The longest line the notice may take.
+const WHERE_WE_LEFT_OFF_MAX: usize = 120;
+
+/// Tools whose presence means the turn checked its own work. A turn that ran one of these and
+/// still reported success has nothing left open.
+const VERIFYING_TOOLS: &[&str] = &["verify", "test.run", "build.run"];
+
+/// A request fragment safe to quote: whitespace flattened, backticks replaced, absolute paths cut
+/// down to their last segment so the notice never says where the operator's files live.
+fn quoted_topic(request: &str) -> String {
+    let flat = request
+        .split_whitespace()
+        .map(|token| {
+            let token = if token.starts_with('/') || token.starts_with("~/") || token.contains("=/")
+            {
+                token
+                    .rsplit('/')
+                    .find(|part| !part.is_empty())
+                    .unwrap_or("")
+            } else {
+                token
+            };
+            token.replace('`', "'")
+        })
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    flat.chars().take(WHERE_WE_LEFT_OFF_TOPIC_MAX).collect()
+}
+
+fn left_off_line(topic: &str, category: &str, status: &str) -> String {
+    if topic.is_empty() {
+        format!("last time: ({category}) {status}")
+    } else {
+        format!("last time: `{topic}` ({category}) {status}")
+    }
+}
+
+/// Where the newest recorded work stopped, or `None` when it stopped on a verified success or
+/// nothing worth naming was recorded. A chat-only turn neither did work nor proved any, so the
+/// scan skips it rather than calling a conversation unfinished. Newest-first by `(timestamp_ms,
+/// id)`, so the answer never depends on store iteration order.
+pub(crate) fn where_we_left_off(experiences: &[vikram_evolution::Experience]) -> Option<String> {
+    use vikram_evolution::ExperienceOutcome;
+    let mut ordered: Vec<&vikram_evolution::Experience> = experiences.iter().collect();
+    ordered.sort_by(|a, b| {
+        b.timestamp_ms
+            .cmp(&a.timestamp_ms)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    let last = ordered
+        .into_iter()
+        .take(WHERE_WE_LEFT_OFF_SCAN)
+        .find(|exp| exp.outcome != ExperienceOutcome::Success || !exp.tools_used.is_empty())?;
+    let verified = last
+        .tools_used
+        .iter()
+        .any(|tool| VERIFYING_TOOLS.contains(&tool.as_str()));
+    if last.outcome == ExperienceOutcome::Success && verified {
+        return None;
+    }
+    let status = match last.outcome {
+        ExperienceOutcome::Failure => "ended with an error — that is where the work stopped",
+        ExperienceOutcome::Partial => "did not finish — that is where the work stopped",
+        ExperienceOutcome::Success => "ended unverified — that is where the work stopped",
+    };
+    let category: String = last.task_category.chars().take(24).collect();
+    let mut topic = quoted_topic(&last.user_request);
+    let mut line = left_off_line(&topic, &category, status);
+    if line.chars().count() > WHERE_WE_LEFT_OFF_MAX {
+        let over = line.chars().count() - WHERE_WE_LEFT_OFF_MAX;
+        topic = topic
+            .chars()
+            .take(topic.chars().count().saturating_sub(over))
+            .collect();
+        line = left_off_line(&topic, &category, status);
+    }
+    Some(line)
+}
+
+/// The session-start line this agent's own history supports about unfinished work, or `None` when
+/// the newest recorded work was a verified success. One bounded page of the agent's experiences
+/// under the existing lock; nothing is written, cached, or acted on.
+pub(crate) fn where_we_left_off_notice(
+    inner: &Arc<crate::runtime::RuntimeInner>,
+    agent_id: &str,
+) -> Option<String> {
+    let experiences = {
+        let engine = inner.learning.evolution.lock().recover();
+        engine
+            .experience
+            .list(Some(agent_id), WHERE_WE_LEFT_OFF_SCAN)
+            .ok()?
+    };
+    where_we_left_off(&experiences)
+}
+
+/// Whether a policy lets the reflector write memory in the same turn it reflected in. Only `Auto`
+/// does: every other policy exists so a human or a later decision sees the change first, and
+/// writing here would spend that decision before it was made.
+fn writes_without_approval(policy: LearningPolicy) -> bool {
+    policy == LearningPolicy::Auto
+}
+
 /// One gate for every proposal source. The policy for the proposal's kind decides whether the
 /// change happens now, waits for the operator, or is dropped; a kind the surface cannot act on and
 /// a disabled policy both drop it rather than offering a decision that does nothing.
@@ -1482,6 +1793,7 @@ pub(crate) fn apply_or_stage(
     // Resolved once so the dedup read and the eventual write can never disagree about the
     // shelf: `user`/`project` targets land on the shared scopes recall is bound to read.
     let scope = memory_write_scope(inner, &proposal);
+    let mut previous = None;
     if proposal.kind == "memory" {
         let existing = match inner.memory.list(&scope) {
             Ok(existing) => existing,
@@ -1495,6 +1807,10 @@ pub(crate) fn apply_or_stage(
                 return;
             }
         };
+        previous = existing
+            .iter()
+            .find(|(key, _)| key == &proposal.key)
+            .map(|(_, value)| value.clone());
         let contents: Vec<String> = existing.into_iter().map(|(_, value)| value).collect();
         if inner
             .learning
@@ -1513,6 +1829,14 @@ pub(crate) fn apply_or_stage(
         inner.learning.surface.stage_proposal(proposal.clone());
         audit(inner, &proposal, "staged", &proposal.reason.clone());
         inner.learning.surface.save();
+        if let Some(pending) = inner.learning.surface.pending_grew() {
+            inner.emit(crate::RuntimeEvent::Notice {
+                level: crate::NoticeLevel::Info,
+                text: format!(
+                    "{pending} learning proposal(s) waiting for you — `vikram learning pending`"
+                ),
+            });
+        }
         return;
     }
     let outcome = if proposal.kind == "memory" {
@@ -1532,6 +1856,16 @@ pub(crate) fn apply_or_stage(
             .unwrap_or_else(|err| format!("could not apply skill: {err}"))
     };
     let applied = outcome.starts_with("auto-applied");
+    if applied && proposal.kind == "memory" {
+        inner.learning.surface.record_applied(LearningApplication {
+            id: proposal.id.clone(),
+            key: proposal.key.clone(),
+            scope: scope.clone(),
+            previous,
+            reverted: false,
+            applied_ms: now_ms(),
+        });
+    }
     audit(
         inner,
         &proposal,
@@ -1539,6 +1873,50 @@ pub(crate) fn apply_or_stage(
         &outcome,
     );
     inner.learning.surface.save();
+}
+
+/// Reverse one auto-applied memory write: restore the value the key held before, or delete the
+/// key when it held nothing. A staged proposal was never written, so undo refuses and names the
+/// decision that would discard it instead of pretending there is anything to reverse.
+///
+/// The record is marked reverted only after the store write succeeds, so a failed restore leaves
+/// the record undoable rather than claiming a reversal that never happened.
+pub fn undo_applied(
+    surface: &LearningManager,
+    memory: &crate::memory::MemoryStore,
+    id: &str,
+) -> Result<String, String> {
+    let Some(application) = surface.find_applied(id) else {
+        return match surface.find_proposal(id) {
+            Some(proposal) if proposal.status == "pending" => Err(format!(
+                "proposal `{id}` is staged, not applied — use `vikram learning reject {id}` to discard it"
+            )),
+            _ => Ok(format!("nothing to undo for {id}")),
+        };
+    };
+    if application.reverted {
+        return Ok(format!("{id} was already reverted"));
+    }
+    let message = match &application.previous {
+        Some(previous) => {
+            memory
+                .save(&application.key, previous, &application.scope)
+                .map_err(|e| e.to_string())?;
+            format!(
+                "reverted {id}: restored the previous value of `{}` in {}",
+                application.key, application.scope
+            )
+        }
+        None => {
+            memory
+                .delete(&application.key, &application.scope)
+                .map_err(|e| e.to_string())?;
+            format!("removed `{}` from {}", application.key, application.scope)
+        }
+    };
+    surface.mark_applied_reverted(id);
+    surface.save();
+    Ok(message)
 }
 
 /// A staged skill proposal is a pending capability change, so it also lands on the
@@ -1613,7 +1991,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// (the store reuses one row per directory, so sessions on the same project share it),
 /// else a hash of the session's working directory so sessions on the same workspace
 /// share a shelf without leaking the absolute path into the scope name.
-fn project_memory_scope(session: &crate::session::SessionRuntime) -> Option<String> {
+pub(crate) fn project_memory_scope(session: &crate::session::SessionRuntime) -> Option<String> {
     let slug = match session.project_id() {
         Some(id) => id.as_str().to_owned(),
         None => {
@@ -1668,10 +2046,11 @@ fn memory_write_scope(
     }
 }
 
-/// Tell the memory store which shared shelves this session may recall. Runs every turn so
-/// a project switch or identity change is picked up; the store skips the write when the
-/// binding is unchanged, and a session with neither dimension clears any stale binding.
-fn bind_session_memory_scopes(
+/// Tell the memory store which shared shelves this session may recall. Runs before every recall
+/// and again at turn end, so a project switch or identity change is picked up in the same turn
+/// that reads it; the store skips the write when the binding is unchanged, and a session with
+/// neither dimension clears any stale binding.
+pub(crate) fn bind_session_memory_scopes(
     inner: &Arc<crate::runtime::RuntimeInner>,
     session: &crate::session::SessionRuntime,
 ) {
@@ -1792,9 +2171,25 @@ fn skill_gate(manager: &vikram_skills::Manager, proposal: &LearningProposal) -> 
         }
     };
     let parsed = vikram_skills::Frontmatter::parse(&candidate).map_err(|err| err.to_string())?;
-    vikram_skills::SkillMetadata::from_frontmatter(&parsed, id.as_str())
-        .map(|_| ())
-        .map_err(|err| err.to_string())
+    let (metadata, _warnings) =
+        vikram_skills::SkillMetadata::from_frontmatter(&parsed, id.as_str())
+            .map_err(|err| err.to_string())?;
+    let issues = vikram_skills::lint_parts(
+        &metadata.description,
+        &parsed.body,
+        &[],
+        &vikram_skills::Budget::default(),
+    );
+    let blockers: Vec<String> = issues
+        .iter()
+        .filter(|issue| issue.severity() == vikram_skills::Severity::Error)
+        .map(|issue| issue.describe())
+        .collect();
+    if blockers.is_empty() {
+        Ok(())
+    } else {
+        Err(blockers.join("; "))
+    }
 }
 
 /// `vikram_skills::frontmatter::render_document` is crate-private; this mirrors it so the
@@ -2282,6 +2677,19 @@ mod tests {
     }
 
     #[test]
+    fn a_skill_body_too_long_to_ever_load_is_refused_before_it_is_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = vikram_skills::Manager::at(tmp.path().join("skills"));
+
+        let mut proposal = surface_proposal("skill", "create", "huge-skill");
+        proposal.content = "x".repeat(30_000);
+        let err = apply_skill_with(&manager, &proposal, true)
+            .expect_err("a body the loader would cut must not become a skill");
+        assert!(err.contains("will be cut"), "got: {err}");
+        assert!(!tmp.path().join("skills/huge-skill").exists());
+    }
+
+    #[test]
     fn a_valid_patch_passes_the_gate_and_applies() {
         let tmp = tempfile::tempdir().unwrap();
         let manager = vikram_skills::Manager::at(tmp.path().join("skills"));
@@ -2621,6 +3029,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_growing_approval_queue_is_announced_once_per_proposal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, _guard) = test_runtime(dir.path()).await;
+        let handle = runtime.handle();
+        let inner = handle.inner.clone();
+        inner
+            .learning
+            .surface
+            .set_policy_memory(LearningPolicy::ApprovalRequired);
+        let mut events = handle.events();
+        let mut nudges = || {
+            let mut count = 0;
+            while let Ok(event) = events.try_recv() {
+                if matches!(&event, crate::RuntimeEvent::Notice { text, .. } if text.contains("learning proposal(s) waiting"))
+                {
+                    count += 1;
+                }
+            }
+            count
+        };
+
+        let mut first = surface_proposal("memory", "add", "user");
+        first.key = "tab-style".to_owned();
+        let repeat = first.clone();
+        apply_or_stage(&inner, first);
+        let mut second = surface_proposal("memory", "add", "user");
+        second.id = "lrn-test-two".to_owned();
+        second.key = "indent-style".to_owned();
+        second.content = "four spaces".to_owned();
+        apply_or_stage(&inner, second);
+        apply_or_stage(&inner, repeat);
+
+        assert_eq!(
+            nudges(),
+            2,
+            "one notice per new proposal, and a restaged duplicate says nothing new"
+        );
+        assert_eq!(inner.learning.surface.pending_proposals().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_correction_is_written_on_auto_and_only_staged_on_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, _guard) = test_runtime(dir.path()).await;
+        let inner = runtime.handle().inner.clone();
+        inner
+            .learning
+            .surface
+            .set_policy_memory(LearningPolicy::ApprovalRequired);
+        inner
+            .learning
+            .surface
+            .set_policy_skill(LearningPolicy::Disabled);
+        let session = inner.session_list().into_iter().next().unwrap();
+        let growth = TurnGrowth::default();
+        record_and_reflect(
+            &inner,
+            &session,
+            "how should the tab be drawn",
+            crate::types::TurnState::Idle,
+            &growth,
+            &["use tabs, not spaces".to_owned()],
+        );
+        let engine_writes = || {
+            inner
+                .learning
+                .evolution
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .memory
+                .count()
+                .unwrap()
+        };
+        assert_eq!(
+            engine_writes(),
+            0,
+            "an approval policy must reach the evolution store too, not only the staged surface"
+        );
+        assert!(
+            !inner.learning.surface.pending_proposals().is_empty(),
+            "the correction is still offered for a decision"
+        );
+
+        inner
+            .learning
+            .surface
+            .set_policy_memory(LearningPolicy::Auto);
+        record_and_reflect(
+            &inner,
+            &session,
+            "how should the indent be drawn",
+            crate::types::TurnState::Idle,
+            &growth,
+            &["indent with four spaces".to_owned()],
+        );
+        assert!(
+            engine_writes() > 0,
+            "auto is the one policy that writes without asking"
+        );
+    }
+
+    #[tokio::test]
     async fn a_recurring_verify_failure_stages_one_project_memory_proposal() {
         let dir = tempfile::tempdir().unwrap();
         let (runtime, _guard) = test_runtime(dir.path()).await;
@@ -2943,5 +3453,301 @@ mod tests {
             Some(expected.clone()),
             "different workspaces must not share a project shelf"
         );
+    }
+
+    #[tokio::test]
+    async fn an_auto_applied_memory_write_can_be_undone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, _guard) = test_runtime(dir.path()).await;
+        let inner = runtime.handle().inner.clone();
+        inner
+            .learning
+            .surface
+            .set_policy_memory(LearningPolicy::Auto);
+
+        let session = inner.session_list().into_iter().next().unwrap();
+        let scope = session.id.as_str().to_owned();
+        inner.memory.save("pref-1", "prefers npm", &scope).unwrap();
+
+        let mut proposal = surface_proposal("memory", "replace", "memory");
+        proposal.session = session.id.clone();
+        proposal.key = "pref-1".to_owned();
+        proposal.content = "prefers pnpm".to_owned();
+        apply_or_stage(&inner, proposal.clone());
+
+        assert_eq!(
+            inner.memory.get("pref-1", &scope).unwrap(),
+            Some("prefers pnpm".to_owned())
+        );
+        let record = inner
+            .learning
+            .surface
+            .find_applied(&proposal.id)
+            .expect("an auto apply records what it can reverse");
+        assert_eq!(record.scope, scope);
+        assert_eq!(record.previous.as_deref(), Some("prefers npm"));
+
+        let message = undo_applied(&inner.learning.surface, &inner.memory, &proposal.id).unwrap();
+        assert_eq!(
+            message,
+            format!(
+                "reverted {}: restored the previous value of `pref-1` in {scope}",
+                proposal.id
+            )
+        );
+        assert_eq!(
+            inner.memory.get("pref-1", &scope).unwrap(),
+            Some("prefers npm".to_owned())
+        );
+
+        let again = undo_applied(&inner.learning.surface, &inner.memory, &proposal.id).unwrap();
+        assert!(
+            again.contains("already reverted"),
+            "a second undo must say so, not silently do nothing: {again}"
+        );
+    }
+
+    #[tokio::test]
+    async fn undoing_a_write_with_no_previous_value_removes_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, _guard) = test_runtime(dir.path()).await;
+        let inner = runtime.handle().inner.clone();
+        inner
+            .learning
+            .surface
+            .set_policy_memory(LearningPolicy::Auto);
+
+        let session = inner.session_list().into_iter().next().unwrap();
+        let scope = session.id.as_str().to_owned();
+        let mut proposal = surface_proposal("memory", "add", "memory");
+        proposal.session = session.id.clone();
+        proposal.key = "fresh-key".to_owned();
+        proposal.content = "learned once".to_owned();
+        apply_or_stage(&inner, proposal.clone());
+
+        assert!(inner.memory.get("fresh-key", &scope).unwrap().is_some());
+        assert!(
+            inner
+                .learning
+                .surface
+                .find_applied(&proposal.id)
+                .unwrap()
+                .previous
+                .is_none()
+        );
+
+        let message = undo_applied(&inner.learning.surface, &inner.memory, &proposal.id).unwrap();
+        assert_eq!(message, format!("removed `fresh-key` from {scope}"));
+        assert_eq!(inner.memory.get("fresh-key", &scope).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn undo_refuses_a_proposal_that_was_only_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, _guard) = test_runtime(dir.path()).await;
+        let inner = runtime.handle().inner.clone();
+        inner
+            .learning
+            .surface
+            .set_policy_memory(LearningPolicy::ApprovalRequired);
+
+        let proposal = surface_proposal("memory", "add", "memory");
+        apply_or_stage(&inner, proposal.clone());
+
+        let err = undo_applied(&inner.learning.surface, &inner.memory, &proposal.id).unwrap_err();
+        assert!(
+            err.contains("vikram learning reject"),
+            "a staged proposal points at the decision that discards it: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_id_reports_nothing_to_undo() {
+        let surface = LearningManager::new();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        assert_eq!(
+            undo_applied(&surface, &memory, "never-seen").unwrap(),
+            "nothing to undo for never-seen"
+        );
+    }
+
+    fn recorded_turn(
+        id: &str,
+        category: &str,
+        outcome: vikram_evolution::ExperienceOutcome,
+        tools: &[&str],
+        timestamp_ms: u64,
+    ) -> vikram_evolution::Experience {
+        vikram_evolution::Experience {
+            id: id.to_owned(),
+            timestamp_ms,
+            agent_id: "main".to_owned(),
+            project_id: Some("proj-1".to_owned()),
+            task_category: category.to_owned(),
+            user_request: format!("{category} turn"),
+            outcome,
+            tools_used: tools.iter().map(|tool| (*tool).to_owned()).collect(),
+            errors: Vec::new(),
+            corrections: Vec::new(),
+            feedback: None,
+            reusable: false,
+            sensitivity: vikram_evolution::Sensitivity::Private,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn a_repeated_pattern_produces_a_likely_next_step() {
+        let mut experiences = Vec::new();
+        for (index, ts) in [1_000u64, 2_000, 3_000].into_iter().enumerate() {
+            experiences.push(recorded_turn(
+                &format!("edit-{index}"),
+                "edit",
+                vikram_evolution::ExperienceOutcome::Success,
+                &["edit"],
+                ts,
+            ));
+            experiences.push(recorded_turn(
+                &format!("test-{index}"),
+                "test",
+                vikram_evolution::ExperienceOutcome::Success,
+                &["verify", "shell"],
+                ts + 1,
+            ));
+        }
+        let mut elsewhere = recorded_turn(
+            "edit-elsewhere",
+            "edit",
+            vikram_evolution::ExperienceOutcome::Success,
+            &["edit"],
+            4_000,
+        );
+        elsewhere.project_id = Some("proj-2".to_owned());
+        experiences.push(elsewhere);
+        let mut elsewhere_next = recorded_turn(
+            "test-elsewhere",
+            "test",
+            vikram_evolution::ExperienceOutcome::Success,
+            &["deploy"],
+            4_001,
+        );
+        elsewhere_next.project_id = Some("proj-2".to_owned());
+        experiences.push(elsewhere_next);
+        experiences.reverse();
+
+        let suggestion =
+            likely_next_step(&experiences, "edit").expect("three matching completed turns");
+
+        assert_eq!(suggestion.tool, "verify");
+        assert_eq!(suggestion.occasions, 3);
+        assert_eq!(
+            suggestion.considered, 3,
+            "another workspace's pair is not this workspace's evidence"
+        );
+        assert_eq!(suggestion.category, "edit");
+        assert_eq!(suggestion.last_seen_ms, 3_001);
+    }
+
+    #[test]
+    fn fewer_than_three_occasions_say_nothing() {
+        let mut experiences = Vec::new();
+        for (index, ts) in [1_000u64, 2_000].into_iter().enumerate() {
+            experiences.push(recorded_turn(
+                &format!("edit-{index}"),
+                "edit",
+                vikram_evolution::ExperienceOutcome::Success,
+                &["edit"],
+                ts,
+            ));
+            experiences.push(recorded_turn(
+                &format!("test-{index}"),
+                "test",
+                vikram_evolution::ExperienceOutcome::Success,
+                &["verify"],
+                ts + 1,
+            ));
+        }
+
+        assert_eq!(likely_next_step(&experiences, "edit"), None);
+    }
+
+    #[test]
+    fn failed_outcomes_do_not_build_a_pattern() {
+        let mut experiences = Vec::new();
+        for (index, ts) in [1_000u64, 2_000, 3_000].into_iter().enumerate() {
+            experiences.push(recorded_turn(
+                &format!("edit-{index}"),
+                "edit",
+                vikram_evolution::ExperienceOutcome::Failure,
+                &["edit"],
+                ts,
+            ));
+            experiences.push(recorded_turn(
+                &format!("test-{index}"),
+                "test",
+                vikram_evolution::ExperienceOutcome::Success,
+                &["verify"],
+                ts + 1,
+            ));
+        }
+
+        assert_eq!(likely_next_step(&experiences, "edit"), None);
+    }
+
+    #[test]
+    fn a_failed_last_session_is_named_as_unfinished() {
+        let mut failed = recorded_turn(
+            "edit-failed",
+            "edit",
+            vikram_evolution::ExperienceOutcome::Failure,
+            &["edit"],
+            2_000,
+        );
+        failed.user_request = "fix /home/operator/Desktop/exporter.rs exporter".to_owned();
+        let experiences = vec![
+            recorded_turn(
+                "edit-ok",
+                "edit",
+                vikram_evolution::ExperienceOutcome::Success,
+                &["verify"],
+                1_000,
+            ),
+            failed,
+        ];
+
+        let line = where_we_left_off(&experiences).expect("a failed last turn is unfinished work");
+
+        assert!(line.contains("exporter"), "{line}");
+        assert!(line.contains("(edit)"), "{line}");
+        assert!(line.contains("error"), "{line}");
+        assert!(!line.contains("/home"), "no absolute path may leak: {line}");
+        assert!(line.chars().count() <= WHERE_WE_LEFT_OFF_MAX, "{line}");
+    }
+
+    #[test]
+    fn a_successful_verified_session_says_nothing() {
+        let experiences = vec![
+            recorded_turn(
+                "edit-failed",
+                "edit",
+                vikram_evolution::ExperienceOutcome::Failure,
+                &["edit"],
+                1_000,
+            ),
+            recorded_turn(
+                "test-ok",
+                "test",
+                vikram_evolution::ExperienceOutcome::Success,
+                &["edit", "test.run"],
+                2_000,
+            ),
+        ];
+
+        assert_eq!(where_we_left_off(&experiences), None);
+    }
+
+    #[test]
+    fn no_history_says_nothing() {
+        assert_eq!(where_we_left_off(&[]), None);
     }
 }

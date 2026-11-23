@@ -36,6 +36,97 @@ fn experience_record_and_reflection() {
 }
 
 #[test]
+fn reflection_run_on_the_turn_path_closes_its_job() {
+    let tmp = tempdir().unwrap();
+    let engine = EvolutionEngine::open_in_memory(tmp.path().join("skills")).unwrap();
+    let exp = engine
+        .experience
+        .record(Experience {
+            id: String::new(),
+            timestamp_ms: 0,
+            agent_id: "rudra".into(),
+            project_id: None,
+            task_category: "coding".into(),
+            user_request: "build feature".into(),
+            outcome: ExperienceOutcome::Success,
+            tools_used: vec![],
+            errors: vec![],
+            corrections: vec!["use tabs".into()],
+            feedback: None,
+            reusable: true,
+            sensitivity: Sensitivity::Public,
+            metadata: serde_json::json!({}),
+        })
+        .unwrap();
+    engine
+        .reflection
+        .reflect_now(&exp.id, "rudra", true)
+        .unwrap();
+    assert!(engine.store.list_pending_jobs().unwrap().is_empty());
+    assert!(engine.store.list_failed_jobs(10).unwrap().is_empty());
+}
+
+#[test]
+fn a_reflection_that_cannot_run_is_left_failed_for_retry() {
+    let tmp = tempdir().unwrap();
+    let engine = EvolutionEngine::open_in_memory(tmp.path().join("skills")).unwrap();
+    assert!(
+        engine
+            .reflection
+            .reflect_now("exp-missing", "rudra", true)
+            .is_err()
+    );
+    let failed = engine.store.list_failed_jobs(10).unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].experience_id, "exp-missing");
+    assert_eq!(failed[0].status, ReflectionJobStatus::Failed);
+    assert!(failed[0].error.is_some());
+}
+
+#[test]
+fn a_drain_records_its_proposals_without_writing_memory() {
+    let tmp = tempdir().unwrap();
+    let engine = EvolutionEngine::open_in_memory(tmp.path().join("skills")).unwrap();
+    let exp = engine
+        .experience
+        .record(Experience {
+            id: String::new(),
+            timestamp_ms: 0,
+            agent_id: "rudra".into(),
+            project_id: None,
+            task_category: "coding".into(),
+            user_request: "build feature".into(),
+            outcome: ExperienceOutcome::Success,
+            tools_used: vec![],
+            errors: vec![],
+            corrections: vec!["use tabs".into()],
+            feedback: None,
+            reusable: true,
+            sensitivity: Sensitivity::Public,
+            metadata: serde_json::json!({}),
+        })
+        .unwrap();
+    engine.reflection.enqueue(&exp.id, "rudra").unwrap();
+    assert_eq!(engine.reflection.process_pending().unwrap(), 1);
+    assert_eq!(
+        engine.memory.count().unwrap(),
+        0,
+        "a drain runs where no policy is in hand, so it must not write operator memory"
+    );
+    assert!(
+        !engine
+            .store
+            .list_proposals(None)
+            .unwrap()
+            .iter()
+            .filter(|p| p.kind == ProposalKind::AddMemory)
+            .collect::<Vec<_>>()
+            .is_empty(),
+        "the proposal is still recorded, so the runtime can still judge it"
+    );
+}
+
+#[test]
 fn skill_create_improve_rollback() {
     let tmp = tempdir().unwrap();
     let skills_root = tmp.path().join("skills");

@@ -39,6 +39,7 @@ pub trait MemoryProvider: Send + Sync {
     fn on_memory_write(&self, action: &str, target: &str, content: &str) {
         let _ = (action, target, content);
     }
+    fn refresh_snapshot(&self) {}
 }
 
 pub struct BuiltInMemoryProvider {
@@ -158,6 +159,15 @@ impl MemoryProvider for BuiltInMemoryProvider {
     fn on_session_end(&self, _messages: Vec<Value>) {}
 
     fn on_memory_write(&self, _action: &str, _target: &str, _content: &str) {}
+
+    fn refresh_snapshot(&self) {
+        if let Ok(mut mf) = self.memory_file.lock() {
+            mf.refresh();
+        }
+        if let Ok(mut uf) = self.user_file.lock() {
+            uf.refresh();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -392,6 +402,14 @@ impl MemoryProviderManager {
         for p in self.providers.iter().rev() {
             let p = p.as_ref();
             let _ = catch_unwind(AssertUnwindSafe(|| p.shutdown()));
+        }
+    }
+
+    /// Re-read the operator's memory files after a write that must be honoured in this session.
+    pub fn refresh_snapshots(&self) {
+        for p in &self.providers {
+            let p = p.as_ref();
+            let _ = catch_unwind(AssertUnwindSafe(|| p.refresh_snapshot()));
         }
     }
 }

@@ -15,10 +15,10 @@
 //! - JSON columns are written with `serde_json::to_string(..)?` and read
 //!   with a checked parse that maps failures to `EvolutionError::Serde`.
 //! - Memory listings/recall/search only ever return *live* entries:
-//!   superseded (`superseded_by IS NOT NULL`) and expired
-//!   (`expires_ms <= now`) rows are filtered in SQL, in the same query
-//!   that applies `LIMIT`, so pagination cannot return a short page that
-//!   is actually full of dead rows.
+//!   superseded (`superseded_by IS NOT NULL`), archived (`lifecycle =
+//!   'archived'`), and expired (`expires_ms <= now`) rows are filtered in
+//!   SQL, in the same query that applies `LIMIT`, so pagination cannot
+//!   return a short page that is actually full of dead rows.
 //! - `EvaluationResult` has its own primary key (`id`), so re-evaluating
 //!   a candidate on the same dataset appends a new row instead of
 //!   silently overwriting the previous evaluation.
@@ -34,7 +34,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Current schema version. Bump when adding a migration step.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Default retention horizon for [`EvolutionStore::prune_older_than`].
 /// 30 days is conservative: it bounds growth of the append-only tables
@@ -44,6 +44,22 @@ pub const DEFAULT_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 #[derive(Clone)]
 pub struct EvolutionStore {
     conn: Arc<Mutex<Connection>>,
+}
+
+/// One memory row's lifecycle view for [`crate::curator::Curator`]: the
+/// identity and value hash inputs, plus the persisted [`MemoryLifecycle`]
+/// and the timestamps needed to decide (and revert) a transition.
+#[derive(Clone, Debug)]
+pub struct MemoryLifecycleRow {
+    pub id: String,
+    pub scope: String,
+    pub key: String,
+    pub value: String,
+    pub created_ms: u64,
+    pub updated_ms: u64,
+    pub expires_ms: Option<u64>,
+    pub superseded: bool,
+    pub lifecycle: MemoryLifecycle,
 }
 
 impl std::fmt::Debug for EvolutionStore {
@@ -238,9 +254,9 @@ impl EvolutionStore {
         let now = crate::types::now_ms() as i64;
         let pattern = format!("%{}%", escape_like(&query.to_lowercase()));
         let sql = if scope.is_some() {
-            "SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE scope=?1 AND superseded_by IS NULL AND (expires_ms IS NULL OR expires_ms > ?2) AND (LOWER(key) LIKE ?3 ESCAPE '\\' OR LOWER(value) LIKE ?3 ESCAPE '\\') ORDER BY updated_ms DESC LIMIT ?4"
+            "SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE scope=?1 AND superseded_by IS NULL AND lifecycle <> 'archived' AND (expires_ms IS NULL OR expires_ms > ?2) AND (LOWER(key) LIKE ?3 ESCAPE '\\' OR LOWER(value) LIKE ?3 ESCAPE '\\') ORDER BY updated_ms DESC LIMIT ?4"
         } else {
-            "SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE superseded_by IS NULL AND (expires_ms IS NULL OR expires_ms > ?1) AND (LOWER(key) LIKE ?2 ESCAPE '\\' OR LOWER(value) LIKE ?2 ESCAPE '\\') ORDER BY updated_ms DESC LIMIT ?3"
+            "SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE superseded_by IS NULL AND lifecycle <> 'archived' AND (expires_ms IS NULL OR expires_ms > ?1) AND (LOWER(key) LIKE ?2 ESCAPE '\\' OR LOWER(value) LIKE ?2 ESCAPE '\\') ORDER BY updated_ms DESC LIMIT ?3"
         };
         let mut stmt = conn
             .prepare(sql)
@@ -259,9 +275,9 @@ impl EvolutionStore {
         let conn = self.lock();
         let now = crate::types::now_ms() as i64;
         let sql = if scope.is_some() {
-            "SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE scope=?1 AND superseded_by IS NULL AND (expires_ms IS NULL OR expires_ms > ?2) ORDER BY updated_ms DESC"
+            "SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE scope=?1 AND superseded_by IS NULL AND lifecycle <> 'archived' AND (expires_ms IS NULL OR expires_ms > ?2) ORDER BY updated_ms DESC"
         } else {
-            "SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE superseded_by IS NULL AND (expires_ms IS NULL OR expires_ms > ?1) ORDER BY updated_ms DESC"
+            "SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE superseded_by IS NULL AND lifecycle <> 'archived' AND (expires_ms IS NULL OR expires_ms > ?1) ORDER BY updated_ms DESC"
         };
         let mut stmt = conn
             .prepare(sql)
@@ -307,9 +323,26 @@ impl EvolutionStore {
         let conn = self.lock();
         count_rows_with(
             &conn,
-            "SELECT COUNT(*) FROM memory_entries WHERE superseded_by IS NULL AND (expires_ms IS NULL OR expires_ms > ?1)",
+            "SELECT COUNT(*) FROM memory_entries WHERE superseded_by IS NULL AND lifecycle <> 'archived' AND (expires_ms IS NULL OR expires_ms > ?1)",
             params![now],
         )
+    }
+
+    // ---- memory lifecycle ----
+    /// Every memory row's lifecycle view, all scopes or one. Unlike
+    /// [`Self::list_memory`] this includes archived, superseded, and expired
+    /// rows, because the curator needs to see state it is allowed to move.
+    pub fn list_memory_lifecycle(&self, scope: Option<&str>) -> Result<Vec<MemoryLifecycleRow>> {
+        let conn = self.lock();
+        list_memory_lifecycle_conn(&conn, scope)
+    }
+    pub fn memory_lifecycle(&self, id: &str) -> Result<Option<MemoryLifecycle>> {
+        let conn = self.lock();
+        memory_lifecycle_conn(&conn, id)
+    }
+    pub fn set_memory_lifecycle(&self, id: &str, lifecycle: MemoryLifecycle) -> Result<bool> {
+        let conn = self.lock();
+        set_memory_lifecycle_conn(&conn, id, lifecycle)
     }
 
     // ---- proposals ----
@@ -627,20 +660,8 @@ impl EvolutionStore {
         id: &str,
         payload: &serde_json::Value,
     ) -> Result<()> {
-        if namespace.is_empty() || id.is_empty() {
-            return Err(EvolutionError::Validation(
-                "engine record namespace and id must not be empty".to_string(),
-            ));
-        }
         let conn = self.lock();
-        let now = now_ms() as i64;
-        conn.execute(
-            "INSERT INTO engine_records (namespace,id,payload,created_ms,updated_ms) VALUES (?1,?2,?3,?4,?4)
-             ON CONFLICT(namespace,id) DO UPDATE SET payload=excluded.payload, updated_ms=excluded.updated_ms",
-            params![namespace, id, to_json(payload)?, now],
-        )
-        .map_err(|e| EvolutionError::Store(e.to_string()))?;
-        Ok(())
+        save_engine_record_conn(&conn, namespace, id, payload)
     }
     /// All records in a namespace as `(id, payload)`, oldest first — the
     /// order engines append to their in-memory lists.
@@ -730,11 +751,14 @@ pub(crate) fn from_json_value<T: for<'de> serde::Deserialize<'de>>(
     serde_json::from_value(v).map_err(|e| EvolutionError::Serde(e.to_string()))
 }
 
-/// Insert or replace a memory entry on an already-locked connection.
+/// Insert or update a memory entry on an already-locked connection.
 ///
 /// `pub(crate)` so [`EvolutionStore::transact`] callers (e.g.
 /// [`crate::memory::LayeredMemory::remember`]) apply the same SQL and the
-/// same self-supersession guard as [`EvolutionStore::save_memory`].
+/// same self-supersession guard as [`EvolutionStore::save_memory`]. The
+/// update arm leaves `lifecycle` alone: rewriting a row's content is not a
+/// curation decision, so an archived row stays archived until
+/// [`crate::curator::Curator`] moves it.
 pub(crate) fn save_memory_conn(conn: &Connection, m: &MemoryEntry) -> Result<()> {
     // Guard the supersession chain: an entry must never supersede
     // itself (a self-loop makes the entry invisible to live listings
@@ -748,8 +772,13 @@ pub(crate) fn save_memory_conn(conn: &Connection, m: &MemoryEntry) -> Result<()>
         )));
     }
     conn.execute(
-        "INSERT OR REPLACE INTO memory_entries (id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        "INSERT INTO memory_entries (id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+         ON CONFLICT(id) DO UPDATE SET layer=excluded.layer, scope=excluded.scope, key=excluded.key,
+             value=excluded.value, status=excluded.status, confidence=excluded.confidence,
+             source_experience=excluded.source_experience, provenance=excluded.provenance,
+             created_ms=excluded.created_ms, updated_ms=excluded.updated_ms,
+             expires_ms=excluded.expires_ms, superseded_by=excluded.superseded_by",
         params![m.id, m.layer.as_str(), m.scope, m.key, m.value, m.status.as_str(), m.confidence, m.source_experience, m.provenance, m.created_ms as i64, m.updated_ms as i64, m.expires_ms.map(|x|x as i64), m.superseded_by],
     ).map_err(|e| EvolutionError::Store(e.to_string()))?;
     Ok(())
@@ -765,13 +794,135 @@ pub(crate) fn find_memory_conn(
     key: &str,
 ) -> Result<Option<MemoryEntry>> {
     let now = crate::types::now_ms() as i64;
-    let mut stmt = conn.prepare("SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE layer=?1 AND scope=?2 AND key=?3 AND superseded_by IS NULL AND (expires_ms IS NULL OR expires_ms > ?4) ORDER BY updated_ms DESC LIMIT 1")
+    let mut stmt = conn.prepare("SELECT id,layer,scope,key,value,status,confidence,source_experience,provenance,created_ms,updated_ms,expires_ms,superseded_by FROM memory_entries WHERE layer=?1 AND scope=?2 AND key=?3 AND superseded_by IS NULL AND lifecycle <> 'archived' AND (expires_ms IS NULL OR expires_ms > ?4) ORDER BY updated_ms DESC LIMIT 1")
         .map_err(|e| EvolutionError::Store(e.to_string()))?;
     let row = stmt
         .query_row(params![layer.as_str(), scope, key, now], map_mem)
         .optional()
         .map_err(|e| EvolutionError::Store(e.to_string()))?;
     Ok(row)
+}
+
+/// Persist an engine record on an already-locked connection.
+pub(crate) fn save_engine_record_conn(
+    conn: &Connection,
+    namespace: &str,
+    id: &str,
+    payload: &serde_json::Value,
+) -> Result<()> {
+    if namespace.is_empty() || id.is_empty() {
+        return Err(EvolutionError::Validation(
+            "engine record namespace and id must not be empty".to_string(),
+        ));
+    }
+    let now = now_ms() as i64;
+    conn.execute(
+        "INSERT INTO engine_records (namespace,id,payload,created_ms,updated_ms) VALUES (?1,?2,?3,?4,?4)
+         ON CONFLICT(namespace,id) DO UPDATE SET payload=excluded.payload, updated_ms=excluded.updated_ms",
+        params![namespace, id, to_json(payload)?, now],
+    )
+    .map_err(|e| EvolutionError::Store(e.to_string()))?;
+    Ok(())
+}
+
+/// Read one engine record's payload from an already-locked connection.
+pub(crate) fn find_engine_record_conn(
+    conn: &Connection,
+    namespace: &str,
+    id: &str,
+) -> Result<Option<serde_json::Value>> {
+    let payload: Option<String> = conn
+        .query_row(
+            "SELECT payload FROM engine_records WHERE namespace=?1 AND id=?2",
+            params![namespace, id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| EvolutionError::Store(e.to_string()))?;
+    payload
+        .map(|p| serde_json::from_str(&p).map_err(|e| EvolutionError::Serde(e.to_string())))
+        .transpose()
+}
+
+pub(crate) fn list_memory_lifecycle_conn(
+    conn: &Connection,
+    scope: Option<&str>,
+) -> Result<Vec<MemoryLifecycleRow>> {
+    let sql = if scope.is_some() {
+        "SELECT id,scope,key,value,created_ms,updated_ms,expires_ms,superseded_by,lifecycle FROM memory_entries WHERE scope=?1 ORDER BY updated_ms DESC, id ASC"
+    } else {
+        "SELECT id,scope,key,value,created_ms,updated_ms,expires_ms,superseded_by,lifecycle FROM memory_entries ORDER BY updated_ms DESC, id ASC"
+    };
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| EvolutionError::Store(e.to_string()))?;
+    let rows = if let Some(s) = scope {
+        stmt.query_map(params![s], map_memory_lifecycle)
+            .map_err(|e| EvolutionError::Store(e.to_string()))?
+    } else {
+        stmt.query_map([], map_memory_lifecycle)
+            .map_err(|e| EvolutionError::Store(e.to_string()))?
+    };
+    collect_rows(rows)
+}
+
+pub(crate) fn find_memory_lifecycle_conn(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<MemoryLifecycleRow>> {
+    let mut stmt = conn
+        .prepare("SELECT id,scope,key,value,created_ms,updated_ms,expires_ms,superseded_by,lifecycle FROM memory_entries WHERE id=?1")
+        .map_err(|e| EvolutionError::Store(e.to_string()))?;
+    stmt.query_row(params![id], map_memory_lifecycle)
+        .optional()
+        .map_err(|e| EvolutionError::Store(e.to_string()))
+}
+
+pub(crate) fn memory_lifecycle_conn(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<MemoryLifecycle>> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT lifecycle FROM memory_entries WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| EvolutionError::Store(e.to_string()))?;
+    match raw {
+        Some(raw) => MemoryLifecycle::parse(&raw)
+            .map(Some)
+            .ok_or_else(|| EvolutionError::Validation(format!("unknown memory lifecycle: {raw}"))),
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn set_memory_lifecycle_conn(
+    conn: &Connection,
+    id: &str,
+    lifecycle: MemoryLifecycle,
+) -> Result<bool> {
+    let n = conn
+        .execute(
+            "UPDATE memory_entries SET lifecycle=?2 WHERE id=?1",
+            params![id, lifecycle.as_str()],
+        )
+        .map_err(|e| EvolutionError::Store(e.to_string()))?;
+    Ok(n > 0)
+}
+
+/// Mark a memory row as used at `at_ms`. This is the only thing that moves
+/// an entry back toward `active`; the curator turns the newer timestamp into
+/// a lifecycle transition on its next sweep.
+pub(crate) fn mark_memory_used_conn(conn: &Connection, id: &str, at_ms: u64) -> Result<bool> {
+    let n = conn
+        .execute(
+            "UPDATE memory_entries SET updated_ms=?2 WHERE id=?1",
+            params![id, at_ms as i64],
+        )
+        .map_err(|e| EvolutionError::Store(e.to_string()))?;
+    Ok(n > 0)
 }
 
 fn collect_rows<T>(
@@ -915,6 +1066,30 @@ fn map_mem(r: &rusqlite::Row) -> rusqlite::Result<MemoryEntry> {
         updated_ms: r.get::<_, i64>(10)? as u64,
         expires_ms: r.get::<_, Option<i64>>(11)?.map(|x| x as u64),
         superseded_by: r.get(12)?,
+    })
+}
+
+fn map_memory_lifecycle(r: &rusqlite::Row) -> rusqlite::Result<MemoryLifecycleRow> {
+    let lifecycle_s: String = r.get(8)?;
+    Ok(MemoryLifecycleRow {
+        id: r.get(0)?,
+        scope: r.get(1)?,
+        key: r.get(2)?,
+        value: r.get(3)?,
+        created_ms: r.get::<_, i64>(4)? as u64,
+        updated_ms: r.get::<_, i64>(5)? as u64,
+        expires_ms: r.get::<_, Option<i64>>(6)?.map(|x| x as u64),
+        superseded: r.get::<_, Option<String>>(7)?.is_some(),
+        lifecycle: MemoryLifecycle::parse(&lifecycle_s).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                8,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown memory lifecycle: {lifecycle_s}"),
+                )),
+            )
+        })?,
     })
 }
 
@@ -1108,7 +1283,8 @@ fn migrate(conn: &Connection) -> Result<()> {
                 created_ms INTEGER NOT NULL,
                 updated_ms INTEGER NOT NULL,
                 expires_ms INTEGER,
-                superseded_by TEXT
+                superseded_by TEXT,
+                lifecycle TEXT NOT NULL DEFAULT 'active'
             );
             CREATE INDEX IF NOT EXISTS idx_mem_scope ON memory_entries(scope);
             CREATE INDEX IF NOT EXISTS idx_mem_layer ON memory_entries(layer);
@@ -1258,6 +1434,25 @@ fn migrate(conn: &Connection) -> Result<()> {
             .map_err(|e| EvolutionError::Store(e.to_string()))?;
     }
 
+    if version < 4 {
+        // v4: memory entries carry a lifecycle (`active`/`stale`/`archived`)
+        // so unused facts can be aged out of live prompts without deleting
+        // the row. Additive; a fresh v1 schema already has the column.
+        let has_lifecycle: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('memory_entries') WHERE name='lifecycle'")
+            .and_then(|mut s| s.exists([]))
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        if !has_lifecycle {
+            conn.execute(
+                "ALTER TABLE memory_entries ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'active'",
+                [],
+            )
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+        }
+        conn.pragma_update(None, "user_version", 4i64)
+            .map_err(|e| EvolutionError::Store(e.to_string()))?;
+    }
+
     Ok(())
 }
 
@@ -1339,6 +1534,49 @@ mod tests {
             expires_ms: None,
             superseded_by: superseded_by.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn an_existing_memory_table_gains_lifecycle_on_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("evolution.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE memory_entries (
+                    id TEXT PRIMARY KEY, layer TEXT NOT NULL, scope TEXT NOT NULL,
+                    key TEXT NOT NULL, value TEXT NOT NULL, status TEXT NOT NULL,
+                    confidence REAL NOT NULL, source_experience TEXT,
+                    provenance TEXT NOT NULL, created_ms INTEGER NOT NULL,
+                    updated_ms INTEGER NOT NULL, expires_ms INTEGER, superseded_by TEXT
+                );
+                INSERT INTO memory_entries VALUES
+                    ('mem-old','semantic','global','k','v','observed',0.5,NULL,'t',1,1,NULL,NULL);
+                "#,
+            )
+            .unwrap();
+        }
+
+        let store = EvolutionStore::open(&path).unwrap();
+        assert_eq!(
+            store.memory_lifecycle("mem-old").unwrap(),
+            Some(MemoryLifecycle::Active),
+            "rows written before the column existed default to active"
+        );
+        store
+            .set_memory_lifecycle("mem-old", MemoryLifecycle::Archived)
+            .unwrap();
+        drop(store);
+
+        let store = EvolutionStore::open(&path).unwrap();
+        assert_eq!(
+            store.memory_lifecycle("mem-old").unwrap(),
+            Some(MemoryLifecycle::Archived),
+            "reopening re-runs the migration without resetting state"
+        );
+        assert!(store.list_memory(None).unwrap().is_empty());
+        assert_eq!(store.list_memory_all(None).unwrap().len(), 1);
     }
 
     #[test]

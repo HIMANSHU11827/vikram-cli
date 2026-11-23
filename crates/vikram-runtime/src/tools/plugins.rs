@@ -4,6 +4,75 @@ use vikram_contracts::{ActionKind, PermissionRequest, SideEffect, Trust, VikramE
 use crate::PluginRegistry;
 
 use crate::tools::*;
+
+/// A callable a plugin declared in its own manifest, exposed to the model under `plugin.`.
+///
+/// The schema is built from the manifest rather than from anything the plugin prints at runtime,
+/// so a plugin cannot widen what the model is told it can ask for after it was installed.
+pub(crate) struct PluginToolCall {
+    plugin: String,
+    tool: crate::plugins::PluginTool,
+}
+
+impl PluginToolCall {
+    pub(crate) fn new(plugin: impl Into<String>, tool: crate::plugins::PluginTool) -> Self {
+        Self {
+            plugin: plugin.into(),
+            tool,
+        }
+    }
+
+    pub(crate) fn tool_name(&self) -> String {
+        format!("plugin.{}", self.tool.name)
+    }
+}
+
+impl Tool for PluginToolCall {
+    fn spec(&self) -> ToolSpec {
+        let mut properties = serde_json::Map::new();
+        for (name, description) in &self.tool.params {
+            properties.insert(
+                name.clone(),
+                json!({"type": "string", "description": description}),
+            );
+        }
+        ToolSpec {
+            name: self.tool_name(),
+            description: self.tool.description.clone(),
+            schema: json!({
+                "type": "object",
+                "properties": properties,
+                "required": self.tool.required,
+                "additionalProperties": false,
+            }),
+        }
+    }
+
+    fn permission(&self, _args: &Value) -> Result<PermissionRequest, VikramError> {
+        Ok(PermissionRequest::new(
+            ActionKind::Execute,
+            "plugin.execute",
+            self.tool_name(),
+            SideEffect::LocalMutation,
+            Trust::Model,
+        ))
+    }
+
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<ToolOutput, VikramError> {
+        let registry = PluginRegistry::for_workspace(&ctx.workspace_root);
+        let payload = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_owned());
+        match registry.execute(&self.plugin, payload.as_str()) {
+            Ok(out) => Ok(ToolOutput {
+                content: truncated(out),
+                ok: true,
+            }),
+            Err(err) => Ok(ToolOutput {
+                content: err,
+                ok: false,
+            }),
+        }
+    }
+}
 pub(crate) struct PluginExecute;
 
 impl Tool for PluginExecute {

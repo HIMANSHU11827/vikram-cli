@@ -13,8 +13,26 @@ use crate::error::Result;
 use crate::frontmatter::Frontmatter;
 use crate::metadata::{ActivationPolicy, SkillMetadata};
 use crate::paths;
-use crate::skill::{Compat, Scope, SkillId, SkillSummary};
+use crate::skill::{Compat, PersonaKind, Scope, SkillId, SkillSource, SkillSummary};
 use crate::trust::TrustPolicy;
+
+/// A persona whose own `skills/` directory should be discovered ahead of the shared roots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersonaSource {
+    pub home: PathBuf,
+    pub kind: PersonaKind,
+    pub slug: String,
+}
+
+impl PersonaSource {
+    pub fn new(home: impl Into<PathBuf>, kind: PersonaKind, slug: impl Into<String>) -> Self {
+        PersonaSource {
+            home: home.into(),
+            kind,
+            slug: slug.into(),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct DiscoveryOptions {
@@ -28,10 +46,15 @@ pub struct DiscoveryOptions {
     pub follow_symlinks: bool,
     /// Directory names never descended into.
     pub exclude: Vec<String>,
-    /// Overrides `<state_dir>` for the disabled list. `None` uses [`crate::paths::state_dir`].
+    /// Overrides `<state_dir>` for the disabled list. `None` uses [`crate::paths::state_dir`],
+    /// or the home root when one is given.
     pub state_dir: Option<PathBuf>,
     /// Overrides the trust policy read from `<state_dir>/trust.json`.
     pub trust: Option<TrustPolicy>,
+    /// Overrides `$VIKRAM_HOME` for the user roots, the state directory and the trust file.
+    pub home: Option<PathBuf>,
+    /// A persona's own roots, discovered before every shared root.
+    pub persona: Option<PersonaSource>,
 }
 
 impl Default for DiscoveryOptions {
@@ -47,6 +70,8 @@ impl Default for DiscoveryOptions {
             exclude: paths::default_excludes(),
             state_dir: None,
             trust: None,
+            home: None,
+            persona: None,
         }
     }
 }
@@ -73,6 +98,21 @@ impl DiscoveryOptions {
 
     pub fn with_trust(mut self, policy: TrustPolicy) -> Self {
         self.trust = Some(policy);
+        self
+    }
+
+    pub fn with_workspace(mut self, workspace: PathBuf) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
+
+    pub fn with_home(mut self, home: PathBuf) -> Self {
+        self.home = Some(home);
+        self
+    }
+
+    pub fn with_persona(mut self, persona: PersonaSource) -> Self {
+        self.persona = Some(persona);
         self
     }
 }
@@ -133,8 +173,18 @@ pub struct Catalog {
 
 impl Catalog {
     pub fn discover(opts: &DiscoveryOptions) -> Catalog {
-        let state = opts.state_dir.clone().unwrap_or_else(paths::state_dir);
-        let trust = opts.trust.clone().unwrap_or_else(TrustPolicy::load);
+        let state = opts
+            .state_dir
+            .clone()
+            .or_else(|| opts.home.as_deref().map(paths::state_dir_at))
+            .unwrap_or_else(paths::state_dir);
+        let trust = match &opts.trust {
+            Some(policy) => policy.clone(),
+            None => match opts.home.as_deref() {
+                Some(home) => TrustPolicy::load_in(&paths::state_dir_at(home)),
+                None => TrustPolicy::load(),
+            },
+        };
         let mut catalog = Catalog::default();
         let (disabled, disabled_unknown) = match read_disabled(&state) {
             Ok(disabled) => (disabled, false),
@@ -161,7 +211,7 @@ impl Catalog {
                 if let Some((summary, policy)) = summarize(
                     &dir,
                     Ok(skill.content.to_string()),
-                    Scope::Builtin,
+                    SkillSource::Builtin,
                     Compat::Native,
                     &trust,
                     &disabled,
@@ -173,7 +223,13 @@ impl Catalog {
             }
         }
 
-        for (scope, compat, root) in collect_sources(opts) {
+        for SourceRoot {
+            scope,
+            compat,
+            root,
+            source,
+        } in collect_sources(opts)
+        {
             if !root.is_dir() {
                 continue;
             }
@@ -182,7 +238,7 @@ impl Catalog {
             let mut exclude = opts.exclude.clone();
             if scope == Scope::User
                 && compat == Compat::Native
-                && same_path(&root, &paths::user_skills_dir())
+                && same_path(&root, &user_skills_root(opts))
             {
                 exclude.extend(paths::compat_subdirs());
             }
@@ -210,7 +266,7 @@ impl Catalog {
                 if let Some((summary, policy)) = summarize(
                     &dir,
                     text,
-                    scope,
+                    source.clone(),
                     compat,
                     &trust,
                     &disabled,
@@ -229,7 +285,7 @@ impl Catalog {
                 catalog.stats.duplicates += list.len() - 1;
                 let names: Vec<String> = list
                     .iter()
-                    .map(|s| format!("{} ({})", s.dir.display(), s.scope.label()))
+                    .map(|s| format!("{} ({})", s.dir.display(), s.source))
                     .collect();
                 let path = list[0].dir.clone();
                 catalog.diagnostics.push(Diagnostic::new(
@@ -246,6 +302,26 @@ impl Catalog {
         }
         catalog.policies = policies;
         catalog
+    }
+
+    /// Build a catalog for `workspace_root` with an optional persona tier ahead of the shared
+    /// roots. With `persona: None` the result is the same set `SkillRegistry::for_workspace`
+    /// scans: user roots, then project roots, no builtins.
+    pub fn for_workspace_and_persona(
+        workspace: &Path,
+        home: &Path,
+        persona: Option<(&str, PersonaKind)>,
+    ) -> Catalog {
+        let mut opts = DiscoveryOptions {
+            include_user: true,
+            ..DiscoveryOptions::roots_only()
+        }
+        .with_home(home.to_path_buf())
+        .with_workspace(workspace.to_path_buf());
+        if let Some((slug, kind)) = persona {
+            opts = opts.with_persona(PersonaSource::new(home, kind, slug));
+        }
+        Catalog::discover(&opts)
     }
 
     /// The precedence winner for a name.
@@ -360,19 +436,89 @@ fn record(
     policies.entry(name).or_insert(policy);
 }
 
-fn collect_sources(opts: &DiscoveryOptions) -> Vec<(Scope, Compat, PathBuf)> {
-    let mut sources: Vec<(Scope, Compat, PathBuf)> = Vec::new();
+/// One root to walk plus the origin recorded on every skill found under it.
+#[derive(Debug)]
+struct SourceRoot {
+    scope: Scope,
+    compat: Compat,
+    root: PathBuf,
+    source: SkillSource,
+}
+
+/// A root that claims `Scope::Persona` without a persona configured cannot be attributed, so it
+/// is skipped rather than mislabelled.
+fn source_root(
+    scope: Scope,
+    compat: Compat,
+    root: PathBuf,
+    persona: Option<&PersonaSource>,
+) -> Option<SourceRoot> {
+    let source = match scope {
+        Scope::Builtin => SkillSource::Builtin,
+        Scope::User => SkillSource::User,
+        Scope::Project => SkillSource::Project,
+        Scope::Imported => SkillSource::Imported,
+        Scope::External => SkillSource::External,
+        Scope::Persona => SkillSource::Persona {
+            kind: persona?.kind,
+            slug: persona?.slug.clone(),
+        },
+    };
+    Some(SourceRoot {
+        scope,
+        compat,
+        root,
+        source,
+    })
+}
+
+fn push_roots(
+    out: &mut Vec<SourceRoot>,
+    roots: Vec<(Scope, Compat, PathBuf)>,
+    persona: Option<&PersonaSource>,
+) {
+    for (scope, compat, root) in roots {
+        if let Some(source) = source_root(scope, compat, root, persona) {
+            out.push(source);
+        }
+    }
+}
+
+fn collect_sources(opts: &DiscoveryOptions) -> Vec<SourceRoot> {
+    let persona = opts.persona.as_ref();
+    let mut sources = Vec::new();
+    if let Some(persona) = persona {
+        push_roots(
+            &mut sources,
+            paths::persona_skill_dirs(&persona.home, &persona.slug, persona.kind),
+            Some(persona),
+        );
+    }
     if let Some(workspace) = &opts.workspace {
-        sources.extend(paths::project_skill_dirs(workspace));
+        push_roots(&mut sources, paths::project_skill_dirs(workspace), persona);
     }
     if opts.include_user {
-        sources.extend(paths::user_skill_dirs());
+        push_roots(&mut sources, user_skill_dirs(opts), persona);
     }
-    sources.extend(opts.extra.iter().cloned());
+    push_roots(&mut sources, opts.extra.clone(), persona);
     if !opts.include_compat {
-        sources.retain(|(_, compat, _)| *compat == Compat::Native);
+        sources.retain(|source| source.compat == Compat::Native);
     }
     sources
+}
+
+fn user_skill_dirs(opts: &DiscoveryOptions) -> Vec<(Scope, Compat, PathBuf)> {
+    match &opts.home {
+        Some(home) => paths::user_skill_dirs_at(home),
+        None => paths::user_skill_dirs(),
+    }
+}
+
+fn user_skills_root(opts: &DiscoveryOptions) -> PathBuf {
+    match &opts.home {
+        Some(home) => paths::user_skills_dir_at(home),
+        None => paths::user_skills_dir(),
+    }
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -530,7 +676,7 @@ fn first_line(text: &str) -> String {
 fn summarize(
     dir: &Path,
     text: Result<String>,
-    scope: Scope,
+    source: SkillSource,
     compat: Compat,
     trust: &TrustPolicy,
     disabled: &BTreeSet<SkillId>,
@@ -549,6 +695,7 @@ fn summarize(
             return None;
         }
     };
+    let scope = source.scope();
     let mut summary = SkillSummary {
         enabled: !disabled_unknown && !disabled.contains(&name),
         name,
@@ -561,6 +708,7 @@ fn summarize(
         version: None,
         categories: Vec::new(),
         tags: Vec::new(),
+        source,
     };
     let mut activation = ActivationPolicy::Suggested;
 
@@ -629,6 +777,7 @@ fn read_disabled(state_dir: &Path) -> std::result::Result<BTreeSet<SkillId>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loader::{Budget, Loader};
     use crate::skill::TrustLevel;
 
     fn write_skill(root: &Path, name: &str, body: &str) {
@@ -1001,5 +1150,217 @@ mod tests {
             catalog.resolve("alpha").expect("found").trust,
             TrustLevel::Community
         );
+    }
+
+    fn persona_options(
+        workspace: &Path,
+        home: &Path,
+        persona: Option<(&str, PersonaKind)>,
+    ) -> DiscoveryOptions {
+        let mut options = DiscoveryOptions {
+            include_user: true,
+            ..DiscoveryOptions::roots_only()
+        }
+        .with_home(home.to_path_buf())
+        .with_workspace(workspace.to_path_buf());
+        if let Some((slug, kind)) = persona {
+            options = options.with_persona(PersonaSource::new(home, kind, slug));
+        }
+        options
+    }
+
+    fn snapshot(catalog: &Catalog) -> Vec<(String, PathBuf, Scope)> {
+        catalog
+            .list()
+            .iter()
+            .map(|summary| {
+                (
+                    summary.name.as_str().to_string(),
+                    summary.dir.clone(),
+                    summary.scope,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_persona_skill_is_discovered_before_a_user_skill() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let workspace = tmp.path().join("ws");
+        let home = tmp.path().join("home");
+        let persona_root = home.join("agents/reviewer/skills");
+        let user_root = home.join("skills");
+        write_skill(
+            &persona_root,
+            "persona-only",
+            &skill_doc("persona-only", "from the persona"),
+        );
+        write_skill(
+            &user_root,
+            "user-only",
+            &skill_doc("user-only", "from the user"),
+        );
+
+        let options = persona_options(&workspace, &home, Some(("reviewer", PersonaKind::Agent)));
+        let sources = collect_sources(&options);
+        assert_eq!(sources[0].root, persona_root);
+        assert_eq!(sources[0].scope, Scope::Persona);
+        let user_index = sources
+            .iter()
+            .position(|source| source.root == user_root)
+            .expect("user root");
+        assert!(user_index > 0, "{sources:?}");
+
+        let catalog = Catalog::discover(&options);
+        let persona = catalog.resolve("persona-only").expect("persona skill");
+        assert_eq!(
+            persona.source,
+            SkillSource::Persona {
+                kind: PersonaKind::Agent,
+                slug: "reviewer".to_string(),
+            }
+        );
+        assert_eq!(persona.scope, Scope::Persona);
+        assert_eq!(
+            catalog.resolve("user-only").expect("user skill").source,
+            SkillSource::User
+        );
+    }
+
+    #[test]
+    fn a_persona_skill_shadows_a_user_skill_with_the_same_name() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let workspace = tmp.path().join("ws");
+        let home = tmp.path().join("home");
+        let persona_dir = home.join("agents/reviewer/skills/alpha");
+        let user_dir = home.join("skills/alpha");
+        write_skill(
+            &home.join("agents/reviewer/skills"),
+            "alpha",
+            "---\nname: alpha\ndescription: persona alpha\n---\npersona body\n",
+        );
+        write_skill(
+            &home.join("skills"),
+            "alpha",
+            "---\nname: alpha\ndescription: user alpha\n---\nuser body\n",
+        );
+
+        let catalog = Catalog::for_workspace_and_persona(
+            &workspace,
+            &home,
+            Some(("reviewer", PersonaKind::Agent)),
+        );
+
+        let alpha: Vec<&SkillSummary> = catalog
+            .list()
+            .into_iter()
+            .filter(|summary| summary.name.as_str() == "alpha")
+            .collect();
+        assert_eq!(alpha.len(), 1, "the catalogue lists one entry per name");
+        assert_eq!(alpha[0].dir, persona_dir);
+        assert_eq!(alpha[0].description, "persona alpha");
+        assert_eq!(alpha[0].scope, Scope::Persona);
+        assert_eq!(catalog.stats.duplicates, 1);
+        assert_eq!(
+            catalog.resolve("alpha").expect("winner").dir,
+            persona_dir,
+            "the persona copy shadows the user copy"
+        );
+
+        let winner = catalog.resolve("alpha").expect("winner");
+        let loaded = Loader::new(Budget::default()).load(winner).expect("load");
+        assert!(loaded.instructions.contains("persona body"));
+        assert!(!loaded.instructions.contains("user body"));
+        assert_ne!(winner.dir, user_dir);
+    }
+
+    #[test]
+    fn a_registry_without_a_persona_finds_exactly_what_it_found_before() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let workspace = tmp.path().join("ws");
+        let home = tmp.path().join("home");
+        write_skill(
+            &workspace.join("skills"),
+            "alpha",
+            &skill_doc("alpha", "from the project"),
+        );
+        write_skill(
+            &home.join("skills"),
+            "beta",
+            &skill_doc("beta", "from the user"),
+        );
+        write_skill(
+            &home.join("agents/reviewer/skills"),
+            "gamma",
+            &skill_doc("gamma", "persona-only"),
+        );
+
+        let mut legacy = DiscoveryOptions::roots_only()
+            .with_state_dir(home.join("skills/.vikram"))
+            .with_trust(TrustPolicy::default());
+        for (scope, compat, root) in paths::user_skill_dirs_at(&home) {
+            legacy = legacy.with_root(scope, compat, root);
+        }
+        for (scope, compat, root) in paths::project_skill_dirs(&workspace) {
+            legacy = legacy.with_root(scope, compat, root);
+        }
+
+        let without_persona = Catalog::for_workspace_and_persona(&workspace, &home, None);
+
+        assert_eq!(
+            snapshot(&without_persona),
+            snapshot(&Catalog::discover(&legacy))
+        );
+        assert_eq!(
+            snapshot(&without_persona),
+            vec![
+                (
+                    "alpha".to_string(),
+                    workspace.join("skills/alpha"),
+                    Scope::Project
+                ),
+                ("beta".to_string(), home.join("skills/beta"), Scope::User),
+            ]
+        );
+        assert!(
+            without_persona
+                .list()
+                .iter()
+                .all(|summary| summary.source.persona().is_none())
+        );
+        assert!(without_persona.resolve("gamma").is_none());
+    }
+
+    #[test]
+    fn a_missing_persona_directory_is_not_an_error() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let workspace = tmp.path().join("ws");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        write_skill(
+            &home.join("skills"),
+            "shared",
+            &skill_doc("shared", "from the user"),
+        );
+
+        let catalog = Catalog::for_workspace_and_persona(
+            &workspace,
+            &home,
+            Some(("absent", PersonaKind::Bot)),
+        );
+
+        assert!(catalog.diagnostics_at(DiagnosticLevel::Error).is_empty());
+        assert_eq!(
+            catalog.resolve("shared").expect("shared").scope,
+            Scope::User
+        );
+        assert!(
+            catalog
+                .list()
+                .iter()
+                .all(|summary| summary.source.persona().is_none())
+        );
+        assert_eq!(catalog.stats.sources, 1);
+        assert!(catalog.resolve("missing").is_none());
     }
 }

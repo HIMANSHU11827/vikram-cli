@@ -30,6 +30,7 @@ use crate::heartbeat::{Beat, BeatKind, Heartbeat, Policy};
 use crate::jobs::{Claimed, JobManager};
 use crate::notify::{self, Destination, Notice};
 use crate::postbox::Postbox;
+use crate::presence::Presence;
 use crate::runner::{self, AgentRequest, RunOutcome};
 use crate::store::{Delivery, Job, JobMode, Run, RunStatus, ScheduleStore, StoreError};
 use crate::time::{self, Millis};
@@ -259,7 +260,7 @@ pub struct TickReport {
     pub refused: Vec<String>,
     /// Jobs an event armed this pass.
     pub triggered: Vec<String>,
-    /// Jobs and notifications quiet hours held back this pass.
+    /// Jobs and notifications quiet hours or presence held back this pass.
     pub suppressed: Vec<String>,
 }
 
@@ -412,23 +413,27 @@ impl Daemon {
 
         let quiet = QuietHours::load(&self.store)?;
         let silent = quiet.is_quiet(now);
+        let presence = Presence::load(&self.store)?;
         for job in self.store.due_jobs(now)? {
             // The slot to claim is the one the store says is due. Recomputing it from the schedule
             // would produce the *following* slot and the compare-and-set would never match.
             let Some(slot) = job.next_run_ms else {
                 continue;
             };
-            // Quiet hours suppress non-urgent work: the slot is advanced exactly like a stale one
-            // — skipped, not replayed — and the decision is audited. Urgent jobs still fire.
-            if silent && job.priority < URGENT_PRIORITY {
+            // Quiet hours and sleep both suppress non-urgent work: the slot is advanced exactly
+            // like a stale one — skipped, not replayed — and the decision is audited naming which
+            // rule held it back. Urgent jobs still fire under both.
+            let held = if !presence.starts_work() && job.priority < URGENT_PRIORITY {
+                Some(presence.silence().to_string())
+            } else if silent && job.priority < URGENT_PRIORITY {
+                Some(format!("quiet hours {}", quiet.describe()))
+            } else {
+                None
+            };
+            if let Some(reason) = held {
                 let next = self.jobs.next_slot(&job, now);
                 self.store.skip_slot(&job.id, next, now)?;
-                self.store.audit(
-                    "job.suppress",
-                    &job.id,
-                    &format!("quiet hours {}", quiet.describe()),
-                    now,
-                )?;
+                self.store.audit("job.suppress", &job.id, &reason, now)?;
                 report.suppressed.push(job.id);
                 continue;
             }
@@ -545,8 +550,8 @@ impl Daemon {
     /// was away is history, not work — and the cursor still advances past them.
     ///
     /// A fire that armed anything is one decision, so it is recorded once: one audit row, and one
-    /// notification through the same local log every other daemon notice uses. Quiet hours hold
-    /// that notification back like any other non-urgent notice, and the hold is audited.
+    /// notification through the same local log every other daemon notice uses. Quiet hours and sleep
+    /// hold that notification back like any other non-urgent notice, and the hold is audited.
     async fn drain_events(&self, now: Millis, report: &mut TickReport) -> Result<(), StoreError> {
         const SEEN_KEY: &str = "events.seen";
         let seen = self.store.state_ms(SEEN_KEY).ok().flatten().unwrap_or(0);
@@ -608,9 +613,12 @@ impl Daemon {
                 let silent = QuietHours::load(&self.store)
                     .map(|quiet| quiet.is_quiet(now))
                     .unwrap_or(false);
-                if silent {
-                    self.store
-                        .audit("notify.suppress", &subject, "quiet hours", now)?;
+                let presence = Presence::load(&self.store)?;
+                let held = presence
+                    .silence_reason(0)
+                    .or(silent.then_some("quiet hours"));
+                if let Some(reason) = held {
+                    self.store.audit("notify.suppress", &subject, reason, now)?;
                     report.suppressed.push(format!("notify:{subject}"));
                 } else {
                     let notice = Notice {
@@ -847,19 +855,25 @@ impl Daemon {
             session: done.outcome.session.clone(),
             at: now,
         };
-        // Quiet hours hold back reports from non-urgent jobs. The run itself already settled —
-        // suppression is a delivery decision, recorded as `suppressed` rather than as a failure.
+        // Quiet hours and sleep hold back reports from non-urgent jobs. The run itself already
+        // settled — suppression is a delivery decision, recorded as `suppressed` rather than as a
+        // failure, and the note says which rule held it.
         let urgent = job.priority >= URGENT_PRIORITY;
         let silent = QuietHours::load(&self.store)
             .map(|quiet| quiet.is_quiet(now))
             .unwrap_or(false);
+        let presence = Presence::load(&self.store)?;
         match Destination::parse(&job.target) {
             Ok(destination) => {
-                if silent && !urgent && destination != Destination::None {
+                let held = presence
+                    .silence_reason(job.priority)
+                    .or_else(|| (silent && !urgent).then_some("quiet hours"));
+                if let Some(reason) = held
+                    && destination != Destination::None
+                {
                     self.store
-                        .set_delivery_note(&run.id, Delivery::Suppressed, "quiet hours")?;
-                    self.store
-                        .audit("notify.suppress", &job.id, "quiet hours", now)?;
+                        .set_delivery_note(&run.id, Delivery::Suppressed, reason)?;
+                    self.store.audit("notify.suppress", &job.id, reason, now)?;
                     report.suppressed.push(format!("notify:{}", job.id));
                     return Ok(());
                 }
@@ -922,19 +936,22 @@ impl Daemon {
         if heartbeat.next_due(now).is_none() {
             return Ok(());
         }
-        // Heartbeat notices are non-urgent by definition: quiet hours hold them like any other
-        // report, and the suppression is audited rather than silently dropped.
+        // Heartbeat notices are non-urgent by definition: quiet hours and sleep hold them like any
+        // other report, and the suppression is audited rather than silently dropped.
         let silent = QuietHours::load(&self.store)
             .map(|quiet| quiet.is_quiet(now))
             .unwrap_or(false);
+        let presence = Presence::load(&self.store)?;
         for kind in [BeatKind::Runtime, BeatKind::Agent, BeatKind::Workers] {
             match heartbeat.beat(kind, now) {
                 Ok(beat) => {
                     if !beat.notify.is_empty() {
                         let subject = format!("heartbeat.{}", beat.kind.as_str());
-                        if silent {
-                            self.store
-                                .audit("notify.suppress", &subject, "quiet hours", now)?;
+                        if let Some(reason) = presence
+                            .silence_reason(0)
+                            .or(silent.then_some("quiet hours"))
+                        {
+                            self.store.audit("notify.suppress", &subject, reason, now)?;
                             report.suppressed.push(format!("notify:{subject}"));
                         } else {
                             let notice = Notice {
@@ -1076,13 +1093,18 @@ fn work_for(job: &Job, timeout: Millis, stop: Option<runner::StopProbe>) -> Work
                 };
                 runner::run_hive_roster(config, request, limit).await
             }
+            // The one mode that improves Vikram itself: the evolution loop, run without a model and
+            // without a session, so a machine nobody is sitting at still consolidates what it learned.
+            JobMode::Maintenance => {
+                runner::run_maintenance(vikram_runtime::config::vikram_home(), limit).await
+            }
         }
     })
 }
 
 fn class_of(mode: JobMode) -> TaskClass {
     match mode {
-        JobMode::Script => TaskClass::Script,
+        JobMode::Script | JobMode::Maintenance => TaskClass::Script,
         JobMode::Agent | JobMode::Delegate => TaskClass::Agent,
         JobMode::Workflow => TaskClass::Workflow,
     }
@@ -1119,6 +1141,7 @@ pub fn pair(store: &ScheduleStore, job_id: &str) -> Option<(Job, Vec<Run>)> {
 mod tests {
     use super::*;
     use crate::jobs::NewJob;
+    use crate::presence::Liveness;
 
     fn store() -> ScheduleStore {
         let store = ScheduleStore::open_in_memory().unwrap();
@@ -1864,6 +1887,156 @@ mod tests {
         );
         let trail = store.audit_trail(50).unwrap();
         assert!(trail.iter().any(|row| row.kind == "notify.suppress"));
+    }
+
+    #[tokio::test]
+    async fn presence_holds_back_the_report_and_records_which_rule_did_it() {
+        let store = store();
+        let manager = JobManager::new(store.clone());
+        let now = time::now_ms();
+        let awake_job = manager
+            .create(
+                NewJob::new("awake report", "every 1m")
+                    .mode(JobMode::Script)
+                    .payload("echo awake report")
+                    .target("local"),
+                now,
+            )
+            .unwrap();
+        let dir = home();
+        let mut daemon = Daemon::new(store.clone(), dir.path()).with_tick_ms(50);
+        manager.run_now(&awake_job.id, now).unwrap();
+        daemon.tick(time::now_ms()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let delivered = daemon.tick(time::now_ms()).await.unwrap();
+        assert!(
+            delivered
+                .delivered
+                .iter()
+                .any(|(subject, ok)| subject == &awake_job.id && *ok),
+            "an awake assistant delivers the report: {:?}",
+            delivered.delivered
+        );
+        assert_eq!(
+            store.runs_for(&awake_job.id, 1).unwrap().remove(0).delivery,
+            Delivery::Delivered
+        );
+
+        // A second run starts while awake and settles after the operator puts the assistant to
+        // sleep: the work finishes, the report is held.
+        let held = manager
+            .create(
+                NewJob::new("held report", "every 1m")
+                    .mode(JobMode::Script)
+                    .payload("echo held report")
+                    .target("local"),
+                time::now_ms(),
+            )
+            .unwrap();
+        manager.run_now(&held.id, time::now_ms()).unwrap();
+        daemon.tick(time::now_ms()).await.unwrap();
+        let asleep = time::now_ms();
+        Presence::default()
+            .moved(Liveness::Asleep, asleep)
+            .apply(&store, asleep)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let report = daemon.tick(time::now_ms()).await.unwrap();
+        assert!(
+            report
+                .suppressed
+                .iter()
+                .any(|s| s == &format!("notify:{}", held.id)),
+            "{:?}",
+            report.suppressed
+        );
+
+        let run = store.runs_for(&held.id, 1).unwrap().remove(0);
+        assert_eq!(run.status, RunStatus::Ok, "the work still ran");
+        assert_eq!(run.delivery, Delivery::Suppressed);
+        assert!(
+            run.delivery_note.contains("asleep"),
+            "the note names the rule: {}",
+            run.delivery_note
+        );
+        let trail = store.audit_trail(50).unwrap();
+        assert!(
+            trail.iter().any(|row| row.kind == "notify.suppress"
+                && row.subject == held.id
+                && row.detail.contains("asleep")),
+            "{trail:?}"
+        );
+        assert!(
+            !std::fs::read_to_string(notify::log_path(dir.path()))
+                .unwrap_or_default()
+                .contains(&held.id),
+            "the held report never reached the notification log"
+        );
+    }
+
+    #[tokio::test]
+    async fn asleep_skips_ordinary_jobs_but_urgent_ones_still_run() {
+        let store = store();
+        let manager = JobManager::new(store.clone());
+        let now = time::now_ms();
+        let ordinary = manager
+            .create(
+                NewJob::new("ordinary", "every 1m")
+                    .mode(JobMode::Script)
+                    .payload("echo ordinary")
+                    .target("none"),
+                now,
+            )
+            .unwrap();
+        let urgent = manager
+            .create(
+                NewJob::new("urgent", "every 1m")
+                    .mode(JobMode::Script)
+                    .payload("echo urgent")
+                    .target("none")
+                    .priority(URGENT_PRIORITY),
+                now,
+            )
+            .unwrap();
+        manager.run_now(&ordinary.id, now).unwrap();
+        manager.run_now(&urgent.id, now).unwrap();
+        let asleep = time::now_ms();
+        Presence::default()
+            .moved(Liveness::Asleep, asleep)
+            .apply(&store, asleep)
+            .unwrap();
+
+        let dir = home();
+        let mut daemon = Daemon::new(store.clone(), dir.path()).with_tick_ms(50);
+        let report = daemon.tick(time::now_ms()).await.unwrap();
+        assert!(
+            report.suppressed.contains(&ordinary.id),
+            "{:?}",
+            report.suppressed
+        );
+        assert!(
+            report.dispatched.contains(&urgent.id),
+            "{:?}",
+            report.dispatched
+        );
+        assert!(store.runs_for(&ordinary.id, 5).unwrap().is_empty());
+        assert_eq!(
+            store.get_job(&ordinary.id).unwrap().unwrap().last_status,
+            "skipped"
+        );
+        assert_eq!(
+            store.runs_for(&urgent.id, 5).unwrap().len(),
+            1,
+            "an urgent job runs while the assistant is asleep"
+        );
+
+        let trail = store.audit_trail(50).unwrap();
+        assert!(
+            trail.iter().any(|row| row.kind == "job.suppress"
+                && row.subject == ordinary.id
+                && row.detail.contains("asleep")),
+            "{trail:?}"
+        );
     }
 
     #[tokio::test]

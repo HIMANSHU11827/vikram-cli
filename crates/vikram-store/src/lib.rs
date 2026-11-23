@@ -519,6 +519,21 @@ pub struct TicketEventRow {
     pub payload: serde_json::Value,
 }
 
+/// A spawned orchestrator worker, durable across restarts. `session`, `parent` and `status` are
+/// columns so a boot can list the workers a crashed run left behind; `record` is the serialized
+/// `WorkerRecord` the runtime reconstructs, so this crate stays ignorant of the runtime's types.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerRow {
+    pub id: String,
+    pub session: String,
+    pub parent: String,
+    pub status: String,
+    pub attempts: u32,
+    pub record: String,
+    pub created_ms: u64,
+    pub updated_ms: u64,
+}
+
 /// Recommended retention window for append-only side tables (hive messages, ticket events, usage,
 /// file changes). The journal is exempt from this sweep: `read_after` cursors, crash recovery and
 /// compaction replay all depend on it. [`Store::prune_journal`] is the only journal
@@ -2968,6 +2983,34 @@ impl Store {
         Ok(rows)
     }
 
+    /// What one profile can invoke: the entities it owns plus the shared machine-wide ones.
+    /// `entities.profile_id IS NULL` marks a definition that belongs to the machine rather than
+    /// to a single profile, so it stays visible to every profile.
+    pub fn list_entities_for_profile(&self, profile: &ProfileId) -> Result<Vec<EntityRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, owner_user, kind, name, slug, title, role, specialization, description, icon, model, profile_id, status, created_ms, updated_ms
+             FROM entities WHERE profile_id = ?1 OR profile_id IS NULL ORDER BY created_ms ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![profile.as_str()], parse_entity_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The entities this profile owns alone. Machine-wide rows (`profile_id IS NULL`) are excluded.
+    pub fn list_entities_owned_by_profile(&self, profile: &ProfileId) -> Result<Vec<EntityRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, owner_user, kind, name, slug, title, role, specialization, description, icon, model, profile_id, status, created_ms, updated_ms
+             FROM entities WHERE profile_id = ?1 ORDER BY created_ms ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![profile.as_str()], parse_entity_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn get_entity(&self, id: &EntityId) -> Result<Option<EntityRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -4176,6 +4219,61 @@ impl Store {
         Ok(count as u64)
     }
 
+    // ---- workers ----------------------------------------------------------
+
+    /// Write one worker row, replacing any row with the same id. A retry, a status change or a
+    /// finished artifact rewrites the same row instead of appending a history of it.
+    pub fn upsert_worker(&self, row: &WorkerRow) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO workers (id, session, parent, status, attempts, record, created_ms, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                 session = excluded.session,
+                 parent = excluded.parent,
+                 status = excluded.status,
+                 attempts = excluded.attempts,
+                 record = excluded.record,
+                 updated_ms = excluded.updated_ms",
+            params![
+                row.id,
+                row.session,
+                row.parent,
+                row.status,
+                row.attempts as i64,
+                row.record,
+                row.created_ms as i64,
+                row.updated_ms as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_worker(&self, id: &str) -> Result<Option<WorkerRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, session, parent, status, attempts, record, created_ms, updated_ms
+             FROM workers WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(parse_worker_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every durable worker, oldest first so a boot restores them in spawn order.
+    pub fn list_workers(&self) -> Result<Vec<WorkerRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, session, parent, status, attempts, record, created_ms, updated_ms
+             FROM workers ORDER BY created_ms, id",
+        )?;
+        let rows = stmt
+            .query_map([], parse_worker_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     // ---- retention --------------------------------------------------------
 
     /// Delete rows older than `max_age_ms` before `now_ms` from the append-only side tables
@@ -4287,6 +4385,19 @@ fn parse_hive_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HiveRow> {
         policy: row.get(7)?,
         created_ms: row.get::<_, i64>(8)? as u64,
         updated_ms: row.get::<_, i64>(9)? as u64,
+    })
+}
+
+fn parse_worker_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerRow> {
+    Ok(WorkerRow {
+        id: row.get(0)?,
+        session: row.get(1)?,
+        parent: row.get(2)?,
+        status: row.get(3)?,
+        attempts: row.get::<_, i64>(4)? as u32,
+        record: row.get(5)?,
+        created_ms: row.get::<_, i64>(6)? as u64,
+        updated_ms: row.get::<_, i64>(7)? as u64,
     })
 }
 
@@ -4771,6 +4882,23 @@ fn migrate(conn: &Connection) -> Result<()> {
             payload     TEXT NOT NULL DEFAULT '{}'
         );
         CREATE INDEX IF NOT EXISTS te_ticket ON ticket_events(ticket, ts_ms);
+
+        -- Spawned workers survive the process that spawned them: one row per worker id, replaced
+        -- on every status/attempt/artifact change, so a restart lists the partial ones and can
+        -- resume them instead of losing the team.
+        CREATE TABLE IF NOT EXISTS workers (
+            id          TEXT PRIMARY KEY,
+            session     TEXT NOT NULL,
+            parent      TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            attempts    INTEGER NOT NULL,
+            record      TEXT NOT NULL,
+            created_ms  INTEGER NOT NULL,
+            updated_ms  INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS workers_session ON workers(session);
+        CREATE INDEX IF NOT EXISTS workers_parent ON workers(parent);
+        CREATE INDEX IF NOT EXISTS workers_status ON workers(status);
         "#,
     )?;
     // Columns added after the first release. SQLite has no `ADD COLUMN IF NOT EXISTS`, so each
@@ -4808,6 +4936,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT ''",
     )?;
     ensure_column(conn, "entities", "status", "TEXT NOT NULL DEFAULT 'active'")?;
+    ensure_profile_scoped_entity_index(conn)?;
 
     // Title provenance. The default is `manual` because a row that predates this column already had
     // its name chosen by whoever created it, and an unrecognised title must never be overwritten by
@@ -4902,6 +5031,33 @@ fn title_migration_needed(conn: &Connection) -> Result<bool> {
 
 fn mark_title_migration_done(conn: &Connection) -> Result<()> {
     conn.execute_batch(&format!("PRAGMA user_version = {TITLE_SCHEMA_VERSION}"))?;
+    Ok(())
+}
+
+/// Widen the entity slug index to include the profile, so two accounts can each own an agent with the
+/// same slug. Machine-wide rows store NULL and SQLite treats NULLs as distinct, so the index folds
+/// NULL to the empty string and "one machine-wide definition per slug" stays a real constraint.
+/// Also indexes `profile_id` itself, because every profile-scoped listing filters on it.
+fn ensure_profile_scoped_entity_index(conn: &Connection) -> Result<()> {
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS entities_profile ON entities(profile_id);")?;
+    let current: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'entities_slug'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if current
+        .as_deref()
+        .is_some_and(|sql| sql.contains("COALESCE"))
+    {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS entities_slug;
+         CREATE UNIQUE INDEX entities_slug
+             ON entities(owner_user, kind, slug, COALESCE(profile_id, ''));",
+    )?;
     Ok(())
 }
 
@@ -5237,6 +5393,60 @@ impl JournalSink for SqliteJournal {
 mod tests {
     use super::*;
 
+    fn worker_row(id: &str, status: &str, attempts: u32) -> WorkerRow {
+        WorkerRow {
+            id: id.into(),
+            session: format!("ses-{id}"),
+            parent: "ses-parent".into(),
+            status: status.into(),
+            attempts,
+            record: format!("{{\"id\":\"{id}\"}}"),
+            created_ms: 10,
+            updated_ms: 10,
+        }
+    }
+
+    #[test]
+    fn workers_round_trip_and_upsert_replaces_the_row() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_worker(&worker_row("wrk-1", "running", 1))
+            .unwrap();
+        store
+            .upsert_worker(&worker_row("wrk-2", "partial", 1))
+            .unwrap();
+        assert_eq!(store.list_workers().unwrap().len(), 2);
+
+        let mut changed = worker_row("wrk-1", "partial", 2);
+        changed.updated_ms = 20;
+        store.upsert_worker(&changed).unwrap();
+
+        let rows = store.list_workers().unwrap();
+        assert_eq!(rows.len(), 2, "a status change replaces, never appends");
+        let row = store.get_worker("wrk-1").unwrap().expect("the row exists");
+        assert_eq!(row.status, "partial");
+        assert_eq!(row.attempts, 2);
+        assert_eq!(row.updated_ms, 20);
+        assert_eq!(store.get_worker("wrk-3").unwrap(), None);
+    }
+
+    #[test]
+    fn workers_survive_reopening_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vikram.db");
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .upsert_worker(&worker_row("wrk-1", "partial", 1))
+                .unwrap();
+        }
+        let reopened = Store::open(&path).unwrap();
+        let rows = reopened.list_workers().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "wrk-1");
+        assert_eq!(rows[0].status, "partial");
+    }
+
     #[test]
     fn deleting_a_user_cascades_to_sessions_stamped_with_an_owner() {
         let store = Store::open_in_memory().unwrap();
@@ -5531,6 +5741,97 @@ mod tests {
         let team = store.create_hive_roster("研究小组 🐝", 1).unwrap();
         assert_eq!(store.list_hive_rosters().unwrap()[0].name, "研究小组 🐝");
         assert_eq!(team.name, "研究小组 🐝");
+    }
+
+    fn entity_row(slug: &str, profile: Option<ProfileId>) -> EntityRow {
+        EntityRow {
+            id: EntityId::generate(),
+            owner_user: None,
+            kind: EntityKind::Agent,
+            name: slug.to_owned(),
+            slug: slug.to_owned(),
+            title: String::new(),
+            role: "agent".into(),
+            specialization: String::new(),
+            description: String::new(),
+            icon: None,
+            model: None,
+            profile_id: profile,
+            status: "active".into(),
+            created_ms: 1,
+            updated_ms: 1,
+        }
+    }
+
+    #[test]
+    fn save_entity_round_trips_the_profile_it_was_given() {
+        let store = Store::open_in_memory().unwrap();
+        let profile = ProfileId::new("prof-1");
+        let row = entity_row("rudra", Some(profile.clone()));
+        store.save_entity(&row).unwrap();
+
+        let stored = store.get_entity(&row.id).unwrap().expect("the row exists");
+        assert_eq!(stored.profile_id, Some(profile));
+    }
+
+    #[test]
+    fn two_profiles_can_each_own_an_entity_with_the_same_slug() {
+        let store = Store::open_in_memory().unwrap();
+        let alpha = entity_row("rudra", Some(ProfileId::new("prof-alpha")));
+        let beta = entity_row("rudra", Some(ProfileId::new("prof-beta")));
+        store.save_entity(&alpha).unwrap();
+        store.save_entity(&beta).unwrap();
+        assert_eq!(
+            store
+                .list_entities_owned_by_profile(&ProfileId::new("prof-alpha"))
+                .unwrap(),
+            vec![alpha]
+        );
+    }
+
+    #[test]
+    fn a_second_machine_wide_entity_with_the_same_slug_is_refused() {
+        let store = Store::open_in_memory().unwrap();
+        let owned = |slug: &str| EntityRow {
+            owner_user: Some(UserId::new("user-1")),
+            ..entity_row(slug, None)
+        };
+        store.save_entity(&owned("rudra")).unwrap();
+        assert!(store.save_entity(&owned("rudra")).is_err());
+    }
+
+    #[test]
+    fn an_entity_created_for_a_profile_is_listed_only_there() {
+        let store = Store::open_in_memory().unwrap();
+        let alpha = ProfileId::new("prof-alpha");
+        let beta = ProfileId::new("prof-beta");
+        let scoped = entity_row("alpha-only", Some(alpha.clone()));
+        let shared = entity_row("machine-wide", None);
+        store.save_entity(&scoped).unwrap();
+        store.save_entity(&shared).unwrap();
+
+        let alpha_rows = store.list_entities_for_profile(&alpha).unwrap();
+        assert_eq!(alpha_rows.len(), 2, "its own row plus the machine-wide one");
+        assert_eq!(
+            store.list_entities_owned_by_profile(&alpha).unwrap(),
+            vec![scoped.clone()]
+        );
+
+        let beta_rows = store.list_entities_for_profile(&beta).unwrap();
+        assert_eq!(beta_rows, vec![shared.clone()]);
+        assert!(
+            store
+                .list_entities_owned_by_profile(&beta)
+                .unwrap()
+                .is_empty(),
+            "a machine-wide row is not owned by any profile"
+        );
+
+        assert_eq!(
+            store.list_entities().unwrap().len(),
+            2,
+            "the machine-wide listing still returns everything"
+        );
     }
 
     #[test]

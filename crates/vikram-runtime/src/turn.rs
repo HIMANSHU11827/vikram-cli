@@ -7,13 +7,13 @@
 
 use futures_util::StreamExt;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tokio::sync::oneshot;
 use vikram_contracts::policy::Decision;
 use vikram_contracts::{
     ActionKind, ApprovalId, Block, ImageSource, Message, PermissionMode, PermissionRequest,
-    RecordKind, Role, SideEffect, ToolCall, ToolCallId, Trust, TurnId,
+    RecordKind, Role, SessionId, SideEffect, ToolCall, ToolCallId, Trust, TurnId,
 };
 
 use crate::bots::ManagedBot;
@@ -31,6 +31,7 @@ use crate::types::{
     ApprovalPrompt, BotState, ContextMeter, ContextPart, NoticeLevel, RuntimeEvent, TaskState,
     TurnState, now_ms,
 };
+use crate::verification::FailureKind;
 
 /// How often a streaming turn republishes its live rate. Fast enough to read as real time, slow
 /// enough that building the metrics snapshot costs nothing measurable.
@@ -154,6 +155,218 @@ fn note_verification_failure(inner: &Arc<RuntimeInner>, content: &str) {
     inner.emit(RuntimeEvent::Notice {
         level: NoticeLevel::Warn,
         text,
+    });
+}
+
+/// What the model is told when the working tree carries edits that nothing has checked.
+const UNVERIFIED_TREE_LINE: &str = "\
+unverified edits: files changed in this session have not been checked since. \
+Run `verify` (or `test.run` / `build.run`) before reporting the change as working.";
+
+/// What the operator is told the first time an edit lands in a session with no check behind it.
+const UNVERIFIED_TREE_NOTICE: &str =
+    "unverified edits: files changed since the last check — run verify to prove the change";
+
+/// Whether a session's working tree holds edits nothing has checked, and whether the operator has
+/// already been told. Process-local and keyed by session, like the pty and browser registries: the
+/// mark describes files this runtime changed, so it must not be written down or handed to a second
+/// session whose tree those edits never touched.
+#[derive(Clone, Copy, Debug, Default)]
+struct TreeCheck {
+    unverified: bool,
+    reminder_sent: bool,
+}
+
+fn tree_checks() -> &'static Mutex<HashMap<SessionId, TreeCheck>> {
+    static CHECKS: OnceLock<Mutex<HashMap<SessionId, TreeCheck>>> = OnceLock::new();
+    CHECKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Tools whose success leaves the file tree different from what was last checked.
+fn edits_the_tree(name: &str) -> bool {
+    matches!(name, "fs.write" | "fs.edit" | "fs.delete")
+}
+
+/// Tools that answer whether the tree still works. Only a successful run counts as a check.
+fn checks_the_tree(name: &str) -> bool {
+    matches!(name, "verify" | "test.run" | "build.run")
+}
+
+/// A tool batch finished. A successful edit marks the session's tree unverified and tells the
+/// operator once; a successful check clears the mark. A failed edit changed nothing, and a failed
+/// check proved nothing, so neither settles the state either way.
+///
+/// An edit and a check in the same batch do not cancel: the check was dispatched beside the edit
+/// and cannot have read what it wrote, so the batch leaves the tree unverified.
+fn record_tree_work(
+    inner: &Arc<RuntimeInner>,
+    session: &SessionRuntime,
+    calls: &[ToolCall],
+    outcomes: &[(String, bool)],
+) {
+    let ran = |tool_kind: fn(&str) -> bool| {
+        calls
+            .iter()
+            .zip(outcomes)
+            .any(|(call, (_, ok))| *ok && tool_kind(&call.name))
+    };
+    let edited = ran(edits_the_tree);
+    let checked = ran(checks_the_tree);
+    if !edited && !checked {
+        return;
+    }
+    let remind = {
+        let mut checks = tree_checks().lock().unwrap_or_else(|e| e.into_inner());
+        let check = checks.entry(session.id.clone()).or_default();
+        if edited {
+            check.unverified = true;
+            !std::mem::replace(&mut check.reminder_sent, true)
+        } else {
+            check.unverified = false;
+            false
+        }
+    };
+    if remind {
+        inner.emit(RuntimeEvent::Notice {
+            level: NoticeLevel::Info,
+            text: UNVERIFIED_TREE_NOTICE.into(),
+        });
+    }
+}
+
+fn tree_is_unverified(session: &SessionRuntime) -> bool {
+    tree_checks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&session.id)
+        .is_some_and(|check| check.unverified)
+}
+
+/// Extensions that make a token in the reply read as a file the assistant says it changed. A name
+/// without one is prose, not a claim about a file.
+const CLAIMED_FILE_EXTENSIONS: &[&str] = &[
+    "rs", "toml", "md", "json", "yaml", "yml", "ts", "tsx", "js", "jsx", "py", "go", "c", "h",
+    "cc", "cpp", "hpp", "cs", "java", "kt", "rb", "php", "sh", "css", "scss", "html", "sql",
+    "proto",
+];
+
+/// One token from the reply, when it is shaped like a workspace-relative path with a source
+/// extension. Deliberately narrow: a URL, an absolute path, a traversal or a bare word is not a
+/// claim that this turn changed a file.
+fn claim_token(token: &str) -> Option<&str> {
+    let token = token.trim_matches(|c: char| {
+        matches!(
+            c,
+            '`' | '"'
+                | '\''
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+                | ','
+                | ';'
+                | ':'
+                | '!'
+                | '?'
+                | '*'
+        )
+    });
+    let token = token.strip_suffix('.').unwrap_or(token);
+    let token = token.strip_prefix("./").unwrap_or(token);
+    if token.is_empty()
+        || token.starts_with('/')
+        || token.starts_with('~')
+        || token.contains("://")
+        || token.contains('\\')
+        || token.split('/').any(|segment| segment == "..")
+        || !token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
+    {
+        return None;
+    }
+    let (stem, extension) = token.rsplit_once('.')?;
+    if stem.is_empty() || !stem.chars().any(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    CLAIMED_FILE_EXTENSIONS
+        .iter()
+        .any(|known| extension.eq_ignore_ascii_case(known))
+        .then_some(token)
+}
+
+/// The file paths a reply names, in the order it names them: workspace-relative tokens with a
+/// source extension, plus the `+++ b/...` header of a fenced diff.
+fn claimed_paths(reply: &str) -> Vec<&str> {
+    let mut claims = Vec::new();
+    for line in reply.lines() {
+        let line = line.trim();
+        if let Some(header) = line.strip_prefix("+++ ") {
+            let header = header.strip_prefix("b/").unwrap_or(header);
+            claims.extend(claim_token(header));
+            continue;
+        }
+        claims.extend(
+            line.split(|c: char| {
+                c.is_whitespace()
+                    || matches!(
+                        c,
+                        '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ','
+                    )
+            })
+            .filter_map(claim_token),
+        );
+    }
+    claims
+}
+
+/// The files a successful mutating call actually wrote, resolved inside the workspace. The turn
+/// tracks tool names and outcomes, not paths, so a path comes from the call's own arguments.
+fn written_files(
+    inner: &Arc<RuntimeInner>,
+    calls: &[ToolCall],
+    outcomes: &[(String, bool)],
+) -> Vec<std::path::PathBuf> {
+    calls
+        .iter()
+        .zip(outcomes)
+        .filter(|(call, (_, ok))| *ok && edits_the_tree(&call.name))
+        .filter_map(|(call, _)| {
+            let raw = call.arguments.get("path").and_then(|v| v.as_str())?;
+            Some(
+                crate::config::resolve_within(&inner.workspace_root, std::path::Path::new(raw))
+                    .unwrap_or_else(|| inner.workspace_root.join(raw)),
+            )
+        })
+        .collect()
+}
+
+/// Advice, never a gate. When the turn changed files and the reply names one it never touched, the
+/// operator is told once, as a question. A turn that changed nothing is silent: a purely
+/// conversational answer may name any file it likes.
+fn note_unsupported_claims(inner: &Arc<RuntimeInner>, written: &[std::path::PathBuf], reply: &str) {
+    if written.is_empty() {
+        return;
+    }
+    let unsupported = claimed_paths(reply).into_iter().find(|claim| {
+        let claim = std::path::Path::new(claim);
+        !written
+            .iter()
+            .any(|path| path.ends_with(claim) || claim.ends_with(path))
+    });
+    let Some(claim) = unsupported else {
+        return;
+    };
+    inner.emit(RuntimeEvent::Notice {
+        level: NoticeLevel::Warn,
+        text: format!(
+            "the reply mentions `{claim}` but nothing this turn changed it — check before you \
+             trust it"
+        ),
     });
 }
 
@@ -344,8 +557,11 @@ pub(crate) async fn run_turn(
     // Watches the run of failures so the model can be handed a different plan. It never blocks a
     // call: a ✗ is information, and a turn that runs out of permitted attempts answers in promises.
     let mut guard = RepeatGuard::new();
+    let mut repair = AutoRepair::new();
     let mut step_notice_sent = false;
     let mut live_metrics = Instant::now();
+    let mut written: Vec<std::path::PathBuf> = Vec::new();
+    let mut final_text = String::new();
 
     // Stage: user_input — accept, normalize and journal the operator's message before any model
     // work begins. The `user_input` hooks run inside the builtin; a native module can replace
@@ -1058,14 +1274,15 @@ pub(crate) async fn run_turn(
             claim_guard.disarm();
             return;
         }
+        if calls.is_empty() {
+            final_text = std::mem::take(&mut text_buffer);
+            break;
+        }
         text_buffer.clear();
         reasoning_buffer.clear();
 
-        if calls.is_empty() {
-            break;
-        }
-
         let mut results: Vec<(ToolCallId, String, bool)> = Vec::new();
+        let mut repair_verdict = RepairVerdict::Nothing;
 
         // The model asked for the whole batch at once, so calls run together unless they share
         // a resource: reads, writes to different files, commands on different terminal or
@@ -1171,6 +1388,10 @@ pub(crate) async fn run_turn(
             claim_guard.disarm();
             return;
         }
+        // The batch's tool names are here and gone by the time the results are committed, so the
+        // tree check is recorded before the loop that consumes them.
+        record_tree_work(&inner, &session, &calls, &outcomes);
+        written.extend(written_files(&inner, &calls, &outcomes));
         for (call, (content, ok)) in calls.iter().zip(outcomes) {
             guard.record(call, ok);
             growth.record_call(&call.name);
@@ -1178,6 +1399,9 @@ pub(crate) async fn run_turn(
                 growth.record_verification(ok, &content);
                 if !ok {
                     note_verification_failure(&inner, &content);
+                }
+                if repair_verdict.is_nothing() {
+                    repair_verdict = repair.observe(ok, &content);
                 }
             } else if !ok {
                 growth.record_failure(&call.name, &content);
@@ -1279,6 +1503,50 @@ pub(crate) async fn run_turn(
             }
             break;
         }
+
+        // One failed verification, one chance to fix it. The verifier already names the step, the
+        // command, the failure kind, the files and a bounded excerpt, and the model has just read
+        // that result; handing the instruction back as a host message is the difference between
+        // advice and a fix attempt. The turn may still have provider rounds, or the nudge would be
+        // a message nobody answers.
+        match repair_verdict {
+            RepairVerdict::Retry {
+                instruction,
+                kind,
+                files,
+            } if steps_used < max_steps => {
+                inner.emit(RuntimeEvent::Notice {
+                    level: NoticeLevel::Info,
+                    text: format!(
+                        "verify failed ({kind}): the repair instruction naming {} was handed back \
+                         to the model once",
+                        files.join(", ")
+                    ),
+                });
+                let msg = Message::text(Role::User, repair_prompt(&instruction), Trust::Host);
+                session.push_message(msg.clone(), now_ms());
+                inner.journal(
+                    &session.id,
+                    RecordKind::Message,
+                    serde_json::json!({"message": msg}),
+                );
+                inner.emit(RuntimeEvent::MessageCommitted {
+                    session: session.id.clone(),
+                    message: msg,
+                });
+                repair.hand_back();
+            }
+            RepairVerdict::StillFailing { kind } => {
+                inner.emit(RuntimeEvent::Notice {
+                    level: NoticeLevel::Warn,
+                    text: format!(
+                        "verify failed again ({kind}) after the repair instruction was handed back \
+                         once — not retried again; the failure is reported as it stands"
+                    ),
+                });
+            }
+            _ => {}
+        }
     }
 
     // A steer that arrived after the last tool-call checkpoint has no safe point left in this
@@ -1288,6 +1556,8 @@ pub(crate) async fn run_turn(
     if let Some(steer_text) = session.take_steer() {
         session.enqueue(steer_text);
     }
+
+    note_unsupported_claims(&inner, &written, &final_text);
 
     session.record_usage(reported_input, reported_output.or(Some(output_tokens)));
     if let (Some(input), Some(output)) = (reported_input, reported_output) {
@@ -1442,6 +1712,129 @@ impl RepeatGuard {
         self.advised_at = self.failures_in_row;
         true
     }
+}
+
+/// One failed `verify` call's repair instruction, read back off the tool result's JSON report.
+/// `verify` builds it (`RepairInstruction::render`) and the model already sees it; the turn re-reads
+/// it so it can hand the same instruction back without waiting for the operator to ask.
+struct VerifyRepair {
+    kind: String,
+    instruction: String,
+    files: Vec<String>,
+}
+
+/// What the turn does with one `verify` result. A retry needs a concrete instruction with at least
+/// one named file and a failure that is not a timeout: an unedited tree repeats a deterministic
+/// failure, and a timeout says nothing about the change.
+enum RepairVerdict {
+    Nothing,
+    Retry {
+        instruction: String,
+        kind: String,
+        files: Vec<String>,
+    },
+    StillFailing {
+        kind: String,
+    },
+}
+
+impl RepairVerdict {
+    fn is_nothing(&self) -> bool {
+        matches!(self, RepairVerdict::Nothing)
+    }
+}
+
+/// Reads the trailing JSON report a failed `verify` writes, and turns its most recent repair into
+/// something the turn can hand back. `None` when the report is missing, truncated, or names nothing
+/// to open — a repair the model cannot act on is not worth a provider round.
+fn verify_repair(content: &str) -> Option<VerifyRepair> {
+    let (_, report) = content.split_once('\n')?;
+    let payload: serde_json::Value = serde_json::from_str(report.trim()).ok()?;
+    let repair = payload.get("repairs")?.as_array()?.last()?;
+    let kind = repair.get("kind")?.as_str()?.to_owned();
+    if kind == FailureKind::Timeout.as_str() {
+        return None;
+    }
+    let files = repair
+        .get("files")?
+        .as_array()?
+        .iter()
+        .filter_map(|file| file.as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    if files.is_empty() {
+        return None;
+    }
+    let instruction = repair.get("instruction")?.as_str()?.trim().to_owned();
+    if instruction.is_empty() {
+        return None;
+    }
+    Some(VerifyRepair {
+        kind,
+        instruction,
+        files,
+    })
+}
+
+/// The turn's one automatic repair. State is local to the turn: no flag survives it, so a later
+/// turn starts clean, and one failed `verify` buys exactly one handed-back instruction.
+struct AutoRepair {
+    retried: bool,
+    awaiting: bool,
+}
+
+impl AutoRepair {
+    fn new() -> Self {
+        Self {
+            retried: false,
+            awaiting: false,
+        }
+    }
+
+    /// Classifies one `verify` result. Only the first failed call of the turn is a retry candidate;
+    /// after that, the next failure is reported and a later one is ignored, because the turn already
+    /// spent its one chance to fix what the verifier named.
+    fn observe(&mut self, ok: bool, content: &str) -> RepairVerdict {
+        if ok {
+            self.awaiting = false;
+            return RepairVerdict::Nothing;
+        }
+        if self.retried {
+            if !self.awaiting {
+                return RepairVerdict::Nothing;
+            }
+            self.awaiting = false;
+            let kind = verification_failure(content)
+                .map(|(kind, _)| kind)
+                .unwrap_or_else(|| "unknown".to_owned());
+            return RepairVerdict::StillFailing { kind };
+        }
+        match verify_repair(content) {
+            Some(repair) => RepairVerdict::Retry {
+                instruction: repair.instruction,
+                kind: repair.kind,
+                files: repair.files,
+            },
+            None => RepairVerdict::Nothing,
+        }
+    }
+
+    /// Records that the instruction was actually pushed into the transcript, which is what makes it
+    /// the one retry this turn gets.
+    fn hand_back(&mut self) {
+        self.retried = true;
+        self.awaiting = true;
+    }
+}
+
+/// The host message the model reads when a failed verification is handed back. The verifier's own
+/// instruction carries the step, command, kind, files and a bounded excerpt; this only says what to
+/// do with it.
+fn repair_prompt(instruction: &str) -> String {
+    format!(
+        "verify failed. {instruction}\n\
+         Fix the cause it names in the files above, then run `verify` again. Do not only describe \
+         the fix."
+    )
 }
 
 /// Replace a message's prose, keeping every non-text block (images) in place. The first text
@@ -1788,6 +2181,127 @@ fn image_artifact(
         return None;
     }
     Some(ImageSource::data("image/png", base64_encode(&bytes)))
+}
+
+/// A screenshot the previous step captured, waiting for the next request to carry it. One per
+/// session: the next request answers "what do you see?", it is not a gallery of everything ever
+/// shown. `turns_left` bounds how long an undelivered image may linger — a screenshot from three
+/// turns ago no longer describes the present.
+struct PendingScreenshot {
+    turn: TurnId,
+    text: String,
+    source: ImageSource,
+    turns_left: u8,
+}
+
+/// An undelivered screenshot expires this many turns after capture. Delivery normally happens on
+/// the very next request, so this is the guard against a screenshot that never got one.
+const SCREENSHOT_TURNS: u8 = 3;
+
+/// Pixels are the most expensive thing a request can carry, so a screenshot reaches the model only
+/// when it is small enough to be read rather than transferred.
+const MAX_REQUEST_IMAGE_BYTES: u64 = 1_536 * 1024;
+
+fn pending_screenshots() -> &'static Mutex<HashMap<SessionId, PendingScreenshot>> {
+    static SHOTS: OnceLock<Mutex<HashMap<SessionId, PendingScreenshot>>> = OnceLock::new();
+    SHOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Keep the most recent screenshot a successful allowlisted tool produced, replacing whatever the
+/// session was holding: only the newest picture describes the screen the model is being asked
+/// about. Bytes over the request cap are never read.
+fn remember_screenshot(
+    inner: &Arc<RuntimeInner>,
+    session: &SessionRuntime,
+    turn: &TurnId,
+    name: &str,
+    raw: &str,
+) {
+    let Some(resolved) =
+        crate::config::resolve_within(&inner.workspace_root, std::path::Path::new(raw))
+    else {
+        return;
+    };
+    let Some(size) = std::fs::metadata(&resolved).map(|meta| meta.len()).ok() else {
+        return;
+    };
+    if size > MAX_REQUEST_IMAGE_BYTES {
+        inner.emit(RuntimeEvent::Notice {
+            level: NoticeLevel::Warn,
+            text: format!(
+                "screenshot `{}` is {} bytes, over the {} byte request cap; not attached as an image",
+                resolved.display(),
+                size,
+                MAX_REQUEST_IMAGE_BYTES
+            ),
+        });
+        return;
+    }
+    let Some(source) = image_artifact(inner, raw, &mut std::collections::HashSet::new()) else {
+        return;
+    };
+    let text = format!(
+        "Screenshot captured by `{name}` on the previous step: {}",
+        resolved.display()
+    );
+    pending_screenshots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            session.id.clone(),
+            PendingScreenshot {
+                turn: turn.clone(),
+                text,
+                source,
+                turns_left: SCREENSHOT_TURNS,
+            },
+        );
+}
+
+/// Take a session's pending screenshot, if any. The image is handed over exactly once: an old
+/// picture must not keep answering questions about the present.
+fn take_pending_screenshot(session: &SessionId, turn: &TurnId) -> Option<PendingScreenshot> {
+    let mut shots = pending_screenshots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let expired = {
+        let pending = shots.get_mut(session)?;
+        if &pending.turn != turn {
+            pending.turns_left = pending.turns_left.saturating_sub(1);
+            pending.turn = turn.clone();
+        }
+        pending.turns_left == 0
+    };
+    let pending = shots.remove(session)?;
+    (!expired).then_some(pending)
+}
+
+/// Model families documented to accept image input. Deliberately a positive list: a model not
+/// named here is assumed blind, because bytes sent to a text-only endpoint fail the whole turn
+/// while a sentence about the screenshot costs one line. Matched like
+/// [`crate::context_engine::ModelLimits::lookup`], by the last `/`-segment and as a prefix.
+fn model_sees_images(model: &str) -> bool {
+    const VISION: &[&str] = &[
+        "gpt-4o",
+        "gpt-4.1",
+        "gpt-4-turbo",
+        "gpt-4-vision",
+        "claude-3",
+        "claude-opus",
+        "claude-sonnet",
+        "claude-haiku",
+        "gemini-",
+        "llama-3.2",
+        "llama-4",
+        "gemma-3",
+    ];
+    let name = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .trim()
+        .to_lowercase();
+    VISION.iter().any(|prefix| name.starts_with(prefix))
 }
 
 fn base64_encode(data: &[u8]) -> String {
@@ -2702,9 +3216,15 @@ async fn recall_memory(
     let memory_text = {
         let inner = Arc::clone(inner);
         let session = Arc::clone(session);
-        tokio::task::spawn_blocking(move || inner.retrieved_memory(&session))
-            .await
-            .unwrap_or_default()
+        tokio::task::spawn_blocking(move || {
+            // Bound here, not only at turn end: the first turn of a new session would otherwise
+            // recall without the `user:`/`project:` shelves a write from a previous session had
+            // already put in place.
+            crate::learning::bind_session_memory_scopes(&inner, &session);
+            inner.retrieved_memory(&session)
+        })
+        .await
+        .unwrap_or_default()
     };
     // A recall hook sees what the store is about to inject — and may withhold it or rewrite
     // it — before the prefix is assembled. It fires once per step because retrieval does.
@@ -2746,7 +3266,12 @@ async fn assemble_context(
     // Inject the budgeted skill catalogue (metadata only) as an External-trust
     // system message. Skill bodies are never loaded here; they are read on demand
     // through skill.load / skill.read.
-    let reg = SkillRegistry::for_workspace(&inner.workspace_root);
+    let persona = inner.active_persona_skills();
+    let reg = SkillRegistry::for_workspace_and_persona(
+        &inner.workspace_root,
+        &crate::config::vikram_home(),
+        persona.as_ref().map(|(slug, kind)| (slug.as_str(), *kind)),
+    );
     let skills = reg.skills();
     let discovered = skills.len();
     let loaded = skills.iter().filter(|s| s.loaded).count();
@@ -2766,6 +3291,18 @@ async fn assemble_context(
         labels.push("project instructions");
         prefix.push(Message::text(Role::System, project_text, Trust::External));
     }
+    // The operator's own memory files: what has been learned about them and about this work,
+    // frozen for the life of the process so it costs the prompt cache nothing turn to turn.
+    if let Some(snapshot) = inner.memory_snapshot() {
+        labels.push("memory snapshot");
+        prefix.push(Message::text(Role::System, snapshot, Trust::External));
+    }
+    // What the machine has, not what the model assumes it has: one line of host facts so a plan
+    // about disk, memory or service restarts is argued from the real numbers.
+    if let Some(machine) = inner.machine_line() {
+        labels.push("machine");
+        prefix.push(Message::text(Role::System, machine, Trust::Host));
+    }
     labels.push("turn voice");
     // The operator sees the model's own words between the tool rows, so the model has to be
     // told that those words exist and what shape they take — unless a bot profile says who the
@@ -2783,10 +3320,23 @@ async fn assemble_context(
     }
     // The contract travels with the voice, in its own message and immediately after it: the voice
     // says how the model sounds, this says what counts as work. It is `Trust::Host` because the
-    // host wrote it — and, because it is the last host-authored block before retrieval, memory and
-    // code-index context, it is the boundary the provider's prompt cache ends at.
+    // host wrote it — and, because it is the last host-authored block that is the same on every
+    // turn before retrieval, memory and code-index context, it is the boundary the provider's
+    // prompt cache ends at. The unverified-tree line below is the one host message that can follow
+    // it, and it appears only after an edit nothing has checked.
     labels.push("work contract");
     prefix.push(Message::text(Role::System, WORK_CONTRACT, Trust::Host));
+    // An edit nothing has checked is a fact the model must not forget between turns, and one the
+    // host observed rather than the model claimed. It follows the contract because it is the one
+    // host message that can change after it: every other turn sends a byte-identical prefix.
+    if tree_is_unverified(session) {
+        labels.push("unverified edits");
+        prefix.push(Message::text(
+            Role::System,
+            UNVERIFIED_TREE_LINE,
+            Trust::Host,
+        ));
+    }
     // Memory and project context are assembled against the budget that is left after the
     // transcript, not on top of it.
     // Two-layer context injection:
@@ -2871,11 +3421,7 @@ async fn build_completion_request(
     request_text: &str,
     mut messages: Vec<Message>,
 ) -> Result<CompletionRequest, String> {
-    let model = if inner.workers.by_session(&session.id).is_some() {
-        session.model().unwrap_or_else(|| inner.model())
-    } else {
-        inner.model()
-    };
+    let model = session.model().unwrap_or_else(|| inner.default_model());
     let model_hook = run_hook(
         inner,
         session,
@@ -2895,6 +3441,36 @@ async fn build_completion_request(
             0,
             Message::text(Role::System, text.clone(), Trust::External),
         );
+    }
+    // A screenshot the previous step captured rides the next request only. The text block comes
+    // first so the pixels are never an unlabelled blob in a transcript read later; a model that
+    // cannot see images is told so instead of being sent bytes it will reject.
+    if let Some(pending) = take_pending_screenshot(&session.id, turn) {
+        let message = if model_sees_images(&model) {
+            Message {
+                role: Role::User,
+                blocks: vec![
+                    Block::Text {
+                        text: pending.text,
+                        trust: Trust::Host,
+                    },
+                    Block::Image {
+                        source: pending.source,
+                        trust: Trust::External,
+                    },
+                ],
+            }
+        } else {
+            Message::text(
+                Role::User,
+                format!(
+                    "{} The model in use cannot see images, so the pixels were not attached.",
+                    pending.text
+                ),
+                Trust::Host,
+            )
+        };
+        messages.push(message);
     }
     for text in &model_hook.effect.append {
         messages.push(Message::text(Role::System, text.clone(), Trust::External));
@@ -2980,9 +3556,37 @@ async fn dispatch_tool_calls(
 fn commit_tool_results(
     inner: &Arc<RuntimeInner>,
     session: &Arc<SessionRuntime>,
+    turn: &TurnId,
     results: Vec<(ToolCallId, String, bool)>,
 ) {
+    let changed = !results.is_empty();
+    let names: HashMap<ToolCallId, String> = if results
+        .iter()
+        .any(|(_, content, ok)| *ok && content.contains(IMAGE_ARTIFACT_PREFIX))
+    {
+        session
+            .messages()
+            .into_iter()
+            .flat_map(|message| message.blocks)
+            .filter_map(|block| match block {
+                Block::ToolCall { call } => Some((call.id, call.name)),
+                _ => None,
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
     for (call_id, content, ok) in results {
+        if ok
+            && let Some(name) = names.get(&call_id)
+            && IMAGE_ARTIFACT_TOOLS.contains(&name.as_str())
+        {
+            for line in content.lines() {
+                if let Some(raw) = line.strip_prefix(IMAGE_ARTIFACT_PREFIX) {
+                    remember_screenshot(inner, session, turn, name, raw.trim());
+                }
+            }
+        }
         let result = Message::tool_result(call_id, content, ok);
         session.push_message(result.clone(), now_ms());
         let mut journaled = serde_json::json!({"message": result});
@@ -2992,6 +3596,13 @@ fn commit_tool_results(
             session: session.id.clone(),
             message: result,
         });
+    }
+    if changed {
+        // `memory.note` and anything else that edits MEMORY.md/USER.md write the file, not this
+        // process's cached snapshot, and those tools carry no runtime handle to tell us. Re-reading
+        // here — where every tool batch lands — means a note taken this turn is in the next turn's
+        // prompt, while an untouched file still produces a byte-identical prefix.
+        inner.refresh_memory_snapshot();
     }
 }
 
@@ -3141,7 +3752,7 @@ impl StageHandler for DefaultResultCommit {
                 ));
             };
             let results = std::mem::take(&mut payload.results);
-            commit_tool_results(&ctx.inner, &ctx.session, results);
+            commit_tool_results(&ctx.inner, &ctx.session, &ctx.turn, results);
             Ok(StageOutcome::Done)
         })
     }
@@ -3633,6 +4244,7 @@ mod tests {
     struct ScriptedProvider {
         script: Mutex<VecDeque<Vec<ProviderEvent>>>,
         requests: Mutex<Vec<Vec<Message>>>,
+        models: Mutex<Vec<String>>,
     }
 
     impl ScriptedProvider {
@@ -3640,11 +4252,17 @@ mod tests {
             Self {
                 script: Mutex::new(batches.into()),
                 requests: Mutex::new(Vec::new()),
+                models: Mutex::new(Vec::new()),
             }
         }
 
         fn taken(&self) -> Vec<Vec<Message>> {
             self.requests.lock().expect("requests lock").clone()
+        }
+
+        /// The model each request carried, in request order.
+        fn models(&self) -> Vec<String> {
+            self.models.lock().expect("models lock").clone()
         }
     }
 
@@ -3662,6 +4280,10 @@ mod tests {
         }
 
         fn stream(&self, request: CompletionRequest) -> ProviderStream {
+            self.models
+                .lock()
+                .expect("models lock")
+                .push(request.model.clone());
             self.requests
                 .lock()
                 .expect("requests lock")
@@ -3923,6 +4545,45 @@ mod tests {
         (seen, messages)
     }
 
+    /// One scripted turn with a chosen model, kept open so the test can read what each request
+    /// carried and submit a second turn.
+    struct SightTurn {
+        provider: Arc<ScriptedProvider>,
+        handle: crate::runtime::RuntimeHandle,
+        session: SessionId,
+        events: broadcast::Receiver<RuntimeEvent>,
+    }
+
+    async fn start_sight_turn(
+        dir: &Path,
+        model: &str,
+        script: Vec<Vec<ProviderEvent>>,
+        tools: Vec<Box<dyn Tool>>,
+    ) -> SightTurn {
+        let mut config = config_for(dir);
+        config.model = model.into();
+        let provider = Arc::new(ScriptedProvider::new(script));
+        let runtime = Runtime::start_with_provider(config, provider.clone())
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        for tool in tools {
+            handle.inner.tools.register(tool);
+        }
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "look at the screen".into())
+            .expect("the turn is accepted");
+        drain_turn(&mut events).await;
+        SightTurn {
+            provider,
+            handle,
+            session,
+            events,
+        }
+    }
+
     /// A real 1x1 PNG: the artifact tests need bytes a signature check accepts, not a mock.
     const PNG_1X1: &[u8] = &[
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
@@ -3969,10 +4630,47 @@ mod tests {
         }
     }
 
+    /// Stands in for a screenshot too large to inline: a real PNG signature, over the request cap.
+    struct OversizedScreenshot;
+
+    impl Tool for OversizedScreenshot {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "computer.screenshot".into(),
+                description: "writes an oversized PNG".into(),
+                schema: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+
+        fn permission(&self, _args: &serde_json::Value) -> Result<PermissionRequest, VikramError> {
+            Ok(PermissionRequest::new(
+                ActionKind::Read,
+                "computer.screenshot",
+                "big.png",
+                SideEffect::None,
+                Trust::Model,
+            ))
+        }
+
+        fn run(
+            &self,
+            _args: &serde_json::Value,
+            ctx: &ToolContext,
+        ) -> Result<ToolOutput, VikramError> {
+            let path = ctx.workspace_root.join("big.png");
+            let mut bytes = PNG_1X1.to_vec();
+            bytes.resize(MAX_REQUEST_IMAGE_BYTES as usize + 1, 0);
+            std::fs::write(&path, &bytes).expect("the oversized screenshot writes");
+            Ok(ToolOutput {
+                content: format!("screenshot saved\nIMAGE:{}", path.display()),
+                ok: true,
+            })
+        }
+    }
+
     /// A tool that is not on the artifact allowlist but prints the marker anyway: a fetched page
     /// or file contents could say the same words, so the host must not honor them.
     struct MarkerTool;
-
     impl Tool for MarkerTool {
         fn spec(&self) -> ToolSpec {
             ToolSpec {
@@ -4117,6 +4815,202 @@ mod tests {
         session.push_message(
             Message::tool_result(call.id, result.to_owned(), ok),
             now_ms(),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_screenshot_from_the_previous_step_reaches_the_next_request() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let turn = start_sight_turn(
+            dir.path(),
+            "gpt-4o",
+            vec![
+                vec![
+                    ProviderEvent::ToolCall(ToolCall::new(
+                        "browser.screenshot",
+                        serde_json::json!({}),
+                    )),
+                    finished(),
+                ],
+                vec![
+                    ProviderEvent::TextDelta("I see a white square".into()),
+                    finished(),
+                ],
+            ],
+            vec![Box::new(FakeScreenshot)],
+        )
+        .await;
+
+        let requests = turn.provider.taken();
+        assert_eq!(requests.len(), 2, "one request per step");
+        assert!(
+            requests[0]
+                .iter()
+                .all(|message| message.images().next().is_none()),
+            "the step that asked for the screenshot cannot carry it: {requests:?}"
+        );
+        let carried = requests[1]
+            .iter()
+            .find(|message| message.images().next().is_some())
+            .expect("the next request carries the screenshot");
+        assert_eq!(carried.role, Role::User);
+        assert_eq!(
+            carried.images().next(),
+            Some(&ImageSource::data("image/png", base64_encode(PNG_1X1)))
+        );
+        let label = carried.text_body();
+        assert!(label.contains("browser.screenshot"), "tool named: {label}");
+        assert!(label.contains("shot.png"), "path named: {label}");
+    }
+
+    #[tokio::test]
+    async fn a_screenshot_is_attached_once_and_then_forgotten() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let mut turn = start_sight_turn(
+            dir.path(),
+            "gpt-4o",
+            vec![
+                vec![
+                    ProviderEvent::ToolCall(ToolCall::new(
+                        "browser.screenshot",
+                        serde_json::json!({}),
+                    )),
+                    finished(),
+                ],
+                vec![
+                    ProviderEvent::TextDelta("I see a white square".into()),
+                    finished(),
+                ],
+                vec![
+                    ProviderEvent::TextDelta("nothing has changed".into()),
+                    finished(),
+                ],
+            ],
+            vec![Box::new(FakeScreenshot)],
+        )
+        .await;
+        turn.handle
+            .submit(&turn.session, "and now?".into())
+            .expect("the second turn is accepted");
+        drain_turn(&mut turn.events).await;
+
+        let requests = turn.provider.taken();
+        assert_eq!(requests.len(), 3, "two steps, then a new turn");
+        assert_eq!(
+            requests[1]
+                .iter()
+                .filter(|message| message.role == Role::User && message.images().next().is_some())
+                .count(),
+            1,
+            "the screenshot reaches exactly one request"
+        );
+        assert!(
+            requests[2]
+                .iter()
+                .all(|message| message.role != Role::User || message.images().next().is_none()),
+            "the request-only screenshot is attached once, not forever: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_image_is_not_attached() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let turn = start_sight_turn(
+            dir.path(),
+            "gpt-4o",
+            vec![
+                vec![
+                    ProviderEvent::ToolCall(ToolCall::new(
+                        "computer.screenshot",
+                        serde_json::json!({}),
+                    )),
+                    finished(),
+                ],
+                vec![
+                    ProviderEvent::TextDelta("the screen text".into()),
+                    finished(),
+                ],
+            ],
+            vec![Box::new(OversizedScreenshot)],
+        )
+        .await;
+
+        let requests = turn.provider.taken();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .flatten()
+                .all(|message| message.images().next().is_none()),
+            "an image over the request cap is never inlined: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_without_a_screenshot_sends_no_image() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let turn = start_sight_turn(
+            dir.path(),
+            "gpt-4o",
+            vec![vec![
+                ProviderEvent::TextDelta("no screenshot here".into()),
+                finished(),
+            ]],
+            vec![Box::new(ProbeTool)],
+        )
+        .await;
+
+        let requests = turn.provider.taken();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .iter()
+                .all(|message| message.images().next().is_none()),
+            "nothing captured means nothing attached: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_that_cannot_see_images_is_told_about_the_screenshot() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let turn = start_sight_turn(
+            dir.path(),
+            "test-model",
+            vec![
+                vec![
+                    ProviderEvent::ToolCall(ToolCall::new(
+                        "browser.screenshot",
+                        serde_json::json!({}),
+                    )),
+                    finished(),
+                ],
+                vec![
+                    ProviderEvent::TextDelta("I cannot see it".into()),
+                    finished(),
+                ],
+            ],
+            vec![Box::new(FakeScreenshot)],
+        )
+        .await;
+
+        let requests = turn.provider.taken();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1]
+                .iter()
+                .all(|message| message.images().next().is_none()),
+            "no bytes go to a model not known to accept them: {requests:?}"
+        );
+        assert!(
+            requests[1]
+                .last()
+                .is_some_and(|message| message.text_body().contains("cannot see images")),
+            "the model is told what was captured instead: {requests:?}"
         );
     }
 
@@ -4973,7 +5867,10 @@ mod tests {
         let config = Config {
             model: "test-model".into(),
             workspace_root: Some(dir.path().to_path_buf()),
-            context_window: Some(14_000),
+            // The tool surface alone is ~12k tokens at 110 schemas, and that overhead is charged
+            // inside the same window as the transcript: too small a window leaves `usable_input` at
+            // zero and no fold can ever trigger, which is the bug this test is meant to catch.
+            context_window: Some(24_000),
             max_output_tokens: Some(200),
             context: ContextConfig {
                 trigger_percent: 10,
@@ -6239,6 +7136,25 @@ mod tests {
         panic!("the turn never finished");
     }
 
+    /// [`drain_turn`], keeping every notice the operator saw.
+    async fn drain_turn_notices(events: &mut broadcast::Receiver<RuntimeEvent>) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut notices = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Ok(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), events.recv()).await
+            else {
+                continue;
+            };
+            match event {
+                RuntimeEvent::Notice { text, .. } => notices.push(text),
+                RuntimeEvent::TurnFinished { .. } => return notices,
+                _ => {}
+            }
+        }
+        panic!("the turn never finished");
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn a_user_input_hook_rewrites_what_the_model_reads() {
@@ -6517,6 +7433,287 @@ mod tests {
         assert!(
             points.contains(&"memory_recall".to_owned()),
             "the memory point fired: {points:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_persona_skill_is_offered_to_its_own_turns() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("ok".into()),
+            finished(),
+        ]]));
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        let entity = vikram_store::EntityRow {
+            id: vikram_contracts::EntityId::new("entity-rudra"),
+            owner_user: None,
+            kind: vikram_store::EntityKind::MainAgent,
+            name: "Rudra".into(),
+            slug: "rudra".into(),
+            title: "Lead".into(),
+            role: "main_agent".into(),
+            specialization: "rust".into(),
+            description: "the operator's main agent".into(),
+            icon: None,
+            model: None,
+            profile_id: None,
+            status: "active".into(),
+            created_ms: 1,
+            updated_ms: 1,
+        };
+        handle
+            .inner
+            .store
+            .save_entity(&entity)
+            .expect("the persona is saved");
+        handle
+            .inner
+            .store
+            .set_active_identity(&vikram_store::ActiveIdentity {
+                user: None,
+                profile: None,
+                main_agent: Some(entity.id.clone()),
+            })
+            .expect("the persona is selected");
+        let skill_dir = crate::config::vikram_home().join("main-agents/rudra/skills/bench-notes");
+        std::fs::create_dir_all(&skill_dir).expect("the persona skill folder is made");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: bench-notes\ndescription: how rudra writes up a bench run\n---\n\nMeasure twice.",
+        )
+        .expect("the persona skill is written");
+
+        let id = handle
+            .create_session(Some("Skill probe".into()))
+            .expect("the session is created");
+        let mut events = handle.events();
+        handle
+            .submit(&id, "what can you do".into())
+            .expect("the turn is accepted");
+        drain_turn(&mut events).await;
+
+        let sent = provider.taken();
+        assert!(
+            sent.iter()
+                .flatten()
+                .any(|message| message.text_body().contains("bench-notes")),
+            "the selected persona's own skill is in its catalogue: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn the_first_turn_of_a_new_session_already_reads_its_project_shelf() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("ok".into()),
+            finished(),
+        ]]));
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        let id = handle
+            .create_session(Some("Shelf probe".into()))
+            .expect("the session is created");
+        let shelf = {
+            let session = handle.inner.session(&id).expect("the session is live");
+            crate::learning::project_memory_scope(&session).expect("the workspace names a shelf")
+        };
+        handle
+            .inner
+            .memory
+            .save(
+                "shelfnote",
+                "the calibration bench is in aisle nine",
+                &shelf,
+            )
+            .expect("the shelf takes the note");
+
+        let mut events = handle.events();
+        handle
+            .submit(&id, "shelfnote".into())
+            .expect("the turn is accepted");
+        drain_turn(&mut events).await;
+
+        let sent = provider.taken();
+        assert!(
+            sent.iter()
+                .flatten()
+                .any(|message| message.text_body().contains("aisle nine")),
+            "the session's first turn read the shelf it is bound to: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_machine_line_reaches_the_prompt() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("ok".into()),
+            finished(),
+        ]]));
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        let line = handle
+            .inner
+            .machine_line()
+            .expect("the probes can read this host");
+        assert!(line.starts_with("machine: "), "{line}");
+        let id = handle
+            .create_session(Some("Machine probe".into()))
+            .expect("the session is created");
+        let mut events = handle.events();
+        handle
+            .submit(&id, "what can this machine do".into())
+            .expect("the turn is accepted");
+        drain_turn(&mut events).await;
+
+        let sent = provider.taken();
+        assert!(
+            sent.iter()
+                .flatten()
+                .any(|message| message.text_body().contains(&line)),
+            "the prompt carries the machine line: {sent:?}"
+        );
+    }
+    #[tokio::test]
+    async fn a_note_written_this_turn_reaches_the_next_prompt() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("ok".into()),
+            finished(),
+        ]]));
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        let id = handle
+            .create_session(Some("Note probe".into()))
+            .expect("the session is created");
+        assert!(
+            handle.inner.memory_snapshot().is_none(),
+            "nothing is known before the note"
+        );
+
+        crate::memory_files::memory_file(&crate::config::vikram_home())
+            .add("the operator prefers tabs over spaces")
+            .expect("the note lands on disk");
+        assert!(
+            handle.inner.memory_snapshot().is_none(),
+            "the snapshot is frozen until something says the file moved"
+        );
+
+        let session = handle.inner.session(&id).expect("the session is live");
+        commit_tool_results(
+            &handle.inner,
+            &session,
+            &TurnId::new("turn-note"),
+            vec![(
+                vikram_contracts::ToolCallId::new("call-note"),
+                "noted in memory".to_owned(),
+                true,
+            )],
+        );
+
+        let mut events = handle.events();
+        handle
+            .submit(&id, "what do I prefer".into())
+            .expect("the turn is accepted");
+        drain_turn(&mut events).await;
+
+        let sent = provider.taken();
+        assert!(
+            sent.iter()
+                .flatten()
+                .any(|message| message.text_body().contains("prefers tabs")),
+            "the next prompt carries the note taken this turn: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_selected_persona_runs_on_the_model_it_declares() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![ProviderEvent::TextDelta("ok".into()), finished()],
+            vec![ProviderEvent::TextDelta("ok".into()), finished()],
+        ]));
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        let entity = vikram_store::EntityRow {
+            id: vikram_contracts::EntityId::new("entity-rudra"),
+            owner_user: None,
+            kind: vikram_store::EntityKind::MainAgent,
+            name: "Rudra".into(),
+            slug: "rudra".into(),
+            title: "Lead".into(),
+            role: "main_agent".into(),
+            specialization: "rust".into(),
+            description: "the operator's main agent".into(),
+            icon: None,
+            model: Some("rudra-model".into()),
+            profile_id: None,
+            status: "active".into(),
+            created_ms: 1,
+            updated_ms: 1,
+        };
+        handle
+            .inner
+            .store
+            .save_entity(&entity)
+            .expect("the persona is saved");
+        handle
+            .inner
+            .store
+            .set_active_identity(&vikram_store::ActiveIdentity {
+                user: None,
+                profile: None,
+                main_agent: Some(entity.id.clone()),
+            })
+            .expect("the persona is selected");
+
+        let id = handle
+            .create_session(Some("Persona probe".into()))
+            .expect("the session is created");
+        let mut events = handle.events();
+        handle
+            .submit(&id, "who are you".into())
+            .expect("the turn is accepted");
+        drain_turn(&mut events).await;
+        assert_eq!(
+            provider.models(),
+            vec!["rudra-model".to_owned()],
+            "a session started under a persona runs on the model that persona declares"
+        );
+
+        handle
+            .set_model(&id, "explicit-model".into())
+            .expect("the operator overrides the model");
+        handle
+            .submit(&id, "and now".into())
+            .expect("the turn is accepted");
+        drain_turn(&mut events).await;
+        assert_eq!(
+            provider.models(),
+            vec!["rudra-model".to_owned(), "explicit-model".to_owned()],
+            "an explicit choice still outranks the persona"
         );
     }
 
@@ -6976,6 +8173,717 @@ mod tests {
         assert!(
             result.contains("kind=expectation_missing"),
             "the model still gets the verdict in the tool result: {result}"
+        );
+    }
+
+    // ---- an automatic repair of a failed verification -----------------------------------------
+
+    /// A `verify` that fails with the full report `verify.rs` renders: the verdict line, then the
+    /// JSON carrying the repair instruction the turn reads back. Each call pops the next report, so
+    /// one turn can be driven through two distinct failures.
+    struct RepairVerifyStub {
+        reports: Mutex<VecDeque<String>>,
+    }
+
+    impl RepairVerifyStub {
+        fn new(reports: Vec<String>) -> Self {
+            Self {
+                reports: Mutex::new(reports.into()),
+            }
+        }
+    }
+
+    impl Tool for RepairVerifyStub {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "verify".into(),
+                description: "reports a failed verification".into(),
+                schema: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+
+        fn permission(&self, _args: &serde_json::Value) -> Result<PermissionRequest, VikramError> {
+            Ok(PermissionRequest::new(
+                ActionKind::Read,
+                "verify",
+                "cargo",
+                SideEffect::None,
+                Trust::Model,
+            ))
+        }
+
+        fn run(
+            &self,
+            _args: &serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolOutput, VikramError> {
+            let content = self
+                .reports
+                .lock()
+                .expect("reports lock")
+                .pop_front()
+                .unwrap_or_else(|| "verify: FAIL step=build kind=unknown".to_owned());
+            Ok(ToolOutput { content, ok: false })
+        }
+    }
+
+    fn failed_verify_report(step: &str, kind: &str, file: &str) -> String {
+        let instruction = format!(
+            "repair `{step}` failed as {kind}: run `cargo build --workspace`; open {file}\n\
+             error[E0425]: cannot find value `x` in this scope\n  --> {file}:4:5"
+        );
+        format!(
+            "verify: FAIL step={step} kind={kind}\n{}",
+            serde_json::json!({
+                "ok": false,
+                "strict": true,
+                "attempts": 1,
+                "failure": {"step": step, "kind": kind},
+                "repairs": [{
+                    "step": step,
+                    "kind": kind,
+                    "command": "cargo build --workspace",
+                    "files": [file],
+                    "instruction": instruction,
+                }],
+            })
+        )
+    }
+
+    fn repair_prompts(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .map(Message::text_body)
+            .filter(|text| text.starts_with("verify failed. "))
+            .collect()
+    }
+
+    fn carries_host_trust(message: &Message) -> bool {
+        message.blocks.iter().any(|block| {
+            matches!(
+                block,
+                Block::Text {
+                    trust: Trust::Host,
+                    ..
+                }
+            )
+        })
+    }
+
+    /// Nothing concrete to open means nothing to fix: a repair with no named file, and a report
+    /// whose JSON never arrived, are both reported by the tool and not handed back.
+    #[test]
+    fn a_repair_with_no_named_file_is_not_handed_back() {
+        let mut repair = AutoRepair::new();
+        let report = format!(
+            "verify: FAIL step=build kind=compile_error\n{}",
+            serde_json::json!({
+                "ok": false,
+                "repairs": [{
+                    "step": "build",
+                    "kind": "compile_error",
+                    "command": "cargo build",
+                    "files": [],
+                    "instruction": "repair `build` failed as compile_error: run `cargo build`; open none named",
+                }],
+            })
+        );
+        assert!(
+            matches!(repair.observe(false, &report), RepairVerdict::Nothing),
+            "a repair that names no file buys no round"
+        );
+        assert!(
+            matches!(
+                repair.observe(false, "verify: FAIL step=build kind=compile_error"),
+                RepairVerdict::Nothing
+            ),
+            "a report without a parseable payload buys no round"
+        );
+        assert!(!repair.retried, "nothing was handed back");
+    }
+
+    /// The verifier names the file, the turn hands that instruction back inside the same turn, and
+    /// the model gets exactly one extra round to fix it.
+    #[tokio::test]
+    async fn a_failed_verify_is_handed_back_to_the_model_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ToolCall(ToolCall::new(
+                    "verify",
+                    serde_json::json!({"expect": ["fn handle_poll"]}),
+                )),
+                finished(),
+            ],
+            vec![
+                ProviderEvent::TextDelta("fixed the missing value".into()),
+                finished(),
+            ],
+        ]));
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        handle
+            .inner
+            .tools
+            .register(Box::new(RepairVerifyStub::new(vec![failed_verify_report(
+                "build",
+                "compile_error",
+                "src/main.rs",
+            )])));
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "prove the change".into())
+            .expect("the turn is accepted");
+        let notices = drain_turn_notices(&mut events).await;
+
+        let requests = provider.taken();
+        assert_eq!(
+            requests.len(),
+            2,
+            "one verify round plus the one repair round: {requests:?}"
+        );
+        let handed = repair_prompts(&requests[1]);
+        assert_eq!(handed.len(), 1, "the instruction is handed back once");
+        let prompt = &handed[0];
+        assert!(
+            prompt.contains("src/main.rs"),
+            "the file is named: {prompt}"
+        );
+        assert!(
+            prompt.contains("cargo build --workspace"),
+            "the command is named: {prompt}"
+        );
+        assert!(
+            prompt.contains("compile_error"),
+            "the failure kind is named: {prompt}"
+        );
+        assert!(
+            requests[1]
+                .iter()
+                .filter(|message| message.role == Role::User)
+                .any(carries_host_trust),
+            "the injected repair is a host message: {:?}",
+            requests[1]
+        );
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|notice| notice.contains("handed back to the model once"))
+                .count(),
+            1,
+            "{notices:?}"
+        );
+        assert!(
+            !notices
+                .iter()
+                .any(|notice| notice.contains("verify failed again")),
+            "one failure does not yet prove the repair failed: {notices:?}"
+        );
+    }
+
+    /// The one retry is the whole budget: a second failing `verify` in the same turn reports, it
+    /// does not buy another round.
+    #[tokio::test]
+    async fn a_second_failing_verify_in_the_same_turn_is_not_retried() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let verify = || ToolCall::new("verify", serde_json::json!({"expect": ["fn handle_poll"]}));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![ProviderEvent::ToolCall(verify()), finished()],
+            vec![ProviderEvent::ToolCall(verify()), finished()],
+            vec![
+                ProviderEvent::TextDelta("still does not compile".into()),
+                finished(),
+            ],
+        ]));
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        handle
+            .inner
+            .tools
+            .register(Box::new(RepairVerifyStub::new(vec![
+                failed_verify_report("build", "compile_error", "src/main.rs"),
+                failed_verify_report("test", "test_failure", "crates/app/tests/it.rs"),
+            ])));
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "prove the change".into())
+            .expect("the turn is accepted");
+        let notices = drain_turn_notices(&mut events).await;
+
+        let requests = provider.taken();
+        assert_eq!(
+            requests.len(),
+            3,
+            "verify, one repair round, then the answer: {requests:?}"
+        );
+        assert_eq!(
+            repair_prompts(&requests[1]).len(),
+            1,
+            "the first failure is handed back"
+        );
+        assert_eq!(
+            repair_prompts(&requests[2]).len(),
+            1,
+            "the second failure adds no second instruction: {:?}",
+            requests[2]
+                .iter()
+                .map(Message::text_body)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !requests[2]
+                .iter()
+                .filter(|message| message.role == Role::User)
+                .any(|message| message.text_body().contains("repair `test`")),
+            "the second failure's instruction never reaches the model as a handed-back message"
+        );
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|notice| notice.contains("handed back to the model once"))
+                .count(),
+            1,
+            "{notices:?}"
+        );
+        assert!(
+            notices.iter().any(|notice| {
+                notice.contains("verify failed again") && notice.contains("test_failure")
+            }),
+            "the operator is told the repair did not hold: {notices:?}"
+        );
+    }
+
+    /// A timeout says the step never finished, not that the change is wrong: it is never handed
+    /// back, even though the report carries a repair entry.
+    #[tokio::test]
+    async fn a_timed_out_verify_is_not_retried_automatically() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ToolCall(ToolCall::new("verify", serde_json::json!({}))),
+                finished(),
+            ],
+            vec![
+                ProviderEvent::TextDelta("the build timed out".into()),
+                finished(),
+            ],
+        ]));
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        handle
+            .inner
+            .tools
+            .register(Box::new(RepairVerifyStub::new(vec![failed_verify_report(
+                "build",
+                "timeout",
+                "src/main.rs",
+            )])));
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "prove the change".into())
+            .expect("the turn is accepted");
+        let notices = drain_turn_notices(&mut events).await;
+
+        let requests = provider.taken();
+        assert_eq!(requests.len(), 2, "verify, then the answer: {requests:?}");
+        assert!(
+            repair_prompts(&requests[1]).is_empty(),
+            "a timeout is never handed back: {:?}",
+            requests[1]
+                .iter()
+                .map(Message::text_body)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !notices
+                .iter()
+                .any(|notice| notice.contains("handed back to the model once")),
+            "{notices:?}"
+        );
+    }
+
+    // ---- an edited tree that nothing has checked ---------------------------------------------
+
+    fn carries_unverified_line(messages: &[Message]) -> bool {
+        messages
+            .iter()
+            .any(|message| message.text_body().starts_with("unverified edits:"))
+    }
+
+    /// Run one session through the scripted provider, submitting the given requests in order and
+    /// draining each turn. Returns what each provider round was sent, in order.
+    async fn run_turns(
+        dir: &Path,
+        provider: Arc<ScriptedProvider>,
+        tools: Vec<Box<dyn Tool>>,
+        requests: &[&str],
+    ) -> (crate::runtime::RuntimeHandle, Vec<Vec<Message>>) {
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        for tool in tools {
+            handle.inner.tools.register(tool);
+        }
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        for text in requests {
+            handle
+                .submit(&session, (*text).into())
+                .expect("the turn is accepted");
+            drain_turn(&mut events).await;
+        }
+        let taken = provider.taken();
+        (handle, taken)
+    }
+
+    /// An edit nobody checked is remembered: the next turn's context says so, and a successful
+    /// `verify` is what clears it. Nothing here blocks the turn or judges the change.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_edited_tree_is_flagged_until_it_is_verified() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let write = ToolCall::new("fs.write", serde_json::json!({"path": "src/lib.rs"}));
+        let verify = ToolCall::new("verify", serde_json::json!({}));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![ProviderEvent::ToolCall(write), finished()],
+            vec![ProviderEvent::TextDelta("wrote it".into()), finished()],
+            vec![ProviderEvent::ToolCall(verify), finished()],
+            vec![ProviderEvent::TextDelta("verified".into()), finished()],
+        ]));
+        let (_handle, requests) = run_turns(
+            dir.path(),
+            provider,
+            vec![
+                Box::new(NamedProbeTool("fs.write")),
+                Box::new(NamedProbeTool("verify")),
+            ],
+            &["write the parser", "check it"],
+        )
+        .await;
+
+        assert_eq!(requests.len(), 4, "two rounds per turn");
+        assert!(
+            !carries_unverified_line(&requests[0]),
+            "nothing was edited before the first request"
+        );
+        assert!(
+            carries_unverified_line(&requests[2]),
+            "the next turn is told the tree carries edits nothing has checked: {:?}",
+            requests[2]
+                .iter()
+                .map(Message::text_body)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !carries_unverified_line(&requests[3]),
+            "the successful verify cleared the mark: {:?}",
+            requests[3]
+                .iter()
+                .map(Message::text_body)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A turn that only reads changed nothing, so it is told nothing and flags nothing.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_read_only_turn_does_not_flag_the_tree() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let read = ToolCall::new("fs.read", serde_json::json!({"path": "src/lib.rs"}));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![ProviderEvent::ToolCall(read), finished()],
+            vec![ProviderEvent::TextDelta("read it".into()), finished()],
+        ]));
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        handle
+            .inner
+            .tools
+            .register(Box::new(NamedProbeTool("fs.read")));
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "read the parser".into())
+            .expect("the turn is accepted");
+        let notices = drain_turn_notices(&mut events).await;
+
+        assert!(
+            !provider
+                .taken()
+                .iter()
+                .any(|messages| carries_unverified_line(messages)),
+            "a read leaves nothing unverified"
+        );
+        assert!(
+            !notices
+                .iter()
+                .any(|notice| notice.contains("unverified edits")),
+            "the operator is not warned about a tree nobody touched: {notices:?}"
+        );
+    }
+
+    /// The operator hears about an unverified tree once, the first time it happens; the model keeps
+    /// reading the line for as long as the mark stands.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn the_reminder_is_said_once_per_session() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let edit = ToolCall::new("fs.edit", serde_json::json!({"path": "src/lib.rs"}));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![ProviderEvent::ToolCall(edit.clone()), finished()],
+            vec![ProviderEvent::TextDelta("edited once".into()), finished()],
+            vec![ProviderEvent::ToolCall(edit), finished()],
+            vec![ProviderEvent::TextDelta("edited twice".into()), finished()],
+        ]));
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        handle
+            .inner
+            .tools
+            .register(Box::new(NamedProbeTool("fs.edit")));
+        let mut events = handle.events();
+        let session = named_session(&handle);
+
+        handle
+            .submit(&session, "edit the parser".into())
+            .expect("the turn is accepted");
+        let first = drain_turn_notices(&mut events).await;
+        handle
+            .submit(&session, "edit it again".into())
+            .expect("the turn is accepted");
+        let second = drain_turn_notices(&mut events).await;
+
+        let reminders = first
+            .iter()
+            .chain(&second)
+            .filter(|notice| notice.contains("unverified edits"))
+            .count();
+        assert_eq!(
+            reminders, 1,
+            "one notice per session, not one per turn: {first:?} then {second:?}"
+        );
+        let requests = provider.taken();
+        assert!(
+            carries_unverified_line(&requests[2]),
+            "the model is still told, even though the operator was already warned"
+        );
+    }
+
+    /// The mark belongs to the session whose turn made the edit. A second session in the same
+    /// runtime starts with a clean slate, even though both share one working tree.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_second_session_does_not_inherit_the_unverified_mark() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let write = ToolCall::new("fs.write", serde_json::json!({"path": "src/lib.rs"}));
+        let read = ToolCall::new("fs.read", serde_json::json!({"path": "src/lib.rs"}));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![ProviderEvent::ToolCall(write), finished()],
+            vec![ProviderEvent::TextDelta("wrote it".into()), finished()],
+            vec![ProviderEvent::ToolCall(read), finished()],
+            vec![ProviderEvent::TextDelta("read it".into()), finished()],
+        ]));
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        handle
+            .inner
+            .tools
+            .register(Box::new(NamedProbeTool("fs.write")));
+        handle
+            .inner
+            .tools
+            .register(Box::new(NamedProbeTool("fs.read")));
+        let mut events = handle.events();
+
+        let first = named_session(&handle);
+        handle
+            .submit(&first, "write the parser".into())
+            .expect("the turn is accepted");
+        drain_turn(&mut events).await;
+
+        let second = handle
+            .create_session(Some("Other session".into()))
+            .expect("a second session");
+        handle
+            .submit(&second, "read the parser".into())
+            .expect("the turn is accepted");
+        drain_turn(&mut events).await;
+
+        let requests = provider.taken();
+        assert_eq!(requests.len(), 4, "two rounds per turn");
+        assert!(
+            carries_unverified_line(&requests[1]),
+            "the session that edited is still flagged"
+        );
+        assert!(
+            !carries_unverified_line(&requests[2]),
+            "the session that did not edit starts clean: {:?}",
+            requests[2]
+                .iter()
+                .map(Message::text_body)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // ---- what the reply claims against what the turn changed --------------------------------
+
+    /// The notices that question a claim the turn cannot back with a change.
+    fn claim_notices(notices: &[String]) -> Vec<&String> {
+        notices
+            .iter()
+            .filter(|notice| notice.contains("check before you trust it"))
+            .collect()
+    }
+
+    /// A reply that says it changed one file while the turn changed another is questioned once,
+    /// and the notice names the claim. It is advice: the turn still finishes normally.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_claim_about_a_file_the_diff_does_not_touch_is_flagged() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let write = ToolCall::new("fs.write", serde_json::json!({"path": "src/lib.rs"}));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![ProviderEvent::ToolCall(write), finished()],
+            vec![
+                ProviderEvent::TextDelta(
+                    "I wired the parser in by changing `crates/a.rs` and nothing else.".into(),
+                ),
+                finished(),
+            ],
+        ]));
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        handle
+            .inner
+            .tools
+            .register(Box::new(NamedProbeTool("fs.write")));
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "wire the parser".into())
+            .expect("the turn is accepted");
+        let notices = drain_turn_notices(&mut events).await;
+
+        let claims = claim_notices(&notices);
+        assert_eq!(claims.len(), 1, "one notice, as a question: {notices:?}");
+        assert!(
+            claims[0].contains("`crates/a.rs`"),
+            "the unsupported claim is named: {}",
+            claims[0]
+        );
+        assert!(
+            !claims[0].contains("`src/lib.rs`"),
+            "the file the turn did write is not treated as a claim: {}",
+            claims[0]
+        );
+        let live = handle.inner.session(&session).expect("session survives");
+        assert_eq!(
+            live.turn(),
+            TurnState::Idle,
+            "the check is advisory and never fails the turn"
+        );
+    }
+
+    /// A claim the turn's own write backs up is left alone.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_claim_the_diff_supports_is_not_flagged() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let write = ToolCall::new("fs.write", serde_json::json!({"path": "crates/a.rs"}));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![ProviderEvent::ToolCall(write), finished()],
+            vec![
+                ProviderEvent::TextDelta("Changed `crates/a.rs` to wire the parser in.".into()),
+                finished(),
+            ],
+        ]));
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        handle
+            .inner
+            .tools
+            .register(Box::new(NamedProbeTool("fs.write")));
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "wire the parser".into())
+            .expect("the turn is accepted");
+        let notices = drain_turn_notices(&mut events).await;
+
+        assert!(
+            claim_notices(&notices).is_empty(),
+            "the turn wrote the file it named: {notices:?}"
+        );
+    }
+
+    /// A turn that only talked changed nothing, so naming files is not a claim to check.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_conversational_answer_naming_a_file_is_not_flagged() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = isolated_home(dir.path());
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta(
+                "The parser lives in `crates/a.rs`; the CLI entry point is \
+                 `crates/vikram-cli/src/main.rs`, and the plan is `docs/plan.md`."
+                    .into(),
+            ),
+            finished(),
+        ]]));
+        let model: Arc<dyn Provider> = provider.clone();
+        let runtime = Runtime::start_with_provider(config_for(dir.path()), model)
+            .await
+            .expect("runtime starts");
+        let handle = runtime.handle();
+        let mut events = handle.events();
+        let session = named_session(&handle);
+        handle
+            .submit(&session, "where does the parser live?".into())
+            .expect("the turn is accepted");
+        let notices = drain_turn_notices(&mut events).await;
+
+        assert!(
+            claim_notices(&notices).is_empty(),
+            "a conversational answer may name any file it likes: {notices:?}"
         );
     }
 }

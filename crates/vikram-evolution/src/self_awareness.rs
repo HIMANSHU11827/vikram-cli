@@ -17,6 +17,9 @@
 //!   They describe the code, not a probed runtime — nothing here performs
 //!   network or process inspection, so `providers.status` is
 //!   [`ProviderStatus::Unknown`] rather than a guessed `Available`.
+//!   `architecture` is the exception: its crates and module counts are read
+//!   from the workspace `Cargo.toml` and each member's `src` tree at call
+//!   time.
 
 use crate::error::{EvolutionError, Result};
 use crate::metrics::{self, ExperienceStats, ProposalStats, ReflectionStats};
@@ -24,6 +27,7 @@ use crate::store::{EvolutionStore, from_json_value, to_json_value};
 use crate::types::{LearningEvent, ProposalKind, gen_id, now_ms};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 /// Snapshot of Vikram's architecture.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -33,6 +37,8 @@ pub struct ArchitectureSnapshot {
     pub subsystems: Vec<SubsystemInfo>,
     pub version: String,
     pub rust_version: String,
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -401,35 +407,10 @@ impl SelfAwarenessEngine {
     }
 
     fn inspect_architecture(&self) -> Result<ArchitectureSnapshot> {
+        let surface = discover_workspace();
         Ok(ArchitectureSnapshot {
-            crates: vec![
-                CrateInfo {
-                    name: "vikram-contracts".to_string(),
-                    version: "0.1.0".to_string(),
-                    features: vec![],
-                },
-                CrateInfo {
-                    name: "vikram-policy".to_string(),
-                    version: "0.1.0".to_string(),
-                    features: vec![],
-                },
-                CrateInfo {
-                    name: "vikram-store".to_string(),
-                    version: "0.1.0".to_string(),
-                    features: vec![],
-                },
-                CrateInfo {
-                    name: "vikram-runtime".to_string(),
-                    version: "0.1.0".to_string(),
-                    features: vec![],
-                },
-                CrateInfo {
-                    name: "vikram-evolution".to_string(),
-                    version: "0.1.0".to_string(),
-                    features: vec![],
-                },
-            ],
-            modules: vec![],
+            crates: surface.crates,
+            modules: surface.modules,
             subsystems: vec![
                 SubsystemInfo {
                     name: "runtime".to_string(),
@@ -456,8 +437,9 @@ impl SelfAwarenessEngine {
                     ],
                 },
             ],
-            version: "0.1.0".to_string(),
-            rust_version: "1.86".to_string(),
+            version: surface.version,
+            rust_version: surface.rust_version,
+            notes: surface.notes,
         })
     }
 
@@ -776,6 +758,248 @@ fn json_u64(v: &serde_json::Value) -> Option<u64> {
         .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
 }
 
+struct WorkspaceSurface {
+    crates: Vec<CrateInfo>,
+    modules: Vec<ModuleInfo>,
+    notes: Vec<String>,
+    version: String,
+    rust_version: String,
+}
+
+fn discover_workspace() -> WorkspaceSurface {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let Some(root) = find_workspace_root(Path::new(manifest_dir)) else {
+        return WorkspaceSurface {
+            crates: Vec::new(),
+            modules: Vec::new(),
+            notes: vec![format!(
+                "workspace root not found: no Cargo.toml with a [workspace] section above {manifest_dir}"
+            )],
+            version: String::new(),
+            rust_version: String::new(),
+        };
+    };
+    discover_workspace_root(&root)
+}
+
+fn find_workspace_root(start: &Path) -> Option<PathBuf> {
+    for dir in start.ancestors() {
+        let manifest = dir.join("Cargo.toml");
+        let Ok(text) = std::fs::read_to_string(&manifest) else {
+            continue;
+        };
+        if text.lines().any(|line| line.trim() == "[workspace]") {
+            return Some(dir.to_path_buf());
+        }
+    }
+    None
+}
+
+fn discover_workspace_root(root: &Path) -> WorkspaceSurface {
+    let mut surface = WorkspaceSurface {
+        crates: Vec::new(),
+        modules: Vec::new(),
+        notes: Vec::new(),
+        version: String::new(),
+        rust_version: String::new(),
+    };
+
+    let manifest_path = root.join("Cargo.toml");
+    let manifest = match std::fs::read_to_string(&manifest_path) {
+        Ok(text) => text,
+        Err(err) => {
+            surface.notes.push(format!(
+                "workspace root not found: cannot read {}: {err}",
+                manifest_path.display()
+            ));
+            return surface;
+        }
+    };
+
+    surface.version = manifest_value(&manifest, "[workspace.package]", "version")
+        .map(|v| v.trim_matches('"').to_string())
+        .unwrap_or_default();
+    surface.rust_version = manifest_value(&manifest, "[workspace.package]", "rust-version")
+        .map(|v| v.trim_matches('"').to_string())
+        .unwrap_or_default();
+
+    let mut discovered: BTreeMap<String, (String, String, usize, usize)> = BTreeMap::new();
+    for member in manifest_members(&manifest) {
+        if member.contains('*') || member.contains('?') {
+            surface
+                .notes
+                .push(format!("skipped glob workspace member {member}"));
+            continue;
+        }
+        let dir = root.join(&member);
+        let (name, version) = match crate_manifest(&dir, &surface.version) {
+            Ok(identity) => identity,
+            Err(reason) => {
+                surface
+                    .notes
+                    .push(format!("skipped workspace member {member}: {reason}"));
+                continue;
+            }
+        };
+        let src = dir.join("src");
+        let (files, lines) = count_sources(&src);
+        if files == 0 {
+            surface.notes.push(format!(
+                "crate {name} has no rust sources under {}",
+                src.display()
+            ));
+        }
+        discovered.insert(name, (member, version, files, lines));
+    }
+
+    if discovered.is_empty() {
+        surface
+            .notes
+            .push("no workspace crates discovered".to_string());
+        return surface;
+    }
+
+    for (name, (member, version, files, lines)) in discovered {
+        surface.modules.push(ModuleInfo {
+            crate_name: name.clone(),
+            module_path: format!("{member}/src"),
+            description: format!("{files} module files, {lines} lines"),
+        });
+        surface.crates.push(CrateInfo {
+            name,
+            version,
+            features: Vec::new(),
+        });
+    }
+    surface
+}
+
+fn manifest_members(text: &str) -> Vec<String> {
+    let mut members = Vec::new();
+    let mut in_workspace = false;
+    let mut collecting = false;
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_workspace = line == "[workspace]";
+            collecting = false;
+            continue;
+        }
+        if !in_workspace {
+            continue;
+        }
+        if !collecting {
+            let Some(rest) = line.strip_prefix("members") else {
+                continue;
+            };
+            let Some(rest) = rest.trim_start().strip_prefix('=') else {
+                continue;
+            };
+            if !rest.trim_start().starts_with('[') {
+                continue;
+            }
+            collecting = true;
+            members.extend(quoted_strings(rest));
+            if rest.contains(']') {
+                collecting = false;
+            }
+        } else {
+            members.extend(quoted_strings(line));
+            if line.contains(']') {
+                collecting = false;
+            }
+        }
+    }
+    members
+}
+
+fn manifest_value(text: &str, section: &str, key: &str) -> Option<String> {
+    let mut in_section = false;
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_section = line == section;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix(key) else {
+            continue;
+        };
+        let Some(value) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        return Some(value.trim().to_string());
+    }
+    None
+}
+
+fn quoted_strings(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(start) = rest.find('"') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('"') else {
+            break;
+        };
+        out.push(after[..end].to_string());
+        rest = &after[end + 1..];
+    }
+    out
+}
+
+fn crate_manifest(
+    dir: &Path,
+    workspace_version: &str,
+) -> std::result::Result<(String, String), String> {
+    let path = dir.join("Cargo.toml");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    let name = manifest_value(&text, "[package]", "name")
+        .ok_or_else(|| format!("no package name in {}", path.display()))?;
+    let version = match manifest_value(&text, "[package]", "version") {
+        Some(version) => version.trim_matches('"').to_string(),
+        None => workspace_version.to_string(),
+    };
+    Ok((name.trim_matches('"').to_string(), version))
+}
+
+fn count_sources(src: &Path) -> (usize, usize) {
+    let mut files = 0usize;
+    let mut lines = 0usize;
+    let mut pending = vec![src.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                if entry.file_name() == "target" {
+                    continue;
+                }
+                pending.push(path);
+            } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+                files += 1;
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    lines += text.lines().count();
+                }
+            }
+        }
+    }
+    (files, lines)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -951,5 +1175,99 @@ mod tests {
         let mut engine = engine(store);
         let second = engine.inspect_runtime().unwrap();
         assert_eq!(second.version, 2);
+    }
+
+    fn module_rollup(model: &SelfModel, crate_name: &str) -> (usize, usize) {
+        let module = model
+            .architecture
+            .modules
+            .iter()
+            .find(|m| m.crate_name == crate_name)
+            .unwrap_or_else(|| panic!("no module entry for {crate_name}"));
+        let mut numbers = module
+            .description
+            .split(|c: char| !c.is_ascii_digit())
+            .filter_map(|part| part.parse::<usize>().ok());
+        (
+            numbers.next().unwrap_or_default(),
+            numbers.next().unwrap_or_default(),
+        )
+    }
+
+    #[test]
+    fn architecture_discovers_workspace_crates_and_modules() {
+        let store = EvolutionStore::open_in_memory().unwrap();
+        let mut engine = engine(store);
+        let model = engine.inspect_runtime().unwrap();
+        let architecture = &model.architecture;
+
+        assert!(
+            architecture.crates.len() >= 10,
+            "expected at least 10 workspace crates, found {}",
+            architecture.crates.len()
+        );
+        let names: Vec<&str> = architecture
+            .crates
+            .iter()
+            .map(|crate_info| crate_info.name.as_str())
+            .collect();
+        assert!(names.contains(&"vikram-evolution"));
+        assert!(names.contains(&"vikram-store"));
+        assert!(names.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(architecture.modules.len(), architecture.crates.len());
+        assert!(architecture.notes.is_empty(), "{:?}", architecture.notes);
+        assert!(!architecture.version.is_empty());
+        assert!(!architecture.rust_version.is_empty());
+
+        for crate_name in ["vikram-evolution", "vikram-store"] {
+            let (files, lines) = module_rollup(&model, crate_name);
+            assert!(files > 0, "{crate_name} module file count is zero");
+            assert!(lines > 0, "{crate_name} line count is zero");
+        }
+    }
+
+    #[test]
+    fn workspace_manifest_parsing_handles_multiline_members_and_globs() {
+        let manifest = r#"
+[workspace]
+resolver = "3"
+members = [
+    "crates/vikram-alpha",
+    "crates/vikram-beta",
+    "crates/globbed-*",
+]
+
+[workspace.package]
+version = "9.9.9"
+rust-version = "1.99"
+"#;
+        assert_eq!(
+            manifest_members(manifest),
+            vec![
+                "crates/vikram-alpha",
+                "crates/vikram-beta",
+                "crates/globbed-*"
+            ]
+        );
+        assert_eq!(
+            manifest_value(manifest, "[workspace.package]", "version"),
+            Some("\"9.9.9\"".to_string())
+        );
+        assert_eq!(
+            manifest_value(manifest, "[workspace.package]", "rust-version"),
+            Some("\"1.99\"".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_workspace_manifest_yields_note_instead_of_panic() {
+        let root = tempfile::tempdir().unwrap();
+        let surface = discover_workspace_root(root.path());
+
+        assert!(surface.crates.is_empty());
+        assert!(surface.modules.is_empty());
+        assert!(surface.version.is_empty());
+        assert_eq!(surface.notes.len(), 1);
+        assert!(surface.notes[0].contains("workspace root not found"));
     }
 }

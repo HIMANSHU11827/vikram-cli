@@ -6,7 +6,7 @@
 //! script run never touches the model at all, because a job that only has to check a port should
 //! not cost a token.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use std::sync::Arc;
@@ -15,8 +15,17 @@ use vikram_runtime::config::Config;
 use vikram_runtime::types::{RuntimeEvent, RuntimeStatus, TurnState};
 use vikram_runtime::{BotControl, Runtime, RuntimeHandle};
 
+use crate::presence::{DISK_REASON, Liveness, Presence};
+use crate::store::ScheduleStore;
+use crate::time::{Millis, now_ms};
+
 /// How much of a run's own words are kept. A job that prints a gigabyte must not fill the database.
 const OUTPUT_CAP: usize = 64 * 1024;
+
+/// The disk share at which maintenance dozes the daemon, and the share it must come back below to
+/// wake it. The evolution loop measures the same band; the hysteresis lives here with the actuator.
+const DISK_DOZE_SHARE: f32 = 0.95;
+const DISK_WAKE_SHARE: f32 = 0.90;
 
 /// What one execution produced, whether it was an agent turn or a script.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -880,6 +889,183 @@ fn shell_command(command: &str) -> tokio::process::Command {
 /// A shell string rather than a parsed argv, because the operator writes the command the way they
 /// would type it, and a scheduled command that cannot use a pipe or a redirect is not worth
 /// scheduling. The shell is `$SHELL`/`sh` on unix and `%COMSPEC%`/`cmd` on Windows.
+/// One unattended pass of the evolution loop, with no model and no session: drain the reflection
+/// queue, run one MAPE-K cycle, and report what each step did.
+///
+/// This is the only scheduled work that improves Vikram itself rather than doing something for the
+/// operator. It opens the same store the runtime opens, so a cycle run here is the cycle the operator
+/// would have run by hand — it just no longer needs somebody to be at the keyboard for it to happen.
+pub async fn run_maintenance(home: PathBuf, timeout: Duration) -> RunOutcome {
+    let work = tokio::task::spawn_blocking(move || maintenance(&home));
+    match tokio::time::timeout(timeout, work).await {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(err)) => RunOutcome::failed(format!("maintenance task failed: {err}")),
+        Err(_) => RunOutcome::failed(format!(
+            "timed out after {}",
+            crate::time::humanize_ms(timeout.as_millis() as i64)
+        )),
+    }
+}
+
+fn maintenance(home: &Path) -> RunOutcome {
+    let skills = home.join("skills");
+    if let Err(err) = std::fs::create_dir_all(&skills) {
+        return RunOutcome::failed(format!("could not create {}: {err}", skills.display()));
+    }
+    let db = home.join("evolution.db");
+    let mut engine = match vikram_evolution::EvolutionEngine::open(db.clone(), skills) {
+        Ok(engine) => engine,
+        Err(err) => {
+            return RunOutcome::failed(format!(
+                "could not open the evolution store at {}: {err}",
+                db.display()
+            ));
+        }
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut ok = true;
+
+    match engine.reflection.recover_jobs() {
+        Ok(recovered) if recovered > 0 => lines.push(format!(
+            "reflection: recovered {recovered} interrupted job(s)"
+        )),
+        Ok(_) => {}
+        Err(err) => {
+            ok = false;
+            lines.push(format!("reflection: could not recover jobs — {err}"));
+        }
+    }
+    match engine.reflection.process_pending() {
+        Ok(done) => lines.push(format!("reflection: {done} job(s) processed")),
+        Err(err) => {
+            ok = false;
+            lines.push(format!("reflection: failed — {err}"));
+        }
+    }
+    match engine.mapek.run_cycle() {
+        Ok(result) => lines.push(format!(
+            "cycle {}: {} planned, {} remediated, {} for review ({})",
+            result.cycle_number,
+            result.planned_actions,
+            result.remediated_actions,
+            result.recorded_for_review,
+            if result.execution_success {
+                "fully remediated"
+            } else {
+                result
+                    .failure_reason
+                    .as_deref()
+                    .unwrap_or("not fully remediated")
+            }
+        )),
+        Err(err) => {
+            ok = false;
+            lines.push(format!("cycle: failed — {err}"));
+        }
+    }
+
+    // The cycle reports no resource reading of its own, so the disk evidence is taken from the
+    // monitoring pass. Only a known share may move presence: an unreadable probe is not a full disk
+    // and is not an empty one either.
+    let disk = match engine.mapek.monitor() {
+        Ok(data) if data.resource_metrics.disk_usage_known => {
+            Some(data.resource_metrics.disk_usage)
+        }
+        Ok(_) => None,
+        Err(err) => {
+            lines.push(format!("disk: could not be read — {err}"));
+            None
+        }
+    };
+    if disk.is_some() {
+        match ScheduleStore::open(&home.join("vikram.db")) {
+            Ok(store) => lines.extend(react_to_disk(&store, disk, now_ms())),
+            Err(err) => lines.push(format!("presence: could not be recorded — {err}")),
+        }
+    }
+
+    // Night-shift forgetting: what stopped being used sinks out of the prompt, and the ledger
+    // keeps every transition undoable. Runs here so an idle machine still tidies itself.
+    match engine.curator.sweep(vikram_evolution::now_ms(), None) {
+        Ok(sweep) => lines.push(format!(
+            "curator: {} staled, {} archived, {} reactivated",
+            sweep.staled, sweep.archived, sweep.reactivated
+        )),
+        Err(err) => {
+            ok = false;
+            lines.push(format!("curator: failed — {err}"));
+        }
+    }
+
+    let text = lines.join("\n");
+    if ok {
+        RunOutcome::finished(text, None)
+    } else {
+        RunOutcome {
+            ok: false,
+            output: clip(text),
+            session: None,
+            error: Some("one or more maintenance steps failed".to_string()),
+        }
+    }
+}
+
+/// Let a known disk reading move presence, and say what it did.
+///
+/// A full disk dozes once: the daemon keeps working, but ordinary reports wait and urgent ones
+/// still land. A recovered disk wakes only the doze this actuator set, because the reason is
+/// recorded separately and an operator's doze carries no disk reason. Every store failure is a line
+/// in the report, never a panic or a silent discard.
+fn react_to_disk(store: &ScheduleStore, disk: Option<f32>, now: Millis) -> Vec<String> {
+    let Some(share) = disk else {
+        return Vec::new();
+    };
+    let presence = match Presence::load(store) {
+        Ok(presence) => presence,
+        Err(err) => return vec![format!("presence: could not be recorded — {err}")],
+    };
+    let full = percent(share);
+
+    if share >= DISK_DOZE_SHARE {
+        if presence.state != Liveness::Awake {
+            return Vec::new();
+        }
+        let line = format!(
+            "disk {full}% full: dozing until it comes back below {}%",
+            percent(DISK_WAKE_SHARE)
+        );
+        if let Err(err) = presence.moved(Liveness::Dozing, now).apply(store, now) {
+            return vec![format!("presence: could not be recorded — {err}")];
+        }
+        if let Err(err) = Presence::record_reason(store, DISK_REASON) {
+            return vec![format!("presence: could not be recorded — {err}")];
+        }
+        return vec![line];
+    }
+
+    if share < DISK_WAKE_SHARE && presence.state == Liveness::Dozing {
+        match Presence::reason(store) {
+            Ok(reason) if reason.as_deref() == Some(DISK_REASON) => {}
+            Ok(_) => return Vec::new(),
+            Err(err) => return vec![format!("presence: could not be recorded — {err}")],
+        }
+        if let Err(err) = presence.moved(Liveness::Awake, now).apply(store, now) {
+            return vec![format!("presence: could not be recorded — {err}")];
+        }
+        if let Err(err) = Presence::clear_reason(store) {
+            return vec![format!("presence: could not be recorded — {err}")];
+        }
+        return vec![format!("disk {full}% full: awake again")];
+    }
+
+    Vec::new()
+}
+
+fn percent(share: f32) -> i64 {
+    (share * 100.0).round() as i64
+}
+
 pub async fn run_script(command: &str, cwd: Option<&Path>, timeout: Duration) -> RunOutcome {
     let mut child = shell_command(command);
     child.kill_on_drop(true);
@@ -1235,5 +1421,115 @@ mod tests {
         });
         assert!(clean.ok);
         assert_eq!(clean.output, "arun: all clear");
+    }
+
+    #[tokio::test]
+    async fn a_maintenance_run_creates_the_store_and_reports_its_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = run_maintenance(dir.path().to_path_buf(), seconds(60)).await;
+        assert!(outcome.ok, "{outcome:?}");
+        assert!(
+            dir.path().join("evolution.db").exists(),
+            "the store is created"
+        );
+        assert!(outcome.output.contains("reflection:"), "{}", outcome.output);
+        assert!(outcome.output.contains("cycle 1"), "{}", outcome.output);
+        assert!(outcome.session.is_none(), "maintenance opens no session");
+    }
+
+    #[tokio::test]
+    async fn a_second_maintenance_run_advances_the_durable_cycle_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = run_maintenance(dir.path().to_path_buf(), seconds(60)).await;
+        assert!(first.ok, "{first:?}");
+        let second = run_maintenance(dir.path().to_path_buf(), seconds(60)).await;
+        assert!(second.ok, "{second:?}");
+        assert!(
+            second.output.contains("cycle 2"),
+            "the cycle count is durable: {}",
+            second.output
+        );
+    }
+
+    fn presence_store() -> ScheduleStore {
+        ScheduleStore::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn a_full_disk_puts_the_daemon_to_doze_once() {
+        let store = presence_store();
+        let at = 1_700_000_000_000;
+
+        let lines = react_to_disk(&store, Some(0.96), at);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("96%"), "{}", lines[0]);
+        assert!(lines[0].contains("dozing"), "{}", lines[0]);
+        assert_eq!(Presence::load(&store).unwrap().state, Liveness::Dozing);
+        assert_eq!(
+            Presence::reason(&store).unwrap().as_deref(),
+            Some(DISK_REASON),
+            "the reason is what lets a later run undo this doze and nobody else's"
+        );
+
+        assert!(
+            react_to_disk(&store, Some(0.97), at + 1).is_empty(),
+            "a second full run has nothing left to change"
+        );
+        let trail = store.audit_trail(10).unwrap();
+        assert_eq!(
+            trail
+                .iter()
+                .filter(|row| row.kind == "presence.set")
+                .count(),
+            1,
+            "the transition happens once: {trail:?}"
+        );
+
+        let recovered = react_to_disk(&store, Some(0.42), at + 2);
+        assert_eq!(recovered.len(), 1, "{recovered:?}");
+        assert!(recovered[0].contains("awake"), "{}", recovered[0]);
+        assert_eq!(Presence::load(&store).unwrap().state, Liveness::Awake);
+        assert_eq!(Presence::reason(&store).unwrap(), None);
+    }
+
+    #[test]
+    fn a_hand_set_doze_is_not_reverted_by_a_recovered_disk() {
+        let store = presence_store();
+        let at = 1_700_000_000_000;
+        Presence::default()
+            .moved(Liveness::Dozing, at)
+            .apply(&store, at)
+            .unwrap();
+
+        assert!(
+            react_to_disk(&store, Some(0.40), at + 1).is_empty(),
+            "a doze without the disk reason was the operator's"
+        );
+        let presence = Presence::load(&store).unwrap();
+        assert_eq!(presence.state, Liveness::Dozing);
+        assert_eq!(presence.since, at, "the operator's transition stands");
+    }
+
+    #[test]
+    fn an_unreadable_disk_changes_nothing() {
+        let store = presence_store();
+        let at = 1_700_000_000_000;
+
+        assert!(react_to_disk(&store, None, at).is_empty());
+        assert_eq!(Presence::load(&store).unwrap().state, Liveness::Awake);
+        assert_eq!(Presence::reason(&store).unwrap(), None);
+        assert!(
+            store.audit_trail(10).unwrap().is_empty(),
+            "an unreadable probe is neither a full disk nor an empty one"
+        );
+
+        let dozed = presence_store();
+        react_to_disk(&dozed, Some(0.96), at);
+        assert!(react_to_disk(&dozed, None, at + 1).is_empty());
+        assert_eq!(
+            Presence::load(&dozed).unwrap().state,
+            Liveness::Dozing,
+            "unknown evidence cannot take a standing state back"
+        );
     }
 }

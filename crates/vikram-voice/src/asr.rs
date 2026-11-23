@@ -281,7 +281,9 @@ impl WavoRecognizer {
             },
         };
         let label = model.device().to_string();
-        eprintln!("voice: asr on {label}");
+        if std::env::var_os("VIKRAM_VOICE_DEBUG").is_some() {
+            eprintln!("voice: asr on {label}");
+        }
         self.adapter = Some(label);
         self.model = Some(model);
         Ok(())

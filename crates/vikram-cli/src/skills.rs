@@ -7,11 +7,12 @@ use clap::{Args, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use vikram_runtime::config::Config;
+use vikram_runtime::config::{Config, database_path};
 use vikram_skills::{
     ActivationPolicy, Budget, BundleIndex, Catalog, Diagnostic, DiagnosticLevel, DiscoveryOptions,
-    History, InstallSource, Installer, Loader, Manager, Manifest, ResourceKind, Scope,
-    SkillSummary, TrustPolicy, bundles_dir, home, project_skill_dirs, state_dir, user_skills_dir,
+    History, InstallSource, Installer, Loader, Manager, Manifest, PersonaKind, PersonaSource,
+    ResourceKind, Scope, SkillSummary, TrustPolicy, bundles_dir, home, project_skill_dirs,
+    state_dir, user_skills_dir,
 };
 
 const NAME_WIDTH: usize = 26;
@@ -144,6 +145,7 @@ pub struct ListArgs {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ScopeArg {
+    Persona,
     Builtin,
     User,
     Project,
@@ -154,6 +156,7 @@ enum ScopeArg {
 impl ScopeArg {
     fn to_scope(self) -> Scope {
         match self {
+            ScopeArg::Persona => Scope::Persona,
             ScopeArg::Builtin => Scope::Builtin,
             ScopeArg::User => Scope::User,
             ScopeArg::Project => Scope::Project,
@@ -832,9 +835,39 @@ fn reload(config: &Config) -> Result<(), String> {
 }
 
 fn discovery_options(config: &Config) -> DiscoveryOptions {
-    DiscoveryOptions {
+    let options = DiscoveryOptions {
         workspace: Some(workspace_dir(config)),
         ..DiscoveryOptions::default()
+    };
+    match active_persona() {
+        Some((slug, kind)) => options.with_persona(PersonaSource::new(
+            vikram_runtime::config::vikram_home(),
+            kind,
+            slug,
+        )),
+        None => options,
+    }
+}
+
+/// The persona the interface last left selected, so `vikram skills` reports the same skills a turn
+/// would be offered — its own folder included — instead of only the shared tiers.
+fn active_persona() -> Option<(String, PersonaKind)> {
+    if !database_path().exists() {
+        return None;
+    }
+    let store = vikram_store::Store::open(&database_path()).ok()?;
+    let identity = store.get_active_identity().ok()?;
+    let entity = store.get_entity(identity.main_agent.as_ref()?).ok()??;
+    let kind = match entity.kind {
+        vikram_store::EntityKind::MainAgent => PersonaKind::MainAgent,
+        vikram_store::EntityKind::Agent => PersonaKind::Agent,
+        vikram_store::EntityKind::Bot => PersonaKind::Bot,
+    };
+    let slug = entity.slug.trim().to_owned();
+    if slug.is_empty() {
+        None
+    } else {
+        Some((slug, kind))
     }
 }
 

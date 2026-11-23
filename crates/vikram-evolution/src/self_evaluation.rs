@@ -219,6 +219,9 @@ impl SelfEvaluationEngine {
             sufficient_data: sample.sufficient_data,
         };
 
+        if result.sufficient_data {
+            self.track_metric(result.actual_metrics.clone())?;
+        }
         self.evaluation_results.push(result.clone());
         if let Err(e) = self.persist(RESULT_NAMESPACE, &result.id, &result) {
             self.evaluation_results.pop();

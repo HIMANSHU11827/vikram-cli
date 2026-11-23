@@ -100,6 +100,19 @@ impl SkillRegistry {
         }
     }
 
+    /// Scan the shared directories plus one persona's own skill folder, so an agent carries the
+    /// skills the operator gave *it* without every other agent inheriting them.
+    pub fn for_workspace_and_persona(
+        workspace: &Path,
+        home: &Path,
+        persona: Option<(&str, vikram_skills::PersonaKind)>,
+    ) -> Self {
+        Self {
+            catalog: Catalog::for_workspace_and_persona(workspace, home, persona),
+            loader: Loader::new(vikram_skills::Budget::default()),
+        }
+    }
+
     pub fn list(&self) -> Vec<Skill> {
         self.catalog
             .list()

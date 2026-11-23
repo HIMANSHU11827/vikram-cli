@@ -137,6 +137,9 @@ fn every_builtin_declares_a_permission_shape() {
             "codeindex" => json!({"action": "search", "query": "x"}),
             "spawn_worker" => json!({"objective": "do the thing"}),
             "worker.collect" => json!({"id": "wrk-test"}),
+            "worker.note" => json!({"to": "wrk-test", "text": "the report is in artifacts/"}),
+            "worker.notes" => json!({"worker": "wrk-test"}),
+            "cross_check" => json!({"question": "is rust async supported?", "other_model": "m"}),
             "session.search" => json!({"query": "x"}),
             "plugin.execute" => json!({"plugin": "p", "args": "x"}),
             "plugin.list" => json!({}),
@@ -147,6 +150,9 @@ fn every_builtin_declares_a_permission_shape() {
             "plugin.deps" => json!({}),
             "permission.check" => json!({"verb": "v", "resource": "r"}),
             "terminal" => json!({"action": "list"}),
+            "terminal.exec" => {
+                json!({"backend": "docker", "image": "ubuntu:22.04", "command": "id"})
+            }
             "computer.screenshot" => json!({"path": "shot.png"}),
             "computer.click" => json!({"x": 10, "y": 20}),
             "computer.type" => json!({"text": "hello"}),

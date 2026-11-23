@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::redact::sanitize_for_storage;
-use crate::store::{EvolutionStore, find_memory_conn, save_memory_conn};
+use crate::store::{EvolutionStore, find_memory_conn, mark_memory_used_conn, save_memory_conn};
 use crate::types::{KnowledgeStatus, MemoryEntry, MemoryLayer, gen_id, now_ms};
 
 pub struct LayeredMemory {
@@ -101,8 +101,13 @@ impl LayeredMemory {
                     return Ok(entry);
                 }
                 // keep existing (superseded/expired rows are already
-                // excluded by `find_memory_conn`)
-                return Ok(existing);
+                // excluded by `find_memory_conn`), but a re-assertion is a
+                // use: bump `updated_ms` so the curator can recover it from
+                // `stale`/`archived` instead of aging it out.
+                let mut kept = existing;
+                mark_memory_used_conn(conn, &kept.id, now)?;
+                kept.updated_ms = now;
+                return Ok(kept);
             }
             let entry = MemoryEntry {
                 id: gen_id("mem"),
@@ -293,5 +298,30 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn forget_deletes_a_live_entry_and_reports_unknown_ids() {
+        let store = EvolutionStore::open_in_memory().unwrap();
+        let memory = LayeredMemory::new(store);
+        let entry = memory
+            .remember(
+                MemoryLayer::Project,
+                "project:p1",
+                "db",
+                "postgres",
+                KnowledgeStatus::Observed,
+                0.6,
+                None,
+                "forget-test",
+            )
+            .unwrap();
+        assert_eq!(memory.list(None).unwrap().len(), 1);
+
+        assert!(memory.forget(&entry.id).unwrap());
+        assert!(memory.list(None).unwrap().is_empty());
+        assert!(memory.get_by_id(&entry.id).unwrap().is_none());
+        assert!(!memory.forget(&entry.id).unwrap());
+        assert!(!memory.forget("mem-unknown").unwrap());
     }
 }
