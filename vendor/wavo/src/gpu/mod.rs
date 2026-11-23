@@ -397,7 +397,7 @@ pub struct Linear {
   k: usize,
   /// Outputs written a second time after the `cols` others, with their own bias.
   dual: usize,
-  /// GEMM pipeline index: 0: F32, 1: F16, 2: Q8_0
+  /// GEMM pipeline index: 0: F32, 1: F16, 2: Q8_0. The K-quants are stored and read as F16.
   ty: usize,
   weight: Buffer,
   scales: Option<Buffer>,
@@ -750,11 +750,13 @@ impl Gpu {
   }
 
   /// Uploads weights `[.., n_i]` of one type and inner size, stacked along n, with the bias of
-  /// the stacked rows, or zeros when `bias` is empty. The GEMM computes 64 outputs at a time, so
-  /// the rows are padded with zeros to a multiple of 64. Outputs past the rows are not written
-  /// when the rows are a multiple of 32 (d 288), else they are `epilogue(0)` up to the padding. A
-  /// bias with `dual` more values has the first `dual` outputs written again after the others
-  /// with those biases (one q with two position biases).
+  /// the stacked rows, or zeros when `bias` is empty. Weights keep their file type in the buffer:
+  /// F32 and F16 as they are, Q8_0 as its 34-byte blocks (1 byte per weight plus 2 bytes per 32),
+  /// and the K-quants dequantized to f16 — never f32, which no kernel reads for them. The GEMM
+  /// computes 64 outputs at a time, so the rows are padded with zeros to a multiple of 64. Outputs
+  /// past the rows are not written when the rows are a multiple of 32 (d 288), else they are
+  /// `epilogue(0)` up to the padding. A bias with `dual` more values has the first `dual` outputs
+  /// written again after the others with those biases (one q with two position biases).
   pub fn linear(&self, weights: &[Tensor], bias: &[f32]) -> Result<Linear> {
     self.upload_linear(weights, bias, false)
   }
@@ -821,16 +823,19 @@ impl Gpu {
         }
         (2, self.filled(dv), Some(self.filled(sv)))
       }
-      // The K-quants are dequantized to f32 at load, as the padded path above does.
+      // The K-quants are dequantized at load, but to f16 and never f32: the GEMM rounds W to f16
+      // before it multiplies (`to_half`), so f16 is the weight the kernel would read anyway, at
+      // half the bytes. Keeping their blocks in the buffer would need the GEMM's 32-wide K step
+      // to line up with their 64-weight chunks (a repack at load), so they stay dequantized here.
       _ => {
-        let mut f = self.fill(n * k * 4, rows * k * 4)?;
+        let mut f = self.fill(n * k * 2, rows * k * 2)?;
         let mut at = 0;
         for w in weights {
-          let w = w.to_f32()?;
-          f.slice(at..at + w.len() * 4).copy_from_slice(bytemuck::cast_slice(&w));
-          at += w.len() * 4;
+          let h = w.to_f16()?;
+          f.slice(at..at + h.len()).copy_from_slice(&h);
+          at += h.len();
         }
-        (0, self.filled(f), None)
+        (1, self.filled(f), None)
       }
     };
     let dual = bias.len().saturating_sub(rows);
@@ -1952,6 +1957,79 @@ mod tests {
           }
         }
       }
+    }
+  }
+
+  /// A Q4_K block of 256 weights with scale `d`, min `dmin` and varying scales and quants.
+  fn q4_k_block() -> Vec<u8> {
+    let mut b = vec![0u8; 144];
+    b[..2].copy_from_slice(&f16::from_f32(0.5).to_le_bytes());
+    b[2..4].copy_from_slice(&f16::from_f32(0.25).to_le_bytes());
+    for (i, s) in b[4..16].iter_mut().enumerate() {
+      *s = (i as u8 * 7 + 3) & 63;
+    }
+    for (i, q) in b[16..].iter_mut().enumerate() {
+      *q = (i as u8).wrapping_mul(37) ^ 0x5a;
+    }
+    b
+  }
+
+  #[test]
+  fn q8_0_weights_stay_quantized_in_vram() {
+    // 64 rows of 256: the 34-byte Q8_0 blocks and their f16 scales, never f32 values.
+    let (k, n) = (256, 64);
+    let w = random(n * k, 21);
+    let q8: Vec<u8> = (w.chunks(32))
+      .flat_map(|block| {
+        let d = block.iter().fold(0f32, |m, x| m.max(x.abs())) / 127.0;
+        let q = block.iter().map(move |x| (x / d).round() as i8 as u8);
+        f16::from_f32(d).to_le_bytes().into_iter().chain(q)
+      })
+      .collect();
+    let file = Gguf::with_tensors(&[("w", &[k, n], Type::Q8_0, &q8)]);
+    let t = || file.tensor("w", &[k, n]).unwrap();
+    for gpu in gpus() {
+      let l = gpu.linear(&[t()], &[]).unwrap();
+      assert_eq!(l.ty, 2);
+      // 1 byte a weight and 2 bytes a block of 32, where f32 took 4 bytes a weight.
+      assert_eq!(l.weight.size(), (n * k) as u64);
+      assert_eq!(l.scales.as_ref().unwrap().size(), (n * k / 16) as u64);
+    }
+  }
+
+  #[test]
+  fn k_quant_weights_are_f16_in_vram() {
+    // Two Q4_K tensors of 32 rows × 256 (one 144-byte block a row), stacked: f16 in the buffer,
+    // half the bytes f32 took, and the GEMM reads the halves it would have rounded f32 to anyway.
+    let (k, rows) = (256, 32);
+    let bytes = q4_k_block().repeat(rows);
+    let dims = [k, rows];
+    let file =
+      Gguf::with_tensors(&[("w1", &dims, Type::Q4_K, &bytes), ("w2", &dims, Type::Q4_K, &bytes)]);
+    let t = |name| file.tensor(name, &dims).unwrap();
+    let half = |x: &f32| f16::from_f32(*x).to_f32();
+    let wf: Vec<f32> = [t("w1").to_f32().unwrap(), t("w2").to_f32().unwrap()].concat();
+    let wf: Vec<f32> = wf.iter().map(half).collect();
+
+    for gpu in gpus() {
+      let l = gpu.linear(&[t("w1"), t("w2")], &[]).unwrap();
+      assert_eq!(l.ty, 1);
+      assert_eq!(l.weight.size(), (2 * rows * k * 2) as u64);
+      assert!(l.scales.is_none());
+
+      let m = 37;
+      let a = random(m * k, 11);
+      let ar: Vec<f32> = a.iter().map(half).collect();
+      let c = random(m * l.width() + 1, 12);
+      let ab = up(gpu, &a);
+      let want: Vec<f32> = (0..c.len())
+        .map(|i| {
+          let (r, j) = (i / l.width(), i % l.width());
+          if r == m { c[i] } else { (0..k).map(|x| ar[r * k + x] * wf[j * k + x]).sum() }
+        })
+        .collect();
+      let got = run(gpu, &c, |p, out| p.gemm(&ab, &l, out, m, Epilogue::Bias));
+      assert_close(&got, &want);
     }
   }
 

@@ -1,6 +1,8 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/wavo
-//! GGUF v3 reader: metadata from the header, F32/F16/Q8_0 and the K-quants (Q4_K, Q5_K, Q6_K)
-//! streamed from the file and dequantized on the CPU.
+//! GGUF v3 reader: metadata from the header, and F32/F16/Q8_0 and the K-quants (Q4_K, Q5_K, Q6_K)
+//! streamed from the file. F32 and F16 are used as they are; Q8_0 and the K-quants are dequantized
+//! block by block, either on the way to a kernel that reads them quantized (the GPU's Q8_0 path,
+//! which takes the 34-byte blocks) or into f16/f32 when a caller asks for floats.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -46,7 +48,7 @@ impl Type {
   }
 
   /// Values per block: a tensor is a whole number of blocks.
-  fn block(self) -> usize {
+  pub(crate) fn block(self) -> usize {
     match self {
       Self::F32 | Self::F16 => 1,
       Self::Q8_0 => 32,
@@ -55,7 +57,7 @@ impl Type {
   }
 
   /// Bytes of a block: an f32 or f16 value, or a quantized block.
-  fn block_bytes(self) -> usize {
+  pub(crate) fn block_bytes(self) -> usize {
     match self {
       Self::F32 => 4,
       Self::F16 => 2,
@@ -68,6 +70,21 @@ impl Type {
 
   fn size(self, n: usize) -> usize {
     n / self.block() * self.block_bytes()
+  }
+
+  /// Dequantizes the block `b` (`block_bytes` bytes) into `out` (`block()` values).
+  pub(crate) fn dequant(self, b: &[u8], out: &mut [f32]) {
+    match self {
+      Self::F32 => out[0] = f32::from_le_bytes(b.try_into().unwrap()),
+      Self::F16 => out[0] = f16::from_le_bytes(b.try_into().unwrap()).to_f32(),
+      Self::Q8_0 => {
+        let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+        out.iter_mut().zip(&b[2..]).for_each(|(o, &q)| *o = q as i8 as f32 * d);
+      }
+      Self::Q4_K => q4_k(b, out),
+      Self::Q5_K => q5_k(b, out),
+      Self::Q6_K => q6_k(b, out),
+    }
   }
 }
 
@@ -308,32 +325,49 @@ impl Tensor<'_> {
     Ok(())
   }
 
+  /// The tensor's values, dequantized a block at a time.
   pub fn to_f32(&self) -> Result<Vec<f32>> {
-    let mut b = Vec::with_capacity(self.size);
-    self.read(self.size.max(1), |_, piece| b.extend_from_slice(piece))?;
-    Ok(match self.ty {
-      Type::F32 => b.as_chunks().0.iter().map(|&c| f32::from_le_bytes(c)).collect(),
-      Type::F16 => b.as_chunks().0.iter().map(|&c| f16::from_le_bytes(c).to_f32()).collect(),
-      Type::Q8_0 => (b.as_chunks::<34>().0.iter())
-        .flat_map(|block| {
-          let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
-          block[2..].iter().map(move |&q| q as i8 as f32 * d)
-        })
-        .collect(),
-      Type::Q4_K => dequant_k(&b, self.ty.block_bytes(), q4_k),
-      Type::Q5_K => dequant_k(&b, self.ty.block_bytes(), q5_k),
-      Type::Q6_K => dequant_k(&b, self.ty.block_bytes(), q6_k),
+    let mut out = vec![0f32; self.len()];
+    self.dequant_into(|at, values| out[at..at + values.len()].copy_from_slice(values))?;
+    Ok(out)
+  }
+
+  /// The tensor's values as little-endian f16: half the memory of [`Tensor::to_f32`], for weights
+  /// a kernel reads as halves anyway.
+  pub fn to_f16(&self) -> Result<Vec<u8>> {
+    let mut out = vec![0u8; self.len() * 2];
+    self.dequant_into(|at, values| {
+      let at = 2 * at;
+      for (i, v) in values.iter().enumerate() {
+        out[at + 2 * i..][..2].copy_from_slice(&f16::from_f32(*v).to_le_bytes());
+      }
+    })?;
+    Ok(out)
+  }
+
+  /// Dequantizes the tensor block by block, handing `f(first value, values)` the whole blocks of
+  /// one piece: a block never straddles two calls.
+  fn dequant_into(&self, mut f: impl FnMut(usize, &[f32])) -> Result<()> {
+    let (block, n) = (self.ty.block_bytes(), self.ty.block());
+    let mut buf = vec![0f32; n];
+    let mut at = 0;
+    // Whole blocks per piece, as many as a read chunk of the size the GPU uploads with.
+    self.read(block * (34 << 13), |_, piece| {
+      for b in piece.chunks_exact(block) {
+        self.ty.dequant(b, &mut buf);
+        f(at, &buf);
+        at += n;
+      }
     })
   }
 }
 
-/// Dequantizes the K-quant blocks of `b`, `block` bytes each, with `f`.
-fn dequant_k(b: &[u8], block: usize, f: fn(&[u8], &mut [f32])) -> Vec<f32> {
-  let mut out = vec![0.0; b.len() / block * QK_K];
-  for (b, out) in b.chunks_exact(block).zip(out.chunks_mut(QK_K)) {
-    f(b, out);
-  }
-  out
+/// Dequantizes row `r` of `k` values of a tensor of `ty` whose raw blocks are `blocks` into `out`
+/// (`k` values): one row at a time, so no caller holds the whole matrix as floats.
+pub(crate) fn dequant_row(ty: Type, blocks: &[u8], r: usize, k: usize, out: &mut [f32]) {
+  let (block, n) = (ty.block_bytes(), ty.block());
+  let row = &blocks[r * (k / n * block)..][..k / n * block];
+  row.chunks_exact(block).zip(out.chunks_mut(n)).for_each(|(b, out)| ty.dequant(b, out));
 }
 
 /// The 6-bit scale and min of sub-block `j` of a K-quant, as llama.cpp packs them in 12 bytes:

@@ -17,7 +17,7 @@ use half::slice::HalfFloatSliceExt;
 
 use super::{Q8, dot, ops, par_each};
 use crate::error::{Result, bail};
-use crate::gguf::{Tensor, Type};
+use crate::gguf::{Tensor, Type, dequant_row};
 use crate::gpu::Epilogue;
 
 /// Panel width: output columns per tile.
@@ -29,12 +29,17 @@ const GROUP: usize = 384 << 10;
 
 enum Weights {
   Q8(Q8),
+  /// A K-quant as its file blocks, dequantized a row at a time.
+  K {
+    ty: Type,
+    blocks: Vec<u8>,
+  },
   F16(Vec<f16>),
   F32(Vec<f32>),
 }
 
-/// A linear layer `y = x·Wᵀ + b`, W `[n][k]` in its GGUF type (Q8_0, F16, F32, or a K-quant
-/// dequantized to f32).
+/// A linear layer `y = x·Wᵀ + b`, W `[n][k]` in its GGUF type (Q8_0, F16, F32, or a K-quant kept
+/// as its blocks and dequantized a row at a time).
 pub struct Linear {
   pub n: usize,
   pub k: usize,
@@ -65,6 +70,15 @@ impl Linear {
 
         Weights::F16(w)
       }
+      ty @ (Type::Q4_K | Type::Q5_K | Type::Q6_K) => {
+        let mut blocks = Vec::new();
+        // Whole blocks per piece, so none straddles two.
+        let chunk = ty.block_bytes() * (1 << 13);
+        for t in ws {
+          t.read(chunk, |_, piece| blocks.extend_from_slice(piece))?;
+        }
+        Weights::K { ty, blocks }
+      }
       _ => Weights::F32(ws.iter().map(|w| w.to_f32()).collect::<Result<Vec<_>>>()?.concat()),
     };
     if !bias.is_empty() && bias.len() != n {
@@ -80,6 +94,11 @@ impl Linear {
     let k = self.k;
     match &self.w {
       Weights::Q8(q8) => q8.row(r),
+      Weights::K { ty, blocks } => {
+        let mut out = vec![0.0; k];
+        dequant_row(*ty, blocks, r, k, &mut out);
+        out
+      }
       Weights::F16(w) => w[r * k..][..k].iter().map(|w| w.to_f32()).collect(),
       Weights::F32(w) => w[r * k..][..k].to_vec(),
     }
@@ -105,6 +124,12 @@ impl Linear {
             for (q, out) in q.iter().zip(out.as_chunks_mut::<NR>().0) {
               out[j] = to_half(*q as f32 * d);
             }
+          }
+        }
+        Weights::K { ty, blocks } => {
+          dequant_row(*ty, blocks, row, k, wide);
+          for (w, out) in wide.iter().zip(out.as_chunks_mut::<NR>().0) {
+            out[j] = to_half(*w);
           }
         }
         Weights::F16(w) => {
@@ -190,6 +215,12 @@ pub fn gemv(x: &[f32], l: &Linear, c: &mut [f32], epilogue: Epilogue) {
       let (r0, acc) = (i * rows, &mut acc[..c.len()]);
       match &l.w {
         Weights::Q8(q8) => q8.rows(r0, x, acc),
+        Weights::K { ty, blocks } => {
+          for (a, r) in acc.iter_mut().zip(r0..) {
+            dequant_row(*ty, blocks, r, k, wide);
+            *a = dot(wide, x);
+          }
+        }
         Weights::F16(w) => {
           for (a, w) in acc.iter_mut().zip(w[r0 * k..].chunks_exact(k)) {
             w.convert_to_f32_slice(wide);
@@ -601,6 +632,56 @@ mod tests {
         let want = 1.0 + 0.5 * (w + bias[i % n]);
         assert!((c - want).abs() <= 1e-4 * want.abs().max(1.0), "{ty:?} {i}: {c} vs {want}");
       }
+    }
+  }
+
+  /// A Q4_K block of 256 weights with scale `d`, min `dmin` and varying scales and quants.
+  fn q4_k_block() -> Vec<u8> {
+    let mut b = vec![0u8; 144];
+    b[..2].copy_from_slice(&f16::from_f32(0.5).to_le_bytes());
+    b[2..4].copy_from_slice(&f16::from_f32(0.25).to_le_bytes());
+    for (i, s) in b[4..16].iter_mut().enumerate() {
+      *s = (i as u8 * 7 + 3) & 63;
+    }
+    for (i, q) in b[16..].iter_mut().enumerate() {
+      *q = (i as u8).wrapping_mul(37) ^ 0x5a;
+    }
+    b
+  }
+
+  #[test]
+  fn k_quant_matches_dequantized() {
+    // 40 rows of 256 (one Q4_K block a row): the layer keeps the blocks and dequantizes a row at a
+    // time, so its GEMM and gemv must agree with the dequantized weights, rounded to f16 as the
+    // GPU's kernels round them.
+    let (k, n, m) = (256, 40, 13);
+    let bytes = q4_k_block().repeat(n);
+    let g = Gguf::with_tensors(&[("w", &[k, n], Type::Q4_K, &bytes)]);
+    let t = g.tensor("w", &[k, n]).unwrap();
+    let v: Vec<f32> = t.to_f32().unwrap().iter().map(|x| f16::from_f32(*x).to_f32()).collect();
+    let bias: Vec<f32> = (0..n).map(|i| i as f32 / 4.0).collect();
+    let l = super::Linear::new(&[t], bias.clone()).unwrap();
+    // Row 7 of the dequantized weights, as the layer's own row accessor gives them.
+    assert_eq!(l.row(7), v[7 * k..][..k]);
+
+    let a: Vec<f32> = (0..m * k).map(|i| (i * 31 % 17) as f32 / 8.0 - 1.0).collect();
+    let ar: Vec<f32> = a.iter().map(|x| f16::from_f32(*x).to_f32()).collect();
+    let want = naive(&ar, &v, k);
+    let mut c = vec![0.0; m * n];
+    super::gemm(&a, &l, &mut c, m, Epilogue::Bias);
+    for (i, (c, w)) in c.iter().zip(&want).enumerate() {
+      let want = w + bias[i % n];
+      assert!((c - want).abs() <= 1e-4 * want.abs().max(1.0), "{i}: {c} vs {want}");
+    }
+
+    let x = &a[..k];
+    let xr: Vec<f32> = x.iter().map(|v| f16::from_f32(*v).to_f32()).collect();
+    let want = naive(&xr, &v, k);
+    let mut c = vec![0.0; n];
+    super::gemv(x, &l, &mut c, Epilogue::Bias);
+    for (i, (c, w)) in c.iter().zip(&want).enumerate() {
+      let want = w + bias[i];
+      assert!((c - want).abs() <= 1e-4 * want.abs().max(1.0), "{i}: {c} vs {want}");
     }
   }
 

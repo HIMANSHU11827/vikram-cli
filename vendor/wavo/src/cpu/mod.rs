@@ -12,7 +12,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use half::f16;
 
 use crate::error::Result;
-use crate::gguf::{Tensor, Type};
+use crate::gguf::{Tensor, Type, dequant_row};
 use crate::{Api, Device, DeviceKind, Kernels};
 
 /// Dot product with 16 independent accumulators (four FMA vectors in flight), summed pairwise so
@@ -191,10 +191,11 @@ fn tile<const R: usize, const F: usize>(w: &[f32], z: &[f32], k: usize) -> [[f32
   std::array::from_fn(|f| std::array::from_fn(|r| dot(&w[r * k..][..k], &z[f * k..][..k])))
 }
 
-/// Weights `[rows][k]` for `matvecs`, kept as Q8_0 or, from any other type, as f32 (exact, as the
-/// reference reads them; the K-quants are dequantized).
+/// Weights `[rows][k]` for `matvecs`, kept as Q8_0, as the blocks of a K-quant (dequantized a row
+/// at a time), or as f32 (exact, as the reference reads them).
 pub enum Matrix {
   Q8(Q8),
+  K { k: usize, ty: Type, blocks: Vec<u8> },
   F32 { k: usize, w: Vec<f32> },
 }
 
@@ -203,6 +204,11 @@ impl Matrix {
     let k = t.dims[0];
     Ok(match t.ty {
       Type::Q8_0 => Self::Q8(Q8::new(&[t])?),
+      ty @ (Type::Q4_K | Type::Q5_K | Type::Q6_K) => {
+        let mut blocks = Vec::new();
+        t.read(ty.block_bytes() * (1 << 13), |_, piece| blocks.extend_from_slice(piece))?;
+        Self::K { k, ty, blocks }
+      }
       _ => Self::F32 { k, w: t.to_f32()? },
     })
   }
@@ -210,6 +216,11 @@ impl Matrix {
   pub fn row(&self, r: usize) -> Vec<f32> {
     match self {
       Self::Q8(q8) => q8.row(r),
+      Self::K { k, ty, blocks } => {
+        let mut out = vec![0.0; *k];
+        dequant_row(*ty, blocks, r, *k, &mut out);
+        out
+      }
       Self::F32 { k, w } => w[r * k..][..*k].to_vec(),
     }
   }
@@ -217,6 +228,7 @@ impl Matrix {
   fn len(&self) -> usize {
     match self {
       Self::Q8(q8) => q8.q.len() / q8.k,
+      Self::K { k, ty, blocks } => blocks.len() / ty.block_bytes() * ty.block() / k,
       Self::F32 { k, w } => w.len() / k,
     }
   }
@@ -225,6 +237,14 @@ impl Matrix {
   fn rows(&self, r0: usize, x: &[f32], out: &mut [f32]) {
     match self {
       Self::Q8(q8) => q8.rows(r0, x, out),
+      Self::K { k, ty, blocks } => {
+        // One row at a time, in a buffer of `k` floats: the matrix is never all floats.
+        let mut row = vec![0.0; *k];
+        for (o, r) in out.iter_mut().zip(r0..) {
+          dequant_row(*ty, blocks, r, *k, &mut row);
+          *o = dot(&row, x);
+        }
+      }
       Self::F32 { k, w } => {
         for (o, w) in out.iter_mut().zip(w[r0 * k..].chunks_exact(*k)) {
           *o = dot(w, x);
