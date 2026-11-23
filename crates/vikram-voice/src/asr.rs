@@ -15,7 +15,7 @@ use crate::{Result, StageStatus, VoiceConfig, VoiceError};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use wavo::hub::Hub;
+use wavo::hub::{Hub, Quant};
 
 /// The hub name of the default tier: 80 MB, English, 7× faster than whisper-turbo.
 pub const DEFAULT_MODEL: &str = "whisper-base.en";
@@ -23,6 +23,54 @@ pub const DEFAULT_MODEL: &str = "whisper-base.en";
 /// A caption needs at least 100 ms of 16 kHz audio; below that the answer is an empty string,
 /// so a caller can caption from the first frame without an error.
 const MIN_PARTIAL_SAMPLES: usize = 1_600;
+
+/// Where the model runs, from `asr_backend`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AsrBackend {
+    /// The GPU through Vulkan, with a CPU fallback that prints why it was taken. The default.
+    Vulkan,
+    /// Whatever wavo picks for the machine: the GPU unless it is a software one, such as llvmpipe.
+    Auto,
+    /// wavo's own kernels on the CPU: an order of magnitude slower, and no graphics driver in
+    /// the way.
+    Cpu,
+}
+
+impl AsrBackend {
+    /// `vulkan`, `auto` or `cpu`; case and surrounding spaces don't matter.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "vulkan" => Some(Self::Vulkan),
+            "auto" => Some(Self::Auto),
+            "cpu" => Some(Self::Cpu),
+            _ => None,
+        }
+    }
+
+    /// The name `parse` takes and `asr_backend` holds.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vulkan => "vulkan",
+            Self::Auto => "auto",
+            Self::Cpu => "cpu",
+        }
+    }
+}
+
+/// The configured quantization, or the error naming the supported ones.
+fn quant_of(config: &VoiceConfig) -> Result<Quant> {
+    Quant::parse(&config.asr_quant).map_err(|err| VoiceError::Config(format!("asr_quant: {err}")))
+}
+
+/// The configured backend, or the error naming the valid ones.
+fn backend_of(config: &VoiceConfig) -> Result<AsrBackend> {
+    AsrBackend::parse(&config.asr_backend).ok_or_else(|| {
+        VoiceError::Config(format!(
+            "asr_backend `{}` is not one of: vulkan, auto, cpu",
+            config.asr_backend.trim()
+        ))
+    })
+}
 
 /// `$VIKRAM_HOME/models`, else `~/.vikram/models`: the same root
 /// `vikram_runtime::config::vikram_home` uses, and the variable *is* that root. Mirrored here
@@ -94,11 +142,12 @@ pub fn resolve_model_in(dir: &Path, config: &VoiceConfig) -> Result<PathBuf> {
         }
         ModelSource::Hub(name) => {
             wavo::hub::lookup(&name).map_err(|err| VoiceError::ModelMissing(err.to_string()))?;
-            match hub(dir).find(&name) {
+            let quant = quant_of(config)?;
+            match hub(dir).find_quant(&name, quant) {
                 Some(path) if path.is_file() => Ok(path),
                 _ => Err(VoiceError::ModelMissing(format!(
-                    "{name} is not downloaded under {}; it downloads on the first utterance, or \
-                     run `wavo pull {name}`",
+                    "{name} ({quant}) is not downloaded under {}; it downloads on the first \
+                     utterance, or run `vikram voice model pull {name} --quant {quant}`",
                     dir.display()
                 ))),
             }
@@ -113,8 +162,17 @@ pub fn resolve_model(config: &VoiceConfig) -> Result<PathBuf> {
 
 pub fn probe_asr(config: &VoiceConfig) -> StageStatus {
     let fast_path = config.voxtype_fast_path && which(VOXTYPE).is_some();
+    // A backend or quant the engine cannot use is the ASR stage's problem, said here rather
+    // than at the first utterance.
+    if let Err(err) = backend_of(config).and_then(|_| quant_of(config)) {
+        return StageStatus::Missing(err.to_string());
+    }
     let detail = match resolve_model(config) {
-        Ok(model) => format!("built-in wavo ({})", model.display()),
+        Ok(model) => format!(
+            "built-in wavo ({}) at {}",
+            describe(config),
+            model.display()
+        ),
         Err(err) => {
             if fast_path {
                 return StageStatus::Degraded(format!(
@@ -131,6 +189,21 @@ pub fn probe_asr(config: &VoiceConfig) -> StageStatus {
     })
 }
 
+/// `whisper-base.en, quant q4_k_m, backend vulkan` for a model named by hub; `backend vulkan`
+/// for a file, whose quantization is whatever it was downloaded as.
+fn describe(config: &VoiceConfig) -> String {
+    let backend = config.asr_backend.trim();
+    match source_of(config) {
+        ModelSource::Hub(name) => {
+            format!(
+                "{name}, quant {}, backend {backend}",
+                config.asr_quant.trim()
+            )
+        }
+        ModelSource::File(_) => format!("backend {backend}"),
+    }
+}
+
 fn wavo_error(err: wavo::Error) -> VoiceError {
     VoiceError::Helper(format!("wavo: {err}"))
 }
@@ -141,43 +214,88 @@ pub struct WavoRecognizer {
     source: ModelSource,
     dir: PathBuf,
     language: Option<String>,
+    /// The quantization a hub download asks for; a file is used as it is.
+    quant: Quant,
+    /// The backend to ask wavo for.
+    backend: AsrBackend,
     model: Option<wavo::Model>,
     /// Where the model actually runs, once it has loaded: adapter name and graphics API.
-    backend: Option<String>,
+    adapter: Option<String>,
 }
 
 impl WavoRecognizer {
-    pub(crate) fn new(source: ModelSource, dir: PathBuf, language: Option<String>) -> Self {
+    pub(crate) fn new(
+        source: ModelSource,
+        dir: PathBuf,
+        language: Option<String>,
+        quant: Quant,
+        backend: AsrBackend,
+    ) -> Self {
         Self {
             source,
             dir,
             language,
+            quant,
+            backend,
             model: None,
-            backend: None,
+            adapter: None,
         }
     }
 
     /// The adapter the model is running on, or `None` before the first utterance.
-    pub fn backend(&self) -> Option<&str> {
-        self.backend.as_deref()
+    pub fn adapter(&self) -> Option<&str> {
+        self.adapter.as_deref()
     }
 
-    /// Build from a resolved config: the same source rules the rest of the module uses.
-    pub fn from_config(config: &VoiceConfig) -> Self {
-        Self::new(
+    /// Build from a resolved config: the same source rules the rest of the module uses. An
+    /// `asr_quant` or `asr_backend` the config cannot use is an error here, never a silent
+    /// default.
+    pub fn from_config(config: &VoiceConfig) -> Result<Self> {
+        Ok(Self::new(
             source_of(config),
             config.models_dir.clone().unwrap_or_else(models_dir),
             config.asr_language.clone(),
-        )
+            quant_of(config)?,
+            backend_of(config)?,
+        ))
+    }
+
+    /// Load `path` on the configured backend, print where it landed, and remember that adapter.
+    fn load(&mut self, path: &Path) -> Result<()> {
+        let model = match self.backend {
+            AsrBackend::Cpu => {
+                wavo::Model::load_with(path, wavo::Backend::Cpu).map_err(wavo_error)?
+            }
+            AsrBackend::Auto => {
+                wavo::Model::load_with(path, wavo::Backend::Auto).map_err(wavo_error)?
+            }
+            // Vulkan explicitly, as the operator asked: an integrated Intel part still runs these
+            // kernels several times faster than the CPU. A driver that cannot give a GPU adapter
+            // falls back to the CPU and says so, so the status line never lies about it.
+            AsrBackend::Vulkan => match wavo::Model::load_with(path, wavo::Backend::Gpu) {
+                Ok(model) => model,
+                Err(err) => {
+                    eprintln!("voice: no vulkan adapter ({err}); transcribing on the cpu");
+                    wavo::Model::load_with(path, wavo::Backend::Cpu).map_err(wavo_error)?
+                }
+            },
+        };
+        let label = model.device().to_string();
+        eprintln!("voice: asr on {label}");
+        self.adapter = Some(label);
+        self.model = Some(model);
+        Ok(())
     }
 
     fn download(&self, name: &str) -> Result<PathBuf> {
         let (tx, rx) = mpsc::channel();
         let dir = self.dir.clone();
         let owned = name.to_owned();
-        eprintln!("voice: downloading wavo model {name} (one time)");
+        let quant = self.quant;
+        eprintln!("voice: downloading wavo model {name} ({quant}, one time)");
         std::thread::spawn(move || {
-            let result = hub(&dir).pull(&owned, |_| std::ops::ControlFlow::Continue(()));
+            let pull = |_: wavo::hub::Progress<'_>| std::ops::ControlFlow::Continue(());
+            let result = hub(&dir).pull_quant(&owned, quant, pull);
             let _ = tx.send(result.map_err(|err| err.to_string()));
         });
         let outcome = rx
@@ -206,26 +324,12 @@ impl WavoRecognizer {
                     }
                     model.clone()
                 }
-                ModelSource::Hub(name) => match hub(&self.dir).find(name) {
+                ModelSource::Hub(name) => match hub(&self.dir).find_quant(name, self.quant) {
                     Some(path) if path.is_file() => path,
                     _ => self.download(name)?,
                 },
             };
-            // Vulkan explicitly, as the operator asked: an integrated Intel part still runs these
-            // kernels several times faster than the CPU. A driver that cannot give a GPU adapter
-            // falls back to wavo's own choice and says so, so the status line never lies about it.
-            let model = match wavo::Model::load_with(&path, wavo::Backend::Gpu) {
-                Ok(model) => model,
-                Err(err) => {
-                    eprintln!("voice: no vulkan adapter ({err}); transcribing on the cpu");
-                    wavo::Model::load(&path).map_err(wavo_error)?
-                }
-            };
-            let device = model.device();
-            let label = format!("{} ({:?})", device.name, device.api);
-            eprintln!("voice: asr on {label}");
-            self.backend = Some(label);
-            self.model = Some(model);
+            self.load(&path)?;
         }
         Ok(self.model.as_ref().expect("model loaded"))
     }
@@ -267,18 +371,20 @@ impl WavoRecognizer {
                     }
                     model.clone()
                 }
-                ModelSource::Hub(name) => match hub(&self.dir).find(name) {
+                ModelSource::Hub(name) => match hub(&self.dir).find_quant(name, self.quant) {
                     Some(path) if path.is_file() => path,
                     _ => {
                         return Err(VoiceError::ModelMissing(format!(
-                            "{name} is not downloaded under {}; live captions never download \
-                             mid-stream — run `wavo pull {name}`",
-                            self.dir.display()
+                            "{name} ({quant}) is not downloaded under {}; live captions never \
+                             download mid-stream — run `vikram voice model pull {name} --quant \
+                             {quant}`",
+                            self.dir.display(),
+                            quant = self.quant
                         )));
                     }
                 },
             };
-            self.model = Some(wavo::Model::load(&path).map_err(wavo_error)?);
+            self.load(&path)?;
         }
         Ok(self.model.as_ref().expect("model loaded"))
     }
@@ -418,18 +524,24 @@ pub struct AsrEngine {
 
 impl AsrEngine {
     pub fn new(config: &VoiceConfig) -> Self {
-        let (wavo, model_error) = match resolve_model(config) {
-            Ok(_) => (Some(WavoRecognizer::from_config(config)), None),
-            Err(err) => {
-                // A hub model that is known but not downloaded is armed: the first
-                // utterance downloads it. Only an unknown or missing file is an error.
-                match source_of(config) {
-                    ModelSource::Hub(name) if wavo::hub::lookup(&name).is_ok() => {
-                        (Some(WavoRecognizer::from_config(config)), None)
+        let (wavo, model_error) = match WavoRecognizer::from_config(config) {
+            // A config the engine cannot use (an unknown quant or backend) is the model's own
+            // error: there is nothing to try.
+            Err(err) => (None, Some(err.to_string())),
+            Ok(recognizer) => match resolve_model(config) {
+                Ok(_) => (Some(recognizer), None),
+                Err(err) => {
+                    // A hub model that is known but not downloaded is armed: the first
+                    // utterance downloads it. Only an unknown or missing file is an error.
+                    let armed = matches!(source_of(config), ModelSource::Hub(name)
+                        if wavo::hub::lookup(&name).is_ok());
+                    if armed {
+                        (Some(recognizer), None)
+                    } else {
+                        (None, Some(err.to_string()))
                     }
-                    _ => (None, Some(err.to_string())),
                 }
-            }
+            },
         };
         Self {
             voxtype: VoxtypeRecognizer::detect(config),
@@ -538,6 +650,109 @@ mod tests {
         assert!(!is_hub_name("weights.gguf"));
         assert!(!is_hub_name("/tmp/weights.gguf"));
         assert!(!is_hub_name("models/weights"));
+    }
+
+    /// A model file in the Hub cache layout `Hub::find_file` reads, so no test needs the network.
+    fn hub_file(dir: &Path, repo: &str, file: &str) {
+        let snapshot = dir
+            .join(format!("models--{}", repo.replace('/', "--")))
+            .join("snapshots")
+            .join("c0ffee");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join(file), b"weights").unwrap();
+    }
+
+    #[test]
+    fn the_backend_names_are_the_three_the_engine_takes() {
+        for (text, backend) in [
+            ("vulkan", AsrBackend::Vulkan),
+            (" CPU ", AsrBackend::Cpu),
+            ("Auto", AsrBackend::Auto),
+        ] {
+            assert_eq!(AsrBackend::parse(text), Some(backend), "{text}");
+            assert_eq!(backend.as_str(), text.trim().to_ascii_lowercase());
+        }
+        assert_eq!(AsrBackend::parse("vulcan"), None);
+    }
+
+    #[test]
+    fn a_hub_model_is_looked_up_in_the_configured_quant() {
+        let dir = tempfile::tempdir().unwrap();
+        hub_file(
+            dir.path(),
+            "handy-computer/whisper-base.en-gguf",
+            "whisper-base.en-Q4_K_M.gguf",
+        );
+        let config = VoiceConfig {
+            asr_quant: "q4_k_m".into(),
+            ..config_with_dir(dir.path())
+        };
+        let path = resolve_model(&config).unwrap();
+        assert!(
+            path.ends_with("whisper-base.en-Q4_K_M.gguf"),
+            "{}",
+            path.display()
+        );
+
+        // The Q8_0 file was never downloaded, so the default quant still reports it missing.
+        let err = resolve_model(&config_with_dir(dir.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("whisper-base.en (q8_0)"), "{err}");
+        assert!(
+            err.contains("model pull whisper-base.en --quant q8_0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_quant_or_backend_is_refused_with_the_valid_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_quant = VoiceConfig {
+            asr_quant: "q3_k".into(),
+            ..config_with_dir(dir.path())
+        };
+        let err = resolve_model(&bad_quant).unwrap_err().to_string();
+        assert!(err.contains("q3_k") && err.contains("q4_k_m"), "{err}");
+
+        let bad_backend = VoiceConfig {
+            asr_backend: "vulcan".into(),
+            voxtype_fast_path: false,
+            ..config_with_dir(dir.path())
+        };
+        let err = WavoRecognizer::from_config(&bad_backend)
+            .err()
+            .expect("a bad backend is refused")
+            .to_string();
+        assert!(err.contains("vulkan, auto, cpu"), "{err}");
+        let mut engine = AsrEngine::new(&bad_backend);
+        let err = engine.transcribe(&[0i16; 160]).unwrap_err();
+        assert!(matches!(err, VoiceError::ModelMissing(_)), "{err}");
+        assert!(err.to_string().contains("vulcan"), "{err}");
+    }
+
+    #[test]
+    fn the_status_line_names_the_configured_quant_and_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        hub_file(
+            dir.path(),
+            "handy-computer/whisper-base.en-gguf",
+            "whisper-base.en-Q4_K_M.gguf",
+        );
+        let config = VoiceConfig {
+            asr_quant: "q4_k_m".into(),
+            asr_backend: "cpu".into(),
+            voxtype_fast_path: false,
+            ..config_with_dir(dir.path())
+        };
+        let StageStatus::Ready(detail) = probe_asr(&config) else {
+            panic!("a downloaded q4_k_m model must probe ready")
+        };
+        assert!(
+            detail.contains("whisper-base.en, quant q4_k_m, backend cpu"),
+            "{detail}"
+        );
+        assert!(detail.contains("Q4_K_M.gguf"), "{detail}");
     }
 
     fn config_with_dir(dir: &Path) -> VoiceConfig {
@@ -695,7 +910,7 @@ mod tests {
             asr_language: None,
             ..config_with_dir(dir.path())
         };
-        let recognizer = WavoRecognizer::from_config(&config);
+        let recognizer = WavoRecognizer::from_config(&config).expect("a valid config");
         assert!(recognizer.options().language.is_none());
         let engine = AsrEngine::new(&config);
         let recognizer = engine.wavo.expect("a model file arms the built-in engine");
@@ -706,7 +921,7 @@ mod tests {
     fn a_short_buffer_is_an_empty_caption_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_dir(dir.path());
-        let mut recognizer = WavoRecognizer::from_config(&config);
+        let mut recognizer = WavoRecognizer::from_config(&config).expect("a valid config");
         assert_eq!(recognizer.transcribe_partial(&[]).unwrap(), "");
         assert_eq!(
             recognizer
@@ -722,7 +937,7 @@ mod tests {
     fn an_unresolved_hub_model_is_an_error_that_names_it_and_downloads_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_dir(dir.path());
-        let mut recognizer = WavoRecognizer::from_config(&config);
+        let mut recognizer = WavoRecognizer::from_config(&config).expect("a valid config");
         let err = recognizer
             .transcribe_partial(&vec![0i16; MIN_PARTIAL_SAMPLES])
             .unwrap_err();
@@ -749,7 +964,7 @@ mod tests {
         resolve_model(&config).expect("a model must be downloaded");
         let mut reader = hound::WavReader::open(&wav).expect("fixture wav must decode");
         let pcm: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap()).collect();
-        let mut recognizer = WavoRecognizer::from_config(&config);
+        let mut recognizer = WavoRecognizer::from_config(&config).expect("a valid config");
         let text = recognizer
             .transcribe_partial(&pcm)
             .expect("partial inference must run on a resolved model");
@@ -800,7 +1015,7 @@ mod tests {
             "fixture must hold at least one second of audio"
         );
         let started = std::time::Instant::now();
-        let mut recognizer = WavoRecognizer::from_config(&config);
+        let mut recognizer = WavoRecognizer::from_config(&config).expect("a valid config");
         let text = recognizer
             .transcribe(&pcm)
             .expect("wavo must run")

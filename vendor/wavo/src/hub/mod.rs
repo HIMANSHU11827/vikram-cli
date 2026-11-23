@@ -1,10 +1,11 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/wavo
 //! Download and manage the supported models in the Hugging Face cache (the `hub` feature).
 //!
-//! [`MODELS`] lists the models wavo knows by name: Q8_0 GGUF files in the Hugging Face repositories
+//! [`MODELS`] lists the models wavo knows by name: GGUF files in the Hugging Face repositories
 //! `<owner>/<full name>-gguf`, transcribe.cpp's own under `handy-computer` and a few more
-//! conversions under `vladkens`. A [`Hub`] finds, downloads and removes them in a cache folder laid
-//! out as the
+//! conversions under `vladkens`. Each is published in several [quantizations](Quant); the
+//! functions that take no quant name the Q8_0 file, and [`Hub::pull_quant`] takes any of them. A
+//! [`Hub`] finds, downloads and removes them in a cache folder laid out as the
 //! [Hub local cache spec](https://huggingface.co/docs/hub/local-cache) says, so `wavo`, the `hf`
 //! CLI, Python's `huggingface_hub` and your app all find what any of them downloaded.
 //!
@@ -111,11 +112,19 @@ impl ModelInfo {
     format!("{}/{}-{suffix}", self.owner, self.full_name)
   }
 
-  /// The file name in [`repo`](Self::repo), such as `parakeet-tdt-0.6b-v3-Q8_0.gguf`; lowercase
-  /// for `mudler`, `nemotron-3-diarization-q8_0.gguf`.
-  pub fn file(&self) -> String {
-    let file = format!("{}-Q8_0.gguf", self.full_name);
+  /// The file name in [`repo`](Self::repo) of a [quantization](Quant), such as
+  /// `parakeet-tdt-0.6b-v3-Q4_K_M.gguf`; lowercase for `mudler`,
+  /// `nemotron-3-diarization-q8_0.gguf`.
+  pub fn file_quant(&self, quant: Quant) -> String {
+    let file = format!("{}-{}.gguf", self.full_name, quant.suffix());
     if self.owner == MU { file.to_lowercase() } else { file }
+  }
+
+  /// The file name of the Q8_0 GGUF in [`repo`](Self::repo), such as
+  /// `parakeet-tdt-0.6b-v3-Q8_0.gguf`; lowercase for `mudler`,
+  /// `nemotron-3-diarization-q8_0.gguf`.
+  pub fn file(&self) -> String {
+    self.file_quant(Quant::Q8_0)
   }
 
   /// Whether it is a speaker diarization model, for [`Diarizer::load`](crate::Diarizer::load)
@@ -179,6 +188,87 @@ impl ModelInfo {
   /// ```
   pub fn speed(&self) -> Option<f32> {
     scores::SPEED.iter().find(|x| x.0 == self.name).map(|x| x.1)
+  }
+}
+
+/// A GGUF quantization the Hub publishes for wavo's models: the file
+/// `<full name>-<QUANT>.gguf` of a model's [repository](ModelInfo::repo).
+///
+/// The repositories wavo knows publish these five; a model whose publisher skipped one fails the
+/// pull with the Hub's own 404 rather than a made-up file name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum Quant {
+  /// 8-bit, the best quality and the largest; the default, and the file [`ModelInfo::file`] names.
+  #[default]
+  Q8_0,
+  /// 4-bit, mixed k-quant: about a third smaller than Q8_0, a few tenths of a point more words
+  /// wrong.
+  Q4KM,
+  /// 5-bit, mixed k-quant.
+  Q5KM,
+  /// 6-bit k-quant.
+  Q6K,
+  /// 16-bit floats: the largest, and the closest to the unquantized model.
+  F16,
+}
+
+impl Quant {
+  /// Every quantization [`parse`](Self::parse) takes, Q8_0 first.
+  pub const ALL: [Self; 5] = [Self::Q8_0, Self::Q4KM, Self::Q5KM, Self::Q6K, Self::F16];
+
+  /// The name [`parse`](Self::parse) takes, such as `q4_k_m`.
+  pub fn as_str(self) -> &'static str {
+    match self {
+      Self::Q8_0 => "q8_0",
+      Self::Q4KM => "q4_k_m",
+      Self::Q5KM => "q5_k_m",
+      Self::Q6K => "q6_k",
+      Self::F16 => "f16",
+    }
+  }
+
+  /// The spelling in the file name: `Q8_0`, `Q4_K_M`, `Q5_K_M`, `Q6_K`, `F16`.
+  pub fn suffix(self) -> &'static str {
+    match self {
+      Self::Q8_0 => "Q8_0",
+      Self::Q4KM => "Q4_K_M",
+      Self::Q5KM => "Q5_K_M",
+      Self::Q6K => "Q6_K",
+      Self::F16 => "F16",
+    }
+  }
+
+  /// A quantization by name: `q8_0`, `Q4_K_M`, `q4-k-m` — case, `-` and `_` don't matter.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::UnknownQuant`] for anything else, naming the supported ones.
+  ///
+  /// # Examples
+  ///
+  /// ```
+  /// use wavo::hub::Quant;
+  ///
+  /// assert_eq!(Quant::parse("Q4_K_M")?, Quant::Q4KM);
+  /// assert_eq!(Quant::parse("q4-k-m")?, Quant::Q4KM);
+  /// assert_eq!(Quant::parse("q8_0")?.suffix(), "Q8_0");
+  /// let e = Quant::parse("q3_k").unwrap_err().to_string();
+  /// assert!(e.contains("q4_k_m"), "{e}");
+  /// # Ok::<(), wavo::Error>(())
+  /// ```
+  pub fn parse(name: &str) -> Result<Self> {
+    let key = name.trim().to_ascii_lowercase().replace('-', "_");
+    Self::ALL
+      .into_iter()
+      .find(|q| q.as_str() == key)
+      .ok_or_else(|| Error::UnknownQuant { quant: name.trim().into() })
+  }
+}
+
+impl fmt::Display for Quant {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str(self.as_str())
   }
 }
 
@@ -310,6 +400,11 @@ pub(crate) fn names() -> String {
   MODELS.iter().map(|m| m.name).collect::<Vec<_>>().join(", ")
 }
 
+/// The quantizations [`Quant::parse`] takes, as `Error::UnknownQuant` lists them.
+pub(crate) fn quants() -> String {
+  Quant::ALL.iter().map(|q| q.as_str()).collect::<Vec<_>>().join(", ")
+}
+
 /// Levenshtein distance.
 fn distance(a: &str, b: &str) -> usize {
   let b: Vec<char> = b.chars().collect();
@@ -412,8 +507,21 @@ impl Hub {
   ///
   /// `None` when the model isn't downloaded, or `name` isn't in [`MODELS`].
   pub fn find(&self, name: &str) -> Option<PathBuf> {
+    self.find_quant(name, Quant::Q8_0)
+  }
+
+  /// The downloaded file of a model in one [quantization](Quant). Never uses the network.
+  ///
+  /// `None` when that file isn't downloaded, or `name` isn't in [`MODELS`].
+  ///
+  /// ```
+  /// use wavo::hub::{Hub, Quant};
+  ///
+  /// assert_eq!(Hub::at("/no/such/cache").find_quant("whisper-base.en", Quant::Q4KM), None);
+  /// ```
+  pub fn find_quant(&self, name: &str, quant: Quant) -> Option<PathBuf> {
     let m = lookup(name).ok()?;
-    self.find_file(&m.repo(), &m.file())
+    self.find_file(&m.repo(), &m.file_quant(quant))
   }
 
   /// The model file a name or path stands for, such as a command line's MODEL argument. Never
@@ -470,6 +578,25 @@ impl Hub {
     MODELS.iter().filter_map(|m| self.find(m.name).map(|path| (m, path))).collect()
   }
 
+  /// Every downloaded file of [`MODELS`], in its order and, for each model, Q8_0 first: what a
+  /// models folder actually holds, by model and [quantization](Quant). Never uses the network.
+  ///
+  /// ```
+  /// use wavo::hub::Hub;
+  ///
+  /// assert!(Hub::at("/no/such/cache").downloaded_quants().is_empty());
+  /// ```
+  pub fn downloaded_quants(&self) -> Vec<(&'static ModelInfo, Quant, PathBuf)> {
+    MODELS
+      .iter()
+      .flat_map(|m| {
+        Quant::ALL
+          .into_iter()
+          .filter_map(move |quant| Some((m, quant, self.find_quant(m.name, quant)?)))
+      })
+      .collect()
+  }
+
   /// Downloads a model by short or full name, unless its latest revision is in the cache already,
   /// and returns the path of its file.
   ///
@@ -521,12 +648,47 @@ impl Hub {
   pub fn pull(
     &self,
     name: &str,
+    progress: impl FnMut(Progress<'_>) -> ControlFlow<()>,
+  ) -> Result<PathBuf> {
+    self.pull_quant(name, Quant::Q8_0, progress)
+  }
+
+  /// Downloads a model in one [quantization](Quant) by short or full name, unless its latest
+  /// revision is in the cache already, and returns the path of its file. The file is
+  /// `<full name>-<QUANT>.gguf`, such as `whisper-base.en-Q4_K_M.gguf`.
+  ///
+  /// Everything else is as [`pull`](Self::pull): it blocks until the file is complete, resumes a
+  /// part an earlier pull left, retries what may pass, and prepares the file for the Neural
+  /// Engine where that applies.
+  ///
+  /// # Errors
+  ///
+  /// Those of [`pull`](Self::pull), and the Hub's own error for a repository that doesn't publish
+  /// the quantization, such as an HTTP 404.
+  ///
+  /// # Examples
+  ///
+  /// The smaller file, then load it as any other:
+  ///
+  /// ```no_run
+  /// use std::ops::ControlFlow;
+  /// use wavo::hub::{Hub, Quant};
+  ///
+  /// let hub = Hub::new();
+  /// let path = hub.pull_quant("whisper-base.en", Quant::Q4KM, |_| ControlFlow::Continue(()))?;
+  /// let model = wavo::Model::load(path)?;
+  /// # Ok::<(), wavo::Error>(())
+  /// ```
+  pub fn pull_quant(
+    &self,
+    name: &str,
+    quant: Quant,
     mut progress: impl FnMut(Progress<'_>) -> ControlFlow<()>,
   ) -> Result<PathBuf> {
     let m = lookup(name)?;
     // The repository lock, held from the download through preparing, as `remove` takes it: the
     // file stays while it is read.
-    let (path, _repo) = self.pull_file(&m.repo(), &m.file(), &mut progress)?;
+    let (path, _repo) = self.pull_file(&m.repo(), &m.file_quant(quant), &mut progress)?;
     if !self.prepare {
       return Ok(path);
     }
@@ -562,8 +724,14 @@ impl Hub {
   /// - [`Error::UnknownModel`]: `name` is not in [`MODELS`].
   /// - [`Error::Io`]: deleting failed.
   pub fn remove(&self, name: &str) -> Result<Option<u64>> {
+    self.remove_quant(name, Quant::Q8_0)
+  }
+
+  /// Deletes one [quantization](Quant) of a model from the cache, as [`remove`](Self::remove)
+  /// does for the Q8_0 file: the other quantizations stay.
+  pub fn remove_quant(&self, name: &str, quant: Quant) -> Result<Option<u64>> {
     let m = lookup(name)?;
-    self.remove_file(&m.repo(), &m.file())
+    self.remove_file(&m.repo(), &m.file_quant(quant))
   }
 }
 
@@ -619,6 +787,40 @@ mod tests {
     let m = lookup("nemotron-diarization").unwrap();
     assert_eq!(m.repo(), "mudler/Nemotron-3-Diarization-GGUF");
     assert_eq!(m.file(), "nemotron-3-diarization-q8_0.gguf");
+  }
+
+  #[test]
+  fn quants_name_the_file_they_download() {
+    let m = lookup("whisper-base.en").unwrap();
+    assert_eq!(m.file_quant(Quant::Q8_0), "whisper-base.en-Q8_0.gguf");
+    assert_eq!(m.file_quant(Quant::Q4KM), "whisper-base.en-Q4_K_M.gguf");
+    assert_eq!(m.file_quant(Quant::Q5KM), "whisper-base.en-Q5_K_M.gguf");
+    assert_eq!(m.file_quant(Quant::Q6K), "whisper-base.en-Q6_K.gguf");
+    assert_eq!(m.file_quant(Quant::F16), "whisper-base.en-F16.gguf");
+    assert_eq!(m.file(), m.file_quant(Quant::Q8_0), "file() keeps naming Q8_0");
+    let d = lookup("nemotron-diarization").unwrap();
+    assert_eq!(d.file_quant(Quant::Q4KM), "nemotron-3-diarization-q4_k_m.gguf");
+
+    for (text, quant) in [
+      ("q8_0", Quant::Q8_0),
+      ("Q8_0", Quant::Q8_0),
+      ("q4_k_m", Quant::Q4KM),
+      ("Q4_K_M", Quant::Q4KM),
+      ("q4-k-m", Quant::Q4KM),
+      ("q5_k_m", Quant::Q5KM),
+      ("q6_k", Quant::Q6K),
+      ("F16", Quant::F16),
+      (" f16 ", Quant::F16),
+    ] {
+      assert_eq!(Quant::parse(text).unwrap(), quant, "{text}");
+    }
+    for text in ["", "q3_k", "q8", "q8_0.gguf", "f32"] {
+      let err = Quant::parse(text).unwrap_err().to_string();
+      assert!(err.contains("q4_k_m"), "{text}: {err}");
+    }
+    assert_eq!(Quant::default(), Quant::Q8_0);
+    assert_eq!(Quant::ALL.map(|q| q.as_str()), ["q8_0", "q4_k_m", "q5_k_m", "q6_k", "f16"]);
+    assert_eq!(Quant::Q4KM.to_string(), "q4_k_m");
   }
 
   #[test]

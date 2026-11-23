@@ -18,7 +18,7 @@ mod session;
 mod vad;
 
 pub use asr::{
-    AsrEngine, DEFAULT_MODEL, VoxtypeRecognizer, WavoRecognizer, models_dir, probe_asr,
+    AsrBackend, AsrEngine, DEFAULT_MODEL, VoxtypeRecognizer, WavoRecognizer, models_dir, probe_asr,
     resolve_model, resolve_model_in,
 };
 pub use cancel::CancelToken;
@@ -30,6 +30,8 @@ pub use session::{
     Recognizer, Synthesizer, VoiceSession, pick_voice, piper_voices, spoken_text,
 };
 pub use vad::{detect_speech, is_silent, noise_floor, speech_gate, trim_silence};
+/// The download types the CLI needs to pull a model by name: `Hub` and its `Quant`.
+pub use wavo::hub::{Hub, Quant};
 
 use std::ffi::OsStr;
 use std::path::PathBuf;
@@ -69,6 +71,13 @@ pub struct VoiceConfig {
     pub capture_fallback: String,
     pub asr_helper: String,
     pub asr_model: PathBuf,
+    /// The quantization a hub download asks for: `q8_0` (the default), `q4_k_m`, `q5_k_m`,
+    /// `q6_k` or `f16`. It only applies to a model named by hub, never to an explicit
+    /// `asr_model` file, which is used as it is.
+    pub asr_quant: String,
+    /// Where the model runs: `vulkan` (the default: the GPU, with a CPU fallback that says so),
+    /// `auto` (wavo's own pick for the machine) or `cpu`.
+    pub asr_backend: String,
     /// None resolves under `models_dir` (or `<vikram home>/models` when unset).
     pub models_dir: Option<PathBuf>,
     /// None lets whisper auto-detect the spoken language.
@@ -80,6 +89,9 @@ pub struct VoiceConfig {
     pub tts_helper: String,
     pub tts_fallback: String,
     pub tts_voice: Option<PathBuf>,
+    /// Spoken language for synthesis (`en`, `en-gb`, `de`). None leaves the helper's own default,
+    /// which on a fresh machine is whatever espeak-ng was built for.
+    pub tts_language: Option<String>,
     /// Speaking rate in words per minute (80..=450). 175 is espeak-ng's own default; piper gets
     /// the reciprocal as `--length_scale`.
     pub rate: u32,
@@ -109,6 +121,8 @@ impl Default for VoiceConfig {
             capture_fallback: "arecord".into(),
             asr_helper: "whisper-cli".into(),
             asr_model: PathBuf::new(),
+            asr_quant: "q8_0".into(),
+            asr_backend: "vulkan".into(),
             models_dir: None,
             asr_language: None,
             voxtype_fast_path: true,
@@ -116,6 +130,7 @@ impl Default for VoiceConfig {
             tts_helper: "piper".into(),
             tts_fallback: "espeak-ng".into(),
             tts_voice: None,
+            tts_language: None,
             rate: 175,
             volume: 1.0,
             player_helper: "paplay".into(),
@@ -165,6 +180,29 @@ impl VoiceConfig {
         }
         if !(0.0..=1.0).contains(&self.volume) {
             return Err(VoiceError::Config("volume must be between 0 and 1".into()));
+        }
+        if let Err(err) = Quant::parse(&self.asr_quant) {
+            return Err(VoiceError::Config(format!("asr_quant: {err}")));
+        }
+        if AsrBackend::parse(&self.asr_backend).is_none() {
+            return Err(VoiceError::Config(format!(
+                "asr_backend `{}` is not one of: vulkan, auto, cpu",
+                self.asr_backend.trim()
+            )));
+        }
+        if let Some(language) = self.tts_language.as_deref() {
+            let language = language.trim();
+            if language.is_empty() {
+                return Err(VoiceError::Config(
+                    "tts_language is set but empty; set a tag like en or en-gb, or remove it"
+                        .into(),
+                ));
+            }
+            if language.chars().any(char::is_whitespace) {
+                return Err(VoiceError::Config(format!(
+                    "tts_language `{language}` contains whitespace; use an espeak voice tag like en-gb"
+                )));
+            }
         }
         Ok(())
     }
@@ -338,6 +376,25 @@ mod tests {
     }
 
     #[test]
+    fn a_spoken_language_must_look_like_a_voice_tag() {
+        let blank = VoiceConfig {
+            tts_language: Some("  ".into()),
+            ..Default::default()
+        };
+        assert!(blank.validate().is_err());
+        let spaced = VoiceConfig {
+            tts_language: Some("en gb".into()),
+            ..Default::default()
+        };
+        assert!(spaced.validate().is_err());
+        let fine = VoiceConfig {
+            tts_language: Some("en-gb".into()),
+            ..Default::default()
+        };
+        fine.validate().expect("a plain tag is accepted");
+    }
+
+    #[test]
     fn stage_labels_name_the_engine_or_the_problem() {
         assert_eq!(
             StageStatus::Ready("built-in cpal".into()).label(),
@@ -393,6 +450,54 @@ mod tests {
         assert_eq!(config.asr_language.as_deref(), Some("en"));
         assert_eq!(config.floor_ratio, 2.5);
         assert!(!config.enabled);
+        assert_eq!(
+            config.asr_quant, "q8_0",
+            "an older voice.json keeps downloading Q8_0"
+        );
+        assert_eq!(config.asr_backend, "vulkan", "and keeps running on Vulkan");
+    }
+
+    #[test]
+    fn the_asr_quant_and_backend_are_checked_against_what_the_engine_can_use() {
+        let config = VoiceConfig::default();
+        assert_eq!(config.asr_quant, "q8_0");
+        assert_eq!(config.asr_backend, "vulkan");
+        config.validate().expect("the defaults are valid");
+
+        for quant in ["q8_0", "q4_k_m", "Q5_K_M", "q6_k", "f16"] {
+            let config = VoiceConfig {
+                asr_quant: quant.into(),
+                ..Default::default()
+            };
+            config
+                .validate()
+                .unwrap_or_else(|err| panic!("{quant}: {err}"));
+        }
+        for backend in ["vulkan", "auto", "cpu", "CPU"] {
+            let config = VoiceConfig {
+                asr_backend: backend.into(),
+                ..Default::default()
+            };
+            config
+                .validate()
+                .unwrap_or_else(|err| panic!("{backend}: {err}"));
+        }
+
+        let bad = VoiceConfig {
+            asr_quant: "q3_k".into(),
+            ..Default::default()
+        };
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(err.contains("asr_quant"), "{err}");
+        assert!(err.contains("q4_k_m"), "the error lists the quants: {err}");
+
+        let bad = VoiceConfig {
+            asr_backend: "vulcan".into(),
+            ..Default::default()
+        };
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(err.contains("asr_backend"), "{err}");
+        assert!(err.contains("vulkan, auto, cpu"), "{err}");
     }
 
     #[test]

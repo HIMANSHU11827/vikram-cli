@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 use vikram_runtime::config::Config;
-use vikram_voice::{AsrEngine, Recognizer, VoiceConfig, VoiceError, VoiceSession, probe};
+use vikram_voice::{
+    AsrBackend, AsrEngine, Hub, Quant, Recognizer, VoiceConfig, VoiceError, VoiceSession, probe,
+};
 
 use crate::chat;
 
@@ -33,6 +35,10 @@ pub enum VoiceAction {
         /// Model to use. Defaults to the configured one.
         #[arg(long = "asr-model", value_name = "PATH")]
         asr_model: Option<PathBuf>,
+        /// Transcribe the same clip this many times in one process, so the second run shows the
+        /// decode cost without the one-time model load.
+        #[arg(long, value_name = "N", default_value_t = 1)]
+        repeat: u32,
     },
     /// Record one utterance locally and print its transcript.
     Listen {
@@ -84,6 +90,25 @@ pub enum VoiceAction {
         #[command(subcommand)]
         action: VoiceConfigAction,
     },
+    /// Download a model by name, or list the ones already downloaded.
+    Model {
+        #[command(subcommand)]
+        action: VoiceModelAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum VoiceModelAction {
+    /// Download one model file into the models folder, and print where it landed.
+    Pull {
+        /// Hub name, such as `whisper-base.en` — a name, not a path.
+        name: String,
+        /// Quantization: q8_0, q4_k_m, q5_k_m, q6_k or f16. Defaults to the saved `asr_quant`.
+        #[arg(long, value_name = "QUANT")]
+        quant: Option<String>,
+    },
+    /// List the wavo models in the models folder, with the size of each file.
+    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -429,6 +454,20 @@ fn apply_setting(config: &mut VoiceConfig, key: &str, value: &str) -> Result<Str
         "asr_model" => set_field(&mut config.asr_model, PathBuf::from(value.trim()), |v| {
             render_path(v)
         }),
+        "asr_quant" => {
+            let quant = Quant::parse(value).map_err(|err| err.to_string())?;
+            set_field(&mut config.asr_quant, quant.as_str().to_string(), |v| {
+                v.clone()
+            })
+        }
+        "asr_backend" => {
+            let backend = AsrBackend::parse(value).ok_or_else(|| {
+                format!("asr_backend: expected one of vulkan, auto, cpu, got {value:?}")
+            })?;
+            set_field(&mut config.asr_backend, backend.as_str().to_string(), |v| {
+                v.clone()
+            })
+        }
         "models_dir" => set_field(
             &mut config.models_dir,
             optional_text(value).map(PathBuf::from),
@@ -562,6 +601,67 @@ fn render_show() -> Result<String, String> {
     Ok(format!("path: {}\n{json}\n", render_path_line()))
 }
 
+/// Where a download lands and a listing looks: `models_dir`, else `<vikram home>/models`, the
+/// same root the engine resolves a hub name in.
+fn models_root(config: &VoiceConfig) -> PathBuf {
+    config
+        .models_dir
+        .clone()
+        .unwrap_or_else(vikram_voice::models_dir)
+}
+
+/// `vikram voice model pull|list`. The models folder is the Hub cache in its own layout, so a
+/// pull here is one `hf` also sees, and the engine finds the file without downloading again.
+fn model_command(action: VoiceModelAction) -> Result<(), String> {
+    let config = VoiceConfig::load().map_err(|err| err.to_string())?;
+    let dir = models_root(&config);
+    match action {
+        VoiceModelAction::Pull { name, quant } => {
+            let quant = match quant.as_deref() {
+                Some(value) => Quant::parse(value),
+                None => Quant::parse(&config.asr_quant),
+            }
+            .map_err(|err| err.to_string())?;
+            eprintln!("voice: pulling {name} ({quant}) into {}", dir.display());
+            let mut shown = 0;
+            let path = Hub::at(&dir)
+                .pull_quant(&name, quant, |progress| {
+                    let total = progress.total.max(1);
+                    let percent = progress.done.saturating_mul(100) / total;
+                    if percent >= shown + 10 || (percent == 100 && shown < 100) {
+                        shown = percent;
+                        eprintln!("voice: {percent}% of {} MB", total / 1_000_000);
+                    }
+                    std::ops::ControlFlow::Continue(())
+                })
+                .map_err(|err| err.to_string())?;
+            let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            println!("{}", path.display());
+            println!("{size} bytes ({:.1} MB)", size as f64 / 1_000_000.0);
+            Ok(())
+        }
+        VoiceModelAction::List => {
+            let files = Hub::at(&dir).downloaded_quants();
+            if files.is_empty() {
+                println!("no wavo models under {}", dir.display());
+                println!("pull one: vikram voice model pull whisper-base.en --quant q4_k_m");
+                return Ok(());
+            }
+            for (model, quant, path) in files {
+                let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+                println!(
+                    "{:<20} {:<7} {:>7.1} MB  {}",
+                    model.name,
+                    quant.as_str(),
+                    size as f64 / 1_000_000.0,
+                    path.display()
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
 pub fn config_command(action: VoiceConfigAction) -> Result<(), String> {
     match action {
         VoiceConfigAction::Show => print!("{}", render_show()?),
@@ -663,6 +763,7 @@ pub async fn chat(runtime_config: Config, action: VoiceAction) -> Result<(), Str
 pub fn run(action: VoiceAction) -> Result<(), String> {
     match action {
         VoiceAction::Config { action } => config_command(action),
+        VoiceAction::Model { action } => model_command(action),
         VoiceAction::Status { asr_model } => {
             let base = VoiceConfig::load().map_err(|err| err.to_string())?;
             let config = config(
@@ -685,21 +786,32 @@ pub fn run(action: VoiceAction) -> Result<(), String> {
             }
             Ok(())
         }
-        VoiceAction::Transcribe { file, asr_model } => {
+        VoiceAction::Transcribe {
+            file,
+            asr_model,
+            repeat,
+        } => {
             let base = VoiceConfig::load().map_err(|err| err.to_string())?;
             let mut config = config(&base, true, asr_model, None, None, &OverrideArgs::default());
             config.enabled = true;
+            config.validate().map_err(|err| err.to_string())?;
             let bytes = std::fs::read(&file).map_err(|err| format!("{}: {err}", file.display()))?;
             let pcm = wav_pcm(&bytes)?;
-            let started = std::time::Instant::now();
             let mut engine = AsrEngine::new(&config);
-            let text = engine.transcribe(&pcm).map_err(|err| err.to_string())?;
-            let elapsed = started.elapsed();
-            match text {
-                Some(text) => println!("{text}"),
-                None => println!("(no speech)"),
+            for run in 1..=repeat.max(1) {
+                let started = std::time::Instant::now();
+                let text = engine.transcribe(&pcm).map_err(|err| err.to_string())?;
+                let elapsed = started.elapsed();
+                match text {
+                    Some(text) => println!("{text}"),
+                    None => println!("(no speech)"),
+                }
+                eprintln!(
+                    "run {run}: {} samples in {:.0} ms",
+                    pcm.len(),
+                    elapsed.as_secs_f64() * 1000.0
+                );
             }
-            eprintln!("{} samples in {:.2}s", pcm.len(), elapsed.as_secs_f32());
             Ok(())
         }
         VoiceAction::Listen {
@@ -931,20 +1043,50 @@ mod tests {
 
     #[test]
     fn every_config_key_can_be_set() {
-        let sample = |value: &serde_json::Value| match value {
+        // A free-form string is fine for most keys; the two the engine checks against a fixed
+        // list take one of their values instead.
+        let sample = |key: &str, value: &serde_json::Value| match value {
             serde_json::Value::Bool(_) => "true".to_string(),
             serde_json::Value::Number(number) if number.is_f64() => "2.0".to_string(),
             serde_json::Value::Number(_) => "1".to_string(),
             serde_json::Value::Null => "x".to_string(),
-            _ => "/tmp/x".to_string(),
+            _ => match key {
+                "asr_quant" => "q4_k_m".to_string(),
+                "asr_backend" => "cpu".to_string(),
+                _ => "/tmp/x".to_string(),
+            },
         };
         let defaults = serde_json::to_value(VoiceConfig::default()).unwrap();
         let map = defaults.as_object().unwrap();
         for (key, value) in map {
             let mut config = VoiceConfig::default();
-            apply_setting(&mut config, key, &sample(value))
+            apply_setting(&mut config, key, &sample(key, value))
                 .unwrap_or_else(|err| panic!("{key} is listed but not settable: {err}"));
         }
+    }
+
+    #[test]
+    fn a_quant_and_a_backend_are_set_and_normalized() {
+        let (_home, _guard) = temp_home();
+        set("asr_quant", "Q4_K_M").expect("a known quant saves");
+        set("asr-backend", "cpu").expect("the kebab spelling is accepted");
+        let loaded = VoiceConfig::load().unwrap();
+        assert_eq!(
+            loaded.asr_quant, "q4_k_m",
+            "stored as the file name spells it"
+        );
+        assert_eq!(loaded.asr_backend, "cpu");
+        assert!(loaded.validate().is_ok());
+
+        let err = set("asr_quant", "q3_k").expect_err("an unknown quant is refused");
+        assert!(err.contains("q3_k") && err.contains("q4_k_m"), "{err}");
+        let err = set("asr_backend", "vulcan").expect_err("an unknown backend is refused");
+        assert!(err.contains("vulkan, auto, cpu"), "{err}");
+        assert_eq!(
+            VoiceConfig::load().unwrap().asr_quant,
+            "q4_k_m",
+            "a refused value writes nothing"
+        );
     }
 
     #[test]

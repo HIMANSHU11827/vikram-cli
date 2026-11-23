@@ -98,6 +98,15 @@ pub enum Error {
   #[cfg_attr(docsrs, doc(cfg(feature = "hub")))]
   #[error("{0}")]
   Hub(String),
+  /// A quantization name the Hub doesn't publish for wavo's models. The message lists the ones
+  /// it does: see [`hub::Quant`](crate::hub::Quant).
+  #[cfg(feature = "hub")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "hub")))]
+  #[error("unknown quantization {quant:?}; supported: {}", crate::hub::quants())]
+  UnknownQuant {
+    /// The name as given.
+    quant: String,
+  },
 }
 
 impl Error {
