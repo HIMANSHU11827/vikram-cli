@@ -175,7 +175,9 @@ impl PickerKind {
             ],
             Self::File => &[(Verb::Choose, '\n', "reference it")],
             Self::Shell => &[(Verb::Choose, '\n', "run it")],
-            Self::Command => &[(Verb::Choose, '\n', "open")],
+            // The command palette is the model picker's twin: Enter takes the highlighted row and
+            // the footer says so in the same word the model panel uses.
+            Self::Command => &[(Verb::Choose, '\n', "choose")],
             Self::Provider => &[(Verb::Choose, '\n', "switch")],
             // The roster is the thing the operator edits, not a list to read: the runtime can
             // create a hive, add a member, drop a member and delete the hive, so each gets a key.
@@ -215,6 +217,16 @@ impl PickerKind {
             .iter()
             .find(|(_, k, _)| k.eq_ignore_ascii_case(&key))
             .map(|(verb, _, _)| *verb)
+    }
+
+    /// Keys the panel answers that are not a Ctrl+letter verb, printed in the footer after the
+    /// verbs. The command palette is typed into and completed with Tab, and both belong in the
+    /// legend the model panel already taught: `choose enter · type to filter · tab fill · esc close`.
+    pub fn hints(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Command => &[("type", "to filter"), ("tab", "fill")],
+            _ => &[],
+        }
     }
 
     /// Whether the verb acts on the panel itself rather than on the row under the cursor.
@@ -293,6 +305,9 @@ pub struct PickerItem {
     pub label: String,
     pub detail: String,
     pub value: String,
+    /// Words the filter matches that the row does not print: a command's aliases, so `/resume`
+    /// still finds `/sessions`, and its description, so `conversation` does too.
+    pub keywords: String,
     /// Already in force — the picker marks it so the operator can see the current answer.
     pub current: bool,
 }
@@ -307,8 +322,14 @@ impl PickerItem {
             label: label.into(),
             detail: detail.into(),
             value: value.into(),
+            keywords: String::new(),
             current: false,
         }
+    }
+
+    pub fn with_keywords(mut self, keywords: impl Into<String>) -> Self {
+        self.keywords = keywords.into();
+        self
     }
 
     pub fn as_current(mut self) -> Self {
@@ -356,7 +377,7 @@ impl Picker {
     /// filter would put `/model` under the cursor for someone asking for `/mode`; an exact name
     /// always wins, and rows that rank the same keep their list order.
     pub fn visible(&self) -> Vec<usize> {
-        let query = self.query.trim().to_lowercase();
+        let query = self.filter_text().to_lowercase();
         if query.is_empty() {
             return (0..self.items.len()).collect();
         }
@@ -367,15 +388,24 @@ impl Picker {
             .filter_map(|(index, item)| {
                 let label = item.label.to_lowercase();
                 let value = item.value.to_lowercase();
+                let keywords = item.keywords.to_lowercase();
                 let bare = label.trim_start_matches('/');
+                // An alias is a second name, not a footnote: typing `res` has to put `/sessions`
+                // above `/presence`, which merely contains the letters. Description words are
+                // searched the same way, so `conversation` finds the session commands first.
+                let keyword_prefix = keywords
+                    .split_whitespace()
+                    .any(|word| word.starts_with(&query));
                 let rank = if bare == query || value == query {
                     0
-                } else if bare.starts_with(&query) || value.starts_with(&query) {
+                } else if bare.starts_with(&query) || value.starts_with(&query) || keyword_prefix {
                     1
                 } else if label.contains(&query) || value.contains(&query) {
                     2
-                } else if subsequence(&query, &label) {
+                } else if !keywords.is_empty() && keywords.contains(&query) {
                     3
+                } else if subsequence(&query, &label) {
+                    4
                 } else {
                     return None;
                 };
@@ -384,6 +414,32 @@ impl Picker {
             .collect();
         ranked.sort_by_key(|(rank, index)| (*rank, *index));
         ranked.into_iter().map(|(_, index)| index).collect()
+    }
+
+    /// The part of the query that narrows the list.
+    ///
+    /// The command palette also carries the command's argument: `/model gpt-5.2` has to leave
+    /// `model` under the cursor while `gpt-5.2` rides along for the command. Only the first word
+    /// filters, so typing an argument never makes the row disappear.
+    fn filter_text(&self) -> &str {
+        let query = self.query.trim();
+        if self.kind == PickerKind::Command {
+            query.split_whitespace().next().unwrap_or("")
+        } else {
+            query
+        }
+    }
+
+    /// The argument typed after a command's name, handed to the command when it runs.
+    pub fn command_args(&self) -> String {
+        if self.kind != PickerKind::Command {
+            return String::new();
+        }
+        self.query
+            .trim()
+            .split_once(char::is_whitespace)
+            .map(|(_, args)| args.trim().to_owned())
+            .unwrap_or_default()
     }
 
     /// The row under the cursor, if any. `None` is a real answer: an empty filter result or an empty
@@ -746,6 +802,22 @@ pub fn picker_body(picker: &Picker, theme: &Theme, width: u16) -> PickerBody {
             start: start as u16,
             end: col as u16,
         });
+    }
+    // Plain keys sit beside the buttons in the same legend, quieter than a chord band because
+    // they are what the hand already does: typing into the filter, Tab completing the name.
+    for (key, action) in picker.kind.hints() {
+        let text = format!(" {key} {action} ");
+        let text_width = UnicodeWidthStr::width(text.as_str());
+        let separator = if col == PAD { 0 } else { 2 };
+        if col + separator + text_width > width {
+            break;
+        }
+        if separator > 0 {
+            spans.push(Span::styled(" ".repeat(separator), theme.muted()));
+        }
+        col += separator;
+        spans.push(Span::styled(text, theme.muted()));
+        col += text_width;
     }
     if col + 2 + "esc close".len() <= width {
         spans.push(Span::styled(
@@ -1232,6 +1304,91 @@ mod tests {
         assert!(
             !text_of(&body.lines[body.first_row - 1]).contains("gpt-5.2"),
             "the line above the first row must not be a row"
+        );
+    }
+
+    fn command_palette() -> Picker {
+        Picker::new(
+            PickerKind::Command,
+            "Commands",
+            vec![
+                PickerItem::new("/sessions", "Switch to another conversation", "sessions")
+                    .with_keywords("resume switch Switch to another conversation"),
+                PickerItem::new("/model", "Choose the model this session runs on", "model")
+                    .with_keywords("Choose the model this session runs on"),
+                PickerItem::new("/help", "Browse every command", "help")
+                    .with_keywords("? Browse every command"),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_command_is_found_by_alias_and_by_a_word_from_its_description() {
+        let mut picker = command_palette();
+        picker.type_str("res");
+        assert_eq!(
+            picker.selected_item().unwrap().value,
+            "sessions",
+            "a partial alias has to beat a name that merely contains the letters"
+        );
+        picker.query.clear();
+        picker.type_str("resume");
+        assert_eq!(
+            picker.selected_item().unwrap().value,
+            "sessions",
+            "an alias has to reach the command it names"
+        );
+        picker.query.clear();
+        picker.type_str("browse");
+        assert_eq!(
+            picker.selected_item().unwrap().value,
+            "help",
+            "a description word has to reach the command too"
+        );
+    }
+
+    #[test]
+    fn an_argument_after_the_command_name_does_not_hide_the_row() {
+        let mut picker = command_palette();
+        picker.type_str("model gpt-5.2");
+        assert_eq!(
+            picker.selected_item().map(|item| item.value.as_str()),
+            Some("model"),
+            "only the first word filters; the rest is the argument"
+        );
+        assert_eq!(picker.command_args(), "gpt-5.2");
+        let mut other = command_palette();
+        other.type_str("model");
+        assert_eq!(other.command_args(), "");
+    }
+
+    #[test]
+    fn the_palette_footer_teaches_the_same_keys_the_model_panel_does() {
+        let picker = command_palette();
+        let body = picker_body(&picker, &Theme::new(false), 72);
+        let footer = text_of(body.lines.last().unwrap());
+        for expected in ["choose enter", "type to filter", "tab fill", "esc close"] {
+            assert!(
+                footer.contains(expected),
+                "the footer is missing `{expected}`: {footer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ascii_mode_draws_the_palette_without_a_single_unicode_glyph() {
+        let mut picker = command_palette();
+        picker.type_str("model");
+        let body = picker_body(&picker, &Theme::new(true), 72);
+        let text: String = body
+            .lines
+            .iter()
+            .map(text_of)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.is_ascii(),
+            "ASCII mode must not fall back to unicode markers: {text:?}"
         );
     }
 

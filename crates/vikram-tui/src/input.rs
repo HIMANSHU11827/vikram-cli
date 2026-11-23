@@ -500,6 +500,19 @@ fn handle_input(app: &mut App, key: KeyEvent) -> bool {
             }
             true
         }
+        // `/` on an empty line is the command palette, not text: it opens the same searchable
+        // picker `/model` uses, and the following keys filter it instead of being typed into the
+        // draft. A `/` anywhere else is still an ordinary character.
+        KeyCode::Char('/')
+            if !ctrl
+                && !key.modifiers.contains(KeyModifiers::ALT)
+                && app
+                    .display_session()
+                    .is_some_and(|session| session.editor.is_empty()) =>
+        {
+            open_palette(app);
+            true
+        }
         KeyCode::Char(ch) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
             if let Some(session) = app.display_session_mut() {
                 session.editor.insert_char(ch);
@@ -668,10 +681,10 @@ fn handle_suggestion_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         KeyCode::Enter => {
-            // Enter takes what is highlighted and runs it, so a command never has to be spelled
-            // out: `/cl` + Enter runs `/close`. A bare prefix (`/`, `@`, `!`) still opens its
-            // panel, and a half-typed `@path` is only filled in, because the mention is part of
-            // a sentence the operator is still writing.
+            // Enter takes what is highlighted. A bare prefix (`@`, `!`) still opens its panel,
+            // and a half-typed `@path` is only filled in, because the mention is part of a
+            // sentence the operator is still writing. Commands do not come through here: they
+            // are the picker's rows, and its Enter runs the command.
             let token = app.display_session().and_then(|session| {
                 let text = session.editor.text();
                 let (_, col) = session.editor.cursor();
@@ -778,16 +791,12 @@ fn refresh_suggestions(app: &mut App) {
     let query = token.query.to_lowercase();
     let mut items: Vec<Suggestion> = Vec::new();
     match token.kind {
+        // Commands are the picker's job: typing `/` opens the searchable palette, so there is no
+        // second, thinner list to keep in step with it. Only inline completions (`@`, `!`) still
+        // ride above the input, because they fill a token inside a sentence rather than replace it.
         PrefixKind::Slash => {
-            for command in crate::commands::COMMANDS {
-                if query.is_empty() || command.name.contains(&query) {
-                    items.push(Suggestion {
-                        text: format!("/{}", command.name),
-                        description: command.description.to_owned(),
-                        category: "command".to_owned(),
-                    });
-                }
-            }
+            app.suggestions = None;
+            return;
         }
         PrefixKind::Shell => {
             // Recent `!` commands from this session's input history first, then common commands.
@@ -1078,6 +1087,14 @@ pub fn open_palette(app: &mut App) {
                 command.description,
                 command.name,
             )
+            // Aliases and the description are searchable but never printed: `/resume` has to find
+            // `/sessions`, and someone who remembers "conversation" but not the command name has
+            // to find it too.
+            .with_keywords(format!(
+                "{} {}",
+                command.aliases.join(" "),
+                command.description
+            ))
         })
         .collect();
     app.open_picker(Picker::new(PickerKind::Command, "Commands", items));
@@ -1136,6 +1153,19 @@ fn handle_picker_overlay(app: &mut App, mut picker: Picker, key: KeyEvent) -> bo
         }
         KeyCode::Enter => {
             commit_verb(app, &picker, picker.kind.primary_verb());
+            true
+        }
+        // Tab fills the highlighted command into the draft instead of running it, so an argument
+        // can still be typed after the name: `/model` + Tab leaves `/model ` in the input.
+        KeyCode::Tab if picker.kind == PickerKind::Command => {
+            if let Some(item) = picker.selected_item() {
+                let text = format!("/{} ", item.value);
+                if let Some(session) = app.display_session_mut() {
+                    session.editor.set_text(&text);
+                }
+                app.overlay = None;
+                app.focus = Focus::Input;
+            }
             true
         }
         KeyCode::Up => {
@@ -1212,6 +1242,26 @@ fn handle_picker_overlay(app: &mut App, mut picker: Picker, key: KeyEvent) -> bo
 /// list does nothing unless it names the panel itself: creating the first bot has to work before
 /// one exists, or the panel can never be used to create it.
 fn commit_verb(app: &mut App, picker: &Picker, verb: crate::widgets::Verb) {
+    // A command row is an instruction to run, with the tail of the filter as its argument. That is
+    // exactly what typing the command would have sent, so the palette and the dispatcher cannot
+    // disagree about what `/model gpt-5.2` means.
+    if picker.kind == PickerKind::Command && verb == crate::widgets::Verb::Choose {
+        let Some(item) = picker.selected_item() else {
+            // No match is already explained by the panel's own "nothing matches" line; a notice on
+            // top of it would just say the same thing twice.
+            return;
+        };
+        let Some(session) = app.display_session() else {
+            return;
+        };
+        app.commands.push(UiCommand::SlashCommand {
+            session: session.id.clone(),
+            command: item.value.clone(),
+            args: picker.command_args(),
+        });
+        app.overlay = None;
+        return;
+    }
     let value = match picker.selected_item() {
         Some(item) => item.value.clone(),
         None if picker.kind.panel_verb(verb) => String::new(),
@@ -2583,15 +2633,19 @@ mod tests {
     }
 
     #[test]
-    fn typing_slash_opens_the_command_popup_and_tab_accepts() {
+    fn typing_slash_opens_the_picker_and_tab_fills_the_highlighted_name() {
         let mut app = app_with_session();
         handle_key(&mut app, key(KeyCode::Char('/')));
+        assert!(
+            matches!(app.overlay, Some(Overlay::Picker(_))),
+            "`/` opens the palette itself, not a thinner list"
+        );
+        assert!(app.suggestions.is_none(), "no second list under the input");
         handle_key(&mut app, key(KeyCode::Char('h')));
         handle_key(&mut app, key(KeyCode::Char('e')));
-        let popup = app.suggestions.as_ref().expect("popup open");
-        assert_eq!(popup.items[0].text, "/help");
+        assert_eq!(picker_of(&app).selected_item().unwrap().value, "help");
         handle_key(&mut app, key(KeyCode::Tab));
-        assert!(app.suggestions.is_none());
+        assert!(app.overlay.is_none());
         assert_eq!(app.display_session().unwrap().editor.text(), "/help ");
     }
 
@@ -2601,10 +2655,9 @@ mod tests {
         for ch in "/cl".chars() {
             handle_key(&mut app, key(KeyCode::Char(ch)));
         }
-        let popup = app.suggestions.as_ref().expect("popup open");
-        assert_eq!(popup.items[0].text, "/close");
+        assert_eq!(picker_of(&app).selected_item().unwrap().value, "close");
         handle_key(&mut app, key(KeyCode::Enter));
-        assert!(app.suggestions.is_none());
+        assert!(app.overlay.is_none());
         assert_eq!(app.display_session().unwrap().editor.text(), "");
         assert!(
             matches!(
@@ -2612,6 +2665,68 @@ mod tests {
                 [UiCommand::SlashCommand { command, .. }] if command == "close"
             ),
             "a half-typed command has to run the completion, not fail as unknown"
+        );
+    }
+
+    #[test]
+    fn an_alias_narrows_the_palette_to_the_command_it_names() {
+        let mut app = app_with_session();
+        for ch in "/resume".chars() {
+            handle_key(&mut app, key(KeyCode::Char(ch)));
+        }
+        assert_eq!(
+            picker_of(&app).selected_item().unwrap().value,
+            "sessions",
+            "`resume` is an alias of `/sessions`, not a command of its own"
+        );
+    }
+
+    #[test]
+    fn a_word_from_the_description_narrows_the_palette_too() {
+        let mut app = app_with_session();
+        for ch in "/conversation".chars() {
+            handle_key(&mut app, key(KeyCode::Char(ch)));
+        }
+        assert_eq!(picker_of(&app).selected_item().unwrap().value, "sessions");
+    }
+
+    #[test]
+    fn arrows_never_leave_the_filtered_list() {
+        let mut app = app_with_session();
+        for ch in "/model".chars() {
+            handle_key(&mut app, key(KeyCode::Char(ch)));
+        }
+        assert_eq!(picker_of(&app).selected, 0);
+        handle_key(&mut app, key(KeyCode::Up));
+        let len = picker_of(&app).visible().len();
+        assert_eq!(
+            picker_of(&app).selected,
+            len - 1,
+            "up from the first row lands on the last visible one"
+        );
+        handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(picker_of(&app).selected, 0);
+    }
+
+    #[test]
+    fn an_argument_typed_after_the_command_name_rides_along() {
+        let mut app = app_with_session();
+        for ch in "/model gpt-5.2".chars() {
+            handle_key(&mut app, key(KeyCode::Char(ch)));
+        }
+        assert_eq!(
+            picker_of(&app).selected_item().unwrap().value,
+            "model",
+            "the argument must not filter the command out"
+        );
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(
+            matches!(
+                app.take_commands().as_slice(),
+                [UiCommand::SlashCommand { command, args, .. }]
+                    if command == "model" && args == "gpt-5.2"
+            ),
+            "the palette sends what typing `/model gpt-5.2` would have sent"
         );
     }
 
@@ -2655,12 +2770,15 @@ mod tests {
     }
 
     #[test]
-    fn typing_unknown_command_closes_the_popup() {
+    fn a_command_that_matches_nothing_leaves_the_palette_open_and_empty() {
         let mut app = app_with_session();
         for ch in ['/', 'z', 'z', 'z'] {
             handle_key(&mut app, key(KeyCode::Char(ch)));
         }
-        assert!(app.suggestions.is_none());
+        assert!(app.suggestions.is_none(), "the old popup never comes back");
+        let picker = picker_of(&app);
+        assert!(picker.visible().is_empty());
+        assert!(picker.selected_item().is_none());
     }
 
     #[test]
@@ -2674,13 +2792,19 @@ mod tests {
     }
 
     #[test]
-    fn escape_dismisses_the_popup_without_losing_the_draft() {
+    fn escape_closes_the_palette_without_running_anything() {
         let mut app = app_with_session();
         handle_key(&mut app, key(KeyCode::Char('/')));
-        assert!(app.suggestions.is_some());
+        handle_key(&mut app, key(KeyCode::Char('m')));
+        assert!(matches!(app.overlay, Some(Overlay::Picker(_))));
         handle_key(&mut app, key(KeyCode::Esc));
-        assert!(app.suggestions.is_none());
-        assert_eq!(app.display_session().unwrap().editor.text(), "/");
+        assert!(app.overlay.is_none());
+        assert!(app.take_commands().is_empty());
+        assert_eq!(
+            app.display_session().unwrap().editor.text(),
+            "",
+            "the filter never becomes a draft"
+        );
     }
 
     fn picker_of(app: &App) -> &Picker {
@@ -2694,7 +2818,6 @@ mod tests {
     fn a_lone_slash_opens_the_palette_naming_every_command_in_the_table() {
         let mut app = app_with_session();
         handle_key(&mut app, key(KeyCode::Char('/')));
-        handle_key(&mut app, key(KeyCode::Enter));
         let picker = picker_of(&app);
         assert_eq!(picker.kind, PickerKind::Command);
         assert_eq!(picker.items.len(), commands::COMMANDS.len());
@@ -2709,7 +2832,6 @@ mod tests {
     fn typing_in_the_palette_filters_and_enter_emits_the_choice_not_the_text() {
         let mut app = app_with_session();
         handle_key(&mut app, key(KeyCode::Char('/')));
-        handle_key(&mut app, key(KeyCode::Enter));
         for ch in "mdl".chars() {
             handle_key(&mut app, key(KeyCode::Char(ch)));
         }
@@ -2720,7 +2842,7 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert!(matches!(
             &commands[0],
-            UiCommand::Act { kind: PickerKind::Command, value, .. } if value == "model"
+            UiCommand::SlashCommand { command, .. } if command == "model"
         ));
     }
 
@@ -2728,7 +2850,6 @@ mod tests {
     fn escape_leaves_the_chooser_without_choosing_anything() {
         let mut app = app_with_session();
         handle_key(&mut app, key(KeyCode::Char('/')));
-        handle_key(&mut app, key(KeyCode::Enter));
         handle_key(&mut app, key(KeyCode::Esc));
         assert!(app.overlay.is_none());
         assert!(app.take_commands().is_empty());
@@ -2738,7 +2859,6 @@ mod tests {
     fn a_filter_that_matches_nothing_cannot_be_chosen() {
         let mut app = app_with_session();
         handle_key(&mut app, key(KeyCode::Char('/')));
-        handle_key(&mut app, key(KeyCode::Enter));
         for ch in "zzz".chars() {
             handle_key(&mut app, key(KeyCode::Char(ch)));
         }
@@ -2786,7 +2906,6 @@ mod tests {
     fn filtering_for_permissions_does_not_put_model_on_the_cursor() {
         let mut app = app_with_session();
         handle_key(&mut app, key(KeyCode::Char('/')));
-        handle_key(&mut app, key(KeyCode::Enter));
         for ch in "permis".chars() {
             handle_key(&mut app, key(KeyCode::Char(ch)));
         }
@@ -2798,7 +2917,7 @@ mod tests {
         let command = app.take_commands().pop().expect("a choice");
         assert!(matches!(
             command,
-            UiCommand::Act { kind: PickerKind::Command, ref value, .. } if value == "permissions"
+            UiCommand::SlashCommand { ref command, .. } if command == "permissions"
         ));
     }
 
@@ -2806,7 +2925,6 @@ mod tests {
     fn ctrl_c_leaves_a_panel_and_stops_instead_of_being_swallowed_by_it() {
         let mut app = app_with_session();
         handle_key(&mut app, key(KeyCode::Char('/')));
-        handle_key(&mut app, key(KeyCode::Enter));
         assert!(matches!(app.overlay, Some(Overlay::Picker(_))));
         handle_key(&mut app, ctrl(KeyCode::Char('c')));
         assert!(app.overlay.is_none(), "a panel must not trap the stop key");

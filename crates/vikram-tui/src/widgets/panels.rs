@@ -746,7 +746,6 @@ pub fn suggestions_popup(frame: &mut Frame, anchor: Rect, app: &mut App, theme: 
     // Same ring, same body and same title-on-the-edge as every other panel, so the list an operator
     // types into reads as a surface of the interface rather than as a second, thinner vocabulary.
     let title = match items.first().map(|item| item.category.as_str()) {
-        Some("command") => " commands ",
         Some("shell") => " shell ",
         _ => " files ",
     };
